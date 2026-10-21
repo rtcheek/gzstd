@@ -519,6 +519,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      measured: `malloc_trim(0)` between inputs (no effect on large inputs, whose peak is the mapped
      input plus in-flight frames: 2.4 GB for one 1.5 GiB input; -45 MB on the capped 96 x 40 MiB, for
      +0.1 s wall); `M_ARENA_MAX` (1 arena: +15% user CPU on one 3.75 GiB input, no RSS gain there).
+   - **v0.18.25: the GPU build too.**  v0.18.24's caps were measured on the CPU-only build and the
+     release (the GPU build) did not get them for this shape: the startup size gate asks of the whole
+     run, so `-r` over 96 x 40 MiB ran every input through the hybrid pipeline (96-thread CPU pool,
+     then the bringup skipped the GPU): 1.09 GB, 6.6 s.  Now each input is asked too, and a hybrid
+     CPU pool is capped at the input's frames: 154 MB, 3.0 s; `-d -r` 1.06-1.26 GB -> 0.19 GB.
+     Measure the build that ships.
    - **`--stats-json` over several inputs is the run's record**, with `files`, summed bytes, per-device
      GPU shares, the largest pool, and elapsed time from the first input (owner's decision, 2026-10-21:
      run totals, not a per-file list).

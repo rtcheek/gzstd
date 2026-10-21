@@ -622,8 +622,10 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=561
-$EXTENSIVE && EXPECTED_TESTS=862
+EXPECTED_TESTS=562
+$EXTENSIVE && EXPECTED_TESTS=863
+# v0.18.25: +1 default GPU cell (an input below a GPU batch takes the CPU path in a run
+# that does not): 561 -> 562, 862 -> 863; the no-GPU deltas +1 (146 -> 147, 212 -> 213).
 # v0.18.24: +1 default cell, no GPU (--stats-json over several inputs reports the
 # run's totals): 560 -> 561, 861 -> 862.
 # v0.18.23: +1 default cell, no GPU (a small input decompresses with one thread per
@@ -911,8 +913,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=146   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=212   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14
+EXPECTED_NOGPU_DELTA=147   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=213   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1731,6 +1733,62 @@ if has_gpu 2>/dev/null; then
     || fail "--stats-json on a GPU compress: written, with each device's share" "got$why"
 else
   skip "--stats-json on a GPU compress: written, with each device's share" "no GPU"
+fi
+
+# ONE INPUT BELOW A GPU BATCH, IN A RUN THAT IS NOT (v0.18.25).  The startup gate asks
+# its question of the whole run, so `-r` over 96 x 40 MiB (3.75 GiB) went hybrid and every
+# 40 MiB input started a 96-thread CPU pool before its bringup skipped the GPU: 1.05 GB
+# peak RSS and 6.5 s against 0.15 GB and 2.9 s.  Now each input is asked too, and an
+# explicit --hybrid keeps its pipeline with no more CPU workers than the input has frames.
+# The suite disables the size gate (GZSTD_DEBUG_GPU_MIN_BYTES=0), so this cell sets a 4 MiB
+# bound: two 3 MiB inputs pass it as a run and each fails it alone.  1 MiB frames, three
+# per input, so the CPU path's pool and the hybrid cap both read 3.
+if has_gpu 2>/dev/null; then
+  t0=$(now_ms); why=""
+  PG="$TMPDIR/pg"; rm -rf "$PG"; mkdir -p "$PG/c" "$PG/d"
+  for pg_f in a b; do head -c 3000000 /dev/urandom | base64 -w0 | head -c 3145728 > "$PG/c/$pg_f"; done
+  pg_bound=(env GZSTD_DEBUG_GPU_MIN_BYTES=4194304)
+  "${pg_bound[@]}" "$GZSTD" -v -k -f --chunk-size=1 "$PG/c/a" "$PG/c/b" 2> "$PG/c.err" || why+=" compress-exit:$?"
+  [[ $(tr '\r' '\n' < "$PG/c.err" | grep -c 'this input .* compressing it on the CPU') == 2 ]] \
+    || why+=" compress:$(tr '\r' '\n' < "$PG/c.err" | grep -oE '\[(GPU|HYBRID)\] [a-z ]+' | sort -u | tr '\n' ',')"
+  grep -q 'HYBRID\] starting CPU pool' "$PG/c.err" && why+=" compress-started-hybrid"
+  "${pg_bound[@]}" "$GZSTD" -v -d -f --output-dir-flat "$PG/d" "$PG/c/a.zst" "$PG/c/b.zst" 2> "$PG/d.err" \
+    || why+=" decompress-exit:$?"
+  [[ $(tr '\r' '\n' < "$PG/d.err" | grep -c 'this input .* decoding it on the CPU') == 2 ]] \
+    || why+=" decompress:$(tr '\r' '\n' < "$PG/d.err" | grep -oE '\[(GPU|HYBRID)\] [a-z ]+' | sort -u | tr '\n' ',')"
+  grep -q 'HYBRID\] decompress:' "$PG/d.err" && why+=" decompress-started-hybrid"
+  for pg_f in a b; do cmp -s "$PG/c/$pg_f" "$PG/d/$pg_f" || why+=" bytes:$pg_f"; done
+  # The per-input estimate must use the held descriptor.  Replace its name
+  # with a FIFO only AFTER startup's probes and the input open; a second open
+  # by name would hang.  Unlink the gate after the rendezvous so input b does
+  # not wait for another writer.  Both inputs must still take the hand-off.
+  mkfifo "$PG/gate"
+  GZSTD_DEBUG_INPUT_GATE="$PG/gate" timeout --foreground -k 2 15 "${pg_bound[@]}" \
+    "$GZSTD" -v -d -f --output-dir-flat "$PG/d" "$PG/c/a.zst" "$PG/c/b.zst" \
+    2> "$PG/pin.err" &
+  pg_pid=$!
+  timeout 10 sh -c 'exec 9>"$1" || exit 1
+                   rm "$1" || exit 1
+                   mv "$2" "$2.held" || exit 1
+                   mkfifo "$2" || exit 1
+                   printf g >&9' sh "$PG/gate" "$PG/c/a.zst" || why+=" pinned-rendezvous"
+  pg_rc=0; wait "$pg_pid" || pg_rc=$?
+  [[ $pg_rc -eq 0 ]] || why+=" pinned-exit:$pg_rc"
+  [[ $(tr '\r' '\n' < "$PG/pin.err" | grep -c 'this input .* decoding it on the CPU') == 2 ]] \
+    || why+=" pinned-handoff"
+  for pg_f in a b; do cmp -s "$PG/c/$pg_f" "$PG/d/$pg_f" || why+=" pinned-bytes:$pg_f"; done
+  "${pg_bound[@]}" "$GZSTD" -v --hybrid -f --chunk-size=1 -c "$PG/c/a" 2> "$PG/h.err" > "$PG/h.zst" || why+=" hybrid-exit:$?"
+  grep -q 'HYBRID\] starting CPU pool: 3 threads' "$PG/h.err" \
+    || why+=" hybrid-pool:$(grep -oE 'starting CPU pool: [0-9]+' "$PG/h.err")"
+  "${pg_bound[@]}" "$GZSTD" -v --hybrid -d -c "$PG/h.zst" 2> "$PG/hd.err" | cmp -s - "$PG/c/a" || why+=" hybrid-d-bytes"
+  grep -q 'HYBRID\] decompress: 3 CPU threads' "$PG/hd.err" \
+    || why+=" hybrid-d-pool:$(grep -oE 'decompress: [0-9]+ CPU' "$PG/hd.err")"
+  rm -rf "$PG"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "an input below a GPU batch takes the CPU path in a run that does not" \
+    || fail "an input below a GPU batch takes the CPU path in a run that does not" "got$why"
+else
+  skip "an input below a GPU batch takes the CPU path in a run that does not" "no GPU"
 fi
 
 # ============================================================
@@ -7125,15 +7183,25 @@ if has_gpu 2>/dev/null; then
     # forced onto an old card: the ranking must land on the one card left.  Run
     # for TWO different survivors -- a ranking that ignored the floor would pick
     # its own favourite both times, so at least one run must then miss.
-    fl_why=""
+    fl_why=""; fl_unexercised=""
     for fl_keep in "${fl_cards[0]}" "${fl_cards[1]}"; do
       fl_hook=$(printf '%s\n' "$fl_proc" | grep -v "^$fl_keep\$" | sed 's/^/6.1@/' | paste -sd, -)
       fl_guess=$(printf '%s\n' "$fl_proc" | grep -n -v "^$fl_keep\$" | head -1 | cut -d: -f1)
-      fl_rc=0
-      fl_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CC="$fl_hook" \
-                 GZSTD_DEBUG_GPU_MASK_GUESS=$(( fl_guess - 1 )) \
-                 timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -vv -k -f \
-                 "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || fl_rc=$?
+      # THE RANKING NEEDS A LOAD SAMPLE.  On a loaded box the driver probe and NVML can
+      # both miss their shared 500 ms budget (seen 2026-10-21, three cards at 100% for
+      # other users); gzstd then keeps the startup guess -- which this arm forces onto an
+      # old card -- and refuses it, correctly, exit 2.  That run tested no ranking: try
+      # again, and a survivor that never gets a sample leaves the arm not exercised.
+      for fl_try in 1 2 3; do
+        fl_rc=0
+        fl_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CC="$fl_hook" \
+                   GZSTD_DEBUG_GPU_MASK_GUESS=$(( fl_guess - 1 )) \
+                   timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -vv -k -f \
+                   "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || fl_rc=$?
+        printf '%s' "$fl_log" | grep -q 'could not read GPU load before choosing' || break
+        fl_log=""
+      done
+      if [[ -z "$fl_log" ]]; then fl_unexercised+=" ${fl_keep:0:12}"; continue; fi
       fl_sel=$(printf '%s' "$fl_log" | sed -n 's/.*\[GPU\] selected \(GPU-[0-9a-f-]*\).*/\1/p' | head -1)
       [[ $fl_rc -eq 0 ]] || fl_why+=" [subset rc=$fl_rc]"
       [[ "$fl_sel" == "$fl_keep" ]] || fl_why+=" [kept ${fl_keep:0:12}, selected '${fl_sel:0:12}']"
@@ -7173,8 +7241,14 @@ if has_gpu 2>/dev/null; then
                "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || fl_why+=" [ranked full fleet: rc=$?]"
     printf '%s' "$fl_log" | grep -q 'checking all CUDA devices' \
       || fl_why+=" [ranked full fleet shrank to the NVML sample: $(printf '%s' "$fl_log" | grep -o '\[GPU\] selected [^(]*' | head -1 | cut -c1-60)]"
-    [[ -z "$fl_why" ]] && pass "a GPU subset never guesses or ranks a card below the floor" \
-      || fail "a GPU subset never guesses or ranks a card below the floor" "$fl_why"
+    if [[ -n "$fl_why" ]]; then
+      fail "a GPU subset never guesses or ranks a card below the floor" "$fl_why"
+    elif [[ -n "$fl_unexercised" ]]; then
+      skip_host "a GPU subset never guesses or ranks a card below the floor" \
+        "not exercised: no GPU load sample within its budget in 3 tries, survivor$fl_unexercised (the other arms passed)"
+    else
+      pass "a GPU subset never guesses or ranks a card below the floor"
+    fi
     rm -f "$TMPDIR/fl-mixed.bin" "$TMPDIR/fl-mixed.zst" "$TMPDIR/fl-mixed.dec" "$TMPDIR/fl-sub.zst"
   else
     skip "mixed card generations: only the card new enough does GPU work" \

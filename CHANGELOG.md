@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.24  
+**Covers:** v0.9.50 → v0.18.25  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,7 +8,94 @@
 ---
 
 
-## v0.18.24 — a one-frame `-d` starts no thread; a pool starts no more workers than its input has frames (`-r` over 96 x 40 MiB: peak RSS 1.33 GB -> 0.15, 1.7x faster); the O_DIRECT writer starts its thread when it first needs one; `--stats-json` describes the whole run
+## v0.18.25 — the GPU build gets v0.18.24's pool fix: an input below one GPU batch takes the CPU path in a run that does not, and a hybrid CPU pool starts no more workers than its input has frames (`-r` over 96 x 40 MiB: 1.09 GB -> 0.15, 2.2x faster)
+
+**v0.18.24's headline did not hold for the binary that ships.**  Checking the v0.18.24 release
+binary (the GPU build) on the 256-core, 8x H100 server: `-r -3` over 96 x 40 MiB peaked at 1.09-1.12 GB
+in 6.4-6.7 s -- the same as before v0.18.24 (1.05 GB, 6.5 s) -- where the CPU-only build, which is
+where v0.18.24 measured it, took 0.15 GB.  `-d -r` over the 96 archives: 1.06-1.26 GB, 5.1-5.2 s.
+v0.18.24 capped `compress_cpu_mt`'s and `decompress_cpu_mt`'s pools; the GPU build never reached
+them.  The startup size gate (`apply_backend_defaults`, "input < one GPU batch: cpu-only") asks its
+question of the WHOLE run's work, and 3.75 GiB passes, so every 40 MiB input went to the hybrid
+pipeline: a 96-thread CPU pool, the tick and bringup threads (103 for one `-d`), and then the
+bringup skipped the GPU ("CPU pool will finish before GPU init could").  A lone 40 MiB file, or a
+run whose total is under one batch, was never affected.
+
+### The two fixes
+
+- **Each input is asked too** (`gz_input_below_gpu_batch`), with the same bound and moving only what
+  the startup gate moves: a DEFAULT backend in adaptive hybrid (an explicit `--hybrid`,
+  `--cpu-share`, `--gpu-batch`, `--gpu-streams`, `--gpu-only` or `--gds-only` keeps the GPU), never
+  `--tar` (whose archive `compress_nvcomp` already gates the same way), and only an input whose
+  size is known: compress by `fstat` of the held descriptor, inside `compress_nvcomp`, mirroring
+  the `--tar` hand-off; decompress at the dispatch in `gzstd_main` -- not inside `decompress_nvcomp`,
+  so neither decoder opens its seek-table scope inside the other's -- by the startup gate's own
+  estimate (the file scaled by its first frame's ratio; a named file only, read from the held
+  descriptor).  The per-input ratio probe runs only for an eligible backend with compressed size
+  below the bound.  A pipe keeps the GPU's
+  chance.  `-v`: "this input N MiB < one GPU batch; compressing (decoding) it on the CPU".  The
+  suite's `GZSTD_DEBUG_GPU_MIN_BYTES=0` disables this exactly as it disables the startup gate.
+- **An auto-sized hybrid CPU pool starts no more workers than the input has frames**:
+  `compress_nvcomp` by ceil(size / chunk) for a known, nonempty plain input once the chunk is fixed,
+  `decompress_nvcomp` by the seek table when present, as v0.18.24 did for the CPU paths.  Frame
+  geometry stays the same; scheduling can still change which frames the CPU and GPU encode.
+  The GPUs share those frames, so the CPU could never use more.  `HybridSched` stores its CPU count
+  and never reads it.  Explicit `-T` counts and `GZSTD_DEBUG_NO_SMALL_SERIAL` retain the full pool.
+
+| 96 x 40 MiB, level 3, GPU build | v0.18.24 release | v0.18.25 |
+|---|---|---|
+| `-r` compress: peak RSS / wall | 1.09-1.12 GB / 6.44-6.73 s | 154 MB / 2.94-3.01 s |
+| `-d -r`: peak RSS / wall | 1.06-1.26 GB / 5.13-5.21 s | 184-192 MB / 4.31-4.39 s |
+
+### A file's bytes no longer depend on how it was named
+
+The hybrid path clamps frames to 16 MiB (the GPU subchunk), the CPU path does not, so an input that
+used to reach the hybrid path compressed differently from the same file alone:
+- in a large `-r`, `--ultra -20` gave a 40 MiB file different bytes than `gzstd --ultra -20 file`;
+- a redirected stdin (`gzstd -c --chunk-size=32 < f`, or `--ultra -20`), which the startup gate
+  cannot size, differed from `gzstd -c --chunk-size=32 f` for the tested inputs over 16 MiB and
+  below one GPU batch.
+These below-batch inputs now match the named, single-file output (checked at `-3`, `-19` and `--ultra -20`, and 8 stdin
+shapes).  Every other compress shape is byte-identical to v0.18.24 (216 shapes, GPU build), and so
+is every decompress cell (286 per build).  A true pipe stays hybrid and clamped, as before.
+
+### Cells
+
+Default run, GPU (EXPECTED 562/863; no-GPU deltas 147/213): **"an input below a GPU batch takes the
+CPU path in a run that does not"** -- two 3 MiB inputs under a 4 MiB bound (`GZSTD_DEBUG_GPU_MIN_BYTES`):
+both compress and both decode on the CPU path with no hybrid pool, bytes right; and an explicit
+`--hybrid` starts 3 CPU workers each way for a 3-frame input.  The v0.18.24 release binary fails all
+four arms (hybrid both ways, 96-thread pools).
+
+**"a GPU subset never guesses or ranks a card below the floor"** failed once in the first `-e` run:
+its subset arm forces gzstd's startup guess onto a card the hook marks old and needs the ranking to
+move it, and that run's load sample never arrived ("could not read GPU load before choosing: driver
+probe: no answer within the shared 500 ms budget"; three of the eight cards were at 100% for other
+users), so gzstd kept the guess and `--gpu-only` refused it -- correctly, exit 2.  By hand the arm
+passed 2 of 3 runs on v0.18.25 and 3 of 3 on v0.18.24; v0.18.25 changes nothing in GPU selection.
+The arm now retries a run that got no sample (up to 3 tries), and a survivor that never gets one
+leaves the cell not exercised (`skip_host`) rather than failed; a ranking that ignores the floor
+with a sample in hand still fails it.  The not-exercised branch was driven through a wrapper that
+answers the subset run the way the failing run did.
+
+Review (round 1) found the per-input decode estimate REOPENING the input by name, after the driver
+held it: a name replaced with a FIFO that has no writer blocked that open forever -- the
+different-UID directory writer this project's input handling defends against.  The estimator now
+preads the held descriptor (startup keeps its name-based wrapper: nothing is held yet), and runs
+only for an eligible backend whose compressed size is already below the bound.  The cell gained the
+arm (`GZSTD_DEBUG_INPUT_GATE`: after input a is opened, its name becomes a FIFO): the pre-patch
+binary times out (exit 124), the patched one decodes both inputs on the CPU with the right bytes.
+
+**Review** (Codex GPT-6.1-Sol, max, a fresh session, two turns, ~435K tokens): round 1 NOT SAFE, the
+FIFO-reopen hang above, reproduced and fixed, plus a LOW (the probe ran before the eligibility check:
+reordered); round 2 adjudicated the fix CORRECT and an open pass found no blocker: SAFE TO TAG.
+
+**Suites** (the 256-core, 8x H100 server, `CUDA_VISIBLE_DEVICES` unset, final tree): CPU-only
+415/0/121 of 536 (as expected: -147 no GPU); `-e` 860/0/3 of 863 (-3 this host could not exercise:
+trivial-park and two tail-yield cells, the GPUs busy with other users' work); no drift note.  The
+first `-e` run was 859/1/3: the GPU-subset flake above, after which only `-e` was rerun.
+
+## v0.18.24 — a one-frame `-d` starts no thread; a pool starts no more workers than its input has frames (`-r` over 96 x 40 MiB: peak RSS 1.33 GB -> 0.15, 1.7x faster -- the CPU-only build only; the GPU build got it in v0.18.25); the O_DIRECT writer starts its thread when it first needs one; `--stats-json` describes the whole run
 
 ROADMAP 26, the three items the v0.18.23 small-file work measured and left, taken before the tag;
 measured on the 256-core, 8x H100 server.

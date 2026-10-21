@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.24";
+static constexpr const char * GZSTD_VERSION = "0.18.25";
 //
 // Architecture overview:
 //
@@ -10118,6 +10118,31 @@ static uint64_t gpu_min_useful_bytes(const Options & opt)
       opt.gpu_batch_cap_gate ? opt.gpu_batch_cap_gate : opt.gpu_batch_cap;
   return gpu_gate_frame_bytes(opt) * (uint64_t)std::max<size_t>(1, gate_batch);
 }
+
+// ONE INPUT BELOW A GPU BATCH, IN A RUN THAT IS NOT (v0.18.25).  The startup gate
+// (apply_backend_defaults) asks this of the whole run's work, so `-r` over 96 x
+// 40 MiB (3.75 GiB) chose the GPU backend, and every 40 MiB input then started the
+// hybrid pipeline -- a 96-thread CPU pool, the tick and bringup threads -- only
+// for the bringup to skip the GPU ("CPU pool will finish before GPU init could"):
+// 1.05 GB peak RSS and 6.5 s on the 256-core server, against 0.15 GB and 2.9 s on
+// the CPU path.  The same bound, asked per input, and moving only what that gate
+// moves: a DEFAULT backend (an explicit --hybrid, --cpu-share, --gpu-batch or
+// --gpu-streams stays hybrid), adaptive hybrid only (--gpu-only and --gds-only
+// keep the GPU), never --tar (compress_nvcomp gates its archive itself).
+// `work` is in the gate's domain, uncompressed bytes, and must be KNOWN: a caller
+// that cannot size its input (a pipe) does not ask.
+#ifdef HAVE_NVCOMP
+static bool gz_input_below_gpu_batch(const Options & opt, uint64_t work)
+{
+  if (opt.backend_user_set || opt.cpu_only || opt.gpu_only || !opt.hybrid
+      || opt.cpu_share >= 0.0 || opt.tar_mode) return false;
+  const uint64_t bound = gpu_min_useful_bytes(opt);   // 0 (the suite's hook): no gate
+  return bound > 0 && work < bound;
+}
+#ifndef _WIN32
+static uint64_t adapt_decomp_uncompressed_est(int fd, uint64_t comp_size);
+#endif
+#endif
 
 // How long GPU bringup takes, near enough.  Same guard the -d --tar decode pool
 // already uses to decide whether to engage its GPU streams; kept identical so
@@ -37606,6 +37631,27 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       return;
     }
   }
+  // The same for a plain input of known size (see gz_input_below_gpu_batch).
+  {
+    struct stat ist{};
+    const int ifd = in ? ::fileno(in) : -1;
+    if (!opt.tar_mode && ifd >= 0 && ::fstat(ifd, &ist) == 0 && S_ISREG(ist.st_mode)
+        && gz_input_below_gpu_batch(opt, (uint64_t)ist.st_size)) {
+      if (opt.verbosity >= V_VERBOSE) {
+        char b[176];
+        std::snprintf(b, sizeof(b),
+          "[GPU] this input %.1f MiB < one GPU batch (%.0f MiB); compressing it on "
+          "the CPU (GPU init would cost more than it)\n",
+          ist.st_size / 1048576.0, gpu_min_useful_bytes(opt) / 1048576.0);
+        vlog(V_VERBOSE, opt, b);
+      }
+      Options cpu_opt = opt;
+      cpu_opt.cpu_only = true;
+      cpu_opt.hybrid = false;
+      compress_cpu_mt(in, out, cpu_opt, m);
+      return;
+    }
+  }
 #endif
 
   // ---- Detect GPU devices ----
@@ -37988,6 +38034,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   int cpu_threads = 0;
   if (sched) {
     cpu_threads = resolve_cpu_threads(opt.cpu_threads);
+    // No more CPU workers than the input has frames (v0.18.25, as compress_cpu_mt
+    // since v0.18.24): the GPUs share those frames, so the CPU can never use more.
+    // The chunk was fixed above from the full count; its geometry stays the same.
+    if (opt.cpu_threads == 0 && !opt.tar_mode && total_in > 0
+        && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
+      const uint64_t nf = (total_in + host_chunk - 1) / host_chunk;
+      if (nf < (uint64_t)cpu_threads) cpu_threads = (int)nf;
+    }
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
 
@@ -43276,6 +43330,14 @@ gds_out_declined:
   // back to CPU; without sched (gpu-only has none) we must still spawn a pool.
   if (sched || (device_count <= 0) || gpu_disabled_by_peek) {
     cpu_threads = resolve_cpu_threads(opt.cpu_threads);
+    // No more workers than the frames the seek table lists (v0.18.25, as
+    // decompress_cpu_mt since v0.18.24); the table is a claim, and an understated
+    // one costs throughput, never a frame.
+    if (opt.cpu_threads == 0 && g_input_geom_known.load(std::memory_order_relaxed)
+        && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
+      const uint64_t nf = g_input_frames.load(std::memory_order_relaxed);
+      if (nf > 0 && nf < (uint64_t)cpu_threads) cpu_threads = (int)nf;
+    }
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
 
@@ -48701,7 +48763,36 @@ static int gzstd_main(int argc, char ** argv)
       decompress_stream_from_file(in, out, opt, &meter);
     } else
 #ifdef HAVE_NVCOMP
-    if (opt.cpu_only) {
+    if (opt.cpu_only || [&] {
+#ifdef _WIN32
+          return false;
+#else
+          // One named input below a GPU batch of work (gz_input_below_gpu_batch),
+          // sized as the startup gate sizes it: the file scaled by its first
+          // frame's ratio.  Asked here, not in decompress_nvcomp, so neither
+          // decoder opens its seek-table scope inside the other's.
+          struct stat dst{};
+          if (opt.input == "-" || !in || ::fstat(::fileno(in), &dst) != 0
+              || !S_ISREG(dst.st_mode)) return false;
+          // The estimator never reduces the on-disk size.  Check that lower
+          // bound first: an explicit backend, a disabled gate or an input
+          // already at the bound needs no probe.
+          if (!gz_input_below_gpu_batch(opt, (uint64_t)dst.st_size)) return false;
+          // The input is already held.  Reopening its name can select another
+          // inode, or block forever if it has been replaced with a FIFO.
+          const uint64_t work = adapt_decomp_uncompressed_est(::fileno(in), (uint64_t)dst.st_size);
+          if (!gz_input_below_gpu_batch(opt, work)) return false;
+          if (opt.verbosity >= V_VERBOSE) {
+            char b[176];
+            std::snprintf(b, sizeof(b),
+              "[GPU] this input ~%.1f MiB of work < one GPU batch (%.0f MiB); decoding "
+              "it on the CPU (GPU init would cost more than it)\n",
+              work / 1048576.0, gpu_min_useful_bytes(opt) / 1048576.0);
+            vlog(V_VERBOSE, opt, b);
+          }
+          return true;
+#endif
+        }()) {
       decompress_cpu_mt(in, out, opt, &meter);
     } else {
       decompress_nvcomp(in, out, opt, &meter);
@@ -49714,18 +49805,14 @@ static double adapt_path_residency(const std::string & path)
 // Frames here are uniform by construction (the writer chunks at chunk_mib), so
 // frame one is representative.  Anything uncertain returns the compressed size,
 // i.e. today's behaviour.
-static uint64_t adapt_decomp_uncompressed_est(const std::string & path,
-                                              uint64_t comp_size)
+static uint64_t adapt_decomp_uncompressed_est(int fd, uint64_t comp_size)
 {
-  if (comp_size == 0) return comp_size;
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) return comp_size;
+  if (comp_size == 0 || fd < 0) return comp_size;
   // One window is enough: if frame one does not fit, its compressed size is
   // already large, so the ratio cannot be extreme and the plain size will do.
   const size_t WIN = 1024 * 1024;
   std::vector<unsigned char> buf(std::min<uint64_t>(WIN, comp_size));
   const ssize_t got = ::pread(fd, buf.data(), buf.size(), 0);
-  ::close(fd);
   if (got <= 8) return comp_size;
   size_t off = 0;
   for (int hop = 0; hop < 16 && off + 8 <= (size_t)got; ++hop) {   // skip skippables
@@ -49746,6 +49833,19 @@ static uint64_t adapt_decomp_uncompressed_est(const std::string & path,
   const double est = (double)comp_size * ratio;
   if (!(est > 0.0) || est > 1e18) return comp_size;    // overflow guard
   return (uint64_t)est;
+}
+
+// Startup has not opened its inputs yet; the per-input gate above instead
+// probes the descriptor already opened by the driver, without another lookup.
+static uint64_t adapt_decomp_uncompressed_est(const std::string & path,
+                                              uint64_t comp_size)
+{
+  if (comp_size == 0) return comp_size;
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return comp_size;
+  const uint64_t est = adapt_decomp_uncompressed_est(fd, comp_size);
+  ::close(fd);
+  return est;
 }
 #endif
 
