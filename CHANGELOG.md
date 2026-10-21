@@ -1,12 +1,145 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.22  
+**Covers:** v0.9.50 → v0.18.23  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.23 — `-d -r` over small files 8x faster, `-r` no longer quadratic in the file count, worker contexts no longer leak per input; the GPU-worker cell binds to the worker's check on any machine
+
+All found by the v0.18.22 second-machine check (RELEASING 4) on the 24-core, 2x RTX 2080 Ti Gen3
+workstation, in this order: a suite cell that raced, then `-d -r -D` over 10,000 JSON records taking
+49 s where compressing them took 6.
+
+### Small-file decompress and `-r`
+
+`gzstd -d -r -D dict` over 10,000 JSON records of ~7 KiB: **44.7-44.9 s -> 5.43-5.66 s** (CPU-only build;
+GPU build 47.2-47.6 -> 5.63-5.70), zstd 0.49-0.50; `-r -D --rm` compressing them 1.85-1.87 -> 1.25-1.28 s,
+zstd 0.74-0.75 (root NVMe, sync inside the timing, two runs each).  A one-file `-d`: 18.3 -> 9.7 ms per
+process (CPU-only build), 22.7 -> 14.9 (GPU build), zstd 4.5 (all through env).  Every output
+byte-identical.  Four separate costs, found by measuring each one away:
+
+- **An 8 MiB parse buffer zeroed for every input.**  The single-stream reader value-initialised a
+  `std::vector<char>(8 MiB)`: ~2,050 page faults and ~7.5 ms of a 13 ms one-file `-d` (strace: the
+  main thread made no system call for 7.7 ms).  The compress stream had the same pattern and lost it
+  in v0.18.22.  Now a `FrameVec` (left uninitialised; only bytes a read wrote are parsed);
+  `GZSTD_DEBUG_STREAM_ZERO` restores the memset, as it does for the compress stream.  Faults 2,386 ->
+  340, peak RSS 13.8 -> 5.6 MB.
+- **The whole pool started for one frame.**  A frame decodes on one thread, so an auto-sized
+  decompress pool no longer exceeds the input's data frames, counted by walking the frame headers of a
+  regular file of at most 1 MiB read at offset 0 (pread; skippable frames do not count; anything that
+  does not parse, a larger file, a pipe or `-T` keeps the pool as it was).  `-v` says "the input holds
+  N frames".  500 files in one `-r`: 1.19-1.23 s -> 0.34-0.38.  `GZSTD_DEBUG_NO_SMALL_SERIAL` keeps
+  the full pool for A/B, as it does for compress.  The bound is 1 MiB because reading more just to
+  count costs what it saves.
+- **Every `Options` copy carried every input name: `-r` was quadratic.**  `Options` is passed by
+  value, and `opt.inputs` lists every file on the line, so each copy duplicated N names: user time
+  0.39 -> 6.83 s for 1,000 -> 8,000 files (callgrind: `Options` copies were 46.5% of all
+  instructions over 1,000 files of `-d -r`, 77% with the destructors over 2,000 of `-r` compress).
+  The two pool copies (`decompress_cpu_mt`, `compress_cpu_mt`) were never needed -- the workers read
+  through a `const Options *` and are joined before return -- and now point at the caller's.  The
+  per-file pass copy in the compress driver is needed (a rebuild changes fields), so the three lists
+  that grow with the input count -- `inputs`, `input_outputs`, `stats_input_candidates` -- are now a
+  copy-on-write `CowList`: copies share one vector and a write through a shared copy clones it first,
+  so value semantics are unchanged.  8,000 files: `-d -r` user 6.83 -> 1.66 s, `-r` compress 2.84 ->
+  0.17 s, both now linear.
+- **Each worker's zstd context leaked when its pool exited.**  `tl_dctx` and `tl_cctx` were bare
+  `thread_local` pointers whose comment assumed long-lived threads; the pools are per input, so every
+  input leaked one context per worker: `-d -r` over 8,000 small files held 216 MB (~27 KB a file),
+  and `-r` compress at level 3 ~4.3 MB per 40 MiB file (with `MALLOC_ARENA_MAX=1` to separate it from
+  arena growth, below).  Both are now held by an owner that frees them at thread exit: 8,000 files
+  peak at 8.4 MB; memcheck finds one 48-byte block where it found 28 MB over 300 files.
+
+**Not fixed, measured and recorded (ROADMAP 26):** `-d` on a small file still starts 4 threads (zstd:
+none), ~0.5 ms a file of mostly system time, ~11x zstd over 10,000 files; the next step is the CPU
+streaming decoder for one small frame, a behaviour change for seek-table checks, `--keep-going` and
+sparse output that wants its own review.  And `-r` over large files grows RSS by glibc's per-thread
+arenas (a fresh pool's threads can each take a fresh arena, and `M_MMAP_THRESHOLD=128M` keeps the
+16 MiB frame buffers in them): 12 files of 40 MiB 85 -> 171 MB, flat with `MALLOC_ARENA_MAX=1`; it
+plateaus at glibc's 8 x cores arenas, so it wants measuring on the 256-core server before any policy
+change.
+
+**The cell** (default run, no GPU): "a small input decompresses with one thread per frame, from an
+unzeroed buffer" asserts the frame-count gate from `-v` (one frame, three frames and a skippable, `-T4`
+untouched, over 1 MiB untouched, the hook), bytes, `-t`, the buffer by peak RSS against
+`GZSTD_DEBUG_STREAM_ZERO` (RSS, not faults: a transparent huge page can zero 8 MiB in four faults), and
+the leak by peak RSS over 1,000 inputs against 40.  Mutation-tested, one change each: without the gate
+it fails the two counts; with the zeroed buffer, the RSS arm; without the context owner, the `-d -r`
+arm (5.8 -> 31.9 MB; the fix 5.8 -> 6.5).  The v0.18.22 binary fails all three.
+
+**Checked byte for byte against the binary without these changes**, both builds: 114 shape x mode
+comparisons (one frame, multi-frame `cat`, skippable frames, empty input, empty frame, trailing
+garbage, a truncated and a bit-flipped frame, a dictionary, sizeless, over 1 MiB, `--tar`; each as
+`-d -c`, `-t`, stdin, a pipe, `--keep-going`, `-T2` and `-o FILE`): same bytes and exit code in
+every one.  And 16 multi-file shapes for the `CowList` change (`-r` both ways, `--rm`, a skipped named
+symlink, `--filelist`, `--output-dir-flat` and `-mirror`, `-c a b`, `--stats-json` and its
+refusal of a walked input or an operand, `-t -r`, `-l -r`): same tree, stdout and exit code.
+
+### Second-machine measurements, no default changed
+
+RELEASING 4.4-4.6 on the workstation (tables in the ROADMAP):
+
+- **Cold read probe (ROADMAP 23).**  v0.18.16's fix holds: cold 32 GiB from a Gen3 x4 NVMe, `--cpu-only`
+  14.33-14.49 s on v0.18.15 against 13.78-13.81 on v0.18.16 (13.64-14.26 here); hybrid and `--gpu-only`
+  level.  Plain pages beat huge pages for the CPU producer's probe pool by 5-7%.
+- **`--sliding-window` on one L3 (ROADMAP 10).**  The v0.18.18 count (6 workers at levels 1-5 here) is
+  data-dependent on this part: faster than 12 on the high-ratio, low-ratio and medium level-1 corpora
+  (up to 1.47x), 20-38% slower on base64 of random, ~5% slower on medium levels 3-5 (where every
+  hardware thread is fastest).  Summed over the three design corpora it still wins (49.7 s against
+  54.3).  Kept; it is the data dependence the ROADMAP's learned-count candidate would answer.
+- **Worker count under a CPU mask (ROADMAP 18).**  One worker per allowed CPU beats the I/O reserve by
+  1-6% here (the server: 8-10%; the NUC: the reserve wins).  Kept.
+
+/data on this box was found linked at PCIe Gen1 (2.5 GT/s, 0.83 GiB/s O_DIRECT reads) since its last
+boot; every disk measurement above ran on the other NVMe (Gen3, 2.0 GiB/s).
+
+### The GPU-worker cell
+
+Found by the v0.18.22 second-machine check (RELEASING 4) on the 2-GPU Gen3 workstation: `-e` ran
+836/1/23 of 860, and the one failure was §42 "a GPU worker with nothing left to take is not set up"
+(v0.18.12, ROADMAP 17), 12 times of 12 by hand.  gzstd did the right thing -- exit 0, the bytes
+right, no device pre-allocated -- but not by the check the cell asserts.  Its piped sizeless frame
+is handed to the CPU streaming decoder at its header, so the queue is drained almost at once, and
+two checks test that: the bringup thread before it spawns any worker ("file already decompressed by
+CPU during init; skipping GPU"), and each worker before its setup ("the queue was drained before
+this device was set up; not starting it").  Which one sees it first is a race between the reader
+and the device count.  On the 8-GPU server the count won and the workers declined; here the whole
+run takes 0.36 s, the count returned after it, and the bringup thread declined with no worker
+started.  No product change: both checks file the run the same way.  The cell had only ever run
+where it passes -- `-e` has not run on the workstation since v0.18.12.
+
+**The fix makes gzstd open the window instead of the cell racing for it.**
+`GZSTD_DEBUG_GPU_START_AFTER_INPUT=1` skips the bringup thread's drained check, and each GPU
+decompress worker then waits on the queue's condition variable (`TaskQueue::wait_done`, woken by
+`set_done`; no sleep) until the producer is done, before its own check.  A queue that still holds
+frames then goes on as before, so the hook cannot hang a run with work left.  The cell now has two
+arms: plain, which accepts either check (exit, bytes, no pre-allocation), and hooked, which must
+reach the worker's.
+
+**Mutation-tested:** with the worker's two drained checks removed, the hooked arm pre-allocates on
+both devices and logs no decline, 3 of 3 (the plain arm still passes here: the bringup check covers
+it).  The v0.18.22 binary fails only the hooked arm (it has no hook); the fixed one passes, 3 of 3.
+Both configurations build warning-free.
+
+**v0.18.22's two speedups, measured on the second machine** (24 cores, 2x RTX 2080 Ti, Gen3; both arms through
+env, ABBA x3, min-max).  One frame on one thread, 1,000 files of 4 KiB: CPU-only build 9.76-9.81 s -> 6.69-6.73
+(1.46x), GPU build 14.78-15.02 -> 11.42-11.64 (1.30x); zstd 5.59-5.63.  Smaller than the server's 2.35x/2.1x, as
+expected with a 20-worker pool instead of 96.  2 MiB x 20: 0.355-0.378 -> 0.327-0.340 (CPU), 0.470-0.480 ->
+0.358-0.422 (GPU); 15 MiB x 10: 0.688-0.758 -> 0.554-0.689, 0.726-0.831 -> 0.583-0.731 (ranges touch).  The GPU
+build still pays ~4.8 ms a process over the CPU-only one (the server: ~3 ms).  GPU -t in VRAM, the 24 GiB archive of
+32 GiB, warm: 4.66-5.02 s against 7.26-7.34 with GZSTD_DEBUG_TEST_D2H=1 (1.5x; the server 2x); default -t 2.70-2.71.
+The saving, ~2.6 s, is about what 32 GiB of Gen3 D2H costs; the ratio is smaller because the 2080 Tis' decode is
+the larger share.  The dropped-frame check exits 1, verified 2047 of 2048.
+
+Suites, on the final tree (the 2-GPU Gen3 workstation, CUDA_VISIBLE_DEVICES unset): `-e` on the GPU build
+839/0 of 861 (22 skipped: 18 GDS unavailable, 4 --sliding-window placement cells that need two L3
+caches); CPU-only default 410/0 of 534 (124 skipped: the no-GPU set, and 4 this host cannot exercise);
+no drift note.  The first run of the final tree failed one cell in both: the 8-CPU-mask worker-count
+cell decompressed a one-frame 1 MiB archive, which now takes one worker; it reads large.bin's archive
+(two frames, 16 MiB) now, as its compress arms have since v0.18.22.
 
 ## v0.18.22 — pre-tag review of v0.18.10-v0.18.21: small files compress 2.4x faster, GPU `-t` takes half the time, the source builds against zstd 1.4.4 (RHEL 8) again, and `--size-hint` takes zstd's full range
 

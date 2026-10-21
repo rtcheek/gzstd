@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.22";
+static constexpr const char * GZSTD_VERSION = "0.18.23";
 //
 // Architecture overview:
 //
@@ -2664,6 +2664,41 @@ enum GzZstdSwitch { GZ_ZSTD_AUTO = 0, GZ_ZSTD_ENABLE = 1, GZ_ZSTD_DISABLE = 2 };
 #define GZ_HAVE_TARGET_CBLOCK 1
 #endif
 
+// A COPY-ON-WRITE LIST, for the Options fields that grow with the number of inputs
+// (v0.18.23).  Options is copied by value on every per-file path -- the compress
+// pass copies it once a file so a rebuild can change a few fields -- and each copy
+// used to duplicate every name on the line: `-r` over N files did N^2 string
+// copies (2,000 small files: 77% of all instructions in Options copies and
+// destructors).  Copies now share one immutable vector; the first write through a
+// shared copy clones it, so value semantics are unchanged.  Reads go through get(),
+// which every const std::vector<T>& parameter accepts implicitly.  A copy taken
+// while another thread writes the SAME Options object races, exactly as a vector
+// copy did; two copies of one list never do, since a writer that shares the
+// buffer always clones first.
+template <typename T>
+class CowList {
+  std::shared_ptr<std::vector<T>> p_;
+  static const std::vector<T> & none() { static const std::vector<T> e; return e; }
+  std::vector<T> & own() {
+    if (!p_) p_ = std::make_shared<std::vector<T>>();
+    else if (p_.use_count() > 1) p_ = std::make_shared<std::vector<T>>(*p_);
+    return *p_;
+  }
+public:
+  CowList() = default;
+  CowList & operator=(std::vector<T> v) { p_ = std::make_shared<std::vector<T>>(std::move(v)); return *this; }
+  const std::vector<T> & get() const { return p_ ? *p_ : none(); }
+  operator const std::vector<T> &() const { return get(); }
+  size_t size() const { return get().size(); }
+  bool empty() const { return get().empty(); }
+  const T & operator[](size_t i) const { return get()[i]; }
+  typename std::vector<T>::const_iterator begin() const { return get().begin(); }
+  typename std::vector<T>::const_iterator end() const { return get().end(); }
+  void push_back(T v) { own().push_back(std::move(v)); }
+  template <typename It> void append(It first, It last) { auto & v = own(); v.insert(v.end(), first, last); }
+  void swap(std::vector<T> & v) { own().swap(v); }
+};
+
 struct Options {
   Mode mode = Mode::COMPRESS;
   bool list_mode = false;    // -l/--list: list .zst frame info, or `-l --tar` archive contents
@@ -2826,7 +2861,7 @@ struct Options {
   // its own line, and the run's exit code is at least this.  zstd skips such an
   // input and carries on; the loop itself stays fail-fast.
   int      deferred_exit = 0;
-  std::vector<std::string> input_outputs;   // per-input output names, when an output dir maps them
+  CowList<std::string> input_outputs;   // per-input output names, when an output dir maps them
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   // The batch cap as parse_args resolved it, snapshotted before --adapt seeds
@@ -2924,7 +2959,7 @@ struct Options {
                                   //  per-engine rates over generated in-memory data, print
                                   //  the table, record the profile) instead of compressing
   std::string input;              // current file being processed
-  std::vector<std::string> inputs; // all positional args (multi-file)
+  CowList<std::string> inputs;   // all positional args (multi-file); copies share it (CowList)
   // Parallel to `inputs` while parsing: true where the name came from --filelist,
   // which zstd's named-symlink rule does not apply to.  Cleared once that rule
   // has run (gz_drop_named_symlinks); nothing after it reads this.
@@ -2938,7 +2973,7 @@ struct Options {
   // --stats-json must protect names dropped by the resolver as well as names
   // it will read.  This records original operands and recursive walk entries
   // before later filters discard them; only populated for --stats-json.
-  std::vector<std::string> stats_input_candidates;
+  CowList<std::string> stats_input_candidates;
   std::string output;             // explicit -o; empty = auto-derive per file
 
   // --tar: synthesize a GNU-format tar stream from tar_sources and feed it to
@@ -5557,7 +5592,9 @@ static void print_help_long()
 "     In CPU frame mode, automatic threads use one thread for a nonempty\n"
 "     file whose known size fits one chunk, unless --verify, --tar or an\n"
 "     explicit reader is requested (v0.18.22).  The pool has no parallel\n"
-"     work for that frame: 2.4x faster on 4 KiB files.\n"
+"     work for that frame: 2.4x faster on 4 KiB files.  Decompression\n"
+"     likewise starts no more automatic workers than a file of at most\n"
+"     1 MiB holds frames (v0.18.23): -d -r over small files 8x faster.\n"
 "     The hardware threads are the ones THIS PROCESS MAY USE: its CPU\n"
 "     affinity (taskset, a container's or batch job's cpuset), and no more\n"
 "     than a cgroup CPU quota allows (docker --cpus, systemd CPUQuota=),\n"
@@ -13694,6 +13731,13 @@ public:
     return q_.empty() && done_;
   }
 
+  // Block until the producer is done (set_done wakes cv_).  Test hooks only.
+  void wait_done()
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] { return done_; });
+  }
+
   size_t size()
   {
     std::unique_lock<std::mutex> lk(m_);
@@ -15702,14 +15746,19 @@ static void writer_thread(FILE * out, ResultStore & results,
 /*======================================================================
  CPU compression helpers / workers
 ======================================================================*/
-// Thread-local CCtx avoids repeated allocation for per-chunk compression
-static thread_local ZSTD_CCtx * tl_cctx = nullptr;
+// Thread-local CCtx avoids repeated allocation for per-chunk compression.  The
+// owner frees it when the thread exits (v0.18.23): the worker pools are per input,
+// so the bare pointer this used to be leaked one context per worker per file --
+// ~9.6 MB a 40 MiB file in a `-r` at level 3 (172 MB peak RSS over 12 such files).
+struct GzTlCCtx { ZSTD_CCtx * p = nullptr; ~GzTlCCtx() { ZSTD_freeCCtx(p); } };
+static thread_local GzTlCCtx tl_cctx_owner;
 
 // Compresses one frame into `out` (a reusable per-thread buffer) and returns the
 // compressed size.  `out` is left sized to >= compressBound, NOT shrunk to csz —
 // the caller uses the returned size, and [csz, out.size()) is undefined padding.
 static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, FrameVec & out)
 {
+  ZSTD_CCtx *& tl_cctx = tl_cctx_owner.p;
   if (!tl_cctx) {
     tl_cctx = ZSTD_createCCtx();
     if (!tl_cctx) die("failed to create ZSTD_CCtx");
@@ -19084,8 +19133,11 @@ static void cpu_worker(
 ======================================================================*/
 // Decompress a single Zstd frame on the CPU.  Each task contains one complete
 // compressed frame and the expected decompressed size from the frame header.
-// Uses a thread-local DCtx to avoid repeated allocation/destruction overhead.
-static thread_local ZSTD_DCtx * tl_dctx = nullptr;
+// Uses a thread-local DCtx to avoid repeated allocation/destruction overhead,
+// freed when its thread exits (v0.18.23; see GzTlCCtx): a bare pointer leaked one
+// ~96 KB context per worker per input -- 27 KB of RSS a file over an 8,000-file `-d -r`.
+struct GzTlDCtx { ZSTD_DCtx * p = nullptr; ~GzTlDCtx() { ZSTD_freeDCtx(p); } };
+static thread_local GzTlDCtx tl_dctx_owner;
 
 
 static void cpu_decomp_worker(
@@ -19153,6 +19205,7 @@ static void cpu_decomp_worker(
   };
 
   // Create a reusable decompression context for this thread
+  ZSTD_DCtx *& tl_dctx = tl_dctx_owner.p;
   if (!tl_dctx) {
     tl_dctx = ZSTD_createDCtx();
     if (!tl_dctx) die("failed to create ZSTD_DCtx");
@@ -20809,7 +20862,14 @@ static size_t stream_frames_to_queue(
   // We compact (memmove) only when the unconsumed tail is too small to
   // hold a new read chunk, keeping the common path allocation-free.
   const size_t READ_CHUNK = 4 * ONE_MIB;
-  std::vector<char> buf(READ_CHUNK * 2);
+  // Left uninitialised (v0.18.23): every byte parsed is first written by a read
+  // into buf[buf_len..], and only buf[buf_off..buf_len) is ever looked at.  The
+  // value-initialised vector zeroed 8 MiB per input -- ~2,050 page faults and
+  // ~7.5 ms of a 13 ms one-file -d on the 24-core workstation, where zstd takes
+  // 3 ms.  GZSTD_DEBUG_STREAM_ZERO restores the memset for A/B, as it does for the
+  // compress stream.
+  FrameVec buf(READ_CHUNK * 2);
+  if (std::getenv("GZSTD_DEBUG_STREAM_ZERO")) std::memset(buf.data(), 0, buf.size());
   size_t buf_len = 0;    // valid data in buf[0..buf_len)
   size_t buf_off = 0;    // parse cursor within buf
 
@@ -21229,6 +21289,50 @@ static size_t stream_frames_to_queue(
  Workers begin decompressing as soon as the first frame arrives 
  no waiting for the entire file to be read.
 ======================================================================*/
+// NO MORE DECOMPRESS WORKERS THAN FRAMES (v0.18.23).  A frame decodes on one
+// thread, so workers beyond the input's frame count only start, park and join:
+// ~1.7 ms a file inside one `-d -r` over small files on the 24-core workstation
+// (500 x 5 KiB JSON: 1.19-1.23 s on the full pool, 0.35 s on one), where zstd
+// takes 0.04 s.  The mirror of v0.18.22's one-frame compress path, and gated the
+// same way: an auto-sized count only, never -T.  It counts by walking the frame
+// headers of a small regular file read at offset 0 (pread; the FILE* is not
+// moved); any frame that does not parse, a foreign byte, a larger file or a pipe
+// returns 0 and the pool stays as it was.  Only the thread count changes, so the
+// output cannot.  GZSTD_DEBUG_NO_SMALL_SERIAL keeps the full pool for A/B.
+static int small_input_data_frames(FILE * in, const Options & opt)
+{
+#ifndef _WIN32
+  static constexpr off_t GZ_SMALL_DECOMP_INPUT = 1 << 20;   // reading more costs what it saves
+  if (!in || opt.cpu_threads != 0 || std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) return 0;
+  const int fd = ::fileno(in);
+  struct stat st;
+  if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0
+      || st.st_size > GZ_SMALL_DECOMP_INPUT || std::ftell(in) != 0) return 0;
+  FrameVec b((size_t)st.st_size);
+  size_t got = 0;
+  while (got < b.size()) {
+    const ssize_t r = ::pread(fd, b.data() + got, b.size() - got, (off_t)got);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) return 0;
+    got += (size_t)r;
+  }
+  int frames = 0;
+  for (size_t off = 0; off < got; ) {
+    if (got - off < 4) return 0;
+    const uint32_t magic = rd_le32(b.data() + off);
+    if (magic == 0xFD2FB528u) ++frames;
+    else if ((magic & 0xFFFFFFF0u) != 0x184D2A50u) return 0;   // neither data nor skippable
+    const size_t fs = ZSTD_findFrameCompressedSize(b.data() + off, got - off);
+    if (ZSTD_isError(fs) || fs == 0) return 0;
+    off += fs;
+  }
+  return frames;
+#else
+  (void)in; (void)opt;
+  return 0;
+#endif
+}
+
 static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   TableCkScope tck_scope(in);   // seek-table checksums for THIS input
@@ -21240,7 +21344,11 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
-
+  if (const int nf = small_input_data_frames(in, opt); nf > 0 && nf < threads) {
+    vlog(V_VERBOSE, opt, "[CPU] the input holds " + std::to_string(nf) + " frame"
+         + (nf == 1 ? "" : "s") + "; one decompression thread per frame\n");
+    threads = nf;
+  }
 
   CpuAgg cpuagg{};
   cpuagg.threads = threads;
@@ -21276,9 +21384,13 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   // Start worker threads (they block on the queue until frames arrive)
   std::vector<std::thread> pool;
   pool.reserve((size_t)threads);
-  Options opt_copy = opt;
+  // The workers read the caller's Options through a pointer; every path below
+  // joins them before returning.  This used to be a copy, and an Options copy
+  // carries opt.inputs -- every file named on the line -- so a `-d -r` over N
+  // files copied N names per file: quadratic, 46.5% of all instructions over
+  // 1,000 small files, 6.8 s of user time over 8,000 (v0.18.23).
   for (int i = 0; i < threads; ++i) {
-    pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt_copy, m,
+    pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
 #ifdef HAVE_NVCOMP
                       nullptr,
 #endif
@@ -31976,8 +32088,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
-  Options opt_copy = opt;
-  for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, i, &queue, &results, &opt_copy, m,
+  // A pointer to the caller's Options, not a copy of it: a copy carries every
+  // input name (see decompress_cpu_mt, v0.18.23).  The workers are joined below.
+  for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m,
 #ifdef HAVE_NVCOMP
     nullptr,
 #endif
@@ -39115,6 +39228,18 @@ static std::atomic<DStageAhead *> g_dstage_ahead{nullptr};
   for (;;) pcv.wait(lk);
 }
 
+// Test-only (GZSTD_DEBUG_GPU_START_AFTER_INPUT=1): open the window the worker's
+// nothing-left check guards (v0.18.23).  The bringup thread's own drained check is
+// skipped, so it spawns the workers, and each worker waits until the producer is
+// done before that check.  Without it the cell raced the reader against the device
+// count: on a 2-GPU box the count returned after the whole stream was read, the
+// bringup thread skipped the GPUs, and no worker ever reached the check.  A queue
+// that still holds frames once the producer is done goes on as before.
+static bool gz_debug_gpu_start_after_input() {
+  static const bool on = ::getenv("GZSTD_DEBUG_GPU_START_AFTER_INPUT") != nullptr;
+  return on;
+}
+
 static void gpu_decomp_worker(
   int device_id,
   int slot_index,
@@ -39572,6 +39697,7 @@ static void gpu_decomp_worker(
     return true;
   };
   try {
+    if (queue && gz_debug_gpu_start_after_input()) queue->wait_done();
     if (nothing_left()) return;
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     {
@@ -43140,7 +43266,7 @@ gds_out_declined:
       // If the CPU pool already drained the whole file during cuInit, skip
       // GPU spawn entirely — no work left, and pointless context creation
       // would just delay process exit on small inputs.
-      if (queue.drained() && queue.size() == 0) {
+      if (queue.drained() && queue.size() == 0 && !gz_debug_gpu_start_after_input()) {
         vlog(V_VERBOSE, opt, "[GPU] file already decompressed by CPU during init; skipping GPU\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
@@ -46814,7 +46940,7 @@ static int gzstd_main(int argc, char ** argv)
       struct stat lst;
       const int lfd = fileno(stdout);
       if (lfd >= 0 && ::fstat(lfd, &lst) == 0 && S_ISREG(lst.st_mode))
-        gz_refuse_stdout_alias(lst, opt.tar_mode ? opt.tar_sources : opt.inputs, nullptr);
+        gz_refuse_stdout_alias(lst, opt.tar_mode ? opt.tar_sources : opt.inputs.get(), nullptr);
       gz_stdout_will_be_written();
     }
     if (opt.tar_mode) { Meter meter; return list_tar(opt, &meter); }
@@ -49373,7 +49499,7 @@ static int adapt_inputs_resid_class(const Options & opt, double first)
   if (first < 0.0) return -1;
   const int c0 = (first >= 0.95) ? 1 : 0;
   const std::vector<std::string> & srcs =
-      opt.tar_mode ? opt.tar_sources : opt.inputs;
+      opt.tar_mode ? opt.tar_sources : opt.inputs.get();
   for (size_t i = 1; i < srcs.size(); ++i) {
     if (srcs[i] == "-") return -1;              // unknowable: don't guess
     const double r = adapt_path_residency(srcs[i]);
@@ -50290,7 +50416,7 @@ static void apply_backend_defaults(Options & opt)
   bool all_known = false;
   {
     const std::vector<std::string> & srcs =
-        opt.tar_mode ? opt.tar_sources : opt.inputs;
+        opt.tar_mode ? opt.tar_sources : opt.inputs.get();
     all_known = !srcs.empty();
     int    est_sampled  = 0;      // inputs actually probed for their expansion ratio
     double est_ratio_sum = 0.0;   // sum of those ratios, for the average
@@ -51069,8 +51195,7 @@ static void gz_resolve_file_inputs(Options & opt)
       std::vector<std::string> walked;
       gz_walk_dir(opt, in, stack, walked, followed_file_links);
       if (!opt.stats_json.empty())
-        opt.stats_input_candidates.insert(opt.stats_input_candidates.end(),
-                                          walked.begin(), walked.end());
+        opt.stats_input_candidates.append(walked.begin(), walked.end());
       for (std::string & f : walked) {
         // -d needs a suffix to name the output.  Only files the WALK found: a
         // file named on the command line keeps gzstd's "NAME.out" naming.
@@ -51410,7 +51535,7 @@ static void gz_drop_named_symlinks(Options & opt)
   kept.reserve(opt.inputs.size());
   bool skipped = false;
   for (size_t k = 0; k < opt.inputs.size(); ++k) {
-    std::string & in = opt.inputs[k];
+    const std::string & in = opt.inputs[k];
     struct stat st {};
     if (in != "-" && !(k < listed.size() && listed[k])
         && ::lstat(in.c_str(), &st) == 0 && S_ISLNK(st.st_mode)
@@ -51421,9 +51546,9 @@ static void gz_drop_named_symlinks(Options & opt)
       skipped = true;
       continue;
     }
-    kept.push_back(std::move(in));
+    kept.push_back(in);
   }
-  opt.inputs.swap(kept);   // always: the kept names were moved out of opt.inputs
+  opt.inputs.swap(kept);   // always: kept holds every name not filtered out
   if (skipped && opt.inputs.empty()) {
     std::fflush(stderr);
     std::exit(EXIT_ERROR);

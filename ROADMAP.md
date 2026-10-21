@@ -160,8 +160,24 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    a second file).  Whole 19.5 GiB files, 30 cells: 102 s against 157 for the default and 90 for the best of each cell, none slower
    than the default.  A rule fitted to 2 GiB slices first was 1.5x slower than the default at level
    12 on whole files; a per-worker rate probe was rejected (a 4 MiB sample's rate varied 5x within a
-   file).  **Still open:** the workstation's check of its new counts (6 at levels 1-5, 12 at 6-12)
-   against its v0.18.8 bests; caches of more than 12 cores (held to caps, unmeasured); `--long`
+   file).  **The workstation's check (v0.18.23, one 12-core L3, whole files, warm, /dev/null, 6 runs an
+   arm, min-max): the count is DATA-dependent there, not a uniform win or loss.**  Levels 1-5 take 6
+   workers by the rule against 12 with `GZSTD_DEBUG_SW_PLACE=off` (levels 6+ are 12 either way):
+
+   | 19.5 GiB corpus | level | rule (6) | off (12) | `-T24` |
+   |---|---|---|---|---|
+   | high-ratio | 1 / 3 / 5 | **6.00-6.23 / 5.16-5.28 / 3.74-3.90** | 6.90-7.06 / 5.83-5.90 / 5.51-5.55 | 7.24-7.32 / 6.09-6.16 / 5.99-6.07 |
+   | medium | 1 / 3 / 5 | **5.91-6.16** / 5.85-6.19 / 5.99-6.28 | 6.65-6.75 / 5.65-5.79 / 5.74-5.89 | 6.73-6.79 / **4.79-4.93 / 4.42-4.57** |
+   | low-ratio | 1 / 3 / 5 | **5.31-5.46 / 5.36-5.49** / 5.68-5.77 | 6.40-6.52 / 5.54-5.71 / 5.49-5.67 | 6.77-6.86 / 5.84-5.96 / 5.35-5.66 |
+
+   Summed: rule 49.7 s, off 54.3, `-T24` 53.7.  But base64 of random (the release round-trip corpus,
+   1.33:1) is the rule's worst case: 8 GiB, levels 1-5, 2.48-3.57 s against 2.04-2.53 (20-38% slower),
+   and 32 GiB at levels 1 and 3, 9.81-11.69 against 8.27-8.54; a -T sweep there is monotone to 18-24
+   workers.  Medium levels 3-5 want every hardware thread (15-25% over 12), as v0.18.8 found at
+   12-19.  To a file on NVMe (1.85 GiB/s) the rule is level with off (5.41-6.13 against 5.66-6.00):
+   the device sets the pace.  A 2 GiB medium file reproduces v0.18.8 (0.64-0.68 against 0.70-0.76).
+   No default changed: one table helps two corpora and hurts one, so this is the data dependence that
+   candidate (b) below would learn, not a rule to refit.  **Still open:** caches of more than 12 cores (held to caps, unmeasured); `--long`
    (moves a level onto the larger-window row, unmeasured with long-distance matching); high-ratio
    data at levels 6-12, up to 2x slower than its own best (never slower than before); the
    single-frame decoder's threads; claims across users.  An `--adapt` action that learns the count
@@ -333,6 +349,14 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    8 workers 4.66-4.68 s against 6's 5.04-5.10 (compress), 3.37-3.38 against 3.67-3.68 (decompress);
    2 cores + SMT, 4 against 3, 9.02 against 9.85 and 6.62 against 7.26.  So the reserve itself is
    in question here too, and still CPU-dependent.
+   **The workstation (v0.18.23, 12-core/24-thread Intel, one L3; `taskset` slices, `-T` per arm, 8 GiB
+   base64-of-random, warm, /dev/null, rotated x4): one worker per CPU is fastest again, by less.**
+   2 cores + SMT: compress 4.59-4.62 s (4) against 4.75-4.90 (3, the reserve) and 5.07-5.09 (2, physical);
+   decompress 3.20-3.22 / 3.24-3.32 / 3.39-3.44.  4 cores + SMT: 2.49-2.52 / 2.55-2.57 / 2.68-2.70 and
+   1.68 / 1.70-1.72 / 1.78-1.79.  6 cores + SMT: 1.79-1.82 / 1.82-1.86 / 1.89-1.92 and 1.18-1.19 /
+   1.18-1.20 / 1.25-1.26 (ranges touch).  The all-CPU arm burns 20-30% more user CPU than the reserve.
+   Three CPUs now: the server (+8-10% without the reserve), this one (+1-6%), the NUC (the reserve
+   faster).  No default changed.
 19. **The GPU device-count model only serves `--gpu-only` compress.** `--calibrate` (and ordinary
    --adapt runs) record, per device count, a fixed overhead and a busy rate, and --adapt then runs a
    single-file `--gpu-only` compress on the count predicted to finish soonest.  Hybrid, decompress,
@@ -417,9 +441,16 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    on the 8-GPU server: a timed pass faults a fresh buffer in outside its read and the rates are over
    reading time; the CPU producer's probe pool is plain pages on 6.4+.  Cold 48 GiB, plain defaults:
    hybrid 14.37-14.82 -> 12.25-12.43 s, `--gpu-only` 16.87-16.98 -> 15.38-15.55, `--cpu-only`
-   11.62-11.96 -> 10.70-10.93 (CHANGELOG v0.18.16).  **Still owed: the same A/B on the Gen3
-   workstation** (the probe's pick there, and plain against huge pages for the CPU producer), and a
-   pre-6.4 kernel, where the CPU probe pool keeps huge pages unmeasured.  The text as found:  Each arm gets a
+   11.62-11.96 -> 10.70-10.93 (CHANGELOG v0.18.16).  **The Gen3 workstation agrees (measured v0.18.23,
+   kernel 6.8, cold 32 GiB from its Gen3 x4 NVMe, read-bound at ~2.4 GiB/s, 3 rounds):** `--cpu-only`
+   14.33-14.49 s (v0.18.15) -> 13.78-13.81 (v0.18.16), 13.64-14.26 (v0.18.23); hybrid 13.88-14.74 ->
+   13.82-14.20, 13.91-14.08; `--gpu-only` 20.43-20.54 -> 20.39-21.37, 20.26-20.50 (no change).  v0.18.15's
+   O_DIRECT arm read 1.9-2.1 GiB/s and picked buffered on the GPU producers; from v0.18.16 both arms read
+   ~2.4.  Plain against huge pages for the CPU producer's pool (12 pinned readers): forced O_DIRECT
+   14.00-14.11 against 14.73-14.80, forced buffered 13.70-13.72 against 14.66-14.71 -- plain wins 5-7%.
+   On `--cpu-only` the probe picks O_DIRECT (2.4 vs 2.2 GiB/s) where forced buffered at 12 readers is
+   ~2% faster, inside the probe's 5% margin on a read-bound run: recorded, not reopened.  Still owed:
+   a pre-6.4 kernel, where the CPU probe pool keeps huge pages unmeasured.  The text as found:  Each arm gets a
    200 ms window, and whichever pool pages are fresh pay their first-touch faults inside it.  The
    GPU/hybrid producer's pool is plain and unfaulted, so its single O_DIRECT reader reads 3.56-3.58
    GiB/s against 4.56-4.63 on a prefaulted pool (cold 48 GiB, 8-GPU server); it picks buffered, and
@@ -462,6 +493,26 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      the descriptor/pool lifetimes; and the physical-core, L3-count and placement topology readers
      overlap (512 sysfs reads for the core count alone on the 256-thread server) but keep different
      fallbacks and affinity scopes.
+
+26. **Left by the v0.18.23 small-file work (measured, deliberately not taken before a tag).**
+   - **`-d` on a small file still starts 4 threads** (writer, one worker, two more), where compress's
+     one-frame path starts none and zstd none: ~0.5 ms a file, mostly system time.  After v0.18.23,
+     `-d -r -D` over 10,000 x ~7 KiB is 5.43-5.66 s against zstd's 0.49 (11x).  The next step is the
+     CPU streaming decoder (`decompress_stream_from_file`, already the path for sizeless frames) for an
+     input of one small frame, gated as v0.18.23's frame count is.  It changes which code checks seek
+     tables, reports `--keep-going` damage and writes sparse output, so it wants its own review and
+     a byte-for-byte matrix like v0.18.23's (CHANGELOG: 114 shapes x modes).
+   - **`-r` over large files grows RSS by glibc arenas, not a leak.**  Each input's pool is new
+     threads; a new thread can take a fresh arena, and `M_MMAP_THRESHOLD=128M` (the munmap TLB-storm
+     fix) keeps 16 MiB frame buffers inside arenas, so freed buffers stay resident: 12 x 40 MiB, level 3,
+     85 -> 171 MB peak (36 files: 311 MB); `MALLOC_ARENA_MAX=1` holds it at 67-74 MB, and memcheck
+     finds no leak.  It plateaus at glibc's 8 x cores arenas (192 here, 2,048 on the 256-core server),
+     so the bound on the server is the question.  Candidates: `malloc_trim(0)` between inputs (all
+     workers joined, so no shootdown storm), a bounded `M_ARENA_MAX`, or a pool that outlives an input.
+     Measure on the server first: the 128 MiB threshold was a measured win there.
+   - **`--stats-json` over several inputs reports the last one.**  `-r --stats-json s.json d e` over
+     three files wrote `input_bytes: 5000`, the last file's size (17,000 in all); v0.18.22 did the
+     same.  Decide whether the record is per run (sum) or per file (a list) before changing it.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
