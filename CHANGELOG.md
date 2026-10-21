@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.23  
+**Covers:** v0.9.50 → v0.18.24  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,7 +8,238 @@
 ---
 
 
-## v0.18.23 — `-d -r` over small files 8x faster, `-r` no longer quadratic in the file count, worker contexts no longer leak per input; the GPU-worker cell binds to the worker's check on any machine
+## v0.18.24 — a one-frame `-d` starts no thread; a pool starts no more workers than its input has frames (`-r` over 96 x 40 MiB: peak RSS 1.33 GB -> 0.15, 1.7x faster); the O_DIRECT writer starts its thread when it first needs one; `--stats-json` describes the whole run
+
+ROADMAP 26, the three items the v0.18.23 small-file work measured and left, taken before the tag;
+measured on the 256-core, 8x H100 server.
+
+### Small-file decompress: no threads for one frame
+
+A one-frame `-d` still started four threads and joined them: the ordered writer, its
+`AsyncWritePool` write thread, one worker, and a progress thread -- which `-d` started even when
+there was no bar to draw (to a pipe, to a file, under `-q`).  Compress had checked
+`progress_loop_needed` first since v0.18.22; `-d` now asks the same question.  And for an input of
+one data frame the worker decodes in one call (declared size at most 64 MiB, its one-shot limit),
+the three existing stages now run one after another on the main thread: the reader queues the frame,
+`cpu_decomp_worker` decodes it, `writer_run` writes it through an inline `AsyncWritePool` (same
+`write_batch`, no thread).  The same code, so the same seek-table checks, `--keep-going` damage
+reports and sparse output; the CPU streaming decoder that ROADMAP 26 proposed was not taken because
+it would have changed exactly those three.  The frame cannot wait for a throttle permit: it takes a
+free one, or the head-of-line overdraft as frame 0.  Not under `--tar`, whose sink has its own
+consumer.
+
+**If the reader finds more than the frame counted** -- a file that grew between the count and the
+read -- the threads start after all, and decode what was queued.  The queue is unbounded while the
+reader runs alone, since nothing else could drain it.  Without the late start a 40-frame input hung
+on the 33rd permit (mutant: timeout, exit 124).  `GZSTD_DEBUG_SMALL_CLAIM_ONE` makes the count say
+one frame whatever the file holds, so the suite opens that window on demand.
+
+1,000 x 7 KiB JSON records, output to ext4, sync inside the timing, ABBA, two rounds:
+
+| | before | after | zstd |
+|---|---|---|---|
+| `-d -r --rm`, CPU-only build | 0.40-0.41 s | 0.24-0.25 | 0.10 |
+| `-d -r --rm`, GPU build | 0.51-0.53 s | 0.32-0.34 | |
+| 1,000 one-file `-d` processes, CPU-only build | 3.52-3.54 s | 3.12-3.19 | |
+| 1,000 one-file `-d` processes, GPU build | 7.12-7.25 s | 6.70-6.75 | |
+
+`strace -f` counts 0 clone calls for a one-frame `-d -c` and `-t` (4 and 3 before) when stderr is not
+a terminal; on a terminal the progress bar keeps its thread.
+
+### No more workers than frames, for compress and decompress
+
+`-r` over large files grew RSS, and ROADMAP 26 put it down to glibc arenas and asked for the
+server's bound before any policy.  On the server, 40 MiB at level 3: one input peaks at 76 MB, 12 at
+270, 96 at 1.33 GB, 192 at 1.81 GB, still climbing; `-d -r` over 96: 881 MB.  A 40 MiB input is
+three 16 MiB frames, yet every input started all 96 workers (100 threads), and sizing the pool to
+the frames removes the growth (below) -- so it was the pool, not glibc's arena limit.  The likely
+mechanism, not traced: the three workers that get work leave freed buffers in their own arenas,
+and each input's new threads put the work on a different few.  An auto-sized compress pool now starts no more than
+ceil(size / chunk) workers for a known-size input; an auto-sized decompress pool no more than the
+frames its seek table lists (read anyway, by `TableCkScope`, before the pool starts).  A table is a
+claim, not evidence: one that understates the frames costs throughput, never a frame, as for the GPU
+batch cap (v0.18.8).  Only the count changes -- the frame size is chosen first -- so the output
+cannot.  A file that grows after its size is read gets more frames than workers: slower, not wrong.
+`-T`, a pipe and `--tar` creation keep their pool (`--tar` decoding is capped by the archive's seek
+table like any input); `GZSTD_DEBUG_NO_SMALL_SERIAL` keeps it for A/B.  `-v`
+says "the input makes N frames" / "the seek table lists N frames".
+
+| `-r` over 40 MiB inputs, level 3 | before | after |
+|---|---|---|
+| compress 12: peak RSS / wall | 305-332 MB / 0.97-0.99 s | 88-123 MB / 0.56 |
+| compress 96 | 1.32-1.33 GB / 7.24-7.43 s | 143-151 MB / 4.18-4.38 |
+| compress 192 | 1.81 GB / 14.41 s | 142 MB / 8.55 |
+| `-d -r` 96 | 879 MB / 7.13 s | 160 MB / 6.39 |
+
+**Measured and not taken:** `malloc_trim(0)` between inputs (a prototype behind an environment
+switch).  No effect on large inputs, whose peak is the memory-mapped input plus the frames in flight
+(one 1.5 GiB input: 2.4 GB; six: 2.95-3.47 GB with or without it); on the capped 96 x 40 MiB, 45 MB
+less for 0.1 s more wall.  And a bounded `M_ARENA_MAX`: one arena costs a 3.75 GiB compress 15%
+more user CPU, for no RSS gain there.
+
+### The O_DIRECT writer starts its thread when it first needs one
+
+Found while measuring the above: on a Gen4+ host the GPU build defaults output to O_DIRECT, and
+`DirectWriter` started its write thread when it opened, for every output -- a 7 KiB one included.
+`-d -r` over the 1,000 files took 0.33-0.34 s by default and 0.26 with `--no-direct`.  The thread now
+starts at the first op the writer queues: a full 16 MiB buffer or a sparse seek.  An output smaller
+than one buffer queues nothing before `finalize()`, which writes the last buffer on its own thread
+through the same `drain_one`.  `flush_for_exit` (a failing run keeping what it wrote to a taken-over
+stdout) still drains through the thread, which it starts if it must, so its 30 s bound on a stalled
+filesystem stands; a run that queued nothing has nothing to wait for.  If a thread cannot be
+created mid-stream, the ops drain on the caller: slower, still written.  `live_` now says "open and
+not finished", which `wt_.joinable()` used to stand for.
+
+| GPU build, 1,000 x 7 KiB, sync in the timing | before | after | `--no-direct` |
+|---|---|---|---|
+| `-d -r --rm` | 0.331-0.343 s | 0.264-0.273 | 0.245-0.261 |
+| `-r --rm` compress | 0.300-0.301 s | 0.232-0.235 | 0.213-0.226 |
+
+The 10-20 us a file left is the O_DIRECT descriptor and the buffer pool.  A 3.75 GiB decode to a file
+with the thread: 1.81-1.95 s both ways.  A failing run that wrote one 7 KiB frame to a redirected
+stdout keeps it, as before.
+
+### `--stats-json` describes the whole run
+
+It was rewritten after every input with that input's numbers alone, so `-r --stats-json s.json d`
+over three files of 17,000 bytes reported the last one's 5,000.  The record now folds in every input
+written so far: a new `"files"` count, bytes summed, each GPU device's batches, frames and bytes
+summed, `cpu.threads` the largest any input reported (decompression reports 1, as before),
+`elapsed_sec` from the first input's start.  It is still rewritten after each input, once its coder
+has finished and before its output is finalized, so a run that fails part way leaves the totals of
+the inputs written so far -- including one that then failed to finalize.  A one-input run writes what
+it did before, plus `"files": 1`.  (Run totals rather
+than a per-file list: the owner's choice, 2026-10-21.)
+
+### Pre-tag review (Codex GPT-6.1-Sol, max), round 1: NOT SAFE, five fixed
+
+The hook hangs and exception abort were reproduced against the binary before their fixes;
+the failed-start exit flush was adopted by inspection.  The context-leak coverage was checked
+with a leaking mutant, and the other changed suite arms were run separately on both builds:
+
+- **`GZSTD_DEBUG_GPU_START_AFTER_INPUT` (v0.18.23's test hook) could hang a valid input.**  Each GPU
+  decompress worker waited for the producer to finish, so 40 sized frames piped into `--gpu-only
+  --gpu-batch=1 --gpu-streams=1` filled the 32-frame queue with nobody to drain it, and fixed-share
+  hybrid (`--cpu-share`) starts its producer only after a GPU registers: both timed out (exit 124).
+  The worker now waits for work OR the producer's end (`wait_for_work`), and not at all under fixed
+  share; the cell's sizeless fixture queues nothing, so its hooked arm still reaches the worker's
+  check.  Two arms added, under `timeout`.
+- **`flush_for_exit` after a failed lazy thread start** would have written the tail synchronously on
+  the dying thread, outside its 30 s bound.  `start_write_thread_()` is separate from `enqueue`; the
+  exit flush gives up if it cannot start one (the outcome before v0.17.92).  `std::bad_alloc` is
+  caught there too.
+- **An exception on the inline route aborted.**  Under `-v` (or on a terminal) a joinable progress
+  thread lives in `gzstd_main`, so an exception escaping `decompress_cpu_mt` hit `std::terminate`:
+  `prlimit --as=20M gzstd -v -d one-frame.zst` aborted (exit 134).  The body now runs inside an
+  exception boundary, the thread handles outside it, and the handler calls `die()` before anything
+  unwinds: "out of memory", exit 1.  The threaded path had the same abort for a throwing reader.
+- **Coverage the inline route had neutered.**  The context-leak arm of the small-decompress cell ran
+  one-frame inputs, which now reuse the main thread's context, so removing the thread-local owner
+  passed it (mutant: 0 KiB growth over 1,000 inputs); it runs `-T1` now (mutant: 14 MB, fails).  The
+  cgroup quota cells compressed the two-frame `large.bin`, so the frame cap could stand in for the
+  quota; they read it in 1 MiB frames.  And the clone-count, stats and RSS arms check exit status.
+- **From its wasted-work ledger:** `compress_cpu_mt`, `compress_nvcomp`, `--sliding-window`,
+  `extract_tar` and `verify_tar` started a progress thread with nothing to draw, as `-d` did; gated
+  the same way (a 40 MiB compress: 7 threads -> 6).  And each CPU worker made its whole 32-slot
+  buffer pool before its first frame; the slots are now made as needed, as the GPU drain's already were.
+
+### Pre-tag review, round 2: NOT SAFE, one fixed (the boundary of round 1 was incomplete)
+
+- **The exception boundary began after the one-frame count**, whose buffer allocation could still
+  throw into `gzstd_main` and its live progress thread.  Injected (`std::bad_alloc` at the top of
+  `small_input_data_frames`, a scratch build), `-v -d one-frame.zst -o out`: exit 134, the partial
+  output left behind.  `decompress_cpu_mt` is now a wrapper with its own boundary around the body
+  (`decompress_cpu_mt_impl`, which keeps the inner one for when threads are live): "out of
+  memory", exit 1, the output removed.
+- **And the general case:** any coder's exception reaching `gzstd_main` met that thread joinable.
+  A joiner now ends it during the unwind, so the exception reaches `main()`'s handler ("fatal",
+  exit 1, the output removed by the atexit cleanup).  The injected build WITHOUT the wrapper, with
+  only the joiner: "fatal: std::bad_alloc", exit 1, no output left.
+
+### Pre-tag review, round 3: NOT SAFE, one fixed (round 1's boundaries could turn an exception into a hang)
+
+- **An exception thrown inside `die()` reached a handler that called `die()` again**, which parks on
+  `g_dying` forever.  `die()` flushes a taken-over O_DIRECT stdout, and that flush enqueues its tail
+  (a deque allocation).  Injected (`std::bad_alloc` from the 16th enqueue, a scratch build), one 8 MiB
+  frame of alternating 32 KiB zeros and data, `-v --cpu-only -d --direct --sparse -c > out`: "out of
+  memory", then a hang (timeout, exit 124).  Every cleanup step in `die()` -- the temporary output's
+  removal, the exit flush, the stdout position, the cuFile log -- is now best effort and cannot throw
+  out of it: exit 1.  (Codex proposed the catch at the flush alone; this covers every step.)
+
+### Pre-tag review, round 4: NOT SAFE, one fixed (a diagnostic's own allocation)
+
+- Codex adjudicated the `die()` guard CORRECT.  Remaining: the boundaries' handlers built their
+  message (`"CPU decompression failed: " + what()`) before entering `die()`, so a second
+  allocation failure there -- after a failed thread start with the writer already live -- left the
+  handler past a joinable thread handle: `std::terminate`.  `die_cpu_decompress_exception` builds it
+  under its own catch and falls back to "out of memory" (short enough not to allocate).  Injected
+  thread-start failure right after the writer starts, `-T2` and auto: "CPU decompression failed:
+  injected thread start: Resource temporarily unavailable", exit 1, the output removed (before
+  round 1: `std::terminate`).  The double failure itself was adopted by inspection.
+
+### Pre-tag review, round 5: SAFE TO TAG
+
+The round-4 fix adjudicated CORRECT; a last open pass over the code of rounds 1-4 found no blocker
+and made no edit.  The bar for this round, stated to the reviewer: a defect reachable from an
+ordinary input or a single failure blocks; a further double failure in code older than this release
+is MEDIUM/LOW.  None was reported at either level.  Session total ~3.2M tokens over five turns.
+
+### Found on the way, recorded (ROADMAP 26)
+
+- **`output_bytes` leaves out the seek-table trailer** (and `-t`'s `input_bytes` too): 5,014 for a
+  5,039-byte archive, on v0.18.23 as well.
+
+### Cells
+
+Default run, no GPU (EXPECTED 561/862):
+
+- **"--stats-json over several inputs reports the run's totals"** (new): one input (`files` 1, its
+  bytes), `-r` compress, `-d` and `-t` over three files (`files` 3, 17,000 bytes).  The v0.18.23
+  binary fails every arm (5,000 bytes: the last file).
+- **"a small input decompresses with one thread per frame (none for one), from an unzeroed buffer"**
+  (v0.18.23's, extended): the one-frame line is now "decoding it on this thread"; zero clone calls
+  under `strace` for `-d -c`, `-t` and `-d --direct -o FILE` where it can trace (the binary with the
+  eager O_DIRECT thread fails the last); and the hooked 40-frame input decodes
+  right, under a timeout, with the late start in `-v`.  The v0.18.23 binary fails four arms; the
+  mutant without the late start times out.  Its reference pool is now read with the hook, since the
+  seek-table cap gives its 1 MiB fixture one worker.
+- **The 8-CPU-mask worker-count cells** read `large.bin` in 1 MiB frames (32 of them), and the
+  `ZSTD_NBTHREADS` cell knows the inline line: at the default chunk `large.bin` is two frames, which
+  the caps would now count.  So do the cgroup quota cells (review round 1) and, found by the first
+  `-e` run, "-M tightens throttle": with two workers the pipeline cap (8 frames) fell under the
+  32-frame floor and its line said `source=floor`, where 96 workers had made it `source=ram`.  The
+  budget was the floor in both; only the label moved.  At 1 MiB frames: pipeline 128, -M's RAM cap
+  32, `source=ram` (and `source=pipeline` without -M, so the cell still discriminates).
+
+### Checked byte for byte against the binary without these changes
+
+- **Decompress, both builds:** 22 fixtures x 13 modes = 286 cells (empty, one byte, 7 KiB, 600 KiB
+  and 1.1 MiB random, 1 MiB / 16 MiB / 64 MiB / 64 MiB + 1 / 300 MiB of zeros in one frame, a sparse
+  mix, `--no-check`, zstd's sized and sizeless frames, two frames, a skippable frame first, a flipped
+  byte, a flipped checksum, a truncated frame, a dictionary frame, a patch; each as `-d -c` to a file
+  and to a pipe, `-o`, `-t`, `--keep-going`, `--sparse`, `--no-sparse`, `-D`, `--patch-from`,
+  `--cpu-only`, `-M 4096`, `--stats-json`, `--direct`): the same exit code (0, 1, 4, 6 and 7 all
+  occur), output bytes, allocated blocks and stderr in every cell; the stats rows differ only by
+  `"files": 1`.  And 9 multi-input runs (inline-eligible inputs mixed with two-frame, 64 MiB + 1,
+  random, empty, damaged, dictionary and plain, sizeless and 300 MiB ones): the same stdout, stderr
+  and exit code.
+- **Compress, both builds:** 216 shapes (6 sizes either side of the 16 MiB chunk x 12 option sets --
+  levels 1/3/19, `--chunk-size` 4 and 32, `-D`, `--no-check`, `--ultra -20`, `--verify`, `--adapt`,
+  `--cpu-only`, `--hybrid` -- x named, redirected stdin, pipe): the same bytes and exit code.
+
+**Suites** (the 256-core, 8x H100 server, `CUDA_VISIBLE_DEVICES` unset, on the final tree): CPU-only
+415/0/120 of 535 (as expected: -146 no GPU); `-e` 860/0/2 of 862 (-2 this host could not exercise:
+the trivial-park cell and a tail-yield cell, the CPU finishing first); no drift note.  The first `-e`
+run was 859/1/2: the -M cell above, a fixture fix, after which only `-e` was rerun.
+
+**Real data (RELEASING 3), final build:** 3.75 GiB `--gpu-only` both ways (48 and 36 GPU batches),
+default `-d`, `-t --gpu-only`; 11 GiB `-T1` hybrid compress, 31 GPU batches (at 3.75 GiB the bringup
+estimate fell under its 4 s guard and correctly skipped the GPU); `zstd -t` accepts every archive;
+`--gds-only` both ways at 40 MiB and 1.5 GiB with peer-to-peer output (two aligned cuFileWrites,
+no host copy); `--tar` create / `-t` / extract over 1,000 small files and 5 x 40 MiB.  Built against
+zstd 1.4.4 (RHEL 8) CPU-only: clean, round trips.
+
+`-d -r` over small files 8x faster, `-r` no longer quadratic in the file count, worker contexts no longer leak per input; the GPU-worker cell binds to the worker's check on any machine
 
 All found by the v0.18.22 second-machine check (RELEASING 4) on the 24-core, 2x RTX 2080 Ti Gen3
 workstation, in this order: a suite cell that raced, then `-d -r -D` over 10,000 JSON records taking

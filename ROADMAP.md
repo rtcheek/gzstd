@@ -494,25 +494,44 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      overlap (512 sysfs reads for the core count alone on the 256-thread server) but keep different
      fallbacks and affinity scopes.
 
-26. **Left by the v0.18.23 small-file work (measured, deliberately not taken before a tag).**
-   - **`-d` on a small file still starts 4 threads** (writer, one worker, two more), where compress's
-     one-frame path starts none and zstd none: ~0.5 ms a file, mostly system time.  After v0.18.23,
-     `-d -r -D` over 10,000 x ~7 KiB is 5.43-5.66 s against zstd's 0.49 (11x).  The next step is the
-     CPU streaming decoder (`decompress_stream_from_file`, already the path for sizeless frames) for an
-     input of one small frame, gated as v0.18.23's frame count is.  It changes which code checks seek
-     tables, reports `--keep-going` damage and writes sparse output, so it wants its own review and
-     a byte-for-byte matrix like v0.18.23's (CHANGELOG: 114 shapes x modes).
-   - **`-r` over large files grows RSS by glibc arenas, not a leak.**  Each input's pool is new
-     threads; a new thread can take a fresh arena, and `M_MMAP_THRESHOLD=128M` (the munmap TLB-storm
-     fix) keeps 16 MiB frame buffers inside arenas, so freed buffers stay resident: 12 x 40 MiB, level 3,
-     85 -> 171 MB peak (36 files: 311 MB); `MALLOC_ARENA_MAX=1` holds it at 67-74 MB, and memcheck
-     finds no leak.  It plateaus at glibc's 8 x cores arenas (192 here, 2,048 on the 256-core server),
-     so the bound on the server is the question.  Candidates: `malloc_trim(0)` between inputs (all
-     workers joined, so no shootdown storm), a bounded `M_ARENA_MAX`, or a pool that outlives an input.
-     Measure on the server first: the 128 MiB threshold was a measured win there.
-   - **`--stats-json` over several inputs reports the last one.**  `-r --stats-json s.json d e` over
-     three files wrote `input_bytes: 5000`, the last file's size (17,000 in all); v0.18.22 did the
-     same.  Decide whether the record is per run (sum) or per file (a list) before changing it.
+26. **Left by the v0.18.23 small-file work -- FIXED v0.18.24, except as noted.**
+   - **`-d` on a small file started 4 threads -- now none.**  They were the ordered writer, its
+     `AsyncWritePool` thread, one worker, and the progress thread, which `-d` started even with no
+     bar to draw.  The progress thread now starts only when `progress_loop_needed` says it will draw,
+     as compress already did.  For one data frame that the worker decodes in one call (declared size
+     <= 64 MiB), the three existing stages run in turn on the main thread: reader, `cpu_decomp_worker`,
+     `writer_run` with an inline `AsyncWritePool`.  It is the same code, so the same seek-table
+     checks, `--keep-going` reports and sparse output.  The streaming-decoder route proposed here was
+     NOT taken, because it would have changed exactly those three.  The queue is unbounded while the
+     reader runs alone.  If the reader finds more than the counted frame (a file that grew;
+     `GZSTD_DEBUG_SMALL_CLAIM_ONE`), the threads start after all: without that, 40 frames hung on
+     the 33rd throttle permit (mutant, timeout).  Server, 1,000 x 7 KiB, ABBA, sync in the timing:
+     `-d -r` 0.40-0.41 -> 0.24-0.25 s on the CPU-only build and 0.51-0.53 -> 0.32-0.34 on the GPU
+     build (zstd 0.10); 1,000 one-file processes 3.52-3.54 -> 3.12-3.19 s and 7.12-7.25 -> 6.70-6.75.
+   - **`-r` RSS growth was oversized pools, not glibc's arena limit.**  On the server, 96 x 40 MiB at
+     level 3 peaked at 1.33 GB and 192 at 1.81 GB (one input: 76 MB).  A 40 MiB input is 3 frames,
+     yet each input started 96 workers; capping the pool at the frames removes the growth (likely,
+     not traced: busy workers' freed buffers spread over a new set of arenas every input).
+     Compress now caps an auto-sized pool at ceil(size / chunk) frames, and
+     decompress at the seek table's frame count (a claim, not evidence: an understated table costs
+     throughput, never a frame).  96 inputs: 1.32-1.33 GB -> 143-151 MB and 7.24-7.43 -> 4.18-4.38 s;
+     192: 1.81 GB -> 142 MB (flat); `-d -r` over 96: 879 -> 160 MB, 7.13 -> 6.39 s.  Not taken,
+     measured: `malloc_trim(0)` between inputs (no effect on large inputs, whose peak is the mapped
+     input plus in-flight frames: 2.4 GB for one 1.5 GiB input; -45 MB on the capped 96 x 40 MiB, for
+     +0.1 s wall); `M_ARENA_MAX` (1 arena: +15% user CPU on one 3.75 GiB input, no RSS gain there).
+   - **`--stats-json` over several inputs is the run's record**, with `files`, summed bytes, per-device
+     GPU shares, the largest pool, and elapsed time from the first input (owner's decision, 2026-10-21:
+     run totals, not a per-file list).
+   - **Found on the way, FIXED v0.18.24: the default `--direct` cost a small output a thread.**  On a
+     Gen4+ host the GPU build defaults output to O_DIRECT, and `DirectWriter` started its write
+     thread at open, for a 7 KiB output too: `-d -r` over 1,000 x 7 KiB 0.33-0.34 s against 0.26
+     with `--no-direct`.  The thread now starts at the first queued op; `finalize()` writes a
+     sub-buffer output itself.  0.26-0.27 s now; the 10-20 us a file left is the O_DIRECT
+     descriptor and the buffer pool (lazy buffers would turn an allocation failure mid-stream into
+     a write error, so not taken).
+   - **OPEN, pre-existing: `output_bytes` (and `-t`'s `input_bytes`) leave out the seek-table
+     trailer** -- 5,014 reported for a 5,039-byte archive.  They count data frames; say so, or count
+     the trailer.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

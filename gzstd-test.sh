@@ -622,8 +622,10 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=560
-$EXTENSIVE && EXPECTED_TESTS=861
+EXPECTED_TESTS=561
+$EXTENSIVE && EXPECTED_TESTS=862
+# v0.18.24: +1 default cell, no GPU (--stats-json over several inputs reports the
+# run's totals): 560 -> 561, 861 -> 862.
 # v0.18.23: +1 default cell, no GPU (a small input decompresses with one thread per
 # frame, from an unzeroed buffer): 559 -> 560, 860 -> 861.
 # v0.18.20: +1 -e (both helps fit 80 columns): 858 -> 859.
@@ -1105,50 +1107,90 @@ done
 # from -v; the buffer by peak RSS against GZSTD_DEBUG_STREAM_ZERO's memset (RSS, not
 # faults: a transparent huge page can zero 8 MiB in four faults).  --cpu-only so the
 # GPU build takes the same path.
+# ONE FRAME STARTS NO THREAD AT ALL (v0.18.24).  It still started the writer, its write
+# thread, one worker and a progress thread with nothing to draw: 0.5 ms a file, `-d -r`
+# 1.6x slower over 1,000 x 7 KiB on the 256-core server.  Asserted by counting clone
+# calls under strace, where it can trace.  An input that turns out to hold more than
+# the frame counted (a file that grew; GZSTD_DEBUG_SMALL_CLAIM_ONE makes one) starts the
+# threads after all: without that, 40 frames waited for a 33rd throttle permit forever.
 sd_why=""
-sd_cnt() { "$GZSTD" -v -d -c --cpu-only "$@" 2>&1 >/dev/null | grep -oE 'the input holds [0-9]+ frames?|[0-9]+ decompression threads online' | tr '\n' ' '; }
+sd_cnt() { "$GZSTD" -v -d -c --cpu-only "$@" 2>&1 >/dev/null | grep -oE 'the input holds [0-9]+ frames?|decoding it on this thread|[0-9]+ decompression threads online' | tr '\n' ' '; }
 "$GZSTD" -q -f --cpu-only "$TMPDIR/small.txt" -o "$TMPDIR/sd1.zst" 2>/dev/null
 "$GZSTD" -q -f --cpu-only "$TMPDIR/onebyte.txt" -o "$TMPDIR/sd2.zst" 2>/dev/null
 "$GZSTD" -q -f --cpu-only "$TMPDIR/random.bin" -o "$TMPDIR/sdbig.zst" 2>/dev/null   # incompressible: over 1 MiB
 cat "$TMPDIR/sd1.zst" "$TMPDIR/sd2.zst" "$TMPDIR/sd1.zst" > "$TMPDIR/sd3.zst"
 printf '\x50\x2a\x4d\x18\x04\x00\x00\x00skip' >> "$TMPDIR/sd3.zst"                 # a skippable frame: not counted
 cat "$TMPDIR/small.txt" "$TMPDIR/onebyte.txt" "$TMPDIR/small.txt" > "$TMPDIR/sd3.src"
-sd_def=$(sd_cnt "$TMPDIR/sdbig.zst" | grep -oE '^[0-9]+')   # the pool the gate stays out of
+# The default pool, from an input the gate stays out of.  Since v0.18.24 a larger input's
+# pool is capped by its seek table (one frame here), so the hook keeps it whole.
+sd_def=$(GZSTD_DEBUG_NO_SMALL_SERIAL=1 sd_cnt "$TMPDIR/sdbig.zst" | grep -oE '^[0-9]+')
 [[ "$(sd_cnt "$TMPDIR/sdbig.zst")" == *"the input holds"* ]] && sd_why+=" [over 1 MiB: gated]"
 [[ -n "$sd_def" ]] || sd_why+=" [no default count]"
-if [[ -n "$sd_def" && $sd_def -gt 1 ]]; then
-  [[ "$(sd_cnt "$TMPDIR/sd1.zst")" == "the input holds 1 frame 1 decompression threads online " ]] \
-    || sd_why+=" [one frame: $(sd_cnt "$TMPDIR/sd1.zst")]"
-  if [[ $sd_def -gt 3 ]]; then
-    [[ "$(sd_cnt "$TMPDIR/sd3.zst")" == "the input holds 3 frames 3 decompression threads online " ]] \
-      || sd_why+=" [three frames + a skippable: $(sd_cnt "$TMPDIR/sd3.zst")]"
-  fi
-  [[ "$(sd_cnt -T4 "$TMPDIR/sd1.zst")" == "4 decompression threads online " ]] \
-    || sd_why+=" [-T4: $(sd_cnt -T4 "$TMPDIR/sd1.zst")]"
-  [[ "$(GZSTD_DEBUG_NO_SMALL_SERIAL=1 sd_cnt "$TMPDIR/sd1.zst")" == "$sd_def decompression threads online " ]] \
-    || sd_why+=" [hook: $(GZSTD_DEBUG_NO_SMALL_SERIAL=1 sd_cnt "$TMPDIR/sd1.zst")]"
+[[ "$(sd_cnt "$TMPDIR/sd1.zst")" == "the input holds 1 frame decoding it on this thread " ]] \
+  || sd_why+=" [one frame: $(sd_cnt "$TMPDIR/sd1.zst")]"
+if [[ -n "$sd_def" && $sd_def -gt 3 ]]; then
+  [[ "$(sd_cnt "$TMPDIR/sd3.zst")" == "the input holds 3 frames 3 decompression threads online " ]] \
+    || sd_why+=" [three frames + a skippable: $(sd_cnt "$TMPDIR/sd3.zst")]"
 fi
+[[ "$(sd_cnt -T4 "$TMPDIR/sd1.zst")" == "4 decompression threads online " ]] \
+  || sd_why+=" [-T4: $(sd_cnt -T4 "$TMPDIR/sd1.zst")]"
+[[ "$(GZSTD_DEBUG_NO_SMALL_SERIAL=1 sd_cnt "$TMPDIR/sd1.zst")" == "$sd_def decompression threads online " ]] \
+  || sd_why+=" [hook: $(GZSTD_DEBUG_NO_SMALL_SERIAL=1 sd_cnt "$TMPDIR/sd1.zst")]"
+if strace -f -qq -e trace=clone,clone3 -o /dev/null true 2>/dev/null; then
+  # The --direct arm is the O_DIRECT writer a GPU build defaults to on a Gen4+ host: since
+  # v0.18.24 it starts its write thread at the first full 16 MiB buffer, not at open.
+  for sd_m in stdout test direct; do
+    case "$sd_m" in
+      stdout) sd_args=(-d -c --no-direct) ;;
+      test)   sd_args=(-t) ;;
+      direct) sd_args=(-d -f --direct -o "$TMPDIR/sd1.out") ;;
+    esac
+    strace -f -qq -e trace=clone,clone3 -o "$TMPDIR/sd.st" "$GZSTD" -q "${sd_args[@]}" --cpu-only \
+      "$TMPDIR/sd1.zst" > "$TMPDIR/sd1.cout" 2> /dev/null
+    sd_rc=$?
+    [[ $sd_rc -eq 0 ]] || sd_why+=" [one frame, $sd_m: exit $sd_rc]"
+    sd_cl=$(grep -c clone "$TMPDIR/sd.st")
+    [[ $sd_cl == 0 ]] || sd_why+=" [one frame, $sd_m: $sd_cl threads started]"
+    if [[ $sd_m == stdout ]]; then
+      cmp -s "$TMPDIR/sd1.cout" "$TMPDIR/small.txt" || sd_why+=" [one frame, stdout: bytes]"
+    fi
+  done
+  cmp -s "$TMPDIR/sd1.out" "$TMPDIR/small.txt" || sd_why+=" [one frame, --direct: bytes]"
+  rm -f "$TMPDIR/sd.st" "$TMPDIR/sd1.out" "$TMPDIR/sd1.cout"
+fi
+for ((sd_i = 0; sd_i < 40; sd_i++)); do cat "$TMPDIR/sd1.zst"; done > "$TMPDIR/sd40.zst"
+for ((sd_i = 0; sd_i < 40; sd_i++)); do cat "$TMPDIR/small.txt"; done > "$TMPDIR/sd40.src"
+GZSTD_DEBUG_SMALL_CLAIM_ONE=1 timeout 60 "$GZSTD" -v -d -c --cpu-only "$TMPDIR/sd40.zst" 2> "$TMPDIR/sd40.err" \
+  | cmp -s - "$TMPDIR/sd40.src" || sd_why+=" [counted one frame, read 40: rc ${PIPESTATUS[0]}]"
+sd_40=$(grep -oE 'the input holds [0-9]+ frames?|decoding it on this thread|[0-9]+ decompression threads online' \
+          "$TMPDIR/sd40.err" | tr '\n' ' ')
+[[ "$sd_40" == "the input holds 1 frame decoding it on this thread 1 decompression threads online " ]] \
+  || sd_why+=" [counted one frame, read 40: $sd_40]"
+rm -f "$TMPDIR/sd40.zst" "$TMPDIR/sd40.src" "$TMPDIR/sd40.err"
 "$GZSTD" -q -d -c --cpu-only "$TMPDIR/sd1.zst" 2>/dev/null | cmp -s - "$TMPDIR/small.txt" || sd_why+=" [one frame: bytes]"
+"$GZSTD" -q -t --cpu-only "$TMPDIR/sd1.zst" 2>/dev/null || sd_why+=" [one frame: -t]"
 "$GZSTD" -q -d -c --cpu-only "$TMPDIR/sd3.zst" 2>/dev/null | cmp -s - "$TMPDIR/sd3.src" || sd_why+=" [three frames: bytes]"
 "$GZSTD" -q -t --cpu-only "$TMPDIR/sd3.zst" 2>/dev/null || sd_why+=" [three frames: -t]"
 if [[ -x /usr/bin/time ]]; then
-  sd_rss() { env "$@" /usr/bin/time -f %M -o "$TMPDIR/sd.rss" "$GZSTD" -q -d -c --cpu-only "$TMPDIR/sd1.zst" > /dev/null 2>&1; tail -1 "$TMPDIR/sd.rss"; }
+  sd_rss() { env "$@" /usr/bin/time -f %M -o "$TMPDIR/sd.rss" "$GZSTD" -q -d -c --cpu-only "$TMPDIR/sd1.zst" > /dev/null 2>&1 || return; tail -1 "$TMPDIR/sd.rss"; }
   sd_r0=$(sd_rss); sd_r1=$(sd_rss GZSTD_DEBUG_STREAM_ZERO=1)
   [[ "$sd_r0" =~ ^[0-9]+$ && "$sd_r1" =~ ^[0-9]+$ && $((sd_r1 - sd_r0)) -ge 6144 ]] \
     || sd_why+=" [buffer: peak RSS ${sd_r0} KiB, ${sd_r1} with the memset (want 6+ MiB less without it)]"
   # Each worker's ZSTD_DCtx (~96 KB) leaked when its pool exited, one pool per input:
   # 1,000 inputs held ~26 MB more than 40 did; now under 1 MB.  Freed at thread exit.
+  # Keep an actual worker per input: the auto one-frame route now reuses main's
+  # context, so even the old bare thread_local pointer would pass this arm there.
   sd_rr() { rm -rf "$TMPDIR/sdr"; mkdir "$TMPDIR/sdr"; local i
     for ((i = 0; i < $1; i++)); do cp "$TMPDIR/sd1.zst" "$TMPDIR/sdr/f$i.zst"; done
-    /usr/bin/time -f %M -o "$TMPDIR/sd.rss" "$GZSTD" -q -d -r -f --cpu-only "$TMPDIR/sdr" > /dev/null 2>&1
+    /usr/bin/time -f %M -o "$TMPDIR/sd.rss" "$GZSTD" -q -d -r -f -T1 --cpu-only "$TMPDIR/sdr" > /dev/null 2>&1 || return
     tail -1 "$TMPDIR/sd.rss"; }
   sd_f40=$(sd_rr 40); sd_f1k=$(sd_rr 1000)
   [[ "$sd_f40" =~ ^[0-9]+$ && "$sd_f1k" =~ ^[0-9]+$ && $((sd_f1k - sd_f40)) -lt 8192 ]] \
     || sd_why+=" [-d -r: peak RSS ${sd_f40} KiB over 40 inputs, ${sd_f1k} over 1,000 (a context kept per input?)]"
   rm -rf "$TMPDIR/sdr"
 fi
-[[ -z "$sd_why" ]] && pass "a small input decompresses with one thread per frame, from an unzeroed buffer" \
-  || fail "a small input decompresses with one thread per frame, from an unzeroed buffer" "$sd_why"
+[[ -z "$sd_why" ]] && pass "a small input decompresses with one thread per frame (none for one), from an unzeroed buffer" \
+  || fail "a small input decompresses with one thread per frame (none for one), from an unzeroed buffer" "$sd_why"
 rm -f "$TMPDIR"/sd1.zst "$TMPDIR"/sd2.zst "$TMPDIR"/sd3.zst "$TMPDIR"/sd3.src "$TMPDIR"/sdbig.zst "$TMPDIR"/sd.rss
 
 # ============================================================
@@ -1475,19 +1517,18 @@ wc_workers() {
   fi
 }
 wc_logged_quota() { grep -aoE 'cgroup CPU quota [0-9]+' "$1" | head -1 | grep -oE '[0-9]+' | head -1; }
-# The compress arms read large.bin, two 16 MiB frames: since v0.18.22 an input that fits in one
-# frame (medium.txt is exactly 1 MiB) compresses on one thread, so it shows no pool to count.
-# The decompress arms read its archive for the same reason: since v0.18.23 a file of at most
-# 1 MiB starts no more decompress workers than it has frames, and medium.txt's is one.
-"$GZSTD" --cpu-only -q -f -c "$TMPDIR/large.bin" > "$TMPDIR/wc.zst" 2>/dev/null
+# Every arm reads large.bin in 1 MiB frames, 32 of them: since v0.18.24 an auto-sized pool
+# starts no more workers than the input has frames (compress from its size, decompress from
+# its seek table), and at the default 16 MiB large.bin is two.
+"$GZSTD" --cpu-only -q -f --chunk-size=1 -c "$TMPDIR/large.bin" > "$TMPDIR/wc.zst" 2>/dev/null
 if (( ${#wc_allowed[@]} < 9 )) || ! command -v taskset >/dev/null 2>&1; then
   for wc_t in "an 8-CPU mask: allowance-sized workers, -T0 and decompress too" "--stats-json reports the pool"; do
     skip_host "worker count: $wc_t" "needs taskset and at least 9 allowed CPUs"
   done
 else
   wc_mask=$(IFS=,; echo "${wc_allowed[*]:0:8}")
-  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc1.err" >/dev/null; wc_rc1=$?
-  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -T0 -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc2.err" >/dev/null; wc_rc2=$?
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f --chunk-size=1 -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc1.err" >/dev/null; wc_rc1=$?
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -T0 --chunk-size=1 -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc2.err" >/dev/null; wc_rc2=$?
   taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -d -f -c "$TMPDIR/wc.zst" 2>"$TMPDIR/wc4.err" >/dev/null; wc_rc4=$?
   wc_want_mask=6
   wc_allowed_mask=8
@@ -1503,7 +1544,7 @@ else
     fail "worker count: an 8-CPU mask: allowance-sized workers, -T0 and decompress too" \
       "rc $wc_rc1/$wc_rc2/$wc_rc4; $(grep -ah '^\[CPU\]' "$TMPDIR/wc1.err" "$TMPDIR/wc2.err" "$TMPDIR/wc4.err" | tr '\n' ' ')"
   fi
-  taskset -c "$wc_mask" "$GZSTD" --cpu-only -q -f --stats-json "$TMPDIR/wc3.json" -c "$TMPDIR/large.bin" >/dev/null 2>&1
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -q -f --chunk-size=1 --stats-json "$TMPDIR/wc3.json" -c "$TMPDIR/large.bin" >/dev/null 2>&1
   wc_rc3=$?
   if [[ $wc_rc3 -eq 0 ]] && grep -q "\"cpu\": { \"threads\": $wc_want_mask }" "$TMPDIR/wc3.json" 2>/dev/null; then
     pass "worker count: --stats-json reports the pool"
@@ -1539,7 +1580,7 @@ for wc_case in "v2 3" "v1 2"; do
   fi
   wc_dir=$wc_v2; [[ $wc_kind == v1 ]] && wc_dir=$wc_v1
   wc_want=$(( wc_base < wc_q ? wc_base : wc_q ))
-  GZSTD_DEBUG_CGROUP_ROOT="$wc_dir" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc-$wc_kind.err" >/dev/null
+  GZSTD_DEBUG_CGROUP_ROOT="$wc_dir" "$GZSTD" --cpu-only -v -f --chunk-size=1 -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc-$wc_kind.err" >/dev/null
   wc_rc=$?
   wc_got=$(wc_workers "$TMPDIR/wc-$wc_kind.err")
   if [[ $wc_rc -eq 0 && "$wc_got" == "$wc_want" ]] \
@@ -1554,7 +1595,7 @@ done
 if command -v systemd-run >/dev/null 2>&1 \
    && systemd-run --user --scope -q -p CPUQuota=200% true >/dev/null 2>&1; then
   wc_want=$(( wc_base < 2 ? wc_base : 2 ))
-  systemd-run --user --scope -q -p CPUQuota=200% "$GZSTD" --cpu-only -v -f -c "$TMPDIR/large.bin" \
+  systemd-run --user --scope -q -p CPUQuota=200% "$GZSTD" --cpu-only -v -f --chunk-size=1 -c "$TMPDIR/large.bin" \
     2>"$TMPDIR/wc-real.err" >/dev/null
   wc_rc=$?
   wc_real_quota=$(wc_logged_quota "$TMPDIR/wc-real.err")
@@ -1619,6 +1660,39 @@ else
   skip "--stats-json" "file not created"
 fi
 rm -f "$json_file" "$TMPDIR/medium.txt.zst"
+
+# --stats-json OVER SEVERAL INPUTS IS THE RUN'S RECORD (v0.18.24).  It was rewritten
+# after each input with that input's numbers alone: `-r --stats-json s.json d` over
+# three files of 17,000 bytes reported the last one's 5,000.  Now "files" counts the
+# inputs and the bytes are summed, for compress, -d and -t; one input reports
+# "files": 1 and its own bytes, as before.
+t0=$(now_ms); why=""
+SJ="$TMPDIR/sj"; rm -rf "$SJ"; mkdir -p "$SJ/d" "$SJ/out"
+head -c 5000 /dev/urandom > "$SJ/d/a"; head -c 7000 /dev/urandom > "$SJ/d/b"; head -c 5000 /dev/urandom > "$SJ/d/c"
+sj_get() { grep -o "^  \"$2\": [0-9]*" "$1" 2>/dev/null | grep -o '[0-9]*$'; }
+"$GZSTD" -q -k -f --cpu-only --stats-json "$SJ/one.json" "$SJ/d/a" -o "$SJ/a1.zst" 2>/dev/null || why+=" one-input-exit:$?"
+[[ "$(sj_get "$SJ/one.json" files) $(sj_get "$SJ/one.json" input_bytes)" == "1 5000" ]] \
+  || why+=" one-input:$(sj_get "$SJ/one.json" files)/$(sj_get "$SJ/one.json" input_bytes)"
+"$GZSTD" -q -k --cpu-only -r --stats-json "$SJ/c.json" "$SJ/d" 2>/dev/null || why+=" -r-exit:$?"
+[[ "$(sj_get "$SJ/c.json" files) $(sj_get "$SJ/c.json" input_bytes)" == "3 17000" ]] \
+  || why+=" -r:$(sj_get "$SJ/c.json" files)/$(sj_get "$SJ/c.json" input_bytes)"
+"$GZSTD" -q -f --cpu-only -d --output-dir-flat "$SJ/out" --stats-json "$SJ/d.json" \
+  "$SJ/d/a.zst" "$SJ/d/b.zst" "$SJ/d/c.zst" 2>/dev/null || why+=" -d-exit:$?"
+[[ "$(sj_get "$SJ/d.json" files) $(sj_get "$SJ/d.json" output_bytes)" == "3 17000" ]] \
+  || why+=" -d:$(sj_get "$SJ/d.json" files)/$(sj_get "$SJ/d.json" output_bytes)"
+for sj_name in a b c; do
+  cmp -s "$SJ/d/$sj_name" "$SJ/out/$sj_name" || why+=" -d-bytes:$sj_name"
+done
+"$GZSTD" -q --cpu-only -t --stats-json "$SJ/t.json" "$SJ/d/a.zst" "$SJ/d/b.zst" "$SJ/d/c.zst" 2>/dev/null || why+=" -t-exit:$?"
+[[ "$(sj_get "$SJ/t.json" files) $(sj_get "$SJ/t.json" output_bytes)" == "3 17000" ]] \
+  || why+=" -t:$(sj_get "$SJ/t.json" files)/$(sj_get "$SJ/t.json" output_bytes)"
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$SJ/c.json" 2>/dev/null || why+=" invalid-json"
+fi
+rm -rf "$SJ"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--stats-json over several inputs reports the run's totals" \
+  || fail "--stats-json over several inputs reports the run's totals" "got$why"
 
 # The GPU build's nvCOMP compress path wrote no --stats-json file at all until
 # v0.17.79, at exit 0 (the cell above passes --cpu-only, so it never saw that).
@@ -5550,7 +5624,7 @@ files_match "$TMPDIR/small.txt" "$TMPDIR/tform1.recovered" \
 # default's.  Counts come from -v's "[CPU] N worker/decompression threads online".
 tf_why=""
 tf_run() { local ev=$1; shift; ZSTD_NBTHREADS="$ev" "$GZSTD" -f --cpu-only "$@" 2>&1 >/dev/null; }
-tf_cnt() { grep -oE '\[CPU\] ([0-9]+ [a-z]+ threads online|single-thread streaming path)' <<<"$1"; }
+tf_cnt() { grep -oE '\[CPU\] ([0-9]+ [a-z]+ threads online|single-thread streaming path|the input holds 1 frame; decoding it on this thread)' <<<"$1"; }
 "$GZSTD" -q -k -f --cpu-only "$TMPDIR/medium.txt" -o "$TMPDIR/tform-nbt.zst" 2>/dev/null
 tf_def_c=$(tf_cnt "$(env -u ZSTD_NBTHREADS "$GZSTD" -f --cpu-only -v -c "$TMPDIR/medium.txt" 2>&1 >/dev/null)")
 tf_def_d=$(tf_cnt "$(env -u ZSTD_NBTHREADS "$GZSTD" -f --cpu-only -v -d -c "$TMPDIR/tform-nbt.zst" 2>&1 >/dev/null)")
@@ -6136,7 +6210,7 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   # returns after the reader is done: always, on a 2-GPU Gen3 box, where this cell
   # failed with no worker started at all.  So the plain arm accepts either check,
   # and GZSTD_DEBUG_GPU_START_AFTER_INPUT makes gzstd open the worker's window
-  # itself (spawn, then wait for the producer) for the arm that binds to the
+  # itself (spawn, then wait for work or producer completion) for the arm that binds to the
   # worker's check.  Without that check the hooked arm pre-allocates on every device.
   sg_why=""
   sg_ns() {  # sg_ns LABEL [ENV...] -> exit, bytes and pre-alloc checks; log in sgp.log
@@ -6156,6 +6230,24 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   sg_ns hooked GZSTD_DEBUG_GPU_START_AFTER_INPUT=1
   tr '\r' '\n' < "$TMPDIR/sgp.log" | grep -q 'the queue was drained before this device was set up; not starting it' \
     || sg_why+=" [hooked: no worker left unstarted]"
+  # The hook must not strand real work.  Forty sized frames exceed the 32-frame
+  # queue floor at batch=1 / streams=1; waiting for producer completion there
+  # prevents the sole consumer from freeing space for the producer to finish.
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$TMPDIR/sg8.bin" -o "$TMPDIR/sgwork.zst" \
+    2>/dev/null || sg_why+=" [hooked work fixture: exit $?]"
+  for sg_i in 1 2 3 4 5; do cat "$TMPDIR/sgwork.zst"; done \
+    | env GZSTD_DEBUG_GPU_START_AFTER_INPUT=1 timeout --foreground -k 5 60 \
+        "$GZSTD" -d --gpu-only --gpu-devices=1 --gpu-streams=1 --gpu-batch=1 -q -c \
+        2>"$TMPDIR/sgp.log" \
+    | cmp -s - <(for sg_i in 1 2 3 4 5; do cat "$TMPDIR/sg8.bin"; done) \
+    || sg_why+=" [hooked, input larger than queue: exit or bytes]"
+  # Fixed-share starts its producer only after GPU registration.  Its worker
+  # cannot wait for work before registering, even when the queue is empty.
+  env GZSTD_DEBUG_GPU_START_AFTER_INPUT=1 timeout --foreground -k 5 60 \
+    "$GZSTD" -d --hybrid --cpu-share=0.5 --gpu-devices=1 --gpu-streams=1 --gpu-batch=1 \
+      -T2 -q -c "$TMPDIR/sgwork.zst" 2>"$TMPDIR/sgp.log" \
+    | cmp -s - "$TMPDIR/sg8.bin" || sg_why+=" [hooked fixed-share: exit or bytes]"
+  rm -f "$TMPDIR/sgwork.zst"
   [[ -z "$sg_why" ]] && pass "a GPU worker with nothing left to take is not set up" \
     || fail "a GPU worker with nothing left to take is not set up" "$sg_why"
 
@@ -12889,8 +12981,11 @@ fi
 ("$GZSTD" --memory=256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memory=N accepted" || fail "--memory=N accepted"
 
 # -M tightens the throttle budget at -vv (source should show `source=ram`).
-# large.bin, two frames: a one-frame input takes the throttle-free serial path.
-out=$("$GZSTD" --cpu-only -vv -M 32M -f -c "$TMPDIR/large.bin" 2>&1 >/dev/null)
+# large.bin in 1 MiB frames, 32 of them: a one-frame input takes the throttle-free
+# serial path, and since v0.18.24 an auto pool starts no more workers than frames, so
+# at the default 16 MiB (two frames) the pipeline cap fell under the 32-frame floor
+# and the line said source=floor.  At 1 MiB: pipeline 128 frames, -M's RAM cap 32.
+out=$("$GZSTD" --cpu-only -vv -M 32M -f --chunk-size=1 -c "$TMPDIR/large.bin" 2>&1 >/dev/null)
 echo "$out" | grep -q "\[THROTTLE\].*source=ram" && pass "-M tightens throttle (source=ram)" \
   || fail "-M tightens throttle" "expected source=ram in throttle line"
 

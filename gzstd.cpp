@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.23";
+static constexpr const char * GZSTD_VERSION = "0.18.24";
 //
 // Architecture overview:
 //
@@ -3643,11 +3643,19 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
   // _Exit() then skips the handlers and destructors.  What is skipped: CUDA's
   // and cuFile's own shutdown, which the kernel does for a dying process anyway,
   // and libcufile's statistics dump, which is not wanted for a failed run.
-  cleanup_tmp_file();
-  gz_direct_stdout_flush_for_exit();   // what was written so far reaches the caller's file
-  gz_stdout_leave_at_end();    // an adopted stdout: after the partial output, not on top of it
+  //
+  // NOTHING MAY THROW OUT OF die() (v0.18.24).  Its callers include catch
+  // handlers -- decompress_cpu_mt's exception boundaries -- so an exception from
+  // a step below (the exit flush's enqueue can allocate) unwound into a handler
+  // that called die() again, which parked on g_dying forever: an injected
+  // allocation failure in a sparse O_DIRECT decode to a redirected stdout hung
+  // there instead of exiting 1.  Each step is best effort, and the next still runs.
+  auto best_effort = [](auto && step) { try { step(); } catch (...) {} };
+  best_effort(cleanup_tmp_file);
+  best_effort(gz_direct_stdout_flush_for_exit);   // what was written so far reaches the caller's file
+  best_effort(gz_stdout_leave_at_end);    // an adopted stdout: after the partial output, not on top of it
 #ifdef HAVE_NVCOMP
-  gz_cufile_log_finish();
+  best_effort(gz_cufile_log_finish);
 #endif
   std::cout.flush();
   std::fflush(stdout);
@@ -5879,7 +5887,8 @@ static void print_help_long()
 "                    environment variable turns it off too (no-color.org).\n"
 "                    Cursor control (the progress line redrawn in place)\n"
 "                    is not colour and stays.\n"
-"  --stats-json FILE Write a machine-readable run summary to FILE.\n"
+"  --stats-json FILE Write a machine-readable run summary to FILE.  With\n"
+"                    several inputs it is the run's: files, bytes summed.\n"
 "\n"
 "============================================================\n"
 " EXIT CODES\n"
@@ -11330,7 +11339,14 @@ private:
     ops_.clear();
     g_odirect_write_ns.store(0, std::memory_order_relaxed);  // -v: per-output write-time
     g_odirect_used.store(true, std::memory_order_relaxed);
-    wt_ = std::thread(&DirectWriter::writer_loop, this);
+    // The write thread starts at the first op (enqueue), not here (v0.18.24).
+    // An output smaller than one 16 MiB buffer never queues one before
+    // finalize(), which then writes it on the caller's thread: a GPU build on a
+    // Gen4+ host defaults output to O_DIRECT, and starting and joining a thread
+    // for every 7 KiB file made `-d -r` over 1,000 of them 0.32-0.34 s against
+    // 0.24-0.26 with --no-direct.
+    wt_started_ = false; sync_drain_ = false;
+    live_ = true;
     return true;
   }
 public:
@@ -11389,8 +11405,14 @@ public:
     std::unique_lock<std::timed_mutex> prod(prod_m_, std::defer_lock);
     if (!prod.try_lock_for(wait)) return false;
     prod.release();
-    if (fd_ < 0 || !wt_.joinable() || werr_.load(std::memory_order_relaxed)) return false;
+    if (fd_ < 0 || !live_ || werr_.load(std::memory_order_relaxed)) return false;
     if (buf_used_ > 0) {
+      // Through the write thread even when it has not started yet: the
+      // bounded wait below is what keeps a stalled filesystem from holding
+      // a failing run forever.
+      // A failed lazy start must NOT send this tail through sync_drain_: a
+      // blocking pwrite on the dying thread would bypass the drain deadline.
+      if (!start_write_thread_()) return false;
       size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;
       enqueue({OP_WRITE, cur_bi_, buf_used_, tail, logical_written_});
       logical_written_ += buf_used_;
@@ -11402,12 +11424,13 @@ public:
     // queued writes one bounded drain attempt; die() then _Exits even if the
     // device never answers.  Normal finalize()/close() still join fully.
     const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    {
+    if (wt_.joinable()) {   // no thread: nothing was queued, or it drained inline
       std::unique_lock<std::mutex> lk(exit_m_);
       if (!exit_cv_.wait_until(lk, drain_deadline, [&] { return wt_exited_; }))
         return false;
+      lk.unlock();
+      wt_.join();
     }
-    wt_.join();
     if (wt2_.joinable()) {
       std::unique_lock<std::mutex> lk(exit_m_);
       if (!exit_cv_.wait_until(lk, drain_deadline, [&] { return wt2_exited_; }))
@@ -11429,16 +11452,22 @@ public:
   bool finalize() {
     std::lock_guard<std::timed_mutex> prod(prod_m_);
     if (fd_ < 0) return false;
-    if (!wt_.joinable()) return !werr_.load(std::memory_order_relaxed);  // never opened/already done
+    if (!live_) return !werr_.load(std::memory_order_relaxed);  // already done
+    live_ = false;
     if (buf_used_ > 0) {
       size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;
-      enqueue({OP_WRITE, cur_bi_, buf_used_, tail, logical_written_});
+      const WOp last{OP_WRITE, cur_bi_, buf_used_, tail, logical_written_};
       logical_written_ += buf_used_;
       buf_used_ = 0;
+      // Nothing queued before it: write it here, as the thread would have.
+      if (wt_started_) enqueue(last);
+      else             drain_one(last);
     }
-    { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
-    cv_op_.notify_all();
-    wt_.join();
+    if (wt_.joinable()) {
+      { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
+      cv_op_.notify_all();
+      wt_.join();
+    }
     if (wt2_.joinable()) wt2_.join();
     if (werr_.load(std::memory_order_relaxed)) return false;
     if (preallocated_ > 0 && logical_written_ < preallocated_) {
@@ -11478,6 +11507,7 @@ public:
       wt_.join();
     }
     if (wt2_.joinable()) wt2_.join();
+    live_ = false;
     if (plain_fd_v_ >= 0) { ::close(plain_fd_v_); plain_fd_v_ = -1; }
     (void)restore_adopted_(false);   // an aborted run still must not leave O_DIRECT behind
     adopted_flags_ = -1;
@@ -11688,6 +11718,9 @@ private:
   int caller_fd_ = -1;                  // adopt_fd_detached: the caller's descriptor (not ours to close)
   bool handed_back_ = false;            // ...and whether finalize() has handed it back via fd()
   bool plain_after_external_prefix_ = false; // unaligned GDS prefix => plain tail
+  bool live_ = false;                   // opened and not yet finalized or closed
+  bool wt_started_ = false;             // enqueue() has started wt_ (producer side only)
+  bool sync_drain_ = false;             // wt_ could not start: ops drain on the caller
   std::thread wt_;
 
   // Drain one op.  All writes are POSITIONAL (pwrite at op.off — every op
@@ -11817,7 +11850,21 @@ private:
     if (werr_.load(std::memory_order_relaxed)) return -1;
     int bi = free_.front(); free_.pop_front(); return bi;
   }
+  bool start_write_thread_() {
+    if (!wt_started_) {
+      wt_started_ = true;
+      // A thread that cannot be created leaves every op to its caller: slower,
+      // and the output is still written.  (At open, this failure used to fall
+      // back to stdio; mid-stream there is no stdio to fall back to.)
+      try { wt_ = std::thread(&DirectWriter::writer_loop, this); }
+      catch (const std::system_error &) { sync_drain_ = true; }
+      catch (const std::bad_alloc &) { sync_drain_ = true; }
+    }
+    return !sync_drain_;
+  }
   void enqueue(WOp op) {
+    (void)start_write_thread_();
+    if (sync_drain_) { drain_one(op); return; }
     { std::lock_guard<std::mutex> lk(mx_); ops_.push_back(op); }
     // notify_all: two drain threads share this CV, and the parked probe
     // thread re-waits without re-notifying when its flag is down — a
@@ -13731,13 +13778,6 @@ public:
     return q_.empty() && done_;
   }
 
-  // Block until the producer is done (set_done wakes cv_).  Test hooks only.
-  void wait_done()
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [&] { return done_; });
-  }
-
   size_t size()
   {
     std::unique_lock<std::mutex> lk(m_);
@@ -15080,13 +15120,17 @@ static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
 ======================================================================*/
 class AsyncWritePool {
 public:
+  // `inline_writes` (v0.18.24): no write thread; submit() writes the batch
+  // itself, through the same code.  For a writer that is the only stage still
+  // running (decompress_cpu_mt's one-frame input), where a thread would only
+  // be started, handed one batch and joined.
   explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true,
                           Meter * meter = nullptr, FrameThrottle * bp = nullptr,
-                          bool progressive_sync = false)
+                          bool progressive_sync = false, bool inline_writes = false)
     : out_(out_file), dw_(dw), sparse_(sparse), done_(false),
       progressive_sync_(progressive_sync), meter_(meter), bp_(bp)
   {
-    worker_ = std::thread(&AsyncWritePool::worker_fn, this);
+    if (!inline_writes) worker_ = std::thread(&AsyncWritePool::worker_fn, this);
   }
 
   ~AsyncWritePool() {
@@ -15112,6 +15156,11 @@ public:
       for (size_t i = 0; i < buffers.size(); ++i)
         dense[i] = (buffers[i] && !buffers[i]->empty())
                        ? (char)frame_dense(buffers[i]->data(), buffers[i]->size()) : (char)1;
+    }
+    if (!worker_.joinable()) {   // inline: write it now, on the caller's thread
+      write_batch(buffers, dense);
+      push_writeback();
+      return;
     }
     std::unique_lock<std::mutex> lk(m_);
     // Wait for previous write to finish (backpressure)
@@ -15315,53 +15364,7 @@ private:
       }
       cv_consumer_.notify_one();  // pending_ now empty: unblock submit() backpressure
 
-      // Write all buffers (last buffer's final block always written to ensure file length)
-      for (size_t bi = 0; bi < work.size(); ++bi) {
-        auto & buf = work[bi];   // FrameBuf (shared_ptr<vector<char>>)
-        uint64_t w_t0 = (g_perf || meter_) ? now_ns() : 0;
-        bool is_last = (bi == work.size() - 1);
-        // Dense frames (no zero blocks; scanned in submit) write whole with no
-        // scan here; only frames with actual holes run the full write_sparse.
-        bool dense = (bi < work_dense.size()) && work_dense[bi];
-        bool wrote = dense ? write_whole(buf->data(), buf->size())
-                           : write_sparse(buf->data(), buf->size(), is_last);
-        if (!wrote) {
-          // Clear writing_ and surface the error, so a flush() blocked on
-          // !writing_ wakes and the post-flush had_error() check sees the
-          // failure (final-batch errors used to be lost here).
-          {
-            std::lock_guard<std::mutex> lk(m_);
-            writing_ = false;
-            error_ = true;
-          }
-          cv_consumer_.notify_one();
-          // Dying HERE (not just flagging and returning) is the deadlock fix
-          // (v0.14.94): this worker holds the only hand that releases
-          // FrameThrottle permits, so a quiet return starved the compress
-          // workers of permits, the writer thread never collected another
-          // batch, submit() was never called again — and the had_error()
-          // checks there were unreachable.  ENOSPC mid-backup hung forever
-          // (observed in the field on 0.14.89).  This worker is the sole
-          // writer of the output stream, so it holds no stdio lock another
-          // thread needs during exit.  The flag + notify above still serve
-          // the flush()/destructor paths.
-          die_io(gz_write_fail("write failed"));
-        }
-        if (g_perf || meter_) {
-          const uint64_t w_dt = now_ns() - w_t0;
-          if (meter_) meter_->writer_disk_ns.fetch_add(w_dt, std::memory_order_relaxed);
-          if (g_perf) {
-            g_perf->write_ns.fetch_add(w_dt);
-            g_perf->write_bytes_total.fetch_add(buf->size());
-          }
-        }
-        // wrote_bytes is now updated incrementally within write_sparse()
-        // Release one frame permit: writer made progress, blocked workers may unblock.
-        if (bp_) bp_->release(1);
-        // Drop our shared_ptr ref now (not at end of loop) so the worker pool
-        // can recycle the buffer for its next frame as soon as we're done.
-        buf.reset();
-      }
+      write_batch(work, work_dense);
 
       // Batch fully written (handed to the OS): clear writing_ and wake any
       // flush() waiter.  flush() blocks on (pending_.empty() && !writing_) so
@@ -15373,24 +15376,78 @@ private:
       }
       cv_consumer_.notify_one();
 
-#ifdef __linux__
-      // Progressive writeback: kick dirty pages to disk asynchronously after
-      // each batch so they don't pile up and cause a stall on rename()/close().
-      // Only for decompression — compression output is smaller and the CPU work
-      // gives the kernel time to flush naturally.  Forcing writeback during
-      // compression creates I/O contention with subsequent fwrite() calls,
-      // triggering balance_dirty_pages throttling.
-      if (progressive_sync_ && !dw_ && out_) {
-        int fd = fileno(out_);
-        off_t cur = ftello(out_);
-        if (cur > sync_offset_) {
-          ::sync_file_range(fd, sync_offset_, cur - sync_offset_,
-                            SYNC_FILE_RANGE_WRITE);
-          sync_offset_ = cur;
+      push_writeback();
+    }
+  }
+
+  void write_batch(std::vector<FrameBuf> & work, const std::vector<char> & work_dense) {
+    // Write all buffers (last buffer's final block always written to ensure file length)
+    for (size_t bi = 0; bi < work.size(); ++bi) {
+      auto & buf = work[bi];   // FrameBuf (shared_ptr<vector<char>>)
+      uint64_t w_t0 = (g_perf || meter_) ? now_ns() : 0;
+      bool is_last = (bi == work.size() - 1);
+      // Dense frames (no zero blocks; scanned in submit) write whole with no
+      // scan here; only frames with actual holes run the full write_sparse.
+      bool dense = (bi < work_dense.size()) && work_dense[bi];
+      bool wrote = dense ? write_whole(buf->data(), buf->size())
+                         : write_sparse(buf->data(), buf->size(), is_last);
+      if (!wrote) {
+        // Clear writing_ and surface the error, so a flush() blocked on
+        // !writing_ wakes and the post-flush had_error() check sees the
+        // failure (final-batch errors used to be lost here).
+        {
+          std::lock_guard<std::mutex> lk(m_);
+          writing_ = false;
+          error_ = true;
+        }
+        cv_consumer_.notify_one();
+        // Dying HERE (not just flagging and returning) is the deadlock fix
+        // (v0.14.94): this worker holds the only hand that releases
+        // FrameThrottle permits, so a quiet return starved the compress
+        // workers of permits, the writer thread never collected another
+        // batch, submit() was never called again — and the had_error()
+        // checks there were unreachable.  ENOSPC mid-backup hung forever
+        // (observed in the field on 0.14.89).  This worker is the sole
+        // writer of the output stream, so it holds no stdio lock another
+        // thread needs during exit.  The flag + notify above still serve
+        // the flush()/destructor paths.
+        die_io(gz_write_fail("write failed"));
+      }
+      if (g_perf || meter_) {
+        const uint64_t w_dt = now_ns() - w_t0;
+        if (meter_) meter_->writer_disk_ns.fetch_add(w_dt, std::memory_order_relaxed);
+        if (g_perf) {
+          g_perf->write_ns.fetch_add(w_dt);
+          g_perf->write_bytes_total.fetch_add(buf->size());
         }
       }
-#endif
+      // wrote_bytes is now updated incrementally within write_sparse()
+      // Release one frame permit: writer made progress, blocked workers may unblock.
+      if (bp_) bp_->release(1);
+      // Drop our shared_ptr ref now (not at end of loop) so the worker pool
+      // can recycle the buffer for its next frame as soon as we're done.
+      buf.reset();
     }
+  }
+
+  void push_writeback() {
+#ifdef __linux__
+    // Progressive writeback: kick dirty pages to disk asynchronously after
+    // each batch so they don't pile up and cause a stall on rename()/close().
+    // Only for decompression — compression output is smaller and the CPU work
+    // gives the kernel time to flush naturally.  Forcing writeback during
+    // compression creates I/O contention with subsequent fwrite() calls,
+    // triggering balance_dirty_pages throttling.
+    if (progressive_sync_ && !dw_ && out_) {
+      int fd = fileno(out_);
+      off_t cur = ftello(out_);
+      if (cur > sync_offset_) {
+        ::sync_file_range(fd, sync_offset_, cur - sync_offset_,
+                          SYNC_FILE_RANGE_WRITE);
+        sync_offset_ = cur;
+      }
+    }
+#endif
   }
 
   FILE * out_;
@@ -15491,9 +15548,11 @@ static GzWritePolicy gz_write_policy(FILE * out, const Options & opt)
   return GzWritePolicy{enable_sparse, psync};
 }
 
-static void writer_thread(FILE * out, ResultStore & results,
-                          const Options & opt, Meter * m,
-                          FrameThrottle * bp)
+// `inline_writes`: run on the caller's thread with no write thread of its own,
+// once every frame is already in `results` (decompress_cpu_mt's one-frame input).
+static void writer_run(FILE * out, ResultStore & results,
+                       const Options & opt, Meter * m,
+                       FrameThrottle * bp, bool inline_writes)
 {
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   // pin_thread_to_core(1);              // disabled: hurts on loaded machines
@@ -15510,10 +15569,12 @@ static void writer_thread(FILE * out, ResultStore & results,
     const bool enable_sparse = wp.sparse;
     const bool psync = wp.psync;
 #ifndef _WIN32
-    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp, psync);
+    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp, psync,
+                                               inline_writes);
     aio = aio_ptr.get();
 #else
-    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse, m, bp, psync);
+    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse, m, bp, psync,
+                                               inline_writes);
     aio = aio_ptr.get();
 #endif
   }
@@ -15741,6 +15802,13 @@ static void writer_thread(FILE * out, ResultStore & results,
   // producer — the fallback/streaming decompress tail runs after wthr.join()
   // (see decompress_cpu_mt) and pushes more frames.  verify_tar closes the sink
   // once, after the whole decompress call returns.
+}
+
+static void writer_thread(FILE * out, ResultStore & results,
+                          const Options & opt, Meter * m,
+                          FrameThrottle * bp)
+{
+  writer_run(out, results, opt, m, bp, false);
 }
 
 /*======================================================================
@@ -18888,8 +18956,10 @@ static void cpu_worker(
   const int n_workers = std::max(1, cpuagg ? cpuagg->threads : 1);
   const int throttle_budget = bp ? bp->max_permits() : 512;
   const int pool_size = std::max(2, throttle_budget / n_workers);
-  std::vector<FrameBuf> out_pool(pool_size);
-  for (auto & b : out_pool) b = std::make_shared<FrameVec>();
+  // Slots are made as they are first needed (v0.18.24): a worker that takes one
+  // frame -- every worker of a small input -- made all pool_size of them first.
+  std::vector<FrameBuf> out_pool;
+  out_pool.reserve((size_t)pool_size);
   uint64_t pool_wait_count = 0;
 
   // OVERDRAFT, NEVER BLOCK — this pool is a per-worker RECYCLING CACHE, not a
@@ -18917,9 +18987,13 @@ static void cpu_worker(
     // Abandoned pass (GPU fault, or an exception unwinding out of the reader
     // region): the writer has stopped draining.  Hand back any slot; the caller
     // exits at the next loop top.
-    if (run_abandoned()) return out_pool[0];
+    if (run_abandoned()) return out_pool.empty() ? std::make_shared<FrameVec>() : out_pool[0];
     for (auto & b : out_pool) {
       if (b.use_count() == 1) return b;
+    }
+    if (out_pool.size() < (size_t)pool_size) {
+      out_pool.push_back(std::make_shared<FrameVec>());
+      return out_pool.back();
     }
     ++pool_wait_count;                     // now: overdrafts (pool misses)
     return std::make_shared<FrameVec>();
@@ -19139,6 +19213,11 @@ static void cpu_worker(
 struct GzTlDCtx { ZSTD_DCtx * p = nullptr; ~GzTlDCtx() { ZSTD_freeDCtx(p); } };
 static thread_local GzTlDCtx tl_dctx_owner;
 
+// A frame that decodes to more than this, alone in its input, is decoded in
+// pieces that each take a throttle permit (see use_streaming below); at or
+// under it, in one call into one buffer.
+static constexpr size_t CPU_DECOMP_STREAM_MIN = 64 * ONE_MIB;
+
 
 static void cpu_decomp_worker(
   int worker_id,
@@ -19235,8 +19314,10 @@ static void cpu_decomp_worker(
   const int n_workers = std::max(1, cpuagg ? cpuagg->threads : 1);
   const int throttle_budget = bp ? bp->max_permits() : 512;
   const int pool_size = std::max(2, throttle_budget / n_workers);
-  std::vector<FrameBuf> decomp_pool(pool_size);
-  for (auto & b : decomp_pool) b = std::make_shared<FrameVec>();
+  // Made as first needed (v0.18.24), as the compress worker's: one frame took
+  // all pool_size slots -- 32 for the one worker of a small input.
+  std::vector<FrameBuf> decomp_pool;
+  decomp_pool.reserve((size_t)pool_size);
   uint64_t pool_wait_count = 0;  // telemetry — # of yields at -vv
 
   // OVERDRAFT, NEVER BLOCK — see the identical note on the compress worker's
@@ -19248,6 +19329,10 @@ static void cpu_decomp_worker(
   auto acquire_decomp_buf = [&]() -> FrameBuf {
     for (auto & b : decomp_pool) {
       if (b.use_count() == 1) return b;    // only ref is ours; safe to reuse
+    }
+    if (decomp_pool.size() < (size_t)pool_size) {
+      decomp_pool.push_back(std::make_shared<FrameVec>());
+      return decomp_pool.back();
     }
     ++pool_wait_count;                     // now: overdrafts (pool misses)
     return std::make_shared<FrameVec>();
@@ -19419,9 +19504,8 @@ static void cpu_decomp_worker(
     // blocked in push() while every worker sits here — waiting on
     // producer_done alone deadlocked low-thread-count decompression of
     // multi-frame files with >64 MiB frames (fixed v0.13.54).
-    static constexpr size_t STREAM_THRESHOLD = 64 * ONE_MIB;
     bool use_streaming = false;
-    if (t.decomp_size > STREAM_THRESHOLD && t.seq == 0 && tq->total_tasks() <= 1) {
+    if (t.decomp_size > CPU_DECOMP_STREAM_MIN && t.seq == 0 && tq->total_tasks() <= 1) {
       std::unique_lock<std::mutex> lk(results->m);
       while (!results->producer_done && tq->total_tasks() <= 1)
         results->cv.wait_for(lk, std::chrono::milliseconds(20));
@@ -21299,8 +21383,12 @@ static size_t stream_frames_to_queue(
 // moved); any frame that does not parse, a foreign byte, a larger file or a pipe
 // returns 0 and the pool stays as it was.  Only the thread count changes, so the
 // output cannot.  GZSTD_DEBUG_NO_SMALL_SERIAL keeps the full pool for A/B.
-static int small_input_data_frames(FILE * in, const Options & opt)
+// `max_decomp` (v0.18.24): the largest size a data frame declares, UINT64_MAX
+// when one declares none -- what decides whether one frame can decode on the
+// caller's thread (decompress_cpu_mt).
+static int small_input_data_frames(FILE * in, const Options & opt, uint64_t * max_decomp)
 {
+  *max_decomp = UINT64_MAX;
 #ifndef _WIN32
   static constexpr off_t GZ_SMALL_DECOMP_INPUT = 1 << 20;   // reading more costs what it saves
   if (!in || opt.cpu_threads != 0 || std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) return 0;
@@ -21317,15 +21405,22 @@ static int small_input_data_frames(FILE * in, const Options & opt)
     got += (size_t)r;
   }
   int frames = 0;
+  uint64_t largest = 0;
   for (size_t off = 0; off < got; ) {
     if (got - off < 4) return 0;
     const uint32_t magic = rd_le32(b.data() + off);
-    if (magic == 0xFD2FB528u) ++frames;
+    if (magic == 0xFD2FB528u) {
+      ++frames;
+      const unsigned long long cs = ZSTD_getFrameContentSize(b.data() + off, got - off);
+      largest = (cs == ZSTD_CONTENTSIZE_UNKNOWN || cs == ZSTD_CONTENTSIZE_ERROR)
+              ? UINT64_MAX : std::max<uint64_t>(largest, cs);
+    }
     else if ((magic & 0xFFFFFFF0u) != 0x184D2A50u) return 0;   // neither data nor skippable
     const size_t fs = ZSTD_findFrameCompressedSize(b.data() + off, got - off);
     if (ZSTD_isError(fs) || fs == 0) return 0;
     off += fs;
   }
+  *max_decomp = largest;
   return frames;
 #else
   (void)in; (void)opt;
@@ -21333,7 +21428,22 @@ static int small_input_data_frames(FILE * in, const Options & opt)
 #endif
 }
 
-static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
+static void die_cpu_decompress_exception(const char * reason)
+{
+  // A failed thread start can leave live pipeline threads and too little
+  // memory even to format its diagnostic.  Catch that allocation failure
+  // here, before it can unwind through the caller's joinable thread handles.
+  std::string message;
+  try {
+    message = "CPU decompression failed: ";
+    message += reason;
+  } catch (...) {
+    die("out of memory");
+  }
+  die(message);
+}
+
+static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   TableCkScope tck_scope(in);   // seek-table checksums for THIS input
   // A pipe's table comes last: hash what it alone can verify under -t and
@@ -21344,10 +21454,53 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
-  if (const int nf = small_input_data_frames(in, opt); nf > 0 && nf < threads) {
-    vlog(V_VERBOSE, opt, "[CPU] the input holds " + std::to_string(nf) + " frame"
-         + (nf == 1 ? "" : "s") + "; one decompression thread per frame\n");
-    threads = nf;
+  uint64_t small_decomp = UINT64_MAX;
+  int small_nf = small_input_data_frames(in, opt, &small_decomp);
+  // GZSTD_DEBUG_SMALL_CLAIM_ONE: the count says one small frame whatever the
+  // input holds, so the reader finds the rest as it would in a file that grew
+  // after the count.  Test-only.
+  if (opt.cpu_threads == 0 && std::getenv("GZSTD_DEBUG_SMALL_CLAIM_ONE")) {
+    small_nf = 1;
+    small_decomp = 0;
+  }
+  // ONE FRAME DECODES ON THIS THREAD (v0.18.24).  A one-frame input still started
+  // a writer, its write thread and one worker, and joined all three: 0.5 ms a
+  // file, mostly system time -- `-d -r -D` over 10,000 x ~7 KiB took 5.4-5.7 s
+  // against zstd's 0.49 on the 24-core workstation (ROADMAP 26).  The same three
+  // stages now run here in turn: the reader queues the frame, cpu_decomp_worker
+  // decodes it, writer_run writes it -- the same code, so the same checks,
+  // damage reports and sparse output.  Only a frame the worker decodes in one
+  // call into one buffer: a larger one is decoded in pieces that each wait for
+  // a throttle permit the writer frees, and no writer would be running.  The
+  // queue is left unbounded while the reader runs alone (nothing else could
+  // drain it); if it then finds anything but that one frame -- the file grew,
+  // or a tail is sizeless -- the threads start as before.  Not under --tar,
+  // whose frame sink has a consumer of its own.  -T, a larger file or a pipe
+  // never reach here (small_input_data_frames).
+  bool run_inline = small_nf == 1 && small_decomp <= CPU_DECOMP_STREAM_MIN
+                 && !g_tar_decomp_sink;
+  if (run_inline) {
+    vlog(V_VERBOSE, opt, "[CPU] the input holds 1 frame; decoding it on this thread\n");
+    threads = 1;
+  } else if (small_nf > 0 && small_nf < threads) {
+    vlog(V_VERBOSE, opt, "[CPU] the input holds " + std::to_string(small_nf) + " frame"
+         + (small_nf == 1 ? "" : "s") + "; one decompression thread per frame\n");
+    threads = small_nf;
+  } else if (small_nf == 0 && opt.cpu_threads == 0
+             && g_input_geom_known.load(std::memory_order_relaxed)
+             && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
+    // A LARGER INPUT BY ITS SEEK TABLE (v0.18.24): no more workers than the
+    // frames the table describes, read by tck_scope above.  `-d -r` over 96 x
+    // 40 MiB archives (3 frames each) started 96 workers per input on the
+    // 256-core server and peak RSS climbed to 881 MB (see compress_cpu_mt).
+    // The table is a claim, not evidence: one that understates the frames costs
+    // throughput, never a frame, as for the GPU batch cap.
+    const uint64_t nf = g_input_frames.load(std::memory_order_relaxed);
+    if (nf > 0 && nf < (uint64_t)threads) {
+      vlog(V_VERBOSE, opt, "[CPU] the seek table lists " + std::to_string(nf) + " frame"
+           + (nf == 1 ? "" : "s") + "; one decompression thread per frame\n");
+      threads = (int)nf;
+    }
   }
 
   CpuAgg cpuagg{};
@@ -21365,8 +21518,9 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 
   // Bound queued (read-but-not-popped) frames to pipeline depth so a consumer
   // slower than the reader can't buffer the whole compressed input in RAM
-  // (ROADMAP 7.8).  Skip when throttling is explicitly disabled.
-  if (opt.throttle_frames != 0) {
+  // (ROADMAP 7.8).  Skip when throttling is explicitly disabled, and while the
+  // reader runs with no consumer at all (run_inline).
+  if (opt.throttle_frames != 0 && !run_inline) {
     int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
     const size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, threads * qslack);
     queue.set_max_depth(qfloor);
@@ -21378,143 +21532,195 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     queue.set_max_bytes(qfloor * (8 * ONE_MIB));
   }
 
-  // Start writer thread (outputs decompressed frames in original order)
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
-
-  // Start worker threads (they block on the queue until frames arrive)
+  std::thread wthr;
   std::vector<std::thread> pool;
-  pool.reserve((size_t)threads);
-  // The workers read the caller's Options through a pointer; every path below
-  // joins them before returning.  This used to be a copy, and an Options copy
-  // carries opt.inputs -- every file named on the line -- so a `-d -r` over N
-  // files copied N names per file: quadratic, 46.5% of all instructions over
-  // 1,000 small files, 6.8 s of user time over 8,000 (v0.18.23).
-  for (int i = 0; i < threads; ++i) {
-    pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
+  // Keep these thread handles outside the exception boundary.  In particular,
+  // the inline reader/worker/writer can now throw on main while gzstd_main has
+  // a joinable progress thread (-v or a terminal).  Letting that exception
+  // unwind to main() would terminate in that thread's destructor.  A late
+  // start can also fail after starting just the writer or part of the pool.
+  // die() exits without unwinding any live pipeline or progress thread.
+  try {
+    auto start_threads = [&]() {
+      // Start writer thread (outputs decompressed frames in original order)
+      wthr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
+
+      // Start worker threads (they block on the queue until frames arrive)
+      pool.reserve((size_t)threads);
+      // The workers read the caller's Options through a pointer; every path below
+      // joins them before returning.  This used to be a copy, and an Options copy
+      // carries opt.inputs -- every file named on the line -- so a `-d -r` over N
+      // files copied N names per file: quadratic, 46.5% of all instructions over
+      // 1,000 small files, 6.8 s of user time over 8,000 (v0.18.23).
+      for (int i = 0; i < threads; ++i) {
+        pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
 #ifdef HAVE_NVCOMP
-                      nullptr,
+                          nullptr,
 #endif
-                      &cpuagg, bp_ptr,
-                      /*discard_results=*/false);   // this path always has a writer
-  }
-  if (opt.verbosity >= V_VERBOSE)
-    std::cerr << "[CPU] " << threads << " decompression threads online\n";
+                          &cpuagg, bp_ptr,
+                          /*discard_results=*/false);   // this path always has a writer
+      }
+      if (opt.verbosity >= V_VERBOSE)
+        std::cerr << "[CPU] " << threads << " decompression threads online\n";
+    };
+    if (!run_inline) start_threads();
 
-  // Stream frames from input directly into the queue.
-  // Workers start decompressing as soon as the first frame is pushed.
-  bool fallback = false;
-  bool stream_rest = false;
-  size_t first_decomp = 0;
-  std::vector<char> raw_data;
-  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data,
-                                           &first_decomp, nullptr, &stream_rest);
+    // Stream frames from input directly into the queue.
+    // Workers start decompressing as soon as the first frame is pushed.
+    bool fallback = false;
+    bool stream_rest = false;
+    size_t first_decomp = 0;
+    std::vector<char> raw_data;
+    size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data,
+                                             &first_decomp, nullptr, &stream_rest);
+    // Not the frame that was counted: decode what was queued with the threads.
+    if (run_inline && n_frames > 0
+        && (n_frames != 1 || fallback || first_decomp > CPU_DECOMP_STREAM_MIN)) {
+      run_inline = false;
+      start_threads();
+    }
 
-  // Preallocate output file to avoid per-write extent allocation overhead.
-  // total_out is known from zstd frame headers parsed by stream_frames_to_queue.
+    // Preallocate output file to avoid per-write extent allocation overhead.
+    // total_out is known from zstd frame headers parsed by stream_frames_to_queue.
 #ifndef _WIN32
-  if (g_direct_writer && m && n_frames > 0 && opt.preallocate_output) {
-    uint64_t total = m->total_out.load(std::memory_order_relaxed);
-    if (total > 0 && g_direct_writer->preallocate(total)) {
-      char sz[32]; human_bytes(double(total), sz, sizeof(sz));
-      vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
+    if (g_direct_writer && m && n_frames > 0 && opt.preallocate_output) {
+      uint64_t total = m->total_out.load(std::memory_order_relaxed);
+      if (total > 0 && g_direct_writer->preallocate(total)) {
+        char sz[32]; human_bytes(double(total), sz, sizeof(sz));
+        vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
+      }
     }
-  }
 #endif
 
-  if (fallback && n_frames == 0) {
-    // Could not parse any frames  shut down workers, fall back to streaming
-    queue.set_done();
-    {
-      std::lock_guard<std::mutex> lk(results.m);
-      results.producer_done = true;
-      results.total_tasks = 0;
-      results.workers_done = true;
-    }
-    results.cv.notify_all();
-    throttle.set_done();
-    for (auto & th : pool) th.join();
-    wthr.join();
+    if (fallback && n_frames == 0) {
+      // Could not parse any frames  shut down workers, fall back to streaming
+      queue.set_done();
+      {
+        std::lock_guard<std::mutex> lk(results.m);
+        results.producer_done = true;
+        results.total_tasks = 0;
+        results.workers_done = true;
+      }
+      results.cv.notify_all();
+      throttle.set_done();
+      for (auto & th : pool) th.join();
+      if (wthr.joinable()) wthr.join();   // not started on the one-frame route
 
-    if (stream_rest) {
-      gz_stream_rest(in, out, opt, m, raw_data, first_decomp);
+      if (stream_rest) {
+        gz_stream_rest(in, out, opt, m, raw_data, first_decomp);
+        return;
+      }
+      vlog(V_VERBOSE, opt,
+           "cannot determine frame sizes; using streaming CPU decompress\n");
+      decompress_from_buffer(raw_data, out, opt, m,
+                             m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
+      gz_late_finish(opt);
       return;
     }
-    vlog(V_VERBOSE, opt,
-         "cannot determine frame sizes; using streaming CPU decompress\n");
-    decompress_from_buffer(raw_data, out, opt, m,
-                           m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
-    gz_late_finish(opt);
-    return;
-  }
 
-  if (n_frames == 0) {
-    // Empty file  clean shutdown
+    if (n_frames == 0) {
+      // Empty file  clean shutdown
+      queue.set_done();
+      {
+        std::lock_guard<std::mutex> lk(results.m);
+        results.producer_done = true;
+        results.total_tasks = 0;
+        results.workers_done = true;
+      }
+      results.cv.notify_all();
+      throttle.set_done();
+      for (auto & th : pool) th.join();
+      if (wthr.joinable()) wthr.join();   // not started on the one-frame route
+      return;
+    }
+
+    vlog(V_VERBOSE, opt,
+         "[READER] streamed " + std::to_string(n_frames) + " frames for MT CPU decompress\n");
+
+    // Signal that all frames have been enqueued
     queue.set_done();
     {
       std::lock_guard<std::mutex> lk(results.m);
       results.producer_done = true;
-      results.total_tasks = 0;
+      results.total_tasks = queue.total_tasks();
+      if (m) {
+        m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+        m->total_out_final.store(true, std::memory_order_release);
+      }
+    }
+    results.cv.notify_all();
+
+    // Wait for workers, then writer.
+    // Do NOT call throttle.set_done() before join: workers must respect
+    // throttle while draining the queue, otherwise they buffer the entire
+    // output in RAM (the done_ flag bypasses acquire()).
+    // The one-frame route runs the worker here instead.  Its one frame cannot
+    // wait for a permit: it takes a free one, or, under a budget with none, the
+    // head-of-line overdraft -- it is frame 0, the writer's next.
+    if (run_inline)
+      cpu_decomp_worker(0, &queue, &results, &opt, m,
+#ifdef HAVE_NVCOMP
+                        nullptr,
+#endif
+                        &cpuagg, bp_ptr, /*discard_results=*/false);
+    for (auto & th : pool) th.join();
+    throttle.set_done();  // safe now: all workers exited
+    {
+      std::lock_guard<std::mutex> lk(results.m);
       results.workers_done = true;
     }
     results.cv.notify_all();
-    throttle.set_done();
-    for (auto & th : pool) th.join();
-    wthr.join();
-    return;
-  }
+    if (run_inline) writer_run(out, results, opt, m, bp_ptr, /*inline_writes=*/true);
+    else            wthr.join();
+    log_throttle_stats(throttle, opt, "decompress-cpu");
 
-  vlog(V_VERBOSE, opt,
-       "[READER] streamed " + std::to_string(n_frames) + " frames for MT CPU decompress\n");
-
-  // Signal that all frames have been enqueued
-  queue.set_done();
-  {
-    std::lock_guard<std::mutex> lk(results.m);
-    results.producer_done = true;
-    results.total_tasks = queue.total_tasks();
-    if (m) {
-      m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
-      m->total_out_final.store(true, std::memory_order_release);
+    // Mid-file fallback tail: stream_frames_to_queue hit a frame with no
+    // content-size header (e.g. `cat a.zst b.zst` where b came from zstd on a
+    // pipe) and buffered the rest of the input in raw_data.  The parsed frames
+    // are fully written now (writer joined), so append the tail via the CPU
+    // streaming decoder.  Before v0.13.54 this tail was silently dropped —
+    // truncated output with exit 0.
+    if (fallback && stream_rest) {
+      gz_stream_tail(in, out, opt, m, raw_data, n_frames);
+    } else if (fallback && !raw_data.empty()) {
+      vlog(V_DEFAULT, opt,
+           "warning: frame " + std::to_string(n_frames) + " onward has no "
+           "content-size header (zstd streaming output); the parallel reader "
+           "can't split it, so the remaining data is decompressed with the CPU "
+           "streaming decoder (slower, but nothing is lost).\n");
+      decompress_from_buffer(raw_data, out, opt, m,
+                             m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
     }
-  }
-  results.cv.notify_all();
+    gz_late_finish(opt);   // a pipe's trailing seek table (GzLateCk), now that all is written
 
-  // Wait for workers, then writer.
-  // Do NOT call throttle.set_done() before join: workers must respect
-  // throttle while draining the queue, otherwise they buffer the entire
-  // output in RAM (the done_ flag bypasses acquire()).
-  for (auto & th : pool) th.join();
-  throttle.set_done();  // safe now: all workers exited
-  {
-    std::lock_guard<std::mutex> lk(results.m);
-    results.workers_done = true;
+    if (g_perf) {
+      g_perf->print_summary("CPU-ONLY DECOMPRESS");
+      g_perf = nullptr;
+    }
+  } catch (const std::bad_alloc &) {
+    die("out of memory");
+  } catch (const std::exception & e) {
+    die_cpu_decompress_exception(e.what());
+  } catch (...) {
+    die_cpu_decompress_exception("unknown exception");
   }
-  results.cv.notify_all();
-  wthr.join();
-  log_throttle_stats(throttle, opt, "decompress-cpu");
+}
 
-  // Mid-file fallback tail: stream_frames_to_queue hit a frame with no
-  // content-size header (e.g. `cat a.zst b.zst` where b came from zstd on a
-  // pipe) and buffered the rest of the input in raw_data.  The parsed frames
-  // are fully written now (writer joined), so append the tail via the CPU
-  // streaming decoder.  Before v0.13.54 this tail was silently dropped —
-  // truncated output with exit 0.
-  if (fallback && stream_rest) {
-    gz_stream_tail(in, out, opt, m, raw_data, n_frames);
-  } else if (fallback && !raw_data.empty()) {
-    vlog(V_DEFAULT, opt,
-         "warning: frame " + std::to_string(n_frames) + " onward has no "
-         "content-size header (zstd streaming output); the parallel reader "
-         "can't split it, so the remaining data is decompressed with the CPU "
-         "streaming decoder (slower, but nothing is lost).\n");
-    decompress_from_buffer(raw_data, out, opt, m,
-                           m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
-  }
-  gz_late_finish(opt);   // a pipe's trailing seek table (GzLateCk), now that all is written
-
-  if (g_perf) {
-    g_perf->print_summary("CPU-ONLY DECOMPRESS");
-    g_perf = nullptr;
+static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
+{
+  // Preflight can throw too: notably the small-input frame counter allocates
+  // before impl's inner boundary.  The caller may already have a progress
+  // thread, so none of these exceptions may unwind into gzstd_main either.
+  // Keep the inner boundary: once pipeline threads start, it calls die()
+  // before their queues and thread handles can be destroyed under them.
+  try {
+    decompress_cpu_mt_impl(in, out, opt, m);
+  } catch (const std::bad_alloc &) {
+    die("out of memory");
+  } catch (const std::exception & e) {
+    die_cpu_decompress_exception(e.what());
+  } catch (...) {
+    die_cpu_decompress_exception("unknown exception");
   }
 }
 
@@ -22654,7 +22860,11 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
          + std::to_string(n_threads) + " zstd worker thread" + (n_threads == 1 ? "\n" : "s\n"));
 
   std::atomic<bool> progress_done{false};
-  std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+  // Only when it will draw (v0.18.24): it returned at once without a bar, but
+  // started and joined a thread per input all the same (see gzstd_main).
+  std::thread progress_thr;
+  if (progress_loop_needed(opt, total_in))
+    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
 
   ZSTD_CCtx * cctx = ZSTD_createCCtx();
   if (!cctx) die("failed to create ZSTD_CCtx");
@@ -23035,7 +23245,8 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
          + " of " + std::to_string(read_total) + " bytes with O_DIRECT\n");
 
   ZSTD_freeCCtx(cctx);
-  progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
+  progress_done = true; gz_wake_periodic_loops();
+  if (progress_thr.joinable()) progress_thr.join();
   if (total_in > 0 && read_total != total_in)
     die_data("--sliding-window: " + opt.input + " shrank while it was being compressed "
              "(" + std::to_string(total_in) + " bytes when it was sized, "
@@ -31997,6 +32208,27 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   }
   const CpuCompressChunk chunk = cpu_compress_chunk(opt, threads, single_frame_size);
   const bool small_serial = chunk.serial && threads > 1;
+  // NO MORE WORKERS THAN FRAMES (v0.18.24).  A known-size input splits into
+  // ceil(size / chunk) frames, and an auto-sized pool beyond that only starts,
+  // parks and joins: a 40 MiB file is 3 frames, and `-r` over 96 of them started
+  // 96 workers each on the 256-core server, and peak RSS climbed with the input
+  // count -- 76 MB for one, 1.33 GB for 96, 1.81 GB for 192; capped, 96 and 192
+  // both peak near 150 MB (ROADMAP 26).  Likely, though not traced: each input's
+  // few busy workers leave freed buffers in their own glibc arenas, and every
+  // input's new threads land on different ones.  Only the count changes: the frame size
+  // is already chosen, so the output is the same.  A file that grows after the
+  // size is read gets more frames than workers, which is slower, not wrong.  -T,
+  // --tar and a pipe keep their pool; GZSTD_DEBUG_NO_SMALL_SERIAL keeps it for A/B.
+  if (!chunk.serial && opt.cpu_threads == 0 && !opt.tar_mode
+      && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
+    const uint64_t sz = single_frame_size > 0 ? single_frame_size : known_input_size(opt, in);
+    const uint64_t nf = sz > 0 ? (sz + chunk.bytes - 1) / chunk.bytes : 0;
+    if (nf > 0 && nf < (uint64_t)threads) {
+      vlog(V_VERBOSE, opt, "[CPU] the input makes " + std::to_string(nf)
+           + " frames; one compression thread per frame\n");
+      threads = (int)nf;
+    }
+  }
   g_cpu_pass_threads.store(threads, std::memory_order_relaxed);
   if (chunk.serial) {
     if (opt.verbosity >= V_VERBOSE)
@@ -32063,7 +32295,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
-  std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+  // Only when it will draw (v0.18.24): it returned at once without a bar, but
+  // started and joined a thread per input all the same (see gzstd_main).
+  std::thread progress_thr;
+  if (progress_loop_needed(opt, total_in))
+    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   // Byte-cap the input queue: a pipe/stdin producer that outruns the workers
   // (fread reads frames into heap) must not buffer the whole input in RAM — the
@@ -32519,7 +32755,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   wthr.join();
   progress_done = true;
   gz_wake_periodic_loops();
-  progress_thr.join();
+  if (progress_thr.joinable()) progress_thr.join();
   log_throttle_stats(throttle, opt, "compress-cpu");
 
   if (g_perf) {
@@ -37699,7 +37935,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
-  std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+  // Only when it will draw (v0.18.24): it returned at once without a bar, but
+  // started and joined a thread per input all the same (see gzstd_main).
+  std::thread progress_thr;
+  if (progress_loop_needed(opt, total_in))
+    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
   // The peer-to-peer path writes from the drain itself, so the ordered writer
   // would have nothing to do and its completion handshake would never fire.
   std::thread writer_thr;
@@ -38794,7 +39034,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   g_wd.store(nullptr, std::memory_order_release);
   progress_done = true;
   gz_wake_periodic_loops();
-  progress_thr.join();
+  if (progress_thr.joinable()) progress_thr.join();
   if (stage_setup_failure) {
     try { std::rethrow_exception(stage_setup_failure); }
     catch (const std::exception & e) {
@@ -39230,8 +39470,13 @@ static std::atomic<DStageAhead *> g_dstage_ahead{nullptr};
 
 // Test-only (GZSTD_DEBUG_GPU_START_AFTER_INPUT=1): open the window the worker's
 // nothing-left check guards (v0.18.23).  The bringup thread's own drained check is
-// skipped, so it spawns the workers, and each worker waits until the producer is
-// done before that check.  Without it the cell raced the reader against the device
+// skipped, so it spawns the workers, and each worker waits for work OR producer
+// completion before that check.  The cell's sizeless frame queues no work, so
+// it must observe producer completion.  Waiting for completion unconditionally
+// deadlocks a gpu-only input larger than the bounded queue: the producer needs
+// one of these workers to pop before it can finish.  Fixed-share bringup cannot
+// wait even for work: the producer starts only after a GPU has registered.
+// Without the hook the cell raced the reader against the device
 // count: on a 2-GPU box the count returned after the whole stream was read, the
 // bringup thread skipped the GPUs, and no worker ever reached the check.  A queue
 // that still holds frames once the producer is done goes on as before.
@@ -39697,7 +39942,8 @@ static void gpu_decomp_worker(
     return true;
   };
   try {
-    if (queue && gz_debug_gpu_start_after_input()) queue->wait_done();
+    if (queue && gz_debug_gpu_start_after_input() && (!sched || !sched->is_fixed_mode()))
+      (void)queue->wait_for_work();
     if (nothing_left()) return;
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     {
@@ -44015,9 +44261,6 @@ gds_out_declined:
 /*======================================================================
  JSON writers (minimal)
 ======================================================================*/
-#if __cplusplus >= 201703L
-[[maybe_unused]]
-#endif
 // `gpu`: the compress_nvcomp() pass that produced the output, or null when a
 // CPU path did (every decompress, and any compress that ended CPU-only).  Its
 // "gpu" object lists each device's share, which is how a reader tells GPU work
@@ -44025,15 +44268,58 @@ gds_out_declined:
 // Returns 0, or the errno of the failure.  It used to return nothing and write
 // nothing on a failed open: `--stats-json /no/such/dir/s.json` exited 0 with no
 // stats file and no message (v0.17.87).
+//
+// THE RECORD IS THE RUN'S, NOT THE LAST INPUT'S (v0.18.24).  It is rewritten
+// after every input, each time with that input's numbers alone, so
+// `-r --stats-json s.json d` over three files of 17,000 bytes reported the last
+// one's 5,000.  Every input written so far is now folded in: bytes and the GPU
+// devices' shares summed, elapsed_sec from the first input's start, cpu.threads
+// the largest pool any input ran, and "files" how many inputs that is.  Still
+// rewritten after each input, so a run that fails part way leaves the totals
+// of the inputs that finished.  One input writes what it always did, plus
+// "files": 1.
+struct GzStatsRun {
+  uint64_t files = 0, in_bytes = 0, out_bytes = 0;
+  int cpu_threads = 0;
+  bool gpu = false;                       // any input's final pass ran a GPU pipeline
+  std::vector<GpuPassDevice> devices;     // summed per device
+  std::chrono::steady_clock::time_point start;
+};
+static GzStatsRun g_stats_run;
+
+#if __cplusplus >= 201703L
+[[maybe_unused]]
+#endif
 static int write_stats_json(const std::string & path, const Options & opt, const Meter & meter,
                             double elapsed_sec, int cpu_threads,
                             const CompressPassStats * gpu = nullptr)
 {
+  GzStatsRun & run = g_stats_run;
+  const auto now = std::chrono::steady_clock::now();
+  if (run.files == 0)
+    run.start = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                          std::chrono::duration<double>(elapsed_sec));
+  ++run.files;
+  run.in_bytes  += meter.read_bytes.load();
+  run.out_bytes += meter.wrote_bytes.load();
+  run.cpu_threads = std::max(run.cpu_threads, cpu_threads);
+  if (gpu) {
+    run.gpu = true;
+    for (const GpuPassDevice & d : gpu->devices) {
+      auto it = std::find_if(run.devices.begin(), run.devices.end(), [&](const GpuPassDevice & r) {
+        return r.device == d.device && r.uuid == d.uuid;
+      });
+      if (it == run.devices.end()) { run.devices.push_back(d); continue; }
+      it->batches += d.batches;   it->frames    += d.frames;
+      it->in_bytes += d.in_bytes; it->out_bytes += d.out_bytes;
+    }
+  }
+  const double run_elapsed = run.files == 1 ? elapsed_sec
+                           : std::chrono::duration<double>(now - run.start).count();
+
   errno = 0;
   std::ofstream js(path, std::ios::out | std::ios::binary | std::ios::trunc);
   if (!js) { return errno ? errno : EIO; }
-  uint64_t in_bytes = meter.read_bytes.load();
-  uint64_t out_bytes = meter.wrote_bytes.load();
   const char * mode_str = (opt.mode == Mode::COMPRESS)    ? "compress"
                         : (opt.mode == Mode::DECOMPRESS)  ? "decompress"
                         :                                    "test";
@@ -44041,21 +44327,22 @@ static int write_stats_json(const std::string & path, const Options & opt, const
   js << "{\n"
      << "  \"version\": \"" << GZSTD_VERSION << "\",\n"
      << "  \"mode\": \"" << mode_str << "\",\n"
-     << "  \"elapsed_sec\": " << std::fixed << std::setprecision(6) << elapsed_sec << ",\n"
-     << "  \"input_bytes\": " << in_bytes << ",\n"
-     << "  \"output_bytes\": " << out_bytes << ",\n"
-     << "  \"cpu\": { \"threads\": " << cpu_threads << " }";
-  if (gpu) {
+     << "  \"files\": " << run.files << ",\n"
+     << "  \"elapsed_sec\": " << std::fixed << std::setprecision(6) << run_elapsed << ",\n"
+     << "  \"input_bytes\": " << run.in_bytes << ",\n"
+     << "  \"output_bytes\": " << run.out_bytes << ",\n"
+     << "  \"cpu\": { \"threads\": " << run.cpu_threads << " }";
+  if (run.gpu) {
     js << ",\n  \"gpu\": { \"devices\": [";
-    for (size_t i = 0; i < gpu->devices.size(); ++i) {
-      const GpuPassDevice & d = gpu->devices[i];
+    for (size_t i = 0; i < run.devices.size(); ++i) {
+      const GpuPassDevice & d = run.devices[i];
       js << (i ? "," : "") << "\n    { \"device\": " << d.device
          << ", \"uuid\": \"" << d.uuid << "\""
          << ", \"batches\": " << d.batches << ", \"frames\": " << d.frames
          << ", \"input_bytes\": " << d.in_bytes
          << ", \"output_bytes\": " << d.out_bytes << " }";
     }
-    js << (gpu->devices.empty() ? "" : "\n  ") << "] }";
+    js << (run.devices.empty() ? "" : "\n  ") << "] }";
   }
   js << "\n}\n";
   errno = 0;
@@ -44399,7 +44686,9 @@ static int extract_tar(const Options & opt, Meter * m)
     if (!ec) total_in += (uint64_t)z;
   }
   std::atomic<bool> prog_done{false};
-  std::thread prog_thr(progress_loop, std::cref(opt), m, total_in, &prog_done);
+  std::thread prog_thr;   // only when it will draw (v0.18.24, see gzstd_main)
+  if (progress_loop_needed(opt, total_in))
+    prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
 
   int rc = EXIT_OK;
   // -v [WRITER] diagnosis accumulators (across archives; the common case is one).
@@ -44743,7 +45032,9 @@ static int verify_tar(const Options & opt, Meter * m)
     if (!ec) total_in += (uint64_t)z;
   }
   std::atomic<bool> prog_done{false};
-  std::thread prog_thr(progress_loop, std::cref(opt), m, total_in, &prog_done);
+  std::thread prog_thr;   // only when it will draw (v0.18.24, see gzstd_main)
+  if (progress_loop_needed(opt, total_in))
+    prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
 
   // Result lines are collected and printed AFTER the progress thread stops, so
   // they don't collide with the bar.
@@ -47940,11 +48231,25 @@ static int gzstd_main(int argc, char ** argv)
   std::atomic<bool> prog_done{false};
   std::thread prog_thr;
   uint64_t total_in_for_progress = 0;
+  // Only when it will draw (v0.18.24), as compress_cpu_stream asks: the thread
+  // returned at once without a bar, but every `-d` of a file to a pipe or a
+  // file still paid for starting and joining it -- one of the four threads a
+  // one-frame `-d` started (ROADMAP 26).
   if (opt.mode == Mode::TEST || opt.mode == Mode::DECOMPRESS) {
     total_in_for_progress = known_input_size(opt, in);
-    prog_thr = std::thread(progress_loop, std::cref(opt), &meter,
-                           total_in_for_progress, &prog_done);
+    if (progress_loop_needed(opt, total_in_for_progress))
+      prog_thr = std::thread(progress_loop, std::cref(opt), &meter,
+                             total_in_for_progress, &prog_done);
   }
+  // AN EXCEPTION MUST NOT FIND THIS THREAD JOINABLE (v0.18.24).  One escaping a
+  // coder unwinds through here to main()'s handler ("fatal", exit 1, the partial
+  // output removed by the atexit cleanup); a joinable std::thread in its way is
+  // std::terminate instead -- an abort that leaves the partial output behind.
+  // The normal paths join it earlier themselves; this covers only the unwind.
+  struct ProgJoin {
+    std::thread & t; std::atomic<bool> & done;
+    ~ProgJoin() { if (t.joinable()) { done = true; gz_wake_periodic_loops(); t.join(); } }
+  } prog_join{prog_thr, prog_done};
 
   const auto t0 = std::chrono::steady_clock::now();
   if (opt.mode == Mode::COMPRESS) {
