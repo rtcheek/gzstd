@@ -1,12 +1,123 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.25  
+**Covers:** v0.9.50 → v0.18.26  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.26 — a GPU build decides a one-file job 1.9 ms faster (the PCIe generation from the driver's GPU list); `-d -r` over small files 16% faster (no writeback hint below one frame)
+
+### The PCIe generation, from the driver's list
+
+Every run of a GPU build reads the GPUs' PCIe generation to set the `--direct` default (and the
+`--verify` engine), and `detect_min_pcie_gen` found the GPUs by reading `vendor` for EVERY PCI
+function -- 158 on the 8-GPU server -- then `class`, then each GPU's and its upstream port's
+`max_link_speed`.  Measured on its own (a copy of the function, 200 calls): **1.75 ms a call**.
+That was most of what a GPU build spent deciding a one-file job: per process, through `env`, a
+one-frame 7 KiB `-d` took 4.7-5.0 ms on the v0.18.25 release binary against 2.4-2.6 for its `-V`
+(which exits before any backend logic), where the CPU-only build's difference is 0.2 ms; zstd's
+`-d` is 2.1-2.2 ms.
+
+The NVIDIA driver names each GPU it manages by its PCI address in `/proc/driver/nvidia/gpus`, so
+those devices' link speeds are now read directly: **0.25 ms**, the same answer (Gen5 here).  Once
+any listed GPU supplies a usable sysfs speed, that set supplies the minimum.  It can differ from
+the walk if an NVIDIA display device is unlisted (unmanaged, or hidden from that procfs view).
+Neither sysfs route applies `CUDA_VISIBLE_DEVICES`.  Entries without usable link speeds are
+skipped as in the walk; with none usable, the walk runs as before and NVML stays the last fallback.
+`-vv` says which answered ("[PCIe]
+Gen5 from the driver's GPU list"); `GZSTD_DEBUG_PCIE_WALK` forces the walk.
+
+| per process, one-frame 7 KiB `-d`, GPU dev build, via `env` | v0.18.25 | v0.18.26 |
+|---|---|---|
+| wall | 6.16-6.19 ms | 4.21-4.23 ms |
+| syscalls | 940 | 441 |
+
+The `-V` figure is unchanged (3.6-3.7 ms: the dev build's dynamic CUDA and nvCOMP libraries; the
+static release binary does not load them).
+
+### No writeback hint below one frame
+
+A buffered decompress output asked the kernel to start writing its pages back after every batch
+(`sync_file_range(SYNC_FILE_RANGE_WRITE)`, v0.12.23): the fix for a 46 s `rename` on a 19.5 GiB output
+whose dirty pages had piled up until the rename's journal commit flushed them all.  A one-frame 7 KiB
+output paid it too -- one hint per file, forcing ext4's delayed allocation and an I/O submission for
+each.  Stubbed out by an `LD_PRELOAD` shim, `-d -r -f` over 1,000 x 7 KiB took 0.115-0.127 s against
+0.140-0.151 (sync inside the timing; zstd 0.092-0.100).  The hint now waits until the output has
+reached one 16 MiB frame -- what a rename can flush in milliseconds -- and then covers it all from the
+start, as every later hint did.
+
+| | v0.18.25 | v0.18.26 |
+|---|---|---|
+| `-d -r -f`, 1,000 x 7 KiB, sync in the timing | 0.153-0.155 s | 0.129-0.131 s |
+| 3.75 GiB `--no-direct -d -f` over an existing file: rename | 739-755 ms | 706-717 ms |
+| the same, total with sync | 5.17-5.34 s | 5.12-5.16 s |
+
+With no hint at all that rename takes 1,840 ms, so the large output still gets it.  (It also costs
+this box ~5% of that run's total, 4.88 s without it; v0.12.23's trade, left as it was.)
+
+### The I/O priority boost, once per thread
+
+`try_boost_io_priority` called `nice(-5)` for every input, from the reader and, since v0.18.24, from
+a one-frame input's writer -- both the main thread.  Unprivileged it is refused (EPERM) and costs
+getpriority + setpriority each time: 4 syscalls a file over `-d -r`; privileged, `nice` is relative,
+so each input stepped the main thread down another 5.  Now once per thread, and not at all once the
+process has been refused: 4,000 calls -> 2 over 1,000 files.
+
+### Measured and not changed: the decode gate's estimate of a mid-ratio archive
+
+The startup and per-input gates estimate a decompress's work from the first frame's ratio, and a
+first frame larger than the estimator's 1 MiB window falls back to the compressed size.  A 170 MiB
+archive of 400 MiB text (2.4:1) therefore reads as 169.5 MiB and goes CPU-only.  It does not matter
+here: explicit `--hybrid` takes the same 0.13-0.15 s (to /dev/null) and its GPU does no batch at all
+-- the CPU decodes 400 MiB before a GPU could start.  The seek table would give the exact size; left
+as a ROADMAP note until an archive this misjudges is measured to want the GPU.
+
+### Build: pkg-config asks for libzstd, quietly
+
+A Rocky 9 source build printed "Package 'zstd', required by 'virtual:world', not found" before finding
+the library anyway: CMake asked pkg-config for module `zstd`, and zstd installs `libzstd.pc`.  The
+`zstd` lookup keeps its place (before the manual search, so a custom `zstd.pc` still wins, as it did)
+but is QUIET; `libzstd` is asked LAST, after the manual search -- ahead of it, a system pkg-config would
+have chosen the system libzstd over the env named by `$CONDA_PREFIX` -- and for shared builds only (a
+static build still needs a `libzstd.a` the search finds, or the explicit pair: `--static` gives names,
+not archives).  Checked in fresh trees: a conda env, the explicit 1.4.4 pair (the release script's), a
+custom `zstd.pc` (picks what v0.18.25 picked), the manual search blinded (`libzstd` found, builds), and
+a static build with the search blinded (fails at configure, as before).
+
+### Tests: two cells another covers, one cell moved
+
+"--stats-json valid JSON" is covered by the run-totals cell (a one-input record's fields, a
+three-input record validated with python, the same writer); "-T 2 round-trip correct" by the
+Threading section's `-T 2` round trip.  v0.18.25's per-input gate cell moves into section 24b, whose
+header said its cells were the only ones that arm the size gate.  Confirmed on the CPU-only suite
+(414/0/121 of 535) before the v0.18.26 code.
+
+### Pre-tag review (Codex GPT-6.1-Sol, max)
+
+Round 1: NOT SAFE on the build change, no defect in the runtime changes.  The pkg-config reorder would
+have dropped a working custom `zstd.pc` behind the manual search (a configure that silently picks a
+different zstd): the `zstd` lookup is back at its place.  The new `libzstd` fallback linked library
+names under BUILD_STATIC: it is shared-only now (the reviewer proposed archive resolution instead).
+And the PCIe cell now checks its host first -- the driver list and the PCI walk naming the same GPUs,
+a readable link speed -- since an unmanaged NVIDIA display device or a container without PCI sysfs
+legitimately gives a different source or generation.  Round 2: the three fixes adjudicated CORRECT (the shared-only fallback included), an open pass found no
+blocker: SAFE TO TAG.
+
+**Cells** (default run, GPU; EXPECTED 562/862, no-GPU deltas 148/214): "the PCIe generation comes
+from the driver's GPU list, as the full walk would say" -- on a host where independent enumeration
+finds the same GPU set and sysfs supplies a supported speed, the default names the list, the hook
+names the walk, and both give the same generation.  Other host shapes skip this comparison.
+The fallback gives the same answer on that host, so only the source line can tell a broken list
+from a working one; the v0.18.25 binary
+fails it (no line).  And the small-decompress cell's strace arm: a 7 KiB buffered `-d -o FILE` makes no
+`sync_file_range` call and a 32 MiB one at least one (the v0.18.25 binary fails the first).
+
+**Suites** (the 256-core, 8x H100 server, `CUDA_VISIBLE_DEVICES` unset, final tree): CPU-only
+414/0/122 of 536 (as expected: -148 no GPU); `-e` 860/0/2 of 862 (-2 this host could not exercise:
+trivial-park and a tail-yield cell); no drift note.  Every new and changed cell passed outright.
 
 ## v0.18.25 — the GPU build gets v0.18.24's pool fix: an input below one GPU batch takes the CPU path in a run that does not, and a hybrid CPU pool starts no more workers than its input has frames (`-r` over 96 x 40 MiB: 1.09 GB -> 0.15, 2.2x faster)
 

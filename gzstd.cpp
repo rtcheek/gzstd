@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.25";
+static constexpr const char * GZSTD_VERSION = "0.18.26";
 //
 // Architecture overview:
 //
@@ -9932,11 +9932,23 @@ static void human_bytes(double x, char * buf, size_t n)
 // ignores failures (non-root, unsupported OS).
 // Skip in GPU-only mode where there is no CPU pool contention  boosting I/O
 // threads there just penalises the GPU worker's CUDA calls.
+//
+// ONCE PER THREAD, AND NOT AT ALL ONCE REFUSED (v0.18.26).  nice() is relative,
+// and the main thread calls this for every input -- it is the reader, and since
+// v0.18.24 also a one-frame input's writer -- so where it was permitted each
+// input stepped that thread down another 5, and where it was not (the common
+// case: unprivileged, EPERM) every input paid getpriority + setpriority twice,
+// 4 syscalls a file over a `-d -r`.  A refusal holds for the whole process.
 static void try_boost_io_priority(bool has_cpu_pool)
 {
   if (!has_cpu_pool) return;
 #ifdef __linux__
-  if (nice(-5) == -1) { /* best-effort; ignore */ }
+  static std::atomic<bool> refused{false};
+  thread_local bool tried = false;
+  if (tried || refused.load(std::memory_order_relaxed)) return;
+  tried = true;
+  errno = 0;
+  if (nice(-5) == -1 && errno != 0) refused.store(true, std::memory_order_relaxed);
 #endif
 }
 
@@ -15463,10 +15475,18 @@ private:
     // gives the kernel time to flush naturally.  Forcing writeback during
     // compression creates I/O contention with subsequent fwrite() calls,
     // triggering balance_dirty_pages throttling.
+    // NOT BEFORE ONE FRAME'S WORTH (v0.18.26).  The hint exists for the large
+    // output whose dirty pages pile up until rename flushes them all (46 s for
+    // 19.5 GiB, v0.12.23); an output smaller than one 16 MiB frame flushes in
+    // milliseconds at the rename, while the hint itself cost a 7 KiB file
+    // ~25-30 us: `-d -r` over 1,000 of them 0.140-0.151 s, 0.115-0.127 with it
+    // stubbed out (sync inside the timing; zstd 0.092-0.100).  Past the frame the
+    // first hint covers the whole output so far, as every later one did.
+    static constexpr off_t PUSH_MIN = 16 * 1024 * 1024;
     if (progressive_sync_ && !dw_ && out_) {
       int fd = fileno(out_);
       off_t cur = ftello(out_);
-      if (cur > sync_offset_) {
+      if (cur >= PUSH_MIN && cur > sync_offset_) {
         ::sync_file_range(fd, sync_offset_, cur - sync_offset_,
                           SYNC_FILE_RANGE_WRITE);
         sync_offset_ = cur;
@@ -49674,9 +49694,13 @@ static int pcie_gen_of_speed_file(const fs::path & p)
   return 0;
 }
 
+// Where the last detect_min_pcie_gen() found its answer, for -vv and the suite.
+static const char * g_pcie_gen_source = "nothing";
+
 static int detect_min_pcie_gen()
 {
   int min_gen = -1;
+  g_pcie_gen_source = "nothing";
   // sysfs FIRST, NVML only as a fallback.  This runs on every GPU-capable run
   // to pick a backend and the --direct default, and an nvmlInit_v2 +
   // per-device-enumerate + nvmlShutdown cycle measures ~300 ms on an 8-GPU host
@@ -49693,6 +49717,35 @@ static int detect_min_pcie_gen()
   // Current would misreport a Gen5 card at rest.
   std::error_code ec;
   const fs::path bus("/sys/bus/pci/devices");
+  // The driver's own list first (v0.18.26).  The walk below reads `vendor` for
+  // EVERY PCI function to find the NVIDIA ones -- 158 of them on the 8-GPU
+  // server, 1.75 ms a call, which is most of what a GPU build spends deciding a
+  // one-file job before it touches it (the release binary: ~2.3 ms of a 4.8 ms
+  // `-d` of 7 KiB, against 0.2 ms for the CPU-only build).  The NVIDIA driver
+  // names each GPU it manages by its PCI address in /proc/driver/nvidia/gpus, so
+  // read those devices' link speeds directly: 0.25 ms, the same answer here.
+  // Any usable listed speed makes this set authoritative: an unlisted NVIDIA
+  // display device (unmanaged, or hidden from this procfs view) cannot lower its
+  // minimum as it can the walk's.  Entries without a usable sysfs speed are
+  // skipped, as in the walk; with none usable, the old fallbacks still run.
+  // Neither sysfs route applies CUDA_VISIBLE_DEVICES.
+  // GZSTD_DEBUG_PCIE_WALK skips the list, so the suite can compare the two.
+  if (!std::getenv("GZSTD_DEBUG_PCIE_WALK")) {
+    for (const auto & g : fs::directory_iterator("/proc/driver/nvidia/gpus", ec)) {
+      const fs::path dev = bus / g.path().filename();
+      int gen = pcie_gen_of_speed_file(dev / "max_link_speed");
+      if (gen <= 0) continue;
+      const fs::path real = fs::canonical(dev, ec);
+      if (!ec) {
+        const int up = pcie_gen_of_speed_file(real.parent_path() / "max_link_speed");
+        if (up > 0) gen = std::min(gen, up);
+      }
+      ec.clear();
+      if (min_gen < 0 || gen < min_gen) min_gen = gen;
+    }
+  }
+  if (min_gen > 0) { g_pcie_gen_source = "the driver's GPU list"; return min_gen; }
+  ec.clear();
   if (fs::exists(bus, ec)) {
     for (const auto & entry : fs::directory_iterator(bus, ec)) {
       if (ec) break;
@@ -49723,7 +49776,7 @@ static int detect_min_pcie_gen()
       if (min_gen < 0 || gen < min_gen) min_gen = gen;
     }
   }
-  if (min_gen > 0) return min_gen;
+  if (min_gen > 0) { g_pcie_gen_source = "a walk of every PCI device"; return min_gen; }
 
 #ifdef HAVE_NVML
   // Fallback: no usable sysfs (a container without /sys/bus/pci, or an
@@ -49747,6 +49800,7 @@ static int detect_min_pcie_gen()
     }
     nvmlShutdown();
   }
+  if (min_gen > 0) g_pcie_gen_source = "NVML";
 #endif
   return (min_gen > 0) ? min_gen : 0;
 }
@@ -50346,6 +50400,7 @@ static void apply_backend_defaults(Options & opt)
   // PCIe-gen probe — drives the --direct default (compress + decompress) and
   // remains useful in the backend-selection diagnostic below.
   int gen = detect_min_pcie_gen();
+  vlog(V_DEBUG, opt, "[PCIe] Gen" + std::to_string(gen) + " from " + g_pcie_gen_source + "\n");
 
   // Resolve the --verify engine (compress only).  GPU verify (decompress + raw
   // byte-compare in VRAM) applies ONLY to gpu-only mode, where every frame flows

@@ -623,7 +623,12 @@ human_size() {
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
 EXPECTED_TESTS=562
-$EXTENSIVE && EXPECTED_TESTS=863
+$EXTENSIVE && EXPECTED_TESTS=862
+# v0.18.26: +1 default GPU cell (the PCIe generation comes from the driver's GPU list):
+# 561 -> 562, 861 -> 862; the no-GPU deltas +1 (147 -> 148, 213 -> 214).
+# tests (after v0.18.25): -1 default and -e ("--stats-json valid JSON", which the run-totals
+# cell covers) and -1 -e ("-T 2 round-trip correct", which the Threading section covers):
+# 562 -> 561, 863 -> 861.  No GPU cell removed, so the no-GPU deltas are unchanged.
 # v0.18.25: +1 default GPU cell (an input below a GPU batch takes the CPU path in a run
 # that does not): 561 -> 562, 862 -> 863; the no-GPU deltas +1 (146 -> 147, 212 -> 213).
 # v0.18.24: +1 default cell, no GPU (--stats-json over several inputs reports the
@@ -913,8 +918,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=147   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=213   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25
+EXPECTED_NOGPU_DELTA=148   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=214   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1158,7 +1163,20 @@ if strace -f -qq -e trace=clone,clone3 -o /dev/null true 2>/dev/null; then
     fi
   done
   cmp -s "$TMPDIR/sd1.out" "$TMPDIR/small.txt" || sd_why+=" [one frame, --direct: bytes]"
-  rm -f "$TMPDIR/sd.st" "$TMPDIR/sd1.out" "$TMPDIR/sd1.cout"
+  # NO WRITEBACK HINT BELOW ONE FRAME (v0.18.26).  A buffered -d output pushed its pages
+  # with sync_file_range after every batch, ~25-30 us a 7 KiB file; the hint is for the
+  # large output whose rename would flush them all.  Below 16 MiB, none; above, some.
+  strace -f -qq -e trace=sync_file_range -o "$TMPDIR/sd.st" "$GZSTD" -q -d -f --no-direct --cpu-only \
+    "$TMPDIR/sd1.zst" -o "$TMPDIR/sd1.out" 2> /dev/null || sd_why+=" [hint, small: exit $?]"
+  sd_sfr=$(grep -c sync_file_range "$TMPDIR/sd.st")
+  [[ $sd_sfr == 0 ]] || sd_why+=" [small output: $sd_sfr writeback hints]"
+  "$GZSTD" -q -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/sdl.zst" 2> /dev/null
+  strace -f -qq -e trace=sync_file_range -o "$TMPDIR/sd.st" "$GZSTD" -q -d -f --no-direct --cpu-only \
+    "$TMPDIR/sdl.zst" -o "$TMPDIR/sdl.out" 2> /dev/null || sd_why+=" [hint, large: exit $?]"
+  sd_sfr=$(grep -c sync_file_range "$TMPDIR/sd.st")
+  [[ $sd_sfr -ge 1 ]] || sd_why+=" [32 MiB output: no writeback hint]"
+  cmp -s "$TMPDIR/sdl.out" "$TMPDIR/large.bin" || sd_why+=" [32 MiB output: bytes]"
+  rm -f "$TMPDIR/sd.st" "$TMPDIR/sd1.out" "$TMPDIR/sd1.cout" "$TMPDIR/sdl.zst" "$TMPDIR/sdl.out"
 fi
 for ((sd_i = 0; sd_i < 40; sd_i++)); do cat "$TMPDIR/sd1.zst"; done > "$TMPDIR/sd40.zst"
 for ((sd_i = 0; sd_i < 40; sd_i++)); do cat "$TMPDIR/small.txt"; done > "$TMPDIR/sd40.src"
@@ -1653,15 +1671,7 @@ rm -f "$compressed"
 section "Stats JSON output"
 
 LAST_TEST_MS=0
-json_file="$TMPDIR/stats.json"
-"$GZSTD" -k -f --cpu-only --stats-json "$json_file" "$TMPDIR/medium.txt" 2>/dev/null
-if [[ -f "$json_file" && -s "$json_file" ]]; then
-  python3 -c "import json; json.load(open('$json_file'))" 2>/dev/null \
-    && pass "--stats-json valid JSON" || fail "--stats-json" "parse error"
-else
-  skip "--stats-json" "file not created"
-fi
-rm -f "$json_file" "$TMPDIR/medium.txt.zst"
+json_file="$TMPDIR/stats.json"   # the GPU cell below writes its records here
 
 # --stats-json OVER SEVERAL INPUTS IS THE RUN'S RECORD (v0.18.24).  It was rewritten
 # after each input with that input's numbers alone: `-r --stats-json s.json d` over
@@ -1733,62 +1743,6 @@ if has_gpu 2>/dev/null; then
     || fail "--stats-json on a GPU compress: written, with each device's share" "got$why"
 else
   skip "--stats-json on a GPU compress: written, with each device's share" "no GPU"
-fi
-
-# ONE INPUT BELOW A GPU BATCH, IN A RUN THAT IS NOT (v0.18.25).  The startup gate asks
-# its question of the whole run, so `-r` over 96 x 40 MiB (3.75 GiB) went hybrid and every
-# 40 MiB input started a 96-thread CPU pool before its bringup skipped the GPU: 1.05 GB
-# peak RSS and 6.5 s against 0.15 GB and 2.9 s.  Now each input is asked too, and an
-# explicit --hybrid keeps its pipeline with no more CPU workers than the input has frames.
-# The suite disables the size gate (GZSTD_DEBUG_GPU_MIN_BYTES=0), so this cell sets a 4 MiB
-# bound: two 3 MiB inputs pass it as a run and each fails it alone.  1 MiB frames, three
-# per input, so the CPU path's pool and the hybrid cap both read 3.
-if has_gpu 2>/dev/null; then
-  t0=$(now_ms); why=""
-  PG="$TMPDIR/pg"; rm -rf "$PG"; mkdir -p "$PG/c" "$PG/d"
-  for pg_f in a b; do head -c 3000000 /dev/urandom | base64 -w0 | head -c 3145728 > "$PG/c/$pg_f"; done
-  pg_bound=(env GZSTD_DEBUG_GPU_MIN_BYTES=4194304)
-  "${pg_bound[@]}" "$GZSTD" -v -k -f --chunk-size=1 "$PG/c/a" "$PG/c/b" 2> "$PG/c.err" || why+=" compress-exit:$?"
-  [[ $(tr '\r' '\n' < "$PG/c.err" | grep -c 'this input .* compressing it on the CPU') == 2 ]] \
-    || why+=" compress:$(tr '\r' '\n' < "$PG/c.err" | grep -oE '\[(GPU|HYBRID)\] [a-z ]+' | sort -u | tr '\n' ',')"
-  grep -q 'HYBRID\] starting CPU pool' "$PG/c.err" && why+=" compress-started-hybrid"
-  "${pg_bound[@]}" "$GZSTD" -v -d -f --output-dir-flat "$PG/d" "$PG/c/a.zst" "$PG/c/b.zst" 2> "$PG/d.err" \
-    || why+=" decompress-exit:$?"
-  [[ $(tr '\r' '\n' < "$PG/d.err" | grep -c 'this input .* decoding it on the CPU') == 2 ]] \
-    || why+=" decompress:$(tr '\r' '\n' < "$PG/d.err" | grep -oE '\[(GPU|HYBRID)\] [a-z ]+' | sort -u | tr '\n' ',')"
-  grep -q 'HYBRID\] decompress:' "$PG/d.err" && why+=" decompress-started-hybrid"
-  for pg_f in a b; do cmp -s "$PG/c/$pg_f" "$PG/d/$pg_f" || why+=" bytes:$pg_f"; done
-  # The per-input estimate must use the held descriptor.  Replace its name
-  # with a FIFO only AFTER startup's probes and the input open; a second open
-  # by name would hang.  Unlink the gate after the rendezvous so input b does
-  # not wait for another writer.  Both inputs must still take the hand-off.
-  mkfifo "$PG/gate"
-  GZSTD_DEBUG_INPUT_GATE="$PG/gate" timeout --foreground -k 2 15 "${pg_bound[@]}" \
-    "$GZSTD" -v -d -f --output-dir-flat "$PG/d" "$PG/c/a.zst" "$PG/c/b.zst" \
-    2> "$PG/pin.err" &
-  pg_pid=$!
-  timeout 10 sh -c 'exec 9>"$1" || exit 1
-                   rm "$1" || exit 1
-                   mv "$2" "$2.held" || exit 1
-                   mkfifo "$2" || exit 1
-                   printf g >&9' sh "$PG/gate" "$PG/c/a.zst" || why+=" pinned-rendezvous"
-  pg_rc=0; wait "$pg_pid" || pg_rc=$?
-  [[ $pg_rc -eq 0 ]] || why+=" pinned-exit:$pg_rc"
-  [[ $(tr '\r' '\n' < "$PG/pin.err" | grep -c 'this input .* decoding it on the CPU') == 2 ]] \
-    || why+=" pinned-handoff"
-  for pg_f in a b; do cmp -s "$PG/c/$pg_f" "$PG/d/$pg_f" || why+=" pinned-bytes:$pg_f"; done
-  "${pg_bound[@]}" "$GZSTD" -v --hybrid -f --chunk-size=1 -c "$PG/c/a" 2> "$PG/h.err" > "$PG/h.zst" || why+=" hybrid-exit:$?"
-  grep -q 'HYBRID\] starting CPU pool: 3 threads' "$PG/h.err" \
-    || why+=" hybrid-pool:$(grep -oE 'starting CPU pool: [0-9]+' "$PG/h.err")"
-  "${pg_bound[@]}" "$GZSTD" -v --hybrid -d -c "$PG/h.zst" 2> "$PG/hd.err" | cmp -s - "$PG/c/a" || why+=" hybrid-d-bytes"
-  grep -q 'HYBRID\] decompress: 3 CPU threads' "$PG/hd.err" \
-    || why+=" hybrid-d-pool:$(grep -oE 'decompress: [0-9]+ CPU' "$PG/hd.err")"
-  rm -rf "$PG"
-  LAST_TEST_MS=$(( $(now_ms) - t0 ))
-  [[ -z "$why" ]] && pass "an input below a GPU batch takes the CPU path in a run that does not" \
-    || fail "an input below a GPU batch takes the CPU path in a run that does not" "got$why"
-else
-  skip "an input below a GPU batch takes the CPU path in a run that does not" "no GPU"
 fi
 
 # ============================================================
@@ -5670,11 +5624,6 @@ LAST_TEST_MS=0
 "$GZSTD" -k -f --cpu-only -T=4 "$TMPDIR/small.txt" -o "$TMPDIR/tform7.zst" 2>/dev/null || true
 [[ -s "$TMPDIR/tform7.zst" ]] && pass "-T=4 (equals)" || fail "-T=4 (equals)"
 
-# Single thread round-trip correctness
-"$GZSTD" -d -k -f --cpu-only "$TMPDIR/tform1.zst" -o "$TMPDIR/tform1.recovered" 2>/dev/null
-files_match "$TMPDIR/small.txt" "$TMPDIR/tform1.recovered" \
-  && pass "-T 2 round-trip correct" || fail "-T 2 round-trip" "mismatch"
-
 # ZSTD_NBTHREADS (v0.18.12), read where zstd 1.5.7 reads it: the COMPRESSION
 # thread count when the line sets none.  -T and --single-thread win; 0 is zstd's
 # "no worker threads" (one thread, not -T0); a non-number is ignored with a
@@ -5901,6 +5850,55 @@ fi  # $EXTENSIVE (cpu-share scheduling + hybrid GPU-bringup overlap moved to -e)
 # ============================================================
 section "Asymmetric mode (PCIe gen detection)"
 
+# THE PCIe GENERATION COMES FROM THE DRIVER'S GPU LIST (v0.18.26).  Every GPU-build run
+# reads it to set the --direct default, and it came from a walk of every PCI function --
+# 158 `vendor` files on the 8-GPU server, 1.75 ms a call, most of the ~2.3 ms the release
+# binary spent deciding a one-file job.  Now /proc/driver/nvidia/gpus names the GPUs and
+# only their link speeds are read; the walk is the fallback without the driver
+# (GZSTD_DEBUG_PCIE_WALK forces it).  When both enumerate the same GPU set and sysfs
+# supplies a supported speed, both must give the same generation and name their source.
+# Check those host prerequisites independently of the binary: an unmanaged GPU can
+# legitimately lower the walk's minimum, and /proc without usable sysfs needs NVML.
+pw_test="the PCIe generation comes from the driver's GPU list, as the full walk would say"
+if has_gpu 2>/dev/null; then
+  pw_driver_bdfs=$(for pw_dev in /proc/driver/nvidia/gpus/*; do
+    [[ -d "$pw_dev" ]] && printf '%s\n' "${pw_dev##*/}"
+  done | LC_ALL=C sort)
+  pw_walk_bdfs=$(for pw_dev in /sys/bus/pci/devices/*; do
+    [[ -r "$pw_dev/vendor" && -r "$pw_dev/class" ]] || continue
+    read -r pw_vendor < "$pw_dev/vendor"
+    read -r pw_class < "$pw_dev/class"
+    [[ "$pw_vendor" == 0x10de && "$pw_class" == 0x03* ]] && printf '%s\n' "${pw_dev##*/}"
+  done | LC_ALL=C sort)
+  pw_speed_known=false
+  for pw_dev in /proc/driver/nvidia/gpus/*; do
+    pw_speed=""
+    [[ -r "/sys/bus/pci/devices/${pw_dev##*/}/max_link_speed" ]] || continue
+    read -r pw_speed < "/sys/bus/pci/devices/${pw_dev##*/}/max_link_speed"
+    case "$pw_speed" in
+      '2.5 GT/s'*|'5.0 GT/s'*|'8.0 GT/s'*|'16.0 GT/s'*|'32.0 GT/s'*|'64.0 GT/s'*) pw_speed_known=true ;;
+    esac
+  done
+  if [[ -n "$pw_driver_bdfs" && "$pw_driver_bdfs" == "$pw_walk_bdfs" ]] && $pw_speed_known; then
+    pw_why=""
+    "$GZSTD" -q -f --cpu-only "$TMPDIR/small.txt" -o "$TMPDIR/pw.zst" 2>/dev/null || pw_why+=" [fixture: exit $?]"
+    pw_log=$(env -u GZSTD_DEBUG_PCIE_WALK "$GZSTD" -vv -t "$TMPDIR/pw.zst" 2>&1) || pw_why+=" [default: exit $?]"
+    pw_list=$(grep -oE '\[PCIe\] Gen[0-9]+ from .*' <<<"$pw_log" | head -1)
+    pw_log=$(GZSTD_DEBUG_PCIE_WALK=1 "$GZSTD" -vv -t "$TMPDIR/pw.zst" 2>&1) || pw_why+=" [hooked: exit $?]"
+    pw_walk=$(grep -oE '\[PCIe\] Gen[0-9]+ from .*' <<<"$pw_log" | head -1)
+    [[ "$pw_list" == *"from the driver's GPU list"* ]] || pw_why+=" [default: ${pw_list:-no [PCIe] line}]"
+    [[ "$pw_walk" == *"from a walk of every PCI device"* ]] || pw_why+=" [hooked: ${pw_walk:-no [PCIe] line}]"
+    pw_g1=$(grep -oE 'Gen[0-9]+' <<<"$pw_list"); pw_g2=$(grep -oE 'Gen[0-9]+' <<<"$pw_walk")
+    [[ -n "$pw_g1" && "$pw_g1" == "$pw_g2" && "$pw_g1" != Gen0 ]] || pw_why+=" [list ${pw_g1:-?} vs walk ${pw_g2:-?}]"
+    rm -f "$TMPDIR/pw.zst"
+    [[ -z "$pw_why" ]] && pass "$pw_test" || fail "$pw_test" "$pw_why"
+  else
+    skip_host "$pw_test" "driver list and PCI walk differ, or no usable sysfs speed"
+  fi
+else
+  skip "$pw_test" "no GPU"
+fi
+
 if has_gpu 2>/dev/null; then
   asym_src="$TMPDIR/asym-src.bin"
   asym_zst="$TMPDIR/asym.zst"
@@ -6125,7 +6123,9 @@ fi
 # drops to cpu-only.  These are the only tests that run with the gate ARMED —
 # the suite disables it globally (see GZSTD_DEBUG_GPU_MIN_BYTES at the top) so
 # every other test keeps exercising the GPU paths on small fixtures.  The hook
-# sets the bound explicitly here rather than relying on >128 MiB fixtures.
+# sets the bound explicitly here rather than relying on >128 MiB fixtures.  The
+# last cell arms the per-input form of the gate (v0.18.25): the run passes it,
+# each input does not.
 # ============================================================
 section "Small-input GPU gate"
 
@@ -6385,6 +6385,62 @@ else
   skip "a GPU worker with nothing left to take is not set up" "no GPU"
   skip "--adapt starts a pipe's GPUs only when the CPUs fall behind" "no GPU"
   skip "--adapt files a run whose GPUs got nothing as hybrid" "no GPU"
+fi
+
+# ONE INPUT BELOW A GPU BATCH, IN A RUN THAT IS NOT (v0.18.25).  The startup gate asks
+# its question of the whole run, so `-r` over 96 x 40 MiB (3.75 GiB) went hybrid and every
+# 40 MiB input started a 96-thread CPU pool before its bringup skipped the GPU: 1.05 GB
+# peak RSS and 6.5 s against 0.15 GB and 2.9 s.  Now each input is asked too, and an
+# explicit --hybrid keeps its pipeline with no more CPU workers than the input has frames.
+# The suite disables the size gate (GZSTD_DEBUG_GPU_MIN_BYTES=0), so this cell sets a 4 MiB
+# bound: two 3 MiB inputs pass it as a run and each fails it alone.  1 MiB frames, three
+# per input, so the CPU path's pool and the hybrid cap both read 3.
+if has_gpu 2>/dev/null; then
+  t0=$(now_ms); why=""
+  PG="$TMPDIR/pg"; rm -rf "$PG"; mkdir -p "$PG/c" "$PG/d"
+  for pg_f in a b; do head -c 3000000 /dev/urandom | base64 -w0 | head -c 3145728 > "$PG/c/$pg_f"; done
+  pg_bound=(env GZSTD_DEBUG_GPU_MIN_BYTES=4194304)
+  "${pg_bound[@]}" "$GZSTD" -v -k -f --chunk-size=1 "$PG/c/a" "$PG/c/b" 2> "$PG/c.err" || why+=" compress-exit:$?"
+  [[ $(tr '\r' '\n' < "$PG/c.err" | grep -c 'this input .* compressing it on the CPU') == 2 ]] \
+    || why+=" compress:$(tr '\r' '\n' < "$PG/c.err" | grep -oE '\[(GPU|HYBRID)\] [a-z ]+' | sort -u | tr '\n' ',')"
+  grep -q 'HYBRID\] starting CPU pool' "$PG/c.err" && why+=" compress-started-hybrid"
+  "${pg_bound[@]}" "$GZSTD" -v -d -f --output-dir-flat "$PG/d" "$PG/c/a.zst" "$PG/c/b.zst" 2> "$PG/d.err" \
+    || why+=" decompress-exit:$?"
+  [[ $(tr '\r' '\n' < "$PG/d.err" | grep -c 'this input .* decoding it on the CPU') == 2 ]] \
+    || why+=" decompress:$(tr '\r' '\n' < "$PG/d.err" | grep -oE '\[(GPU|HYBRID)\] [a-z ]+' | sort -u | tr '\n' ',')"
+  grep -q 'HYBRID\] decompress:' "$PG/d.err" && why+=" decompress-started-hybrid"
+  for pg_f in a b; do cmp -s "$PG/c/$pg_f" "$PG/d/$pg_f" || why+=" bytes:$pg_f"; done
+  # The per-input estimate must use the held descriptor.  Replace its name
+  # with a FIFO only AFTER startup's probes and the input open; a second open
+  # by name would hang.  Unlink the gate after the rendezvous so input b does
+  # not wait for another writer.  Both inputs must still take the hand-off.
+  mkfifo "$PG/gate"
+  GZSTD_DEBUG_INPUT_GATE="$PG/gate" timeout --foreground -k 2 15 "${pg_bound[@]}" \
+    "$GZSTD" -v -d -f --output-dir-flat "$PG/d" "$PG/c/a.zst" "$PG/c/b.zst" \
+    2> "$PG/pin.err" &
+  pg_pid=$!
+  timeout 10 sh -c 'exec 9>"$1" || exit 1
+                   rm "$1" || exit 1
+                   mv "$2" "$2.held" || exit 1
+                   mkfifo "$2" || exit 1
+                   printf g >&9' sh "$PG/gate" "$PG/c/a.zst" || why+=" pinned-rendezvous"
+  pg_rc=0; wait "$pg_pid" || pg_rc=$?
+  [[ $pg_rc -eq 0 ]] || why+=" pinned-exit:$pg_rc"
+  [[ $(tr '\r' '\n' < "$PG/pin.err" | grep -c 'this input .* decoding it on the CPU') == 2 ]] \
+    || why+=" pinned-handoff"
+  for pg_f in a b; do cmp -s "$PG/c/$pg_f" "$PG/d/$pg_f" || why+=" pinned-bytes:$pg_f"; done
+  "${pg_bound[@]}" "$GZSTD" -v --hybrid -f --chunk-size=1 -c "$PG/c/a" 2> "$PG/h.err" > "$PG/h.zst" || why+=" hybrid-exit:$?"
+  grep -q 'HYBRID\] starting CPU pool: 3 threads' "$PG/h.err" \
+    || why+=" hybrid-pool:$(grep -oE 'starting CPU pool: [0-9]+' "$PG/h.err")"
+  "${pg_bound[@]}" "$GZSTD" -v --hybrid -d -c "$PG/h.zst" 2> "$PG/hd.err" | cmp -s - "$PG/c/a" || why+=" hybrid-d-bytes"
+  grep -q 'HYBRID\] decompress: 3 CPU threads' "$PG/hd.err" \
+    || why+=" hybrid-d-pool:$(grep -oE 'decompress: [0-9]+ CPU' "$PG/hd.err")"
+  rm -rf "$PG"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "an input below a GPU batch takes the CPU path in a run that does not" \
+    || fail "an input below a GPU batch takes the CPU path in a run that does not" "got$why"
+else
+  skip "an input below a GPU batch takes the CPU path in a run that does not" "no GPU"
 fi
 
 # ============================================================

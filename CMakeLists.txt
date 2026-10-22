@@ -33,8 +33,9 @@ find_package(Threads REQUIRED)
 #      can retain both variables from a previous find, even when they are stale;
 #      those trees must keep the old FindZSTD/pkg-config priority.
 #   1) CMake's FindZSTD (target ZSTD::ZSTD)
-#   2) pkg-config 'zstd'
-#   3) Manual fallback that looks in common prefixes (e.g., $CONDA_PREFIX)
+#   2) Legacy pkg-config 'zstd', preserving existing configurations
+#   3) Manual search of common prefixes (e.g., $CONDA_PREFIX)
+#   4) pkg-config 'libzstd' (the name zstd installs)
 #
 # When BUILD_STATIC is ON, prefer libzstd.a over libzstd.so.  A STATIC libzstd
 # must be built multithreaded (zstd's `make libzstd.a-mt`): zstd's Makefile
@@ -71,11 +72,12 @@ if(NOT TARGET ZSTD::ZSTD)
   find_package(ZSTD QUIET)
 endif()
 
-# 2) pkg-config fallback (synthesizes target when found)
+# 2) Preserve the old 'zstd' lookup's priority.  Upstream installs libzstd.pc,
+# but an existing custom zstd.pc can work, and must still beat the manual search.
 if(NOT TARGET ZSTD::ZSTD AND NOT ZSTD_FOUND)
   find_package(PkgConfig QUIET)
   if(PKG_CONFIG_FOUND)
-    pkg_check_modules(ZSTD_PKG zstd IMPORTED_TARGET)
+    pkg_check_modules(ZSTD_PKG QUIET IMPORTED_TARGET zstd)
     if(ZSTD_PKG_FOUND)
       add_library(ZSTD::ZSTD INTERFACE IMPORTED)
       target_include_directories(ZSTD::ZSTD INTERFACE ${ZSTD_PKG_INCLUDE_DIRS})
@@ -84,12 +86,12 @@ if(NOT TARGET ZSTD::ZSTD AND NOT ZSTD_FOUND)
       else()
         target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_PKG_LINK_LIBRARIES})
       endif()
-      message(STATUS "Zstd found via pkg-config: ${ZSTD_PKG_LINK_LIBRARIES}")
+      message(STATUS "Zstd found via pkg-config (zstd): ${ZSTD_PKG_LINK_LIBRARIES}")
     endif()
   endif()
 endif()
 
-# 3) Manual fallback (works even without zstd.pc)
+# 3) Manual search (works without any .pc file)
 # Hints: user-supplied variables, then environment prefixes.
 if(NOT TARGET ZSTD::ZSTD)
   # Allow explicit overrides:
@@ -124,6 +126,30 @@ if(NOT TARGET ZSTD::ZSTD)
     target_include_directories(ZSTD::ZSTD INTERFACE ${ZSTD_INCLUDE_DIR})
     target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_LIBRARY})
     message(STATUS "Zstd found (manual): ${ZSTD_LIBRARY}")
+  endif()
+endif()
+
+# 4) Upstream's libzstd.pc, last: adding it before the manual search would
+# choose a system libzstd over the env named by $CONDA_PREFIX.  The legacy
+# 'zstd' spelling was already tried at its original priority above.  Shared
+# builds only: pkg-config's --static gives library NAMES, which lose the .pc's
+# prefix and can resolve to a .so, so a static build still needs a libzstd.a
+# the manual search can find, or the explicit pair (as before this fallback).
+if(NOT TARGET ZSTD::ZSTD AND NOT BUILD_STATIC)
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    # A separate prefix also keeps the legacy lookup's cached library paths
+    # from leaking into this newly supported module on a reused build tree.
+    pkg_search_module(ZSTD_UPSTREAM_PKG QUIET IMPORTED_TARGET libzstd)
+    if(ZSTD_UPSTREAM_PKG_FOUND)
+      add_library(ZSTD::ZSTD INTERFACE IMPORTED)
+      target_include_directories(ZSTD::ZSTD INTERFACE ${ZSTD_UPSTREAM_PKG_INCLUDE_DIRS})
+      target_compile_options(ZSTD::ZSTD INTERFACE ${ZSTD_UPSTREAM_PKG_CFLAGS_OTHER})
+      target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_UPSTREAM_PKG_LINK_LIBRARIES})
+      target_link_directories(ZSTD::ZSTD INTERFACE ${ZSTD_UPSTREAM_PKG_LIBRARY_DIRS})
+      target_link_options(ZSTD::ZSTD INTERFACE ${ZSTD_UPSTREAM_PKG_LDFLAGS_OTHER})
+      message(STATUS "Zstd found via pkg-config (${ZSTD_UPSTREAM_PKG_MODULE_NAME}): ${ZSTD_UPSTREAM_PKG_LINK_LIBRARIES}")
+    endif()
   endif()
 endif()
 

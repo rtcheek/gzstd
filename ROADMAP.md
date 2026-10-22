@@ -482,12 +482,23 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      warm 24 GiB archive copies ~6.4 GiB twice from the page cache.  A tighter overlap derived from
      the validated frame geometry could remove most of it; it overlaps decode and the pipe, so the
      wall gain is unproven.  Measure on a sink-bound and a CPU-bound decode before building.
+     **MEASURED v0.18.26 (server, a measurement-only build), a warm 65 GiB tar archive of mixed data,
+     `-d -c > /dev/null`, 3 interleaved rounds:** 17 MiB (today) `--cpu-only` 2.66-2.86 s, hybrid
+     2.52-2.76; 9 MiB 2.69-3.12 / 2.86-2.99; none 3.74-4.15 / 3.47-4.16.  The overlap is worth ~30%,
+     and a smaller one LOSES on a mixed archive, whose poorly compressing frames then carry; a
+     table-derived overlap would be ~17 MiB there anyway.  Still unmeasured: a large, uniformly
+     high-ratio archive (2.4:1 text frames are ~7 MiB), where up to 11% of the readers' copying could
+     go -- the consumer waited 1.7 s of 2.7 for blocks, so the readers do bind warm.  A fair test
+     needs a ~130 GiB corpus; a 2 GiB one ran 0.45 s and was all noise.
    - **The O_DIRECT output staging copy** (`--sliding-window` and the frame writer to a file): every
      compressed byte is copied into an aligned 16 MiB buffer.  Handing the aligned buffers to the
      positional writes would remove the copy; it overlaps the NVMe writes, so the gain is unproven.
    - **Checksum threads per GPU compress batch** are created and joined for every batch of more than
      one frame; a persistent pool would save `min(b,8)` thread lifecycles per batch.  Bounded by the
      GPU share of a run; measure on a hybrid compress where the GPU takes most frames.
+     **MEASURED v0.18.26, NOT WORTH A POOL:** 3.75 GiB `--gpu-only` compress on the server, 39 batches,
+     282 threads started in the whole run; 8 threads started and joined cost 0.30 ms on this box
+     (1,000 empty batches), so ~12 ms of a ~5.7 s run (0.2%).
    - **Tightness, listed not done:** the three-pass read-probe orchestration still exists once per
      producer (CPU, GPU/hybrid) -- sharing it needs adapters for the GPU path's abort handling and
      the descriptor/pool lifetimes; and the physical-core, L3-count and placement topology readers
@@ -535,6 +546,11 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      sub-buffer output itself.  0.26-0.27 s now; the 10-20 us a file left is the O_DIRECT
      descriptor and the buffer pool (lazy buffers would turn an allocation failure mid-stream into
      a write error, so not taken).
+   - **Measured v0.18.26, not changed: the decode gates' estimate undercounts a mid-ratio archive**
+     whose first frame exceeds the estimator's 1 MiB window (170 MiB of 2.4:1 text reads as 169.5 MiB
+     of work, really 400) -- and it does not matter here: `--hybrid` takes the same time and its GPU
+     does no batch.  The seek table gives exact sizes; take it only when an archive this misjudges is
+     measured to want the GPU (a few-core box, several GiB of work under a 256 MiB archive).
    - **OPEN, pre-existing: `output_bytes` (and `-t`'s `input_bytes`) leave out the seek-table
      trailer** -- 5,014 reported for a 5,039-byte archive.  They count data frames; say so, or count
      the trailer.
