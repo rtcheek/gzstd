@@ -622,8 +622,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=562
-$EXTENSIVE && EXPECTED_TESTS=862
+EXPECTED_TESTS=564
+$EXTENSIVE && EXPECTED_TESTS=864
+# v0.18.27: +2 default cells, no GPU (--stats-json counts an archive's skippable frames,
+# both ways; an append redirect takes the O_DIRECT writer only under an explicit --direct):
+# 562 -> 564, 862 -> 864.
 # v0.18.26: +1 default GPU cell (the PCIe generation comes from the driver's GPU list):
 # 561 -> 562, 861 -> 862; the no-GPU deltas +1 (147 -> 148, 213 -> 214).
 # tests (after v0.18.25): -1 default and -e ("--stats-json valid JSON", which the run-totals
@@ -1705,6 +1708,110 @@ rm -rf "$SJ"
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "--stats-json over several inputs reports the run's totals" \
   || fail "--stats-json over several inputs reports the run's totals" "got$why"
+
+# THE ARCHIVE'S BYTES ARE ALL OF ITS BYTES (v0.18.27).  output_bytes was written before
+# the trailer was appended, and -d/-t's input_bytes counted only what reached a decoder:
+# both left out the skippable frames (the seek table, --tar's index), 5,014 reported for a
+# 5,039-byte archive.  Both now count them, and skippable_bytes says how many.  The seek
+# table's size comes from its own footer (frame count, descriptor), not from gzstd.  Arms:
+# compress; -d and -t; a skippable frame in the MIDDLE (two archives concatenated); and the
+# streaming decoder, which passes over a skippable frame itself: a frame with no content
+# size, as zstd writes from a pipe (built here: one raw block of 100 bytes), then a 12-byte
+# skippable frame.  (gzstd always records the size; otherwise only a 256 MiB frame streams.)
+t0=$(now_ms); why=""
+SK="$TMPDIR/sk"; rm -rf "$SK"; mkdir -p "$SK"
+head -c 5000 /dev/urandom > "$SK/a"
+sk_get() { grep -o "^  \"$2\": [0-9]*" "$1" 2>/dev/null | grep -o '[0-9]*$'; }
+sk_table() {   # sk_table ARCHIVE: the size of the seek table at its end, from its footer
+  local sz n d
+  sz=$(stat -c %s "$1"); n=$(od -An -tu4 -j $((sz - 9)) -N4 "$1" | tr -d ' ')
+  d=$(od -An -tu1 -j $((sz - 5)) -N1 "$1" | tr -d ' ')
+  [[ "$(od -An -tx4 -j $((sz - 4)) -N4 "$1" | tr -d ' ')" == 8f92eab1 ]] || { echo none; return; }
+  echo $(( 17 + n * ( (d & 128) ? 12 : 8 ) ))
+}
+"$GZSTD" -q -f --cpu-only --stats-json "$SK/c.json" "$SK/a" -o "$SK/a.zst" 2>/dev/null || why+=" compress-exit:$?"
+sk_sz=$(stat -c %s "$SK/a.zst" 2>/dev/null); sk_tb=$(sk_table "$SK/a.zst")
+[[ "$(sk_get "$SK/c.json" output_bytes) $(sk_get "$SK/c.json" skippable_bytes)" == "$sk_sz $sk_tb" ]] \
+  || why+=" compress:$(sk_get "$SK/c.json" output_bytes)/$(sk_get "$SK/c.json" skippable_bytes)-want-$sk_sz/$sk_tb"
+for sk_m in -d -t; do
+  rm -f "$SK/d.json"
+  "$GZSTD" -q -f --cpu-only $sk_m --stats-json "$SK/d.json" "$SK/a.zst" -o /dev/null 2>/dev/null || why+=" $sk_m-exit:$?"
+  [[ "$(sk_get "$SK/d.json" input_bytes) $(sk_get "$SK/d.json" skippable_bytes)" == "$sk_sz $sk_tb" ]] \
+    || why+=" $sk_m:$(sk_get "$SK/d.json" input_bytes)/$(sk_get "$SK/d.json" skippable_bytes)-want-$sk_sz/$sk_tb"
+done
+cat "$SK/a.zst" "$SK/a.zst" > "$SK/aa.zst"
+"$GZSTD" -q -f --cpu-only -d -c --stats-json "$SK/aa.json" "$SK/aa.zst" 2>/dev/null | cmp -s - <(cat "$SK/a" "$SK/a") || why+=" concatenated-bytes"
+[[ "$(sk_get "$SK/aa.json" input_bytes) $(sk_get "$SK/aa.json" skippable_bytes)" == "$((2 * sk_sz)) $((2 * sk_tb))" ]] \
+  || why+=" concatenated:$(sk_get "$SK/aa.json" input_bytes)/$(sk_get "$SK/aa.json" skippable_bytes)"
+head -c 100 "$SK/a" > "$SK/a100"
+{ printf '\x28\xb5\x2f\xfd\x00\x00\x21\x03\x00'; cat "$SK/a100"; printf '\x50\x2a\x4d\x18\x04\x00\x00\x00abcd'; } > "$SK/sw.zst"
+"$GZSTD" -q -f --cpu-only -d -c --stats-json "$SK/sw.json" "$SK/sw.zst" 2>/dev/null | cmp -s - "$SK/a100" || why+=" streamed-bytes"
+[[ "$(sk_get "$SK/sw.json" input_bytes) $(sk_get "$SK/sw.json" skippable_bytes)" == "$(stat -c %s "$SK/sw.zst") 12" ]] \
+  || why+=" streamed:$(sk_get "$SK/sw.json" input_bytes)/$(sk_get "$SK/sw.json" skippable_bytes)-want-$(stat -c %s "$SK/sw.zst")/12"
+# A recoverable clipped trailer still occupies input bytes.  Both a partial
+# header and a partial payload, through the splitter and the streaming decoder.
+for sk_src in a sw; do
+  sk_skip=$sk_tb; sk_want="$SK/a"
+  [[ $sk_src == sw ]] && { sk_skip=12; sk_want="$SK/a100"; }
+  sk_size=$(stat -c %s "$SK/$sk_src.zst")
+  for sk_left in 4 $((sk_skip - 1)); do
+    sk_clip_size=$((sk_size - sk_skip + sk_left))
+    head -c "$sk_clip_size" "$SK/$sk_src.zst" > "$SK/clip.zst"
+    rm -f "$SK/clip.json"
+    "$GZSTD" -q --cpu-only -dc --stats-json "$SK/clip.json" "$SK/clip.zst" 2>/dev/null \
+      | cmp -s - "$sk_want" || why+=" clipped-$sk_src-$sk_left-bytes-or-exit"
+    [[ "$(sk_get "$SK/clip.json" input_bytes) $(sk_get "$SK/clip.json" skippable_bytes)" == "$sk_clip_size $sk_left" ]] \
+      || why+=" clipped-$sk_src-$sk_left-accounting"
+  done
+done
+# A 129 MiB sparse skippable crosses the parallel reader's 128 MiB gate without
+# a large decoded output.  A later sizeless frame takes its BUFFERED tail route,
+# not feed() above.  Assert the route as well as the independently known counts.
+sk_pad=$((129 * 1048576)); sk_prefix=$((sk_sz + 8 + sk_pad))
+cat "$SK/a.zst" > "$SK/mt.zst"
+printf '\x50\x2a\x4d\x18\x00\x00\x10\x08' >> "$SK/mt.zst"
+truncate -s "$sk_prefix" "$SK/mt.zst"
+cat "$SK/sw.zst" >> "$SK/mt.zst"
+for sk_m in -dc -t; do
+  rm -f "$SK/mt.json"
+  "$GZSTD" -v --no-progress --cpu-only --read-threads=2 $sk_m --stats-json "$SK/mt.json" \
+    "$SK/mt.zst" > "$SK/mt.out" 2> "$SK/mt.err" || why+=" buffered-tail-$sk_m-exit:$?"
+  grep -aq 'parallel prefetch: 2 reader threads' "$SK/mt.err" || why+=" buffered-tail-$sk_m-route"
+  [[ $sk_m == -t ]] || cmp -s "$SK/mt.out" <(cat "$SK/a" "$SK/a100") || why+=" buffered-tail-bytes"
+  [[ "$(sk_get "$SK/mt.json" input_bytes) $(sk_get "$SK/mt.json" skippable_bytes)" == "$(stat -c %s "$SK/mt.zst") $((sk_tb + 8 + sk_pad + 12))" ]] \
+    || why+=" buffered-tail-$sk_m-accounting"
+done
+# The BUFFERED tail must share the clipped-trailer policy too: -d recovers and
+# counts the 11 physical bytes, while -t rejects the identical damaged stream.
+sk_clip_size=$(( $(stat -c %s "$SK/mt.zst") - 1 ))
+truncate -s "$sk_clip_size" "$SK/mt.zst"
+rm -f "$SK/mt.json"
+"$GZSTD" -v --no-progress --cpu-only --read-threads=2 -dc --stats-json "$SK/mt.json" \
+  "$SK/mt.zst" > "$SK/mt.out" 2> "$SK/mt.err" || why+=" buffered-clipped-exit:$?"
+grep -aq 'parallel prefetch: 2 reader threads' "$SK/mt.err" || why+=" buffered-clipped-route"
+grep -aq "parallel reader can't split it" "$SK/mt.err" || why+=" buffered-clipped-no-buffered-tail"
+grep -aq 'truncated trailing skippable frame (11 bytes)' "$SK/mt.err" || why+=" buffered-clipped-no-warning"
+cmp -s "$SK/mt.out" <(cat "$SK/a" "$SK/a100") || why+=" buffered-clipped-bytes"
+[[ "$(sk_get "$SK/mt.json" input_bytes) $(sk_get "$SK/mt.json" skippable_bytes)" == "$sk_clip_size $((sk_tb + 8 + sk_pad + 11))" ]] \
+  || why+=" buffered-clipped-accounting"
+rm -f "$SK/mt.json"; sk_rc=0
+"$GZSTD" -q --cpu-only --read-threads=2 -t --stats-json "$SK/mt.json" "$SK/mt.zst" \
+  >/dev/null 2>/dev/null || sk_rc=$?
+[[ $sk_rc -eq 4 && ! -e "$SK/mt.json" ]] || why+=" buffered-clipped-test:$sk_rc"
+# The parallel splitter's own tolerated trailer, with no streaming handoff.
+truncate -s "$sk_prefix" "$SK/mt.zst"
+head -c $((sk_sz - 1)) "$SK/a.zst" >> "$SK/mt.zst"
+rm -f "$SK/mt.json"
+"$GZSTD" -v --no-progress --cpu-only --read-threads=2 -dc --stats-json "$SK/mt.json" \
+  "$SK/mt.zst" > "$SK/mt.out" 2> "$SK/mt.err" || why+=" parallel-clipped-exit:$?"
+grep -aq 'parallel prefetch: 2 reader threads' "$SK/mt.err" || why+=" parallel-clipped-route"
+cmp -s "$SK/mt.out" <(cat "$SK/a" "$SK/a") || why+=" parallel-clipped-bytes"
+[[ "$(sk_get "$SK/mt.json" input_bytes) $(sk_get "$SK/mt.json" skippable_bytes)" == "$(stat -c %s "$SK/mt.zst") $((2 * sk_tb - 1 + 8 + sk_pad))" ]] \
+  || why+=" parallel-clipped-accounting"
+rm -rf "$SK"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--stats-json counts an archive's skippable frames, both ways" \
+  || fail "--stats-json counts an archive's skippable frames, both ways" "got$why"
 
 # The GPU build's nvCOMP compress path wrote no --stats-json file at all until
 # v0.17.79, at exit 0 (the cell above passes --cpu-only, so it never saw that).
@@ -10563,6 +10670,52 @@ rc=0; "$GZSTD" --cpu-only -q -c --filelist "$so/paths.keep" 2>/dev/null > "$so/o
 [[ -z "$so_why" ]] && pass "a redirected stdout that is also an input is refused" \
   || fail "a redirected stdout that is also an input is refused" "$so_why"
 
+# 5c. AN APPEND REDIRECT TAKES THE O_DIRECT WRITER ONLY UNDER AN EXPLICIT --direct
+# (v0.18.27).  `>>` stayed on the buffered writer whatever was asked, 3x slower on a
+# large output, and an explicit --direct was dropped without a word: the O_DIRECT
+# writer's positional writes from the file's end overwrite what another appender adds
+# during the run.  --direct now says this command is the file's only writer; the Gen4+
+# default and --no-direct still append through the descriptor (the default arm tells them
+# apart only where the default is --direct: a GPU build on PCIe Gen4+).  Byte identity cannot
+# tell the writers apart: the adoption line at -v does (printed only once the writer
+# holds the file), and strace's positional writes where strace is installed.
+if dd if=/dev/zero of="$so/odp" bs=4096 count=1 oflag=direct 2>/dev/null; then
+  so_why=""
+  cp "$so/a" "$so/o16"; rc=0
+  "$GZSTD" --cpu-only --direct -v -dc "$so/b.zst" >> "$so/o16" 2> "$so/e16" || rc=$?
+  [[ $rc -eq 0 ]] && cmp -s "$so/o16" "$so/ab" || so_why+=" [--direct -dc >> f: exit $rc, $(stat -c %s "$so/o16") bytes]"
+  grep -aq "stdout append redirect using O_DIRECT from byte $(stat -c %s "$so/a") " "$so/e16" \
+    || so_why+=" [--direct -dc >> f: not adopted at the file's end]"
+  cp "$so/a.zst" "$so/o17.zst"; rc=0
+  "$GZSTD" --cpu-only --direct -v -c "$so/b" >> "$so/o17.zst" 2> "$so/e17" || rc=$?
+  [[ $rc -eq 0 ]] && cat "$so/a.zst" "$so/b.zst" | cmp -s - "$so/o17.zst" \
+    || so_why+=" [--direct -c >> f: exit $rc, not the two archives written separately]"
+  grep -aq "stdout append redirect using O_DIRECT" "$so/e17" || so_why+=" [--direct -c >> f: not adopted]"
+  for so_fl in "" --no-direct; do
+    cp "$so/a" "$so/o18"; rc=0
+    "$GZSTD" --cpu-only $so_fl -v -dc "$so/b.zst" >> "$so/o18" 2> "$so/e18" || rc=$?
+    [[ $rc -eq 0 ]] && cmp -s "$so/o18" "$so/ab" || so_why+=" [${so_fl:-default} -dc >> f: exit $rc]"
+    ! grep -aq "stdout append redirect using O_DIRECT" "$so/e18" \
+      || so_why+=" [${so_fl:-default} -dc >> f took the O_DIRECT writer without --direct]"
+  done
+  # A rebuild on it discards only its own output (cell 4, on the adopted writer).
+  cp "$so/a.zst" "$so/o19.zst"; rc=0
+  GZSTD_DEBUG_CORRUPT_FRAME=3 "$GZSTD" --cpu-only --direct --verify --chunk-size=1 -v -c "$so/b" >> "$so/o19.zst" 2> "$so/e19" || rc=$?
+  grep -aq "rebuilding" "$so/e19" || so_why+=" [--direct --verify >> f: no rebuild happened]"
+  [[ $(grep -ac "stdout append redirect using O_DIRECT" "$so/e19") -ge 1 ]] || so_why+=" [--direct --verify >> f: not adopted]"
+  [[ $rc -eq 0 ]] && so_is "$so/o19.zst" "$so/ab" || so_why+=" [--direct --verify >> f: exit $rc, the earlier content did not survive]"
+  if command -v strace >/dev/null 2>&1; then
+    cp "$so/a" "$so/o20"
+    strace -f -qq -e trace=pwrite64,write -o "$so/st20" "$GZSTD" --cpu-only --direct -q -dc "$so/b.zst" >> "$so/o20" 2>/dev/null
+    [[ $(grep -c 'pwrite64(' "$so/st20") -ge 1 && $(grep -cE '^[0-9]+ +write\(1,' "$so/st20") -eq 0 ]] && cmp -s "$so/o20" "$so/ab" \
+      || so_why+=" [strace --direct -dc >> f: $(grep -c 'pwrite64(' "$so/st20") positional writes, $(grep -cE '^[0-9]+ +write\(1,' "$so/st20") to the descriptor]"
+  fi
+  [[ -z "$so_why" ]] && pass "an append redirect takes the O_DIRECT writer only under an explicit --direct" \
+    || fail "an append redirect takes the O_DIRECT writer only under an explicit --direct" "$so_why"
+else
+  skip_host "an append redirect takes the O_DIRECT writer only under an explicit --direct" "no O_DIRECT in $TMPDIR"
+fi
+
 # 6 + 7. --gds-only.  Its peer-to-peer output reopens the descriptor at offset
 # zero, so the second command above overwrote the first there too; and two of
 # its refusals exited 1 where --help promises a usage error (2).
@@ -11974,10 +12127,18 @@ DSDPY
   }
   dsd_got() { grep -a -o '\[DSTAGE\] [0-9]* frames, [0-9]* bytes' "$1" | head -1 | awk '{print $2, $4}'; }
   dsd_want=$(dsd_expect "$dsd_zst")
+  dsd_stats="$TMPDIR/dstage-d.json"
+  dsd_stats_ok() {
+    local archive_size data_bytes
+    archive_size=$(stat -c %s "$dsd_zst"); data_bytes=${dsd_want#* }
+    [[ "$data_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$(sk_get "$dsd_stats" input_bytes) $(sk_get "$dsd_stats" output_bytes) $(sk_get "$dsd_stats" skippable_bytes)" \
+       == "$archive_size $(stat -c %s "$dsd_src") $((archive_size - data_bytes))" ]]
+  }
 
   # 1. -d to a file.
   rc=0
-  timeout --foreground -k 10 120 "$GZSTD" -d --direct-stage -v -f "$dsd_zst" -o "$dsd_out" 2>"$dsd_log" || rc=$?
+  timeout --foreground -k 10 120 "$GZSTD" -d --direct-stage -v -f --stats-json "$dsd_stats" "$dsd_zst" -o "$dsd_out" 2>"$dsd_log" || rc=$?
   dsd_have=$(dsd_got "$dsd_log")
   if [[ $rc -ne 0 ]]; then
     fail "--direct-stage -d stages every frame and round-trips" "exit $rc"
@@ -11987,6 +12148,8 @@ DSDPY
   elif grep -aq -e '--gds-only' -e 'cuFile transfers' "$dsd_log"; then
     fail "--direct-stage -d stages every frame and round-trips" \
          "a --gds-only / cuFile message printed under --direct-stage"
+  elif ! dsd_stats_ok; then
+    fail "--direct-stage -d stages every frame and round-trips" "stats must include the seek table"
   elif files_match "$dsd_src" "$dsd_out"; then
     pass "--direct-stage -d stages every frame and round-trips"
   else
@@ -11996,14 +12159,16 @@ DSDPY
 
   # 2. -t: verified on the device, nothing downloaded.
   rc=0
-  timeout --foreground -k 10 120 "$GZSTD" -t --direct-stage -v "$dsd_zst" >/dev/null 2>"$dsd_log" || rc=$?
+  rm -f "$dsd_stats"
+  timeout --foreground -k 10 120 "$GZSTD" -t --direct-stage -v --stats-json "$dsd_stats" "$dsd_zst" >/dev/null 2>"$dsd_log" || rc=$?
   dsd_have=$(dsd_got "$dsd_log")
-  if [[ $rc -eq 0 && "$dsd_have" == "$dsd_want" ]]; then
+  if [[ $rc -eq 0 && "$dsd_have" == "$dsd_want" ]] && dsd_stats_ok; then
     pass "--direct-stage -t stages every frame and verifies"
   else
     fail "--direct-stage -t stages every frame and verifies" \
-         "exit $rc; staged '${dsd_have:-nothing}', expected '$dsd_want'"
+         "exit $rc; staged '${dsd_have:-nothing}', expected '$dsd_want'; stats must include the seek table"
   fi
+  rm -f "$dsd_stats"
 
   # 3. -d to standard output: the writer is the ordinary one, so a pipe works.
   rc=0
@@ -15610,10 +15775,54 @@ else
     pass "-t --tar reports the true stream size (not content-only)"
   else fail "-t --tar stream size" "t=$t_bytes stream=$real_stream (line: $t_line)"; fi
 
-  # 2. truncated archive: -t --tar must reject it (exit 4).
+  # 2. truncated archive: -t --tar must reject it (exit 4).  Test the input's
+  #    integrity even when the tar stream itself is complete: verify_tar uses
+  #    DECOMPRESS to feed its validator, but that must not enable -d's clipped
+  #    skippable recovery.  Cover the splitter, FILE tail and BUFFERED tail.
+  vt_why=""
   vsz=$(stat -c%s "$VA"); head -c $((vsz*60/100)) "$VA" > "$TMPDIR/v.trunc.zst"
   "$GZSTD" -t --cpu-only --tar "$TMPDIR/v.trunc.zst" >/dev/null 2>&1
-  [[ $? -eq 4 ]] && pass "-t --tar rejects a truncated archive" || fail "-t --tar truncated" "expected exit 4"
+  [[ $? -eq 4 ]] || vt_why+=" truncated-data"
+  "$GZSTD" -q -d --cpu-only -O --tar "$VA" > "$TMPDIR/v.policy.want" 2>/dev/null \
+    || vt_why+=" extraction-control"
+  for vt_route in splitter streamed buffered; do
+    cp "$VA" "$TMPDIR/v.policy.zst"
+    if [[ $vt_route == buffered ]]; then
+      # Cross the 128 MiB parallel-reader gate with a sparse 129 MiB skippable.
+      printf '\x50\x2a\x4d\x18\x00\x00\x10\x08' >> "$TMPDIR/v.policy.zst"
+      truncate -s $((vsz + 8 + 129 * 1048576)) "$TMPDIR/v.policy.zst"
+    fi
+    if [[ $vt_route != splitter ]]; then
+      # A complete sizeless DATA frame with one empty raw block: tar bytes stay
+      # unchanged, while a later skippable reaches the chosen streaming helper.
+      printf '\x28\xb5\x2f\xfd\x00\x00\x01\x00\x00' >> "$TMPDIR/v.policy.zst"
+    fi
+    printf '\x50\x2a\x4d\x18\x04\x00\x00\x00abcd' >> "$TMPDIR/v.policy.zst"
+    "$GZSTD" -q -t --cpu-only --read-threads=2 --tar "$TMPDIR/v.policy.zst" >/dev/null 2>&1 \
+      || vt_why+=" $vt_route-intact"
+    truncate -s $(( $(stat -c%s "$TMPDIR/v.policy.zst") - 1 )) "$TMPDIR/v.policy.zst"
+    # Extraction still salvages the identical member bytes and warns.
+    "$GZSTD" -q -d --cpu-only --read-threads=2 -O --tar "$TMPDIR/v.policy.zst" \
+      > "$TMPDIR/v.policy.out" 2> "$TMPDIR/v.policy.err" || vt_why+=" $vt_route-extract"
+    cmp -s "$TMPDIR/v.policy.want" "$TMPDIR/v.policy.out" || vt_why+=" $vt_route-bytes"
+    grep -aq 'truncated trailing skippable frame (11 bytes)' "$TMPDIR/v.policy.err" \
+      || vt_why+=" $vt_route-no-warning"
+    for vt_kg in "" --keep-going; do
+      vt_rc=0
+      "$GZSTD" -v --no-progress -t --cpu-only --read-threads=2 $vt_kg --tar "$TMPDIR/v.policy.zst" \
+        >/dev/null 2> "$TMPDIR/v.policy.err" || vt_rc=$?
+      [[ $vt_rc -eq 4 ]] || vt_why+=" $vt_route-test${vt_kg}:$vt_rc"
+      if [[ $vt_route == buffered ]]; then
+        grep -aq 'parallel prefetch: 2 reader threads' "$TMPDIR/v.policy.err" \
+          || vt_why+=" $vt_route-route${vt_kg}"
+        grep -aq "parallel reader can't split it" "$TMPDIR/v.policy.err" \
+          || vt_why+=" $vt_route-no-buffered-tail${vt_kg}"
+      fi
+    done
+  done
+  rm -f "$TMPDIR"/v.policy.*
+  [[ -z "$vt_why" ]] && pass "-t --tar rejects a truncated archive" \
+    || fail "-t --tar truncated" "got$vt_why"
 
   # 3. content checksum: a bit-flip in the compressed stream is caught (exit 4)
   #    on plain -t — proves ZSTD_c_checksumFlag is active.

@@ -107,8 +107,10 @@ and -t.
 the gap was PIPES (a single-frame archive on stdin was read whole before decoding; the compressor
 read and wrote on one thread), now faster than zstd both ways. What is still open:
 
-1. **`>>` stays on the buffered writer**, 3.5x slower than O_DIRECT on a redirected file. Adopting an
-   append descriptor would mean positional writes at a base another appender could also be writing to.
+1. ~~**`>>` stays on the buffered writer**~~, 3.5x slower than O_DIRECT on a redirected file. DECIDED
+   v0.18.27 (owner): an explicit `--direct` adopts it at the file's end (a 20 GB append 20.3-23.2 s ->
+   6.84-7.11 s); the default and `--no-direct` keep appending through the descriptor, because the
+   O_DIRECT writer's positional writes overwrite what another appender adds during the run.
 2. **`--gds-only` peer-to-peer output declines a descriptor that already holds output**, so the second
    archive of `{ gzstd --gds-only -c a; gzstd --gds-only -c b; } > f` is written device-to-host.
 3. ~~**The `--tar` GPU decode pool has no stall guard.**~~ CLOSED v0.18.0: a watchdog hands a stuck
@@ -551,9 +553,21 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      of work, really 400) -- and it does not matter here: `--hybrid` takes the same time and its GPU
      does no batch.  The seek table gives exact sizes; take it only when an archive this misjudges is
      measured to want the GPU (a few-core box, several GiB of work under a 256 MiB archive).
-   - **OPEN, pre-existing: `output_bytes` (and `-t`'s `input_bytes`) leave out the seek-table
-     trailer** -- 5,014 reported for a 5,039-byte archive.  They count data frames; say so, or count
-     the trailer.
+   - ~~**`output_bytes` (and `-t`'s `input_bytes`) leave out the seek-table trailer**~~ -- 5,014
+     reported for a 5,039-byte archive.  FIXED v0.18.27 (owner: count it): both count every byte of
+     the archive, and `skippable_bytes` says how many are skippable frames.
+
+27. **`--tar` extraction and `-t --tar` write no `--stats-json`** (found v0.18.27).  `gzstd -d --tar
+    --stats-json s.json a.tzst -C d` and `-t --tar` exit 0 and leave no file; `--tar` create writes
+    one.  `--help` promises a run summary for any run.  Either write the record from the extraction
+    path (it has its own meter and byte counts: archive bytes in, member bytes out) or refuse the
+    combination at parse time as a usage error.  Owner's call; not a data defect.
+    Also found then, pre-existing (v0.18.26 the same): when a GPU decompress batch fails after
+    delivering frames, the batch-end `read_bytes` credit is skipped.  Catch requeues only the
+    undelivered tail, which CPU rescue credits; the already delivered prefix is never counted
+    (12.6 MB short of a 203 MB archive under `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST`, on `-d`,
+    `--gpu-only`, `--direct-stage`, `-t`).  Fix the GPU delivery accounting with a cell on the hook,
+    not in passing.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

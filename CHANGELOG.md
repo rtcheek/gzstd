@@ -1,12 +1,146 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.26  
+**Covers:** v0.9.50 → v0.18.27  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.27 — `--stats-json` counts all of an archive (`skippable_bytes` says how much is seek table); `>>` takes the O_DIRECT writer under an explicit `--direct` (a 20 GB append 3.1x faster)
+
+### `--stats-json`: an archive's bytes are all of its bytes
+
+Every gzstd archive ends in skippable frames: the seek table, and `--tar`'s member index before
+it.  A compress wrote its `--stats-json` record before `append_tar_index` appended them, and `-d`
+and `-t` counted only the bytes that reached a decoder, so both left them out while `-v` and `ls`
+gave the file's size:
+
+| archive | size | `output_bytes` (compress) / `input_bytes` (`-d`, `-t`) before |
+|---|---|---|
+| 5,000 random bytes | 5,039 | 5,014 |
+| 40 MiB random | 41,944,083 | 41,944,042 |
+| `--tar` of a 1,001-file JSON tree | 1,437,141 | 1,426,697 (10,444 left out, 0.7%) |
+| the first two, concatenated | 41,949,122 | 41,949,056 (a trailer in the middle too) |
+
+Both now count them, and a new `skippable_bytes` says how many there were: in the output when
+compressing, in the input when decoding (any skippable frame, gzstd's or not), so the data-only
+figure is still one subtraction away.  The compress record is written once the trailer is
+(`elapsed_sec` is still measured where it was), which `append_tar_index` now counts in
+`Meter::index_bytes`.  The decode side needed no new counting: the three frame splitters already
+kept `skipped_input_bytes` for the GPU tuner's cost gate, and nothing reported it.  The
+exception was the streaming decoder (a frame of 256 MiB or more, or one with no content size, as
+zstd writes from a pipe), which hands skippable frames to zstd and so counted them as read; it
+moves them to skipped when the frame ends.
+
+Checked against an independent frame walker: nine archives (one frame; several; two
+concatenated; a 200 MiB archive on the large-file reader; one 203 MiB frame; a sizeless frame
+with and without a skippable frame after it; skippable frames leading and trailing) through
+file, pipe, redirect, `-t` and `-t` from a pipe on both builds, plus `--gpu-only`, `--hybrid`,
+`--cpu-only` and `-t --gpu-only` on the GPU build: `input_bytes` is the file's size and
+`skippable_bytes` the walker's count in all 126 cells.  Compress, 29 cells per build (32 with
+`--gpu-only`): `-o`, `-c > f`, `-c | cat`, `--direct`, `--no-direct`, `--no-index` (0),
+`--sliding-window` (no trailer, 0), `--verify`, three inputs on one stdout, `-r`, and `--tar` to
+`-o`, to `> f` and with `--no-index`.  The decompress matrix's bytes, exit codes and messages are
+unchanged (22 archives x 13 modes, 286 cells per build): its
+`--stats-json` records differ only in the version, `input_bytes` and the new field, and one 300
+MiB dense output's allocation by 8 sectors, the noise seen before.
+
+Found while checking, not changed (ROADMAP 27): `--tar` extraction and `-t --tar` write no
+`--stats-json` at all, exiting 0 with no file; and, as in v0.18.26, when a GPU batch fails after
+delivering frames, that delivered prefix's compressed bytes are missing from `input_bytes`
+(12.6 MB of a 203 MB archive with `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST`; `skippable_bytes` stays
+right).  The fault skips the batch-end credit; CPU rescue credits the undelivered tail only.
+
+### `>>` takes the O_DIRECT writer when `--direct` is given
+
+With `> f` a regular file behind stdout is written by the O_DIRECT writer (on a GPU build on
+PCIe Gen4+, the default; anywhere with `--direct`).  `>>` was always left on the buffered writer,
+and an explicit `--direct` was dropped without a word.  Appending has a promise the O_DIRECT
+writer cannot keep by itself: the kernel puts every write at the end of the file as it is at
+that moment, even with other processes appending.  The O_DIRECT writer writes by position from
+the end as it was at adoption, and finalize cuts the file at its own end, so anything another
+appender adds during the run is overwritten or cut off, at exit 0.  So the default stays as it
+was, and an explicit `--direct` now means "this command is the file's only writer": the file is
+adopted at its end, through the base offset `{ a; b; } > f` has used since v0.17.89, with
+nothing truncated (the file must still end where this output begins).  `-v` says so: "[O_DIRECT]
+stdout append redirect using O_DIRECT from byte N".
+
+| 20 GB decode (5.8 GB archive, warm) appended to a 1,000-byte file, flush included, ABBA x3 | wall |
+|---|---|
+| `>>`, default (buffered) | 20.3-23.2 s |
+| `>>`, `--direct` | 6.84-7.11 s |
+| `>`, default (O_DIRECT on Gen5), for reference | 6.85-6.95 s |
+
+Checked on both builds, bytes compared: `-dc >> f`, `>>` an empty file, `-dc a b >> f`, `-c >> f`
+(the earlier bytes kept, the archive decodes), `{ gzstd; gzstd; echo; } >> f`, `--sparse`, a
+`--verify` rebuild (only its own output discarded), `--tar -c >> f` (lists 1,001 entries, `-t`
+passes), and tmpfs; strace shows positional writes only under `--direct`, ordinary writes to the
+descriptor by default and with `--no-direct`.  A sparse output gets holes when the file's end is
+block-aligned; at an unaligned end it gets the zeros written, as `{ a; b; } > f` always has (the
+bytes are right either way).
+
+### Pre-tag review (Codex GPT-6.1-Sol, max)
+
+Round 1: no defect in the `>>` change; four in the counting, three reproduced here before fixing:
+- **the staged routes** (`--direct-stage`, `--gds-only`, decode and `-t`) read frames by the seek
+  table and never pass a splitter, so `input_bytes` still left out the 153-byte table of a 203 MB
+  archive and `skippable_bytes` was 0.  The table parse now keeps the trailing extent, credited
+  once the route can no longer demote (a GPU fault after that does not count it twice: checked);
+- **the parallel reader's buffered tail** (a sizeless frame after sized ones in a file over 128
+  MiB) is decoded by `decompress_from_buffer`, which counted its skippable frames as read: 12 bytes;
+- **a truncated trailing skippable frame**, which every decoder tolerates with a warning, was
+  counted nowhere by the splitters and as read by the streaming decoder: 11 bytes of 5,050;
+- **`elapsed_sec` over several compressed inputs**: the run's start is derived from the first
+  record's write time less its elapsed, and the write now comes after the finalize, so the first
+  input's finalize was subtracted from the run.  Arithmetic, not observed (the finalize here is too
+  short to see); the measurement time now travels with the elapsed.
+
+Round 2: the staged credit, the buffered-tail transfer and the elapsed fix CORRECT; the truncated
+trailer INCOMPLETE.  The parallel reader's buffered tail (`decompress_from_buffer`) still died on
+it -- exit 4, "truncated zstd stream", no record -- where every other decoder warns and exits 0,
+since v0.18.26 at least (reproduced on both).  It now applies the same rule: `-d` keeps the
+recovered bytes and counts the clipped frame as skipped; `-t`, and a truncated data frame, stay
+fatal.  The rescue gap above is the GPU-delivered prefix of the failed batch, not the CPU-rescued
+tail (corrected in ROADMAP 27).  Round 3: that fix INCOMPLETE, and the gap older than it.  `-t
+--tar` decodes in decompress mode so its tar validator gets the bytes, and so took `-d`'s leniency:
+an archive whose trailer was cut passed `-t --tar` with a warning (exit 0) where `-t` fails it
+(exit 4) -- on every route in v0.18.26, and on the buffered tail too once round 2 made it lenient.
+The tar test now keeps `-t`'s rule (`Options::tar_test`): exit 4 on the splitter, the streaming
+decoder and the buffered tail, with and without `--keep-going`; extraction still recovers every
+member and warns.  Round 4: that fix CORRECT, nothing else rewrites the mode of a test (listing
+and calibration aside, which own their runs): SAFE TO TAG.
+
+### Cells
+
+**Cells** (default run, no GPU; EXPECTED 564/864, no-GPU deltas unchanged): "--stats-json counts an
+archive's skippable frames, both ways" (compress, `-d`, `-t`, two concatenated archives, a
+hand-built frame with no content size followed by a 12-byte skippable frame, for the streaming
+decoder, the seek table's size from its own footer; from review: a truncated trailing skippable
+frame through the splitter and the streaming decoder, and a file over 128 MiB -- a sparse skippable
+frame -- for the parallel reader's own truncated trailer and its buffered tail, plain and truncated
+(`-d` recovers, `-t` exits 4), the route asserted at `-v`) and "an append redirect takes the
+O_DIRECT writer only under an explicit --direct" (`-dc`, `-c`, the default and `--no-direct`, a
+`--verify` rebuild, strace where installed; skip_host without O_DIRECT in `$TMPDIR`).  Both pass on
+both builds; the v0.18.26 binaries fail every arm.  Mutants, each caught by its arm: the streaming
+decoder's move undone; the compress record written before the trailer; `-d`'s sum without the
+skipped bytes; `>>` never adopted; `>>` adopted under the Gen4 default too (GPU build, this Gen5
+host); and from review, each fix undone in turn (the buffered tail, the streaming decoder's
+truncated trailer, the parallel reader's, the sequential splitter's, the staged credit, and the
+buffered tail's tolerance, whose control is the round-1 build): each caught.  The GPU cell
+"--direct-stage -d stages every frame and round-trips" and its `-t` sibling now also check the
+record's three byte counts.  The streaming arm's first fixture, a `--sliding-window` archive from
+stdin, let its mutant through: gzstd records the content size even then, so it never reached that
+decoder. From round 3, the default cell "-t --tar rejects a truncated archive" also cuts the trailer
+on the splitter, the streaming decoder and the buffered tail: exit 4 with and without
+`--keep-going`, extraction recovering the same member bytes with the warning; the v0.18.26 and
+round-2 binaries fail it.
+
+**Suites** (the 256-core, 8x H100 server, `CUDA_VISIBLE_DEVICES` unset, final tree): CPU-only
+416/0/122 of 538 (as expected: -148 no GPU); `-e` 863/0/1 of 864 (-1 this host could not exercise:
+trivial-park; one GPU busy with another user's work throughout); no drift note.  Every new and
+changed cell passed outright.
 
 ## v0.18.26 — a GPU build decides a one-file job 1.9 ms faster (the PCIe generation from the driver's GPU list); `-d -r` over small files 16% faster (no writeback hint below one frame)
 

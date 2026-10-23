@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.26";
+static constexpr const char * GZSTD_VERSION = "0.18.27";
 //
 // Architecture overview:
 //
@@ -2982,6 +2982,9 @@ struct Options {
   // member path (files to archive on create; on -d/-l --tar the first is the
   // archive and the rest are member selectors, exactly like tar's name args).
   bool tar_mode = false;
+  // verify_tar decodes into the tar validator with mode DECOMPRESS so output
+  // reaches its sink.  Retain -t's strict input policy through that rewrite.
+  bool tar_test = false;
   std::vector<std::string> tar_sources;  // compress: files/dirs to archive; decompress: input archive(s) (post-`--tar`)
   // -d/-l --tar ARCHIVE MEMBER...: GNU tar member selection.  Each selector
   // names an entry (a directory selects its whole subtree) and remembers the
@@ -4409,7 +4412,7 @@ static void print_help()
 "                      (default: off; slower for O_DIRECT — see --preallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache; auto-on for\n"
 "                      Gen4+ compress & decompress, --no-direct to force\n"
-"                      buffered)\n"
+"                      buffered; a >> redirect only when given)\n"
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
@@ -4903,6 +4906,12 @@ static void print_help_long()
 "     forces buffered I/O (e.g. to benchmark the buffered baseline on\n"
 "     Gen4).  O_DIRECT can expose the app to NVMe (NVM Express)\n"
 "     garbage-collection (GC) stalls and journal commits.\n"
+"     An APPEND redirect (>> FILE) takes O_DIRECT only when --direct is\n"
+"     given: its writes start at the file's end as it was when the run\n"
+"     began, so anything another process appends to FILE meanwhile is\n"
+"     overwritten.  --direct says this command is FILE's only writer;\n"
+"     without it >> appends through the descriptor, safe with any\n"
+"     number of writers (and about 3x slower on a large output).\n"
 "\n"
 "  --mmap / --no-mmap    (default: on, with a kernel auto-gate)\n"
 "     Use a zero-copy memory-mapped reader for regular-file inputs.\n"
@@ -5889,6 +5898,9 @@ static void print_help_long()
 "                    is not colour and stays.\n"
 "  --stats-json FILE Write a machine-readable run summary to FILE.  With\n"
 "                    several inputs it is the run's: files, bytes summed.\n"
+"                    input_bytes and output_bytes count all of an archive;\n"
+"                    skippable_bytes says how much of it is skippable\n"
+"                    frames (the seek table; --tar's member index).\n"
 "\n"
 "============================================================\n"
 " EXIT CODES\n"
@@ -6499,6 +6511,9 @@ struct Meter {
   // exploration gate can subtract bytes already consumed by the reader.
   std::atomic< uint64_t > skipped_input_bytes { 0 };
   std::atomic< uint64_t > wrote_bytes  { 0 };
+  // Compress: the trailer append_tar_index wrote (the seek table, and --tar's
+  // member index), also counted in wrote_bytes.  --stats-json reports it.
+  std::atomic< uint64_t > index_bytes  { 0 };
   std::atomic< uint64_t > tasks_done   { 0 };  // frames handed to writer (written in-order)
   std::atomic< uint64_t > total_frames { 0 };  // total frames to process (set by producer)
   std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
@@ -6556,7 +6571,7 @@ struct Meter {
   // Zero all counters and restart the clock — used when a GPU fault forces a
   // full CPU-only rebuild so the rebuild's progress/summary start fresh.
   void reset() {
-    read_bytes = 0; skipped_input_bytes = 0; wrote_bytes = 0;
+    read_bytes = 0; skipped_input_bytes = 0; wrote_bytes = 0; index_bytes = 0;
     tasks_done = 0; total_frames = 0;
     total_out = 0; total_out_final = false; read_elapsed_ms = 0;
     writer_disk_ns = 0; writer_iowrite_ns = 0; writer_hol_ns = 0;
@@ -13287,7 +13302,7 @@ static bool trailing_is_truncated_skippable(const unsigned char * p, size_t n)
 }
 
 // ...and MAY we tolerate them?  Recognising the shape is not the whole decision,
-// and keeping the policy in one place is deliberate: THREE readers reach this
+// and keeping the policy in one place is deliberate: FOUR readers reach this
 // question, and a divergence between them is exactly what let `gzstd -t` pass a
 // damaged archive undetected for five review rounds.
 //
@@ -13310,6 +13325,7 @@ static bool trailing_skippable_tolerated(const Options & opt, uint64_t frames,
 {
   return frames > 0
       && opt.mode != Mode::TEST
+      && !opt.tar_test
       && trailing_is_truncated_skippable(p, n);
 }
 
@@ -15550,7 +15566,7 @@ static GzWritePolicy gz_write_policy(FILE * out, const Options & opt)
   //     to the end of the file whatever the position is, so the seeks did
   //     nothing and each run of zeros was DROPPED from the output at exit 0.
   // Where a hole cannot be made the zeros are written, --sparse or not.
-  bool sparse_capable = (g_direct_writer != nullptr);   // adopted: regular, not append
+  bool sparse_capable = (g_direct_writer != nullptr);   // adopted: regular, positional writes
 #ifndef _WIN32
   if (!sparse_capable && out) {
     struct stat sst{};
@@ -17223,6 +17239,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
   sck.frame_off_ = base_off;
   sck.out_total_ = base_off;
   uint64_t fb_frames = 0;
+  uint64_t data_frames = 0;   // trailer recovery requires a completed DATA frame
   {
     const unsigned char * ip = (const unsigned char *)input.data();
     sck.head(ip, input.size());
@@ -17260,6 +17277,14 @@ static void decompress_from_buffer(const std::vector<char> & input,
       // Frame boundary: settle this frame's checksum, then arm the next one from
       // the bytes that follow -- its header descriptor says whether it carries a
       // checksum of its own.
+      const uint32_t magic = zin.pos - frame_at >= 4
+                           ? rd_le32(input.data() + frame_at) : 0;
+      if (magic == 0xFD2FB528u) ++data_frames;
+      if (m && (magic & 0xFFFFFFF0u) == 0x184D2A50u) {
+        const uint64_t skipped = zin.pos - frame_at;
+        m->read_bytes.fetch_sub(skipped, std::memory_order_relaxed);
+        m->skipped_input_bytes.fetch_add(skipped, std::memory_order_relaxed);
+      }
       sck.frame_end(fb_frames++);
       frame_at = zin.pos;   // one call never crosses a frame boundary
       if (zin.pos < zin.size)
@@ -17267,9 +17292,20 @@ static void decompress_from_buffer(const std::vector<char> & input,
     }
   }
 
-  // ret > 0 means ZSTD expected more input  the stream was truncated mid-frame.
-  if (ret > 0)
-    die_data("truncated zstd stream (expected more data)");
+  // The parallel reader's sizeless tail uses this decoder.  Apply the same
+  // trailer policy as the FILE streamer: -d recovers a clipped skippable and
+  // counts its physical bytes; -t and a truncated DATA frame remain fatal.
+  if (ret > 0) {
+    const size_t tail = input.size() - frame_at;
+    if (!trailing_skippable_tolerated(opt, data_frames,
+            (const unsigned char *)input.data() + frame_at, tail))
+      die_data("truncated zstd stream (expected more data)");
+    warn_damaged_trailer(opt, tail);
+    if (m) {
+      m->read_bytes.fetch_sub(tail, std::memory_order_relaxed);
+      m->skipped_input_bytes.fetch_add(tail, std::memory_order_relaxed);
+    }
+  }
 
   ZSTD_freeDCtx(dctx);
 }
@@ -17729,6 +17765,13 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
           skip_big = false;
           skip_tail_n = 0;
         }
+        // A skippable frame went through the decoder here (zstd passes over
+        // it), so feed() counted it as read; the readers count theirs as
+        // skipped, and --stats-json reports them (v0.18.27).
+        if (m && head_n >= 4 && (rd_le32(head) & 0xFFFFFFF0u) == 0x184D2A50u) {
+          m->read_bytes.fetch_sub(cur_len, std::memory_order_relaxed);
+          m->skipped_input_bytes.fetch_add(cur_len, std::memory_order_relaxed);
+        }
         // frame_end may exit on a seek-table checksum mismatch.  The old
         // synchronous writer had already emitted this frame at that point.
         if (aio && sck.mismatch()) drain();
@@ -17868,6 +17911,10 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
     if (trailing_skippable_tolerated(opt, data_frames, head,
                                      (size_t)std::min<uint64_t>(cur_len, SIZE_MAX))) {
       warn_damaged_trailer(opt, (size_t)cur_len);
+      if (m) {
+        m->read_bytes.fetch_sub(cur_len, std::memory_order_relaxed);
+        m->skipped_input_bytes.fetch_add(cur_len, std::memory_order_relaxed);
+      }
     } else if (opt.keep_going) {
       // --keep-going MUST MEAN THE SAME THING ON EVERY ROUTE.  The splitter
       // records a framing break here and exits 7 with the recovered output; this
@@ -20743,12 +20790,13 @@ static size_t stream_frames_to_queue_mt(
   // in the stream.
   if (!aborted && !failed.load(std::memory_order_relaxed) && !carry.empty()) {
     if (trailing_skippable_tolerated(opt, (uint64_t)seq,
-                                     (const unsigned char *)carry.data(), carry.size()))
+                                     (const unsigned char *)carry.data(), carry.size())) {
       // Previously this reader stayed silent even at -vvv — it merely skipped
       // the fail() — so the same damaged archive warned on one path and said
       // nothing on the other.
       warn_damaged_trailer(opt, carry.size());
-    else
+      if (m) m->skipped_input_bytes.fetch_add(carry.size(), std::memory_order_relaxed);
+    } else
       fail("truncated zstd stream: " + std::to_string(carry.size())
            + " trailing bytes after " + std::to_string(seq) + " frames");
   }
@@ -21359,6 +21407,7 @@ static size_t stream_frames_to_queue(
       && trailing_skippable_tolerated(opt, (uint64_t)seq,
              (const unsigned char *)(buf.data() + buf_off), leftover)) {
     warn_damaged_trailer(opt, leftover);
+    if (m) m->skipped_input_bytes.fetch_add(leftover, std::memory_order_relaxed);
     leftover = 0;
   }
   // TRAILING BYTES, judged against TOTAL frames — not against `seq`.
@@ -31278,6 +31327,8 @@ private:
 // validate.
 struct TarSeekTable {
   uint64_t tar_size = 0;              // total tar-stream size
+  // parse_foreign_seek_table: trailing skippable frames, including the table.
+  uint64_t skippable_bytes = 0;
   std::vector<uint64_t> c_off;        // nframes+1 prefix sums (archive offsets)
   std::vector<uint64_t> u_off;        // nframes+1 prefix sums (tar offsets)
   // Per-frame content checksums, when the table carries them (Checksum_Flag):
@@ -31620,6 +31671,7 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     if (std::fseek(in, 0, SEEK_SET) != 0 || std::fread(mg, 1, 4, in) != 4
         || rd_le32(mg) != 0xFD2FB528u) break;
     st.tar_size = u;
+    st.skippable_bytes = end - co.back();
     st.c_off = std::move(co);
     st.u_off = std::move(uo);
     st.checksums = std::move(cks);
@@ -42721,6 +42773,9 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     m->reader_threads.store(1, std::memory_order_relaxed);
     m->total_out.store(st.u_off.back(), std::memory_order_relaxed);
     m->total_out_final.store(true, std::memory_order_relaxed);
+    // This producer bypasses the frame splitters, which count these bytes on
+    // their own routes.  Credit only after every possible demotion above.
+    m->skipped_input_bytes.fetch_add(st.skippable_bytes, std::memory_order_relaxed);
   }
   g_adapt_src_path.store("cufile", std::memory_order_relaxed);
   // DO NOT credit read_bytes here.  The GPU worker already adds each batch's
@@ -44360,8 +44415,17 @@ gds_out_declined:
 // rewritten after each input, so a run that fails part way leaves the totals
 // of the inputs that finished.  One input writes what it always did, plus
 // "files": 1.
+//
+// THE ARCHIVE'S BYTES ARE ALL OF ITS BYTES (v0.18.27).  output_bytes was
+// written before the trailer was appended, and -d/-t's input_bytes counted only
+// what reached a decoder, so both left out the skippable frames -- the seek
+// table every gzstd archive ends with, and --tar's member index: a 5,039-byte
+// archive reported 5,014, a --tar archive of 1,437,141 bytes 1,426,697, while
+// -v and ls said the file's size.  Both now count them, and skippable_bytes says
+// how many of them there were: in the output when compressing, in the input when
+// decoding (any skippable frame there, gzstd's or not).
 struct GzStatsRun {
-  uint64_t files = 0, in_bytes = 0, out_bytes = 0;
+  uint64_t files = 0, in_bytes = 0, out_bytes = 0, skippable_bytes = 0;
   int cpu_threads = 0;
   bool gpu = false;                       // any input's final pass ran a GPU pipeline
   std::vector<GpuPassDevice> devices;     // summed per device
@@ -44374,16 +44438,26 @@ static GzStatsRun g_stats_run;
 #endif
 static int write_stats_json(const std::string & path, const Options & opt, const Meter & meter,
                             double elapsed_sec, int cpu_threads,
-                            const CompressPassStats * gpu = nullptr)
+                            const CompressPassStats * gpu = nullptr,
+                            std::chrono::steady_clock::time_point measured_at =
+                                std::chrono::steady_clock::now())
 {
   GzStatsRun & run = g_stats_run;
-  const auto now = std::chrono::steady_clock::now();
+  // Compress is written after finalization; its saved measurement time keeps
+  // that delay from shifting the first input's start or a later input's end.
+  const auto now = measured_at;
   if (run.files == 0)
     run.start = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                           std::chrono::duration<double>(elapsed_sec));
   ++run.files;
-  run.in_bytes  += meter.read_bytes.load();
+  // The readers keep skippable input frames out of read_bytes (see Meter); a
+  // compress's trailer is already in wrote_bytes.
+  const bool compress = opt.mode == Mode::COMPRESS;
+  const uint64_t skippable = compress ? meter.index_bytes.load()
+                                      : meter.skipped_input_bytes.load();
+  run.in_bytes  += meter.read_bytes.load() + (compress ? 0 : skippable);
   run.out_bytes += meter.wrote_bytes.load();
+  run.skippable_bytes += skippable;
   run.cpu_threads = std::max(run.cpu_threads, cpu_threads);
   if (gpu) {
     run.gpu = true;
@@ -44413,6 +44487,7 @@ static int write_stats_json(const std::string & path, const Options & opt, const
      << "  \"elapsed_sec\": " << std::fixed << std::setprecision(6) << run_elapsed << ",\n"
      << "  \"input_bytes\": " << run.in_bytes << ",\n"
      << "  \"output_bytes\": " << run.out_bytes << ",\n"
+     << "  \"skippable_bytes\": " << run.skippable_bytes << ",\n"
      << "  \"cpu\": { \"threads\": " << run.cpu_threads << " }";
   if (run.gpu) {
     js << ",\n  \"gpu\": { \"devices\": [";
@@ -45162,6 +45237,7 @@ static int verify_tar(const Options & opt, Meter * m)
     Options dopt = opt;
     dopt.sparse_mode = 0;
     dopt.unsafe_overwrite = true;
+    dopt.tar_test = true;          // the sink needs output; trailer policy still needs -t
     dopt.mode = Mode::DECOMPRESS;  // produce the tar stream (routed to the sink by
                                    // writer_thread / the streaming helpers); the
                                    // validate-only Extractor gives the test
@@ -45187,7 +45263,7 @@ static int verify_tar(const Options & opt, Meter * m)
       decompress_cpu_mt(in, nullptr, dopt, m);
 #endif
     }
-    sink.close();          // idempotent: writer_thread also closes on normal exit
+    sink.close();          // EOF only after the writer and any streaming tail finish
     exth.join();
     g_tar_decomp_sink = nullptr;
     if (opt.verbosity >= V_DEBUG) {
@@ -45828,6 +45904,7 @@ static void append_tar_index(int dfd, FILE * f, Meter & meter) {
   else if (f)   ok = robust_fwrite(frame.data(), frame.size(), f) == frame.size();
   if (!ok) die_io("failed to append tar member index");
   meter.wrote_bytes.fetch_add(frame.size(), std::memory_order_relaxed);
+  meter.index_bytes.fetch_add(frame.size(), std::memory_order_relaxed);
 }
 #endif
 
@@ -48210,7 +48287,19 @@ static int gzstd_main(int argc, char ** argv)
       struct stat st;
       if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;   // S_ISREG is the real gate
       int flags = fcntl(fd, F_GETFL);
-      if (flags < 0 || (flags & O_APPEND)) break;                // append: never truncate
+      if (flags < 0) break;
+      // AN APPEND REDIRECT ONLY WHEN --direct IS GIVEN (v0.18.27).  `>>` asks the
+      // kernel to put every write at the end of the file as it is at that moment,
+      // even with other processes appending too.  These writes are positional,
+      // from the end as it was at adoption, and finalize cuts the file to this
+      // output's end -- right while nothing else writes the file, but bytes
+      // another appender adds during the run are overwritten or cut off, at exit
+      // 0.  So `>>` stayed on the buffered writer, 3.5x slower on a large output.
+      // An explicit --direct is the caller saying this command is the file's only
+      // writer; the Gen4 default never says it.  Nothing is truncated: the file
+      // must still end where this output begins.
+      const bool append = (flags & O_APPEND) != 0;
+      if (append && !opt.direct_io_user_set) break;
       // AT OFFSET ZERO, OR AT THE END OF WHAT IS ALREADY THERE (see out_base
       // above).  v0.17.87 adopted only at zero and v0.17.88 kept that, sending
       // everything after the first output of a redirection to the buffered
@@ -48221,7 +48310,7 @@ static int gzstd_main(int argc, char ** argv)
       // in the middle of existing data (`exec 1<>old` after a seek) stays on
       // the buffered writer, which appends at the position and touches nothing
       // else.
-      if (out_base != 0 && st.st_size != out_base) break;
+      if ((out_base != 0 || append) && st.st_size != out_base) break;
 #ifdef HAVE_NVCOMP
       // This is a caller-owned file, so die() cannot restore its previous
       // contents if a later --gpu-only check finds no usable device.
@@ -48248,7 +48337,7 @@ static int gzstd_main(int argc, char ** argv)
         die_io("cannot flush stdout before O_DIRECT adoption");
       // (At a non-zero base nothing is truncated and nothing rewound: the file
       // already ends where this output begins.)
-      if (out_base == 0) {
+      if (out_base == 0 && !append) {
         if (::ftruncate(fd, 0) != 0)
           die_io("cannot truncate redirected stdout (" + std::string(std::strerror(errno)) + ")");
         if (::lseek(fd, 0, SEEK_SET) == (off_t)-1)
@@ -48267,7 +48356,11 @@ static int gzstd_main(int argc, char ** argv)
       else {
         out = nullptr;
         direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "[O_DIRECT] stdout redirect using O_DIRECT (--direct)\n");
+        vlog(V_VERBOSE, opt, append
+             ? "[O_DIRECT] stdout append redirect using O_DIRECT from byte "
+               + std::to_string((long long)out_base) + " (--direct: this command "
+               "must be the file's only writer)\n"
+             : std::string("[O_DIRECT] stdout redirect using O_DIRECT (--direct)\n"));
       }
       // If open failed, fall through to normal fwrite via stdout
     } while (false);
@@ -48334,6 +48427,10 @@ static int gzstd_main(int argc, char ** argv)
   } prog_join{prog_thr, prog_done};
 
   const auto t0 = std::chrono::steady_clock::now();
+  // A compress's --stats-json, written once its trailer is (see GzStatsRun).
+  struct { bool due = false; double elapsed = 0; int threads = 0;
+           std::chrono::steady_clock::time_point measured_at{};
+           const CompressPassStats * gpu = nullptr; } compress_stats;
   if (opt.mode == Mode::COMPRESS) {
     // Warn if input looks like it's already zstd-compressed
     if (opt.input.size() > 4
@@ -48702,10 +48799,12 @@ static int gzstd_main(int argc, char ** argv)
         threads = gpu->cpu_threads;
       }
 #endif
-      double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
-          std::chrono::steady_clock::now() - t0).count();
-      stats_json_errno = write_stats_json(opt.stats_json, opt, meter, elapsed, threads, gpu);
-      stats_json_failed = stats_json_errno != 0;
+      compress_stats.due = true;
+      compress_stats.measured_at = std::chrono::steady_clock::now();
+      compress_stats.elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
+          compress_stats.measured_at - t0).count();
+      compress_stats.threads = threads;
+      compress_stats.gpu = gpu;
     }
   } else {
     // Decompression / test mode
@@ -48973,6 +49072,12 @@ static int gzstd_main(int argc, char ** argv)
   // (the O_DIRECT path appended via the writer's fd above and cleared it).
   append_tar_index(-1, out, meter);
 #endif
+  if (compress_stats.due) {
+    stats_json_errno = write_stats_json(opt.stats_json, opt, meter, compress_stats.elapsed,
+                                        compress_stats.threads, compress_stats.gpu,
+                                        compress_stats.measured_at);
+    stats_json_failed = stats_json_errno != 0;
+  }
 
   if (!to_stdout) {
     if (out) {
