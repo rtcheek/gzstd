@@ -622,8 +622,12 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=564
-$EXTENSIVE && EXPECTED_TESTS=864
+EXPECTED_TESTS=567
+$EXTENSIVE && EXPECTED_TESTS=867
+# v0.18.28: +3 default cells, no GPU (--stats-json for -d --tar and -t --tar counts what
+# each route read; --stats-json beside --tar never replaces an archive or an extracted
+# file; --stats-json cpu.threads on decode is the CPU pool that decoded): 564 -> 567,
+# 864 -> 867.  The GPU rescue cell (gpu-only -t integrity) gained arms.
 # v0.18.27: +2 default cells, no GPU (--stats-json counts an archive's skippable frames,
 # both ways; an append redirect takes the O_DIRECT writer only under an explicit --direct):
 # 562 -> 564, 862 -> 864.
@@ -1813,6 +1817,265 @@ LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "--stats-json counts an archive's skippable frames, both ways" \
   || fail "--stats-json counts an archive's skippable frames, both ways" "got$why"
 
+# --TAR'S EXTRACT AND TEST WRITE THE RECORD TOO (v0.18.28).  They returned before the
+# writer, so --stats-json left no file at exit 0 -- or left an older run's record in
+# place.  The numbers are what each route READ: a whole extract or test counts the whole
+# archive like plain -d, whichever route takes it (the parallel partitioner, the walk
+# under --keep-going, stdin, -O, a selection without an index); a selection served by
+# the member index, or by a foreign archive's header-hop, counts the frames it decoded
+# (the hop's own frames once) plus the trailing index and seek table, and output_bytes
+# the tar bytes handed to the extractor.  The oracle does not ask gzstd: frames from the
+# archive's bytes, member offsets from Python's tarfile over zstd's decode, the frame
+# map from the seek table.  -t over two archives checks the per-archive marks.
+TX="$TMPDIR/tx"
+if ! command -v python3 >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 \
+   || ! command -v tar >/dev/null 2>&1; then
+  skip "--stats-json for -d --tar and -t --tar counts what each route read" \
+    "python3, zstd, or tar not available"
+else
+  t0=$(now_ms); why=""
+  rm -rf "$TX"; mkdir -p "$TX/t/s" "$TX/t/d"
+  head -c 1500000 /dev/urandom > "$TX/t/big.bin"
+  head -c 900000 /dev/urandom | base64 > "$TX/t/mid.txt"
+  for i in $(seq 1 60); do head -c $((700 + i * 53)) /dev/urandom | base64 > "$TX/t/s/f$i"; done
+  for i in $(seq 1 20); do head -c $((9000 + i * 701)) /dev/urandom | base64 > "$TX/t/d/g$i"; done
+  "$GZSTD" -q --cpu-only --tar --chunk-size 1 -C "$TX" -o "$TX/g.tzst" t 2>/dev/null || why+=" create:$?"
+  "$GZSTD" -q --cpu-only --tar --chunk-size 1 --no-index -C "$TX" -o "$TX/gn.tzst" t 2>/dev/null \
+    || why+=" create-no-index:$?"
+  tar --format=gnu -C "$TX" -cf "$TX/plain.tar" t
+  cat > "$TX/or.py" <<'TXPY'
+import io, struct, subprocess, sys, tarfile
+mode, path = sys.argv[1], sys.argv[2]
+if mode == 'chunk':                            # t2sz-style: frames (200 kB) + seek table
+    t = open(sys.argv[3], 'rb').read(); out = b''; ents = []
+    step = int(sys.argv[4]) if len(sys.argv) > 4 else 200000
+    for i in range(0, len(t), step):
+        c = subprocess.run(['zstd', '-q', '-3', '-c'], input=t[i:i+step],
+                           capture_output=True).stdout
+        ents.append((len(c), len(t[i:i+step]))); out += c
+    tbl = struct.pack('<II', 0x184D2A5E, len(ents) * 8 + 9)
+    for cz, dz in ents: tbl += struct.pack('<II', cz, dz)
+    open(path, 'wb').write(out + tbl + struct.pack('<IBI', len(ents), 0, 0x8F92EAB1))
+    sys.exit(0)
+d = open(path, 'rb').read(); p = skip = 0
+while p < len(d):                              # the frames, from the bytes alone
+    m = struct.unpack_from('<I', d, p)[0]
+    if m & 0xFFFFFFF0 == 0x184D2A50:
+        n = 8 + struct.unpack_from('<I', d, p + 4)[0]; skip += n; p += n; continue
+    q = p + 4; fhd = d[q]; q += 1
+    single = (fhd >> 5) & 1
+    q += (0 if single else 1) + [0, 1, 2, 4][fhd & 3] + [single, 2, 4, 8][fhd >> 6]
+    while True:
+        bh = int.from_bytes(d[q:q+3], 'little'); q += 3
+        q += 1 if (bh >> 1) & 3 == 1 else bh >> 3
+        if bh & 1: break
+    p = q + (4 if (fhd >> 2) & 1 else 0)
+tar = subprocess.run(['zstd', '-q', '-dc', path], capture_output=True, check=True).stdout
+if mode == 'full': print(len(d), skip, len(tar)); sys.exit(0)
+kind, names = sys.argv[3], sys.argv[4:]
+nf = struct.unpack_from('<I', d, len(d) - 9)[0]
+esz = 12 if d[len(d) - 5] & 0x80 else 8
+at = len(d) - 9 - nf * esz; c = u = 0; co = [0]; uo = [0]
+for k in range(nf):
+    cz, dz = struct.unpack_from('<II', d, at + k * esz); c += cz
+    if dz: u += dz; co.append(c); uo.append(u)
+over = lambda a, b: {k for k in range(len(uo) - 1) if uo[k] < b and uo[k + 1] > a}
+mem = tarfile.open(fileobj=io.BytesIO(tar), mode='r:').getmembers()
+end = lambda m: m.offset_data + (-(-m.size // 512) * 512 if m.isreg() else 0)
+rng = []
+for m in mem:
+    if any(m.name == s or m.name.startswith(s + '/') for s in names):
+        if rng and rng[-1][1] >= m.offset: rng[-1][1] = max(rng[-1][1], end(m))
+        else: rng.append([m.offset, end(m)])
+read = set().union(*(over(a, b) for a, b in rng))
+if kind == 'foreign':                          # the header-hop decodes every header's frames
+    for m in mem: read |= over(m.offset, m.offset_data)
+    read |= over(end(mem[-1]), end(mem[-1]) + 1024)   # it reads both zero blocks
+tail = len(d) - co[-1]
+print(sum(co[k + 1] - co[k] for k in read) + tail, tail, sum(b - a for a, b in rng))
+TXPY
+  python3 -I "$TX/or.py" chunk "$TX/f.tzst" "$TX/plain.tar" || why+=" foreign-fixture"
+  tx_run() {  # tx_run LABEL ROUTE WANT GZSTD-ARGS... : one run (exit $TX_RC, 0), its record checked
+    local label=$1 route=$2 want=$3 rc=0; shift 3
+    rm -rf "$TX/x" "$TX/r.json"; mkdir "$TX/x"
+    "$GZSTD" -v --no-progress "$@" --stats-json "$TX/r.json" > "$TX/out" 2> "$TX/e" \
+      < "${TX_STDIN:-/dev/null}" || rc=$?
+    [[ $rc -eq ${TX_RC:-0} ]] || why+=" $label-exit:$rc"
+    local got="$(sk_get "$TX/r.json" files) $(sk_get "$TX/r.json" input_bytes)"
+    got+=" $(sk_get "$TX/r.json" skippable_bytes) $(sk_get "$TX/r.json" output_bytes)"
+    [[ "$got" == "$want" ]] || why+=" $label:got-${got// /\/}-want-${want// /\/}"
+    case $route in
+      walk) grep -aqE '\[TAR\] (parallel|seek)-extract' "$TX/e" && why+=" $label:not-the-walk" ;;
+      *)    grep -aq "\[TAR\] $route-extract" "$TX/e" || why+=" $label:not-$route" ;;
+    esac
+  }
+  for tx_a in g gn f; do
+    tx_full="1 $(python3 -I "$TX/or.py" full "$TX/$tx_a.tzst")"
+    tx_kind=index; [[ $tx_a == g ]] || tx_kind=foreign
+    tx_route=parallel; [[ $tx_a == gn ]] && tx_route=walk
+    tx_run $tx_a-extract $tx_route "$tx_full" -d --tar "$TX/$tx_a.tzst" -C "$TX/x"
+    diff -r "$TX/t" "$TX/x/t" >/dev/null 2>&1 || why+=" $tx_a-extract-bytes"
+    tx_sel=(t/mid.txt t/s/f7)
+    tx_sroute=walk; tx_want=$tx_full    # no index and no seek table: the walk
+    [[ $tx_a == gn ]] || { tx_sroute=seek
+      tx_want="1 $(python3 -I "$TX/or.py" seek "$TX/$tx_a.tzst" $tx_kind "${tx_sel[@]}")"; }
+    tx_run $tx_a-select $tx_sroute "$tx_want" -d --tar "$TX/$tx_a.tzst" -C "$TX/x" "${tx_sel[@]}"
+    cmp -s "$TX/t/mid.txt" "$TX/x/t/mid.txt" || why+=" $tx_a-select-bytes"
+    [[ $tx_a == gn ]] && continue
+    tx_run $tx_a-keep-going walk "$tx_full" -d --tar --keep-going "$TX/$tx_a.tzst" -C "$TX/x"
+    TX_STDIN="$TX/$tx_a.tzst" tx_run $tx_a-stdin walk "$tx_full" -d --tar - -C "$TX/x"
+    tx_run $tx_a-stdout walk "$tx_full" -d --tar -O "$TX/$tx_a.tzst"
+    tx_want="1 $(python3 -I "$TX/or.py" seek "$TX/$tx_a.tzst" $tx_kind t/d)"
+    tx_run $tx_a-select-stdout seek "$tx_want" -d --tar -O "$TX/$tx_a.tzst" t/d
+    tx_run $tx_a-test walk "$tx_full" -t --tar "$TX/$tx_a.tzst"
+    grep -q '"mode": "test"' "$TX/r.json" 2>/dev/null || why+=" $tx_a-test-mode"
+  done
+  read -r tx_i tx_s tx_o <<< "$(python3 -I "$TX/or.py" full "$TX/g.tzst")"
+  cp "$TX/g.tzst" "$TX/g2.tzst"
+  tx_run test-two walk "2 $((2 * tx_i)) $((2 * tx_s)) $((2 * tx_o))" -t --tar "$TX/g.tzst" "$TX/g2.tzst"
+  # Tar's zero blocks and padding can fill whole frames after the last entry
+  # (two 3-byte members, 512-byte frames: 16 of the 20).  The parallel route
+  # credited their output and never read them (review); the hop reads both
+  # zero blocks, here in frames of their own.  A selection matching nothing
+  # still reads the hop and the table, and outputs nothing (exit 1).
+  python3 -I - "$TX/pad.tar" <<'TXPAD'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w', format=tarfile.USTAR_FORMAT) as tf:
+    for name in ('a', 'b'):
+        info = tarfile.TarInfo(name); info.size = 3
+        tf.addfile(info, io.BytesIO(b'pad'))
+TXPAD
+  python3 -I "$TX/or.py" chunk "$TX/pad.tzst" "$TX/pad.tar" 512 || why+=" padding-fixture"
+  tx_full="1 $(python3 -I "$TX/or.py" full "$TX/pad.tzst")"
+  tx_run padding parallel "$tx_full" -d --tar "$TX/pad.tzst" -C "$TX/x"
+  GZSTD_FORCE_POOL=1 tx_run padding-pool parallel "$tx_full" -d --tar "$TX/pad.tzst" -C "$TX/x"
+  tx_run padding-walk walk "$tx_full" -d --tar --keep-going "$TX/pad.tzst" -C "$TX/x"
+  tx_run padding-test walk "$tx_full" -t --tar "$TX/pad.tzst"
+  tx_want="1 $(python3 -I "$TX/or.py" seek "$TX/pad.tzst" foreign b)"
+  tx_run padding-select seek "$tx_want" -d --tar "$TX/pad.tzst" -C "$TX/x" b
+  [[ "$(cat "$TX/x/b" 2>/dev/null)" == pad ]] || why+=" padding-select-bytes"
+  tx_want="1 $(python3 -I "$TX/or.py" seek "$TX/pad.tzst" foreign missing)"
+  TX_RC=1 tx_run padding-no-match seek "$tx_want" -d --tar "$TX/pad.tzst" -C "$TX/x" missing
+  grep -q '"cpu": { "threads": 1 }' "$TX/r.json" 2>/dev/null || why+=" padding-no-match:cpu.threads"
+  rm -rf "$TX"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--stats-json for -d --tar and -t --tar counts what each route read" \
+    || fail "--stats-json for -d --tar and -t --tar counts what each route read" "got$why"
+fi
+
+# A --TAR RECORD MUST NOT DESTROY WHAT THE RUN READS OR WRITES (v0.18.28).  It is written
+# after each archive, so naming the archive is refused up front, as plain -d refuses an
+# input (-d and -t, through stdin and a symlink too); with -O it would land inside the
+# member stream.  And the extraction can write the record's own name -- an entry of that
+# name, or a symlink there that the record's open would follow -- which the record then
+# replaced with JSON.  The record's directory is held from the start and its name must
+# be unchanged before each write: otherwise the extracted file is kept and the run exits
+# 3.  A directory that only the extraction made is not used either, nor /dev/null once
+# the extraction has replaced the link to it.  A record beside the tree's own files and
+# /dev/null still work; a run that failed keeps its exit code.  From review: --tar
+# create's --files-from list, read before the work, is refused like an input.
+t0=$(now_ms); why=""
+TC="$TMPDIR/tc"; rm -rf "$TC"; mkdir -p "$TC/t/s"
+head -c 300000 /dev/urandom | base64 > "$TC/t/big2.txt"
+echo small > "$TC/t/s/f1"; ln -s big2.txt "$TC/t/link"
+"$GZSTD" -q --cpu-only --tar -C "$TC" -o "$TC/g.tzst" t 2>/dev/null || why+=" create:$?"
+tc_sum=$(cksum < "$TC/g.tzst")
+tc_go() {  # tc_go WANT-EXIT LABEL GZSTD-ARGS... : fresh tree and archives, one run
+  local want=$1 label=$2; shift 2
+  rm -rf "$TC/x" "$TC/o.bin"; mkdir "$TC/x"; cp "$TC/g.tzst" "$TC/a.tzst"; cp "$TC/g.tzst" "$TC/b.tzst"
+  [[ -n "${TC_PRE:-}" ]] && eval "$TC_PRE"
+  tc_rc=0; "$GZSTD" -q --cpu-only "$@" > "${TC_OUT:-/dev/null}" 2> "$TC/e" \
+    < "${TC_IN:-/dev/null}" || tc_rc=$?
+  [[ $tc_rc -eq $want ]] || why+=" $label:exit=$tc_rc"
+}
+tc_kept() { cmp -s "$TC/t/big2.txt" "$TC/x/t/big2.txt" || why+=" $1:member-replaced"; }
+tc_go 2 archive -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/a.tzst"
+[[ "$(cksum < "$TC/a.tzst")" == "$tc_sum" ]] || why+=" archive-replaced"
+grep -q 'also an input' "$TC/e" || why+=" archive-message"
+tc_go 2 test-second -t --tar "$TC/a.tzst" "$TC/b.tzst" --stats-json "$TC/b.tzst"
+[[ "$(cksum < "$TC/b.tzst")" == "$tc_sum" ]] || why+=" test-second-replaced"
+TC_PRE='ln -sf a.tzst "$TC/al"' TC_IN="$TC/a.tzst" \
+  tc_go 2 stdin-link -d --tar - -C "$TC/x" --stats-json "$TC/al"
+[[ "$(cksum < "$TC/a.tzst")" == "$tc_sum" ]] || why+=" stdin-link-replaced"
+TC_OUT="$TC/o.bin" tc_go 2 stdout -d --tar -O "$TC/a.tzst" t/big2.txt --stats-json "$TC/o.bin"
+grep -q 'redirected stdout' "$TC/e" || why+=" stdout-message"
+tc_go 0 stdout-null -d --tar -O "$TC/a.tzst" t/big2.txt --stats-json /dev/null
+TC_PRE='mkdir -p "$TC/x/t"' tc_go 3 entry -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/x/t/big2.txt"
+tc_kept entry; grep -q 'written by the extraction' "$TC/e" || why+=" entry-message"
+TC_PRE='mkdir -p "$TC/x/t"; echo "{}" > "$TC/x/t/big2.txt"' \
+  tc_go 3 stale-entry -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/x/t/big2.txt"
+tc_kept stale-entry
+TC_PRE='mkdir -p "$TC/x/t"; ln -s /dev/null "$TC/x/t/big2.txt"' \
+  tc_go 3 was-dev-null -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/x/t/big2.txt"
+tc_kept was-dev-null
+TC_PRE='mkdir -p "$TC/x/t"' tc_go 3 planted-link -d --tar "$TC/a.tzst" -C "$TC/x" \
+  t/big2.txt t/link --stats-json "$TC/x/t/link"
+tc_kept planted-link; [[ -L "$TC/x/t/link" ]] || why+=" planted-link-replaced"
+TC_PRE='mkdir -p "$TC/x/t"; ln -s big2.txt "$TC/x/t/link"' tc_go 3 own-link \
+  -d --tar "$TC/a.tzst" -C "$TC/x" t/big2.txt --stats-json "$TC/x/t/link"
+tc_kept own-link
+tc_go 3 made-dir -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/x/t/s/r.json"
+tc_kept made-dir; [[ -e "$TC/x/t/s/r.json" ]] && why+=" made-dir-written"
+grep -q 'did not exist when the extraction began' "$TC/e" || why+=" made-dir-message"
+tc_go 0 beside -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/x/r.json"
+[[ "$(sk_get "$TC/x/r.json" input_bytes)" == "$(stat -c %s "$TC/g.tzst")" ]] || why+=" beside-record"
+tc_go 0 dev-null -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json /dev/null
+tc_go 3 unwritable -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/no/dir/r.json"
+tc_kept unwritable; grep -q 'cannot write' "$TC/e" || why+=" unwritable-message"
+tc_go 3 test-unwritable -t --tar "$TC/a.tzst" --stats-json "$TC/no/dir/r.json"
+tc_go 3 record-is-dir -d --tar "$TC/a.tzst" -C "$TC/x" --stats-json "$TC/x"
+tc_kept record-is-dir
+TC_PRE='echo t > "$TC/list"' tc_go 2 create-list --tar -C "$TC" --files-from "$TC/list" \
+  -o "$TC/c.tzst" --stats-json "$TC/list"
+[[ "$(cat "$TC/list")" == t ]] || why+=" create-list-replaced"
+tc_go 1 failed-run -d --tar "$TC/a.tzst" -C "$TC/x" t/nonesuch --stats-json "$TC/no/dir/r.json"
+grep -q 'cannot write' "$TC/e" || why+=" failed-run-message"
+rm -rf "$TC"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--stats-json beside --tar never replaces an archive or an extracted file" \
+  || fail "--stats-json beside --tar never replaces an archive or an extracted file" "got$why"
+
+# A DECODE RECORD'S cpu.threads IS THE POOL THAT DECODED (v0.18.28, ROADMAP 28).  Every
+# decode route wrote a literal 1 -- `-d -T 3` and a 3-partition `-d --tar` alike -- where
+# compress has reported its pool since v0.18.19.  It is now the largest CPU decode pool
+# that frames reached: the -T pool for -d and -t (also under --tar's walk), the
+# partitions of a parallel extract, the seek feeder's pool; 1 for the one-frame and
+# streaming decoders; 0 when nothing was decoded (an indexed selection matching
+# nothing).  Explicit -T throughout, so no number depends on this host's cores.  (A
+# foreign header-hop decodes on one thread: the accounting cell's no-match arm.)
+t0=$(now_ms); why=""
+TT="$TMPDIR/tt"; rm -rf "$TT"; mkdir -p "$TT/t"
+head -c 3000000 /dev/urandom | base64 > "$TT/t/big.txt"
+for i in 1 2 3 4 5; do head -c 300000 /dev/urandom | base64 > "$TT/t/f$i"; done
+head -c 5000 /dev/urandom > "$TT/one"
+"$GZSTD" -q -f --cpu-only --chunk-size 1 "$TT/t/big.txt" -o "$TT/multi.zst" 2>/dev/null || why+=" multi:$?"
+"$GZSTD" -q -f --cpu-only "$TT/one" -o "$TT/one.zst" 2>/dev/null || why+=" one:$?"
+head -c 100 "$TT/one" > "$TT/one100"   # a frame with no content size, as zstd writes from a pipe
+{ printf '\x28\xb5\x2f\xfd\x00\x00\x21\x03\x00'; cat "$TT/one100"; } > "$TT/sizeless.zst"
+"$GZSTD" -q --cpu-only --tar --chunk-size 1 -C "$TT" -o "$TT/t.tzst" t 2>/dev/null || why+=" tar:$?"
+tt_threads() { grep -o '"cpu": { "threads": [0-9]*' "$TT/r.json" 2>/dev/null | grep -o '[0-9]*$'; }
+tt_run() {  # tt_run LABEL WANT-THREADS WANT-EXIT GZSTD-ARGS...
+  local label=$1 want=$2 wrc=$3 rc=0; shift 3
+  rm -rf "$TT/x" "$TT/r.json"; mkdir "$TT/x"
+  "$GZSTD" -q "$@" --stats-json "$TT/r.json" > /dev/null 2>&1 || rc=$?
+  [[ $rc -eq $wrc ]] || why+=" $label-exit:$rc"
+  [[ "$(tt_threads)" == "$want" ]] || why+=" $label:$(tt_threads)-want-$want"
+}
+tt_run d-T3 3 0 -d -T 3 -c "$TT/multi.zst"
+tt_run t-T2 2 0 -t -T 2 "$TT/multi.zst"
+tt_run one-frame 1 0 -d -c "$TT/one.zst"
+tt_run sizeless 1 0 -d -c "$TT/sizeless.zst"
+tt_run tar-parallel 3 0 -d --tar -T 3 "$TT/t.tzst" -C "$TT/x"
+GZSTD_FORCE_POOL=1 tt_run tar-pool 3 0 -d --tar -T 3 "$TT/t.tzst" -C "$TT/x"   # the shared decoders
+tt_run tar-walk 2 0 -d --tar -T 2 --keep-going "$TT/t.tzst" -C "$TT/x"
+tt_run tar-test 2 0 -t --tar -T 2 "$TT/t.tzst"
+tt_run tar-seek 2 0 -d --tar -T 2 "$TT/t.tzst" -C "$TT/x" t/big.txt
+tt_run tar-no-match 0 1 -d --tar "$TT/t.tzst" -C "$TT/x" t/nonesuch
+rm -rf "$TT"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--stats-json cpu.threads on decode is the CPU pool that decoded" \
+  || fail "--stats-json cpu.threads on decode is the CPU pool that decoded" "got$why"
+
 # The GPU build's nvCOMP compress path wrote no --stats-json file at all until
 # v0.17.79, at exit 0 (the cell above passes --cpu-only, so it never saw that).
 # --gpu-only puts every frame on a GPU, so the devices' input must add up to the
@@ -2988,8 +3251,18 @@ def save_table(suffix, ent):
 save_table('-table', entries)
 entries[-4] ^= 1
 save_table('-bad-table', entries)
+# The foreign header-hop decodes the first frame, then rejects the global PAX
+# header and falls back to the walk.  The walk itself can be entirely GPU.
+import io, tarfile
+with tarfile.open(p + '-hop.tar', 'w', format=tarfile.PAX_FORMAT,
+                  pax_headers={'comment': 'force the foreign hop to fall back'}) as tf:
+    entry = tarfile.TarInfo('member')
+    entry.size = 100
+    tf.addfile(entry, io.BytesIO(b'x' * entry.size))
 GTPY
-  if [[ ! -s "$gt-bad-table.zst" || ! -s "$gt-one.zst" || ! -s "$gt.frames" ]]; then
+  "$GZSTD" -q -k -f --cpu-only --chunk-size=1 "$gt-hop.tar" -o "$gt-hop.zst" 2>/dev/null \
+    || gt_why+=" hop:compress"
+  if [[ ! -s "$gt-bad-table.zst" || ! -s "$gt-one.zst" || ! -s "$gt.frames" || ! -s "$gt-hop.zst" ]]; then
     gt_why="fixture construction failed"
   else
     t0=$(now_ms)
@@ -2999,10 +3272,10 @@ GTPY
       IFS=: read -r gt_name gt_want gt_suffix <<< "$gt_case"
       gt_fault=()
       [[ $gt_name == rescue* ]] && gt_fault=(GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1)
-      gt_rc=0
+      gt_rc=0; rm -f "$gt.json"
       env -u GZSTD_DEBUG_TEST_D2H "${gt_fault[@]}" timeout --foreground -k 10 120 \
         "$GZSTD" -vv -t --gpu-only --gpu-devices=1 --gpu-streams=1 --gpu-batch=2 \
-        "$gt$gt_suffix.zst" > /dev/null 2>"$gt.err" || gt_rc=$?
+        --stats-json "$gt.json" "$gt$gt_suffix.zst" > /dev/null 2>"$gt.err" || gt_rc=$?
       [[ $gt_rc -eq $gt_want ]] || gt_why+=" $gt_name:exit=$gt_rc,want=$gt_want"
       grep -q 'device verification selected; no plaintext D2H' "$gt.err" \
         || gt_why+=" $gt_name:no-device-check-path"
@@ -3016,6 +3289,93 @@ GTPY
         grep -Fq 'simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)' "$gt.err" \
           || gt_why+=" $gt_name:fault-did-not-fire"
       fi
+      # The batch the fault cuts short had DELIVERED frames: their input counts
+      # (v0.18.28; a frame short of the file's size before, the rescue counting
+      # only the undelivered tail).
+      if [[ $gt_name == clean || $gt_name == table || $gt_name == rescue ]]; then
+        [[ "$(grep -oE '"input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+           == "$(stat -c %s "$gt$gt_suffix.zst")" ]] || gt_why+=" $gt_name:input_bytes"
+      fi
+      # No CPU decoded anything on a clean --gpu-only run (v0.18.28: cpu.threads 0).
+      if [[ $gt_name == clean ]]; then
+        grep -q '"cpu": { "threads": 0 }' "$gt.json" 2>/dev/null || gt_why+=" clean:cpu.threads"
+      fi
+    done
+    # The same fault on -d, whose frames are delivered through the host.
+    gt_rc=0; rm -f "$gt.json"
+    env -u GZSTD_DEBUG_TEST_D2H GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 timeout --foreground -k 10 120 \
+      "$GZSTD" -v -d -c -T 3 --gpu-only --gpu-devices=1 --gpu-streams=1 --gpu-batch=2 \
+      --stats-json "$gt.json" "$gt.zst" 2>"$gt.err" | cmp -s - "$TMPDIR/large.bin" \
+      || gt_why+=" rescue-d:bytes"
+    grep -Fq 'simulated GPU decompress fault' "$gt.err" || gt_why+=" rescue-d:fault-did-not-fire"
+    [[ "$(grep -oE '"input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+       == "$(stat -c %s "$gt.zst")" ]] || gt_why+=" rescue-d:input_bytes"
+    # The CPU rescue pool decoded the tail: -T 3 of it (v0.18.28).
+    grep -q '"cpu": { "threads": 3 }' "$gt.json" 2>/dev/null || gt_why+=" rescue-d:cpu.threads"
+    # Lose every GPU BEFORE any DATA frame arrives.  The rescue starts but gets
+    # no tasks: a sizeless first frame bypasses it for the one-thread streamer.
+    # Wait for the rescue warning before sending stdin, so bringup cannot lose
+    # the race to producer completion.  The old spawn-time note reported 3.
+    rm -f "$gt-idle.json"
+    python3 -I - "$GZSTD" "$gt-idle.json" "$gt-idle.err" <<'GTIDLE' >/dev/null 2>&1 \
+      || gt_why+=" idle-rescue:cpu.threads"
+import json, os, select, subprocess, sys, time
+env = os.environ.copy()
+env['GZSTD_DEBUG_FAIL_BRINGUP_ALLOC'] = '-1'
+p = subprocess.Popen([sys.argv[1], '-v', '-d', '-c', '-T', '3', '--gpu-only',
+                      '--gpu-devices=1', '--gpu-streams=1', '--gpu-batch=1',
+                      '--stats-json', sys.argv[2]], env=env,
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+err = bytearray()
+deadline = time.monotonic() + 120
+try:
+    marker = b'finishing decompression on CPU (3 threads)'
+    while marker not in err:
+        left = deadline - time.monotonic()
+        assert left > 0 and select.select([p.stderr], [], [], left)[0], 'no rescue warning'
+        chunk = os.read(p.stderr.fileno(), 65536)
+        assert chunk, 'exited before rescue warning'
+        err.extend(chunk)
+    # One raw, final block of 100 bytes, no content-size header.
+    plain = b'x' * 100
+    frame = bytes.fromhex('28 b5 2f fd 00 00 21 03 00') + plain
+    out, tail = p.communicate(frame, timeout=max(0, deadline - time.monotonic()))
+    err.extend(tail)
+    assert p.returncode == 0 and out == plain, (p.returncode, out)
+    with open(sys.argv[2]) as f:
+        record = json.load(f)
+    assert record['cpu']['threads'] == 1, record
+    assert record['input_bytes'] == len(frame) and record['output_bytes'] == len(plain), record
+finally:
+    if p.poll() is None:
+        p.kill()
+        p.wait()
+    with open(sys.argv[3], 'wb') as f:
+        f.write(err)
+GTIDLE
+    # Only --tar plans the foreign header-hop.  Both planners reject the valid
+    # global-PAX tar after a CPU decode, so both fallback records must say 1.
+    for gt_hop in plain full selected; do
+      rm -rf "$gt-hop-x"; mkdir "$gt-hop-x"
+      gt_args=(-d -c); gt_want=0
+      if [[ $gt_hop != plain ]]; then
+        gt_args=(-d --tar -C "$gt-hop-x"); gt_want=1
+      fi
+      gt_args+=("$gt-hop.zst")
+      [[ $gt_hop == selected ]] && gt_args+=(member)
+      gt_rc=0; rm -f "$gt.json"
+      timeout --foreground -k 10 120 "$GZSTD" -vv --gpu-only --gpu-devices=1 \
+        --gpu-streams=1 --gpu-batch=1 "${gt_args[@]}" --stats-json "$gt.json" \
+        > /dev/null 2>"$gt.err" || gt_rc=$?
+      [[ $gt_rc -eq 0 ]] || gt_why+=" hop-$gt_hop:exit=$gt_rc"
+      grep -q '"cpu": { "threads": '"$gt_want"' }' "$gt.json" 2>/dev/null \
+        || gt_why+=" hop-$gt_hop:cpu.threads"
+      grep -qE '\[GPU[0-9]+/S[0-9]+\] done batch=' "$gt.err" \
+        || gt_why+=" hop-$gt_hop:no-GPU-batch"
+      [[ "$(grep -oE '"input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+         == "$(stat -c %s "$gt-hop.zst")" ]] || gt_why+=" hop-$gt_hop:input_bytes"
+      [[ "$(grep -oE '"output_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+         == "$(stat -c %s "$gt-hop.tar")" ]] || gt_why+=" hop-$gt_hop:output_bytes"
     done
     # The A/B hook restores D2H, and /dev/null remains on that delivery path.
     for gt_arm in test-d2h null-output; do
@@ -3060,7 +3420,8 @@ GTPY
   fi
   [[ -z "$gt_why" ]] && pass "gpu-only -t integrity" \
     || fail "gpu-only -t integrity" "$gt_why"
-  rm -f "$gt"*.zst "$gt.err" "$gt.frames"
+  rm -f "$gt"*.zst "$gt.err" "$gt.frames" "$gt-hop.tar" "$gt-idle.json" "$gt-idle.err"
+  rm -rf "$gt-hop-x"
 
   # v0.17.15 regression: one GPU faults while holding the FINAL batch and
   # re-enqueues its undelivered frames; the other device has already drained the

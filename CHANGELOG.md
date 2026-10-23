@@ -1,12 +1,206 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.27  
+**Covers:** v0.9.50 → v0.18.28  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.28 — `-d --tar` and `-t --tar` write `--stats-json` (what each route read; never over an extracted file); a GPU decompress fault no longer drops its delivered frames from `input_bytes`; decode records give the CPU pool that decoded
+
+### `--stats-json` for `--tar` extraction and test
+
+`-d --tar` and `-t --tar` returned from `main` before the record was written: exit 0, no file,
+and a record from an earlier run left in place unchanged, for a script to read as this run's.
+`--help` promises a run summary for any run.  Both now write one, rewritten after each archive as
+plain `-d` rewrites it after each input (`files` counts the archives; `--tar` keeps one meter
+for all of them, so each archive's share is taken from a mark set when it starts).  The fields
+are plain `-d`'s, and what they count is what the run READ:
+
+| 4 x 8 MiB text members, 34,165,917-byte indexed archive | `input_bytes` | `skippable_bytes` | `output_bytes` |
+|---|---|---|---|
+| `-d --tar` (the parallel partitioner), `-d --tar -` (the walk), `-t --tar` | 34,165,917 | 219 | 45,332,480 |
+| `-d --tar a.tzst src/f2` (seek: 2 of 3 frames) | 25,289,686 | 219 | 11,332,608 |
+| `-d --tar -O a.tzst src/f3` (seek) | 21,521,505 | 219 | 11,332,608 |
+
+A whole extract or test counts the whole archive, whichever route takes it, so it matches plain
+`-d` of the same file; `output_bytes` is the tar stream.  A selection that the member index (or a
+foreign archive's seek table) serves counts the frames it decoded and the trailing index and seek
+table, and `output_bytes` is the tar bytes of the selected entries; without an index the
+selection walks the whole archive and counts it.
+
+Three routes needed counting.  The parallel partitioner and the seek feeder count the data frames
+they pread, and nothing counted the index and seek table they were planned from: they are now
+credited as skippable (`read_tar_index` records their extent, as `parse_foreign_seek_table` has
+since v0.18.27).  And a foreign archive's header-hop counted every frame it decoded into the meter,
+then the extraction counted the same frames again: the summary line said 13.21 MiB read for a
+10.44 MiB archive, and a hop that gave up before the walk took over was counted twice as well.
+The planners now count nothing; the seek plan adds the hop's frames that the selection does not
+read itself, each once.
+
+**Where the record may not go.**  It is written after each archive, so naming one of the archives
+is refused up front (exit 2), as plain `-d` refuses an input, for `-d` and `-t`, through stdin and
+through a symlink.  With `-O`, naming the redirected stdout is refused like `-c`.  And the
+extraction can write the record's own name: an entry of that name, a symlink planted there that the
+record's open would follow, or the user's own symlink pointing into the tree.  The record replaced
+it with JSON.  So the record's directory is held from the start (an archive cannot redirect it by
+replacing a path component), and before each write the name, and what it resolves to, must be as
+the previous check left them, held open in between so an inode number cannot be reissued.  When
+they are not, the extracted file is kept, the record is not written, and the run exits 3: "was
+written by the extraction (an archive entry of that name?)".  A directory that did not exist when
+the run began is not used either, and the message says so.  A run that already failed keeps its own
+exit code and reports the record as well.  `/dev/null`, and a record beside the tree's own files,
+work as before.  The record now goes out in one `write`, through `openat` on the held directory
+(plain runs pass the working directory).
+
+Not done: an entry count.  The extractor counts entries differently on each route (the validator,
+`-O`, the parallel partitioner), and a field that is right on some of them is worse than none.
+
+### A GPU decompress fault keeps its delivered frames in `input_bytes`
+
+The GPU decompress worker credited a batch's compressed bytes once, after its delivery loop.  A
+fault or a reclaim part way through the loop skipped that, and the fault path re-enqueues only
+the undelivered tail, which its rescuer counts: the frames already delivered were never counted.
+Each frame is now credited inside the commit that advances `C.delivered` (all five), so the two
+halves of a cut batch are counted by exactly one worker each.  With `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST`:
+
+| 203,627,078-byte archive | v0.18.27 `input_bytes` | v0.18.28 |
+|---|---|---|
+| `--gpu-only -d`, `--gpu-only -t` | 190,982,404 (12.6 MB short) | 203,627,078 |
+| `--direct-stage -d`, `--gds-only -t` | 190,982,434 | 203,627,078 |
+
+Bytes were never affected.  The meter now advances per frame rather than per batch.
+
+### A decode record's `cpu.threads` is the CPU pool that decoded (ROADMAP 28)
+
+Every decode route wrote a literal 1 into `"cpu": { "threads": N }`, where compress has reported
+its pool since v0.18.19 (v0.18.24 kept decode's "as before").  The meter now keeps the largest CPU
+decode pool that frames reached (`Meter::cpu_decode_threads`, reset with the meter): a pool counts
+once frames are queued to it, so one started and then bypassed for the streaming decoder does
+not; the one-frame inline route and the streaming and buffered decoders are one thread; the hybrid
+pool, `--gpu-only`'s CPU rescue (once a worker takes a frame), the parallel extract's partitions
+(when they decode their own frames), its shared decode pool and the seek feeder each count their
+threads, and a foreign archive's header-hop counts 1, even one that gives up its plan.  On this
+host:
+
+| run | before | now |
+|---|---|---|
+| `-d -T 8`, 17-frame archive | 1 | 8 |
+| `-d`, default (the pool is capped at the seek table's 17 frames) | 1 | 17 |
+| `-d` of a one-frame file; of a frame with no content size (streamed) | 1 | 1 |
+| `--hybrid -T 6 -d` | 1 | 6 |
+| `--gpu-only -d` | 1 | 0 |
+| `--gpu-only -d -T 5`, the CPU rescue after a GPU fault | 1 | 5 |
+| `-d --tar`, indexed: 13 partitions; one member by seek over 6 frames | no record | 13; 6 |
+| `-d --tar`, a selection matching nothing (indexed; foreign: the hop, 1) | no record | 0; 1 |
+| `-d --tar` with the decode pool forced (25 decoders) | no record | 25 |
+
+Found, not changed: the `--gpu-only` CPU rescue starts the full `-T` pool (96 here) to finish
+a one-frame tail, and an archive with no seek table starts the full pool too (v0.18.24's cap
+reads the table); the record now says so.  The decompress matrix's records differ from v0.18.27's
+only there: a 2-frame archive's 1 became 2.
+
+### Checks
+
+An independent oracle (frames from the archive's bytes, member offsets from Python's `tarfile`
+over zstd's decode, the frame map from the seek table) against four archives: gzstd's indexed, a
+`--no-index` one, a t2sz-style foreign one (200 kB frames, seek table, no index) and `tar | zstd`
+(one frame).  The routes: default, `--cpu-only`, `--keep-going`, stdin, `-O`, `-t --tar`, `-t`
+from stdin, three selections (two members, a directory, one to `-O`), a selection under
+`--keep-going` and from stdin; on the GPU build also `--gpu-only`, `--hybrid`, `-T 1`, `-t --tar
+--gpu-only` and a `--gpu-only` selection.  All 52 cells on the CPU-only build and 72 on the GPU
+build match; v0.18.27 writes no record in any.  Collisions: 16 arms per build.  The fault hook
+under `--tar`: `-t --tar --gpu-only` and `-d --tar --gpu-only` on 200 MB indexed and `--no-index`
+archives count the file.  v0.18.27's checks, rerun: decode 50 + 90 cells and compress 29 + 32,
+all right; the decompress matrix (22 archives x 13 modes, 286 cells per build) identical but for
+the version and, once, a 300 MB dense output's allocation by 8 sectors, the noise seen before.  A
+CPU-only build against zstd 1.4.4 is warning-free and passes the new cells.
+
+### Cells
+
+**Cells** (default run, no GPU; EXPECTED 566/866, no-GPU deltas unchanged): "--stats-json for -d
+--tar and -t --tar counts what each route read" (an indexed, a `--no-index` and a t2sz-style
+archive through the parallel partitioner, the walk under `--keep-going`, stdin, `-O`, `-t --tar`,
+selections served by the index, by the header-hop and by the walk, the route asserted at `-v`;
+`-t --tar` over two archives for the per-archive marks; the oracle above in Python, skipped
+without python3, zstd or tar) and "--stats-json beside --tar never replaces an archive or an
+extracted file" (the archive, a second `-t` archive, stdin's archive through a symlink, `-O`'s
+stdout, an entry at the record's name with and without a stale record there, a planted symlink,
+the user's own symlink into the tree, a directory only the extraction made, beside the tree,
+`/dev/null`, unwritable for `-d` and `-t`, and a failed run).  The GPU cell "gpu-only -t integrity"
+checks `input_bytes` on its clean, table and rescue arms and gains a `-d` rescue arm, whose frames
+go through the host.  All pass on both builds; v0.18.27 fails the new cells and the rescue arms.
+Mutants, each caught: the partitioner's and the seek plan's skippable credit dropped; the index's
+extent not recorded; the hop's frames not credited, and credited even where the selection reads
+them; the walk's record, `-t --tar`'s record, and its per-archive mark; the name guard; the held
+directory; the archive refusal; the `-O` refusal (the name guard still caught it: exit 3); the
+exit 3; and on the GPU build the host and device-verify commits' credit, the batch-end credit
+restored in place of them, and both together.
+
+### Pre-tag review (Codex GPT-6.1-Sol, max)
+
+Round 1: seven findings, four reproduced here and fixed.
+- **A link to `/dev/null` at the record's name, replaced by the extraction with a member**: the
+  guard exempted the character device it had seen, so the record replaced the member with JSON at
+  exit 0 (reproduced).  A character device is now exempt only while the name still resolves to
+  that same device (the review's version exempted any character device there; a device node the
+  archive planted is not).
+- **Frames holding only tar's zero blocks and padding** (two 3-byte members in 512-byte frames:
+  16 of 20 frames) were never read or decoded by the parallel partitioner, whose last partition
+  ended at the last entry, while their output was credited: `input_bytes` 369 of 721, and those
+  frames went unverified where the walk decodes them.  The last partition now owns them, and every
+  partition drains its slice after parsing, as `run_sink` drains the walk's.
+- **`--tar --files-from list --stats-json list`** (create, since the compress record existed)
+  replaced the list it had just read.  The side inputs read before the work (the lists, `-D`'s
+  dictionary) are refused like inputs, from the registry the stdout check already keeps.  The
+  review's trigger, `-t --tar --files-from`, is a usage error.
+- **The collision cell aborted the suite**: `$TC_PRE` unset under its `set -u` (reproduced; the
+  harness that ran the cells had no `set -u`, and has now).
+
+Declined, with the reasons given back: opening the record `O_EXCL` or validating the opened
+descriptor against a name swapped after the last check (the extraction has finished by then --
+`run_sink` and `run_parallel` have returned and the extractor's destructor touches nothing -- so
+only another process could swap it, and such a process can already redirect any `--stats-json`
+write; `O_EXCL` would also refuse a user's dangling symlink); `O_NONBLOCK` on the record (a FIFO
+without a reader waits, as it does for any writer; nonblocking fails a reader that opens late);
+refusing a record on redirected stderr or on the `--adapt` profile's path (pre-existing on every
+path, nothing of the user's is lost, and `--stats-json /dev/stderr` into a pipe would be refused);
+and `cpu.threads` in decode records, 1 on every decode route since the field existed: ROADMAP 28.
+The cells gained arms for each fix: the padding archive through the partitioner inline and pooled,
+the walk, `-t --tar`, a hop seek and a seek matching nothing (exit 1); a `/dev/null` link replaced
+by a member; a record that is a directory; create's `--files-from` list.  Each fix undone in turn
+(no drain, the last partition ending at the last entry, the old exemption, no side-input refusal)
+fails its arm, and so does the round-0 tree.  Round 2: the four fixes correct, the declined items
+withdrawn (no writer of the extraction survives into the window; a nonblocking open would reject
+late readers; the stderr and profile cases are pre-existing; `cpu.threads` is inherited): SAFE TO
+TAG.
+
+Round 3 (the ROADMAP 28 change): two count errors, both reproduced, fixed with the review's patch
+after building and running it.  A foreign header-hop that decoded a frame and then gave up its plan
+(a global pax header) left 0 when the walk that followed ran on the GPU; it is 1 now, from either
+planner.  And a `--gpu-only` CPU rescue that started but decoded nothing (every GPU lost at
+bringup, then a sizeless frame on stdin, streamed) reported its `-T 3` for the streamer's 1; the
+rescue now counts only if a worker took a frame.  The GPU rescue cell gained both arms, with a plain
+`--gpu-only` control (0); each fix undone is caught.  Round 4, on those results: SAFE TO TAG.
+
+**Cells for ROADMAP 28** (default run, no GPU; EXPECTED 567/867, no-GPU deltas unchanged): "--stats-json
+cpu.threads on decode is the CPU pool that decoded" (`-d -T 3`, `-t -T 2`, one frame, a frame with
+no content size, `-d --tar -T 3` inline and with the decode pool forced, the walk, `-t --tar`, a
+seek, a selection matching nothing; explicit `-T` so no figure depends on the host); the accounting
+cell's foreign no-match arm expects 1 (the hop); the GPU rescue cell expects 0 on its clean
+`--gpu-only` arm and 3 on its `-d -T 3` rescue arm.  v0.18.27 and the round-2 tree fail the new
+cell and the GPU count assertions; the one-frame and sizeless controls still expect 1, as before.
+Mutants, each count site removed in turn: the CPU pool, the streaming decoder, the partitions,
+the decode pool, the seek feeder, the hop, the hybrid pool (under the suite's
+`GZSTD_DEBUG_GPU_MIN_BYTES=0`) and the rescue pool, each caught.  The buffered decoder's 1 is
+not observable: it only ever runs after the pool has decoded the frames before it.
+
+**Suites** (the 256-core, 8x H100 server, `CUDA_VISIBLE_DEVICES` unset, final tree): CPU-only
+419/0/122 of 541 (as expected: -148 no GPU); `-e` 866/0/1 of 867 (-1 this host could not exercise:
+trivial-park; one GPU busy with another user's work throughout); no drift note.  Every new and
+changed cell passed outright.
 
 ## v0.18.27 — `--stats-json` counts all of an archive (`skippable_bytes` says how much is seek table); `>>` takes the O_DIRECT writer under an explicit `--direct` (a 20 GB append 3.1x faster)
 

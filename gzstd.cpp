@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.27";
+static constexpr const char * GZSTD_VERSION = "0.18.28";
 //
 // Architecture overview:
 //
@@ -3906,6 +3906,21 @@ static void gz_note_side_input(const struct stat & st, const std::string & what)
 #endif
 }
 
+// The same registry answers --stats-json: the record is truncated and
+// rewritten, so it must not be one of these files either.  `--tar
+// --files-from list --stats-json list` replaced the list it had just read.
+static std::string gz_stats_side_alias(const struct stat & st)
+{
+#ifndef _WIN32
+  std::lock_guard<std::mutex> lk(g_side_m);
+  for (const GzSideInput & si : g_side_inputs)
+    if (st.st_dev == si.dev && st.st_ino == si.ino) return si.what;
+#else
+  (void)st;
+#endif
+  return {};
+}
+
 static void gz_stdout_will_be_written()
 {
 #ifndef _WIN32
@@ -5901,6 +5916,11 @@ static void print_help_long()
 "                    input_bytes and output_bytes count all of an archive;\n"
 "                    skippable_bytes says how much of it is skippable\n"
 "                    frames (the seek table; --tar's member index).\n"
+"                    -d --tar and -t --tar write one too: input_bytes is\n"
+"                    what was read (a selection extracted by seek reads\n"
+"                    only its frames), output_bytes the tar bytes handed\n"
+"                    to the extractor.  The record never replaces a file\n"
+"                    the extraction wrote: that is exit 3.\n"
 "\n"
 "============================================================\n"
 " EXIT CODES\n"
@@ -6514,6 +6534,14 @@ struct Meter {
   // Compress: the trailer append_tar_index wrote (the seek table, and --tar's
   // member index), also counted in wrote_bytes.  --stats-json reports it.
   std::atomic< uint64_t > index_bytes  { 0 };
+  // Decode: the largest CPU decode pool that frames reached, for --stats-json's
+  // cpu.threads (v0.18.28; every decode record said 1).  The streaming and
+  // inline decoders are one thread; --gpu-only with no CPU rescue is 0.
+  std::atomic< int >      cpu_decode_threads { 0 };
+  void note_cpu_decode_threads(int n) {
+    int cur = cpu_decode_threads.load(std::memory_order_relaxed);
+    while (n > cur && !cpu_decode_threads.compare_exchange_weak(cur, n, std::memory_order_relaxed)) {}
+  }
   std::atomic< uint64_t > tasks_done   { 0 };  // frames handed to writer (written in-order)
   std::atomic< uint64_t > total_frames { 0 };  // total frames to process (set by producer)
   std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
@@ -6572,6 +6600,7 @@ struct Meter {
   // full CPU-only rebuild so the rebuild's progress/summary start fresh.
   void reset() {
     read_bytes = 0; skipped_input_bytes = 0; wrote_bytes = 0; index_bytes = 0;
+    cpu_decode_threads = 0;
     tasks_done = 0; total_frames = 0;
     total_out = 0; total_out_final = false; read_elapsed_ms = 0;
     writer_disk_ns = 0; writer_iowrite_ns = 0; writer_hol_ns = 0;
@@ -17223,6 +17252,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
                                    FILE * out, const Options & opt, Meter * m,
                                    uint64_t base_off = 0)
 {
+  if (m) m->note_cpu_decode_threads(1);   // this thread decodes it all
   const size_t chunk_bytes = 4 * ONE_MIB;
   std::vector<char> outbuf(chunk_bytes);
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
@@ -17559,6 +17589,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   // Decodes on the CPU whatever the hardware; --gpu-only still needs a GPU.
   gz_require_usable_gpu(opt, "single-frame stream decode");
 #endif
+  if (m) m->note_cpu_decode_threads(1);   // this thread decodes it all
   const size_t IO_CHUNK = 4 * ONE_MIB;
   std::vector<char> outbuf(IO_CHUNK);   // -t and the tar sink decode here
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
@@ -20008,6 +20039,14 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
           pool.size(), threads, e.what());
   }
   for (auto & th : pool) th.join();
+  // Bringup can fail while the producer still owes its first frame.  If that
+  // input then streams (sizeless/huge), this rescue pool drains empty: it must
+  // not hide the streaming decoder's 1 with an unused -T pool.  The joined
+  // workers' task counts are stable here, including a partially-started pool.
+  if (decompress && m
+      && std::any_of(agg.per_thread.begin(), agg.per_thread.end(),
+                     [](const CpuThreadStats & st) { return st.tasks > 0; }))
+    m->note_cpu_decode_threads((int)pool.size());
 }
 #endif // HAVE_NVCOMP
 
@@ -21673,6 +21712,10 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
       run_inline = false;
       start_threads();
     }
+    // The pool counts once frames reach it (none may: a sizeless input goes to
+    // the streaming decoder below, which counts itself); the one-frame route
+    // decodes on this thread.
+    if (m && n_frames > 0) m->note_cpu_decode_threads(run_inline ? 1 : (int)pool.size());
 
     // Preallocate output file to avoid per-write extent allocation overhead.
     // total_out is known from zstd frame headers parsed by stream_frames_to_queue.
@@ -28246,7 +28289,12 @@ public:
     for (size_t pi = 0; pi < parts.size(); ++pi) {
       const Part pr = parts[pi];
       const uint64_t start = pr.a == 0 ? 0 : bounds[pr.a - 1];
-      const uint64_t end   = bounds[pr.b - 1];
+      // The LAST partition also owns what follows the last entry: the two zero
+      // blocks and tar's padding, which can fill whole frames of their own (512
+      // bytes a frame in a t2sz-style archive).  Ending it at the last entry left
+      // those frames unread and undecoded -- unlike the serial walk -- while the
+      // output was credited with their bytes (v0.18.28 review).
+      const uint64_t end   = pi + 1 == parts.size() ? u_off.back() : bounds[pr.b - 1];
       pg[pi] = PG{ frame_of(start), frame_of(end - 1), start, end };
       total_items += pg[pi].f1 - pg[pi].f0 + 1;
     }
@@ -28331,6 +28379,9 @@ public:
     // Inline decode is the default when there is no pool (!use_pool) or the archive
     // is trivial-decode (prefer_inline, above).
     std::atomic<bool> offload_active{ pool_on };
+    // Whether a partition decoded any frame itself (pure inline, or before an
+    // offload): the partitions are then a CPU decode pool too (--stats-json).
+    std::atomic<bool> inline_decoded{ false };
     if (use_pool && dopt.verbosity >= V_VERBOSE) {
       char b[208];
       if (prefer_inline)
@@ -28489,6 +28540,10 @@ public:
     auto spawn_decoder = [&] {
       d_retire.push_back(std::make_unique<std::atomic<bool>>(false));
       dworkers.emplace_back(decoder_loop, d_retire.back().get());
+      if (!feed_meter) return;      // --stats-json: the decoders running now
+      int active = 0;
+      for (auto & f : d_retire) if (!f->load(std::memory_order_relaxed)) ++active;
+      feed_meter->note_cpu_decode_threads(active);
     };
     // Retire the newest still-active worker of a stage and wake the queue so it
     // observes the flag and exits.  Callers keep >= 1 active.
@@ -29073,6 +29128,7 @@ public:
           FrameBuf fb;
           if (!use_pool) {                              // pure inline (no --adapt / no force)
             fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
+            inline_decoded.store(true, std::memory_order_relaxed);
             next_dispatch = k + 1;
           } else {
             auto dispatch = [&](size_t j) {
@@ -29090,6 +29146,7 @@ public:
               fb = take_pool(k); budget.release();
             } else {                                    // inline (writers not decode-starved)
               fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
+              inline_decoded.store(true, std::memory_order_relaxed);
               next_dispatch = k + 1;
             }
           }
@@ -29103,6 +29160,10 @@ public:
         StreamReader r(std::move(producer), u_off[g.f0], g.end);
         if (g.start > u_off[g.f0]) r.skip(g.start - u_off[g.f0]);   // align to the entry boundary
         parse(r, &pctx[pi]);
+        // Read and decode the rest of the slice, as run_sink drains the serial
+        // walk's: the last partition's parse stops at the zero blocks, before its
+        // padding frames, and any partition's stops at tar-level damage.
+        r.drain();
         // Reclaim permits for frames dispatched but never consumed.  parse()
         // does NOT always run to the end of the slice: tar-level corruption (bad
         // header checksum, truncated long-name/pax record) calls fail_data() and
@@ -29118,6 +29179,8 @@ public:
       });
     }
     for (auto & t : workers) t.join();
+    if (feed_meter && inline_decoded.load(std::memory_order_relaxed))
+      feed_meter->note_cpu_decode_threads((int)workers.size());
     if (pool_on) {
       // Stop the controller first (no more decoder spawning), then let the
       // decoders drain the queue and exit.
@@ -29193,11 +29256,9 @@ public:
       for (auto & d : pc.dirmeta)   dirmeta_.push_back(std::move(d));
     }
     stream_bytes_ = u_off.empty() ? 0 : u_off.back();   // full decompressed tar-stream size
-    // The workers counted tar bytes only up to the last entry's end; add the
-    // trailing end-of-archive zero blocks + padding so the reported output
-    // equals the full decompressed stream, matching the serial walk.
-    if (feed_meter && !u_off.empty() && !bounds.empty() && u_off.back() > bounds.back())
-      feed_meter->wrote_bytes.fetch_add(u_off.back() - bounds.back(), std::memory_order_relaxed);
+    // The last partition drains through u_off.back(), so its producer has
+    // counted the zero blocks and padding with everything else (they used to be
+    // added here, unread).
     ex_wall_ns_ = now_ns() - t0;
     stop_pool();
     finish_deferred();
@@ -31327,7 +31388,8 @@ private:
 // validate.
 struct TarSeekTable {
   uint64_t tar_size = 0;              // total tar-stream size
-  // parse_foreign_seek_table: trailing skippable frames, including the table.
+  // The skippable frames after the data -- gzstd's member index and the seek
+  // table itself -- set by both parsers (read_tar_index from v0.18.28).
   uint64_t skippable_bytes = 0;
   std::vector<uint64_t> c_off;        // nframes+1 prefix sums (archive offsets)
   std::vector<uint64_t> u_off;        // nframes+1 prefix sums (tar offsets)
@@ -31482,6 +31544,7 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
       }
       if (!tbad && c == data_end && u == tar_size) {
         st->tar_size = tar_size;
+        st->skippable_bytes = end - data_end;   // the index frame + the seek table
         st->c_off = std::move(co);
         st->u_off = std::move(uo);
       }
@@ -31514,6 +31577,10 @@ struct SeekPlan {
   std::vector<size_t> frames;                         // needed frame indices, ascending
   size_t sel_entries = 0, all_entries = 0;
   bool active = false;                                // plan trustworthy: seek path engaged
+  // --stats-json (v0.18.28): what planning consumed that seek_feed does not
+  // count -- the trailing index and seek table, and the data frames a foreign
+  // archive's header-hop decoded that the selection itself does not need.
+  uint64_t skippable_bytes = 0, scan_read_bytes = 0;
 };
 
 // Build the plan from the index.  False (plan stays !active) on any doubt:
@@ -31565,6 +31632,7 @@ static bool build_seek_plan(FILE * in,
       plan.frames.push_back(f);
   }
   plan.tar_size = st.tar_size;
+  plan.skippable_bytes = st.skippable_bytes;
   plan.c_off = std::move(st.c_off); plan.u_off = std::move(st.u_off);
   plan.active = true;
   return true;
@@ -31703,9 +31771,16 @@ struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; char typeflag; }
 static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
                                  const Options & opt, Meter * m,
                                  std::vector<ScanEnt> & ents,
-                                 std::vector<InEntry> * lmeta = nullptr) {
+                                 std::vector<InEntry> * lmeta = nullptr,
+                                 std::vector<char> * loaded = nullptr,
+                                 bool * decoded_cpu = nullptr) {
   const int fd = fileno(in);
   const size_t nframes = st.c_off.size() - 1;
+  // loaded (optional): which frames the hop read.  The extract planners pass no
+  // meter and count from this instead, so a frame the extraction reads again is
+  // not counted twice -- and a scan that bails before the walk takes over is
+  // not counted at all (the walk counts every frame itself).
+  if (loaded) loaded->assign(nframes, 0);
 
   // Range reader over the virtual tar stream: decompresses (and caches) one
   // frame at a time.  Frame decompressed sizes come from the (untrusted)
@@ -31730,11 +31805,15 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
       got += (size_t)r;
     }
     if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+    if (loaded) (*loaded)[k] = 1;
     gz_enforce_window_limit(comp.data(), csz);
     unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
     if (fcs == ZSTD_CONTENTSIZE_ERROR
         || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz)) return false;
     fbuf.resize(usz);
+    // A rejected plan still did this CPU work.  Keep it separate from byte
+    // accounting: the walk will credit these same frames if the hop bails.
+    if (decoded_cpu) *decoded_cpu = true;
     size_t dz = ZSTD_decompressDCtx(dctx, fbuf.data(), usz, comp.data(), csz);
     if (ZSTD_isError(dz) || dz != usz) return false;
     fcur = k;
@@ -31886,11 +31965,13 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
 // then select and map to frames exactly like the indexed build_seek_plan.
 static bool build_foreign_seek_plan(FILE * in,
                                     const std::vector<std::pair<std::string, int>> & members,
-                                    const Options & opt, SeekPlan & plan, Meter * m) {
+                                    const Options & opt, SeekPlan & plan,
+                                    bool * decoded_cpu = nullptr) {
   TarSeekTable st;
   if (!parse_foreign_seek_table(in, st)) return false;
   std::vector<ScanEnt> ents;
-  if (!foreign_scan_entries(in, st, opt, m, ents)) return false;
+  std::vector<char> loaded;
+  if (!foreign_scan_entries(in, st, opt, nullptr, ents, nullptr, &loaded, decoded_cpu)) return false;
   const size_t nframes = st.c_off.size() - 1;
   auto frame_of = [&](uint64_t v) {
     return (size_t)(std::upper_bound(st.u_off.begin(), st.u_off.end(), v)
@@ -31919,7 +32000,14 @@ static bool build_foreign_seek_plan(FILE * in,
     for (size_t f = plan.frames.empty() ? f0 : std::max(f0, plan.frames.back() + 1); f <= f1; ++f)
       plan.frames.push_back(f);
   }
+  // The hop's frames that seek_feed will not read again (plan.frames ascends).
+  for (size_t k = 0, j = 0; k < nframes; ++k) {
+    while (j < plan.frames.size() && plan.frames[j] < k) ++j;
+    if (loaded[k] && !(j < plan.frames.size() && plan.frames[j] == k))
+      plan.scan_read_bytes += st.c_off[k + 1] - st.c_off[k];
+  }
   plan.tar_size = st.tar_size;
+  plan.skippable_bytes = st.skippable_bytes;
   plan.c_off = std::move(st.c_off); plan.u_off = std::move(st.u_off);
   plan.active = true;
   return true;
@@ -32060,6 +32148,7 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
     std::vector<std::thread> pool;
     pool.reserve((size_t)nthreads);
     for (int t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+    if (m) m->note_cpu_decode_threads((int)pool.size());
 
     size_t ri = 0;   // two-pointer walk: ranges and frames both ascend
     for (size_t i = 0; i < nfr; ++i) {
@@ -32143,9 +32232,9 @@ static bool tar_output_alias_collision(
   return false;
 }
 
-static bool build_full_parallel_plan(FILE * in, int dest_fd,
-                                     const Options & opt, Meter * m,
-                                     TarSeekTable & st, std::vector<uint64_t> & bounds) {
+static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt,
+                                     TarSeekTable & st, std::vector<uint64_t> & bounds,
+                                     bool * decoded_cpu = nullptr) {
   bounds.clear();
   // DUPLICATES ARE REJECTED ON THE FILESYSTEM SPELLING, NOT THE ARCHIVE'S.  This
   // planner exists to partition members across workers, which is only safe when
@@ -32197,7 +32286,8 @@ static bool build_full_parallel_plan(FILE * in, int dest_fd,
   // Foreign zstd-seekable archives (t2sz-style): header-hop for the geometry.
   if (!have) {
     TarSeekTable s2; std::vector<ScanEnt> fes;
-    if (parse_foreign_seek_table(in, s2) && foreign_scan_entries(in, s2, opt, m, fes)
+    if (parse_foreign_seek_table(in, s2)
+        && foreign_scan_entries(in, s2, opt, nullptr, fes, nullptr, nullptr, decoded_cpu)
         && !fes.empty()) {
       uint64_t prev = 0; bool ok = true;
       std::unordered_map<std::string, char> seen;
@@ -41893,6 +41983,17 @@ static void gpu_decomp_worker(
         // single batch transfer, but it keeps the writer busy in parallel 
         // the writer can write frame 0 to disk while frame 1 is transferring.
         // A single batch D2H would stall the writer for the entire transfer.
+        //
+        // A FRAME'S INPUT IS COUNTED WHEN IT IS DELIVERED, inside the same commit
+        // that advances C.delivered (v0.18.28).  It was credited once, after the
+        // loop, for the whole batch -- so a batch that faulted or was reclaimed
+        // part way never counted the frames it HAD delivered: the fault path
+        // re-enqueues only the undelivered tail, whose rescuer counts that tail.
+        // --stats-json reported a 203 MB archive 12.6 MB short with
+        // GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST.  Every commit below credits its frame.
+        auto credit_input = [&](size_t i) {
+          if (m) m->read_bytes.fetch_add(batch_comp_sizes[i], std::memory_order_relaxed);
+        };
         for (size_t i = 0; i < C.filled; ++i) {
           if (discard_results && gz_debug_drop_test_frame(batch_seqs[i])) {
             bool dropped = false;
@@ -41901,6 +42002,7 @@ static void gpu_decomp_worker(
             rc_commit_delivery([&] {
               if (results->drop_discard_frame_for_test(batch_seqs[i], opt)) {
                 if (bp) bp->release(1);
+                credit_input(i);
                 C.batch[i].release_input();
                 C.delivered = i + 1;
                 dropped = true;
@@ -41946,6 +42048,7 @@ static void gpu_decomp_worker(
               if (!opt.gds_only)
                 g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
               // Mirrors the loop tail below, which this branch skips.
+              credit_input(i);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -42124,6 +42227,7 @@ static void gpu_decomp_worker(
               // queue-time release so its next batch can overlap the write.
               if (bp) bp->release(1);
               g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
+              credit_input(i);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -42183,6 +42287,7 @@ static void gpu_decomp_worker(
               results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
               // See the compress site: engagement means a DELIVERED frame.
               g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
+              credit_input(i);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -42194,6 +42299,7 @@ static void gpu_decomp_worker(
           // undelivered tail, whose inputs are still intact.
           if (!delivery_committed)
             rc_commit_delivery([&] {
+              credit_input(i);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -42280,12 +42386,12 @@ static void gpu_decomp_worker(
           g_perf->gpu_batch_count.fetch_add(1);
         }
 
-        // Track compressed bytes consumed for progress bar
+        // The batch's compressed bytes (each frame's reached read_bytes as it
+        // was delivered, above).
         {
           uint64_t in_sum = 0;
           for (size_t i = 0; i < C.filled; ++i)
             in_sum += batch_comp_sizes[i];
-          if (m) m->read_bytes.fetch_add(in_sum, std::memory_order_relaxed);
           // This device's tuner: what ran, at the size intake asked for.
           if (!C.throttle_limited)
             device_tune_record(tune, C.stream_index, C.pop_req, C.filled,
@@ -43995,6 +44101,9 @@ gds_out_declined:
     n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback,
                                       &raw_data, &max_frame_decomp,
                                       &gpu_only_no_device, &stream_rest);
+  // The CPU pool (none under --gpu-only, whose rescue counts itself), once
+  // frames reach it; a sizeless input streams on one thread instead.
+  if (m && n_frames > 0 && !cpu_pool.empty()) m->note_cpu_decode_threads((int)cpu_pool.size());
 
   // Deferred bringup found no GPU for a --gpu-only request: error out as the
   // old synchronous path did, now that the reader has stopped streaming.
@@ -44433,6 +44542,19 @@ struct GzStatsRun {
 };
 static GzStatsRun g_stats_run;
 
+// A meter's byte counters at one moment.  --tar's extract and test keep ONE
+// meter across all their archives, so each archive's share of the record is
+// the difference from the mark taken when that archive started.
+struct GzStatsMark { uint64_t read = 0, wrote = 0, skipped = 0, index = 0; };
+static GzStatsMark gz_stats_mark(const Meter & m)
+{
+  return { m.read_bytes.load(), m.wrote_bytes.load(),
+           m.skipped_input_bytes.load(), m.index_bytes.load() };
+}
+
+// `since`: count only what the meter gained after that mark (see GzStatsMark).
+// `dir_fd`: resolve `path` there -- --tar extraction writes through the
+// directory it held when the run began (see GzStatsTarget).
 #if __cplusplus >= 201703L
 [[maybe_unused]]
 #endif
@@ -44440,9 +44562,11 @@ static int write_stats_json(const std::string & path, const Options & opt, const
                             double elapsed_sec, int cpu_threads,
                             const CompressPassStats * gpu = nullptr,
                             std::chrono::steady_clock::time_point measured_at =
-                                std::chrono::steady_clock::now())
+                                std::chrono::steady_clock::now(),
+                            const GzStatsMark * since = nullptr, int dir_fd = AT_FDCWD)
 {
   GzStatsRun & run = g_stats_run;
+  const GzStatsMark at = gz_stats_mark(meter), from = since ? *since : GzStatsMark{};
   // Compress is written after finalization; its saved measurement time keeps
   // that delay from shifting the first input's start or a later input's end.
   const auto now = measured_at;
@@ -44453,10 +44577,9 @@ static int write_stats_json(const std::string & path, const Options & opt, const
   // The readers keep skippable input frames out of read_bytes (see Meter); a
   // compress's trailer is already in wrote_bytes.
   const bool compress = opt.mode == Mode::COMPRESS;
-  const uint64_t skippable = compress ? meter.index_bytes.load()
-                                      : meter.skipped_input_bytes.load();
-  run.in_bytes  += meter.read_bytes.load() + (compress ? 0 : skippable);
-  run.out_bytes += meter.wrote_bytes.load();
+  const uint64_t skippable = compress ? at.index - from.index : at.skipped - from.skipped;
+  run.in_bytes  += at.read - from.read + (compress ? 0 : skippable);
+  run.out_bytes += at.wrote - from.wrote;
   run.skippable_bytes += skippable;
   run.cpu_threads = std::max(run.cpu_threads, cpu_threads);
   if (gpu) {
@@ -44473,9 +44596,7 @@ static int write_stats_json(const std::string & path, const Options & opt, const
   const double run_elapsed = run.files == 1 ? elapsed_sec
                            : std::chrono::duration<double>(now - run.start).count();
 
-  errno = 0;
-  std::ofstream js(path, std::ios::out | std::ios::binary | std::ios::trunc);
-  if (!js) { return errno ? errno : EIO; }
+  std::ostringstream js;
   const char * mode_str = (opt.mode == Mode::COMPRESS)    ? "compress"
                         : (opt.mode == Mode::DECOMPRESS)  ? "decompress"
                         :                                    "test";
@@ -44502,10 +44623,97 @@ static int write_stats_json(const std::string & path, const Options & opt, const
     js << (run.devices.empty() ? "" : "\n  ") << "] }";
   }
   js << "\n}\n";
-  errno = 0;
-  js.close();
-  if (!js) return errno ? errno : EIO;
-  return 0;
+  const std::string body = js.str();
+  const int fd = ::openat(dir_fd, path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+  if (fd < 0) return errno ? errno : EIO;
+  int err = 0;
+  for (size_t done = 0; done < body.size() && !err;) {
+    const ssize_t w = ::write(fd, body.data() + done, body.size() - done);
+    if (w < 0 && errno == EINTR) continue;
+    if (w <= 0) err = w < 0 ? errno : EIO;
+    else done += (size_t)w;
+  }
+  if (::close(fd) != 0 && !err) err = errno ? errno : EIO;
+  return err;
+}
+
+// --stats-json BESIDE A --tar EXTRACTION (v0.18.28).  The record is written
+// after each archive, and the extraction may have written that same name: an
+// entry extracted at that path, or a symlink planted where it resolves.
+// Writing the record then replaces an extracted file with JSON.  So the
+// record's directory is held from the start -- an archive cannot redirect it by
+// replacing a component of the path -- and before each write the name must
+// still be what the previous check left: the same entry and, through any
+// symlink, the same target, unmodified.  Both are held open in between, so
+// their inode numbers cannot be reissued to a file the extraction creates (see
+// HeldEntry).  A character device keeps nothing (gz_stats_target_holds_data),
+// so /dev/null is written however its timestamps moved -- if it is still the
+// target (see unchanged()).
+struct GzStatsTarget {
+  HeldDir dir;
+  int dir_err = 0;                 // why the directory could not be held
+  HeldEntry ent, tgt;              // the name itself, and what it resolves to
+  bool ent_ok = false, tgt_ok = false;
+  struct stat ent_st {}, tgt_st {};
+
+  void begin(const std::string & path) {
+    errno = 0;
+    dir.acquire(path);
+    if (!dir.valid()) dir_err = dir.base.empty() ? EISDIR : errno ? errno : ENOENT;
+    capture();
+  }
+  void capture() {
+    ent.release(); tgt.release();
+    ent_ok = tgt_ok = false;
+    if (!dir.valid()) return;
+    int f = ::openat(dir.fd, dir.base.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (f >= 0) { ent.adopt(f); ent_ok = ::fstat(f, &ent_st) == 0; }
+    f = ::openat(dir.fd, dir.base.c_str(), O_PATH | O_CLOEXEC);
+    if (f >= 0) { tgt.adopt(f); tgt_ok = ::fstat(f, &tgt_st) == 0; }
+  }
+  bool unchanged() const {
+    // A character device keeps nothing -- while the name still resolves to THAT
+    // device.  A link to /dev/null that the extraction replaced with a member
+    // let the record replace the member at exit 0 (v0.18.28 review); a device
+    // node the archive planted there is not exempt either.  The held target
+    // keeps the device's inode number from being reissued.
+    if (tgt_ok && !gz_stats_target_holds_data(tgt_st)) {
+      struct stat now {};
+      return ::fstatat(dir.fd, dir.base.c_str(), &now, 0) == 0
+          && now.st_dev == tgt_st.st_dev && now.st_ino == tgt_st.st_ino
+          && now.st_rdev == tgt_st.st_rdev;
+    }
+    auto same = [](const struct stat & a, const struct stat & b) {
+      return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_mode == b.st_mode
+          && a.st_size == b.st_size
+          && a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec
+          && a.st_ctim.tv_sec == b.st_ctim.tv_sec && a.st_ctim.tv_nsec == b.st_ctim.tv_nsec;
+    };
+    struct stat now {};
+    const bool e_now = ::fstatat(dir.fd, dir.base.c_str(), &now, AT_SYMLINK_NOFOLLOW) == 0;
+    if (e_now != ent_ok || (e_now && !same(now, ent_st))) return false;
+    const bool t_now = ::fstatat(dir.fd, dir.base.c_str(), &now, 0) == 0;
+    return t_now == tgt_ok && (!t_now || same(now, tgt_st));
+  }
+};
+
+// Report a --tar record that could not be written, once the run's own verdict
+// is out.  A run that already failed keeps its exit code; the record is the
+// only failure of an otherwise clean one, which exits like plain -d (3).
+// `nodir`: the record's directory was missing when the run began (the
+// extraction may have made it since -- which is why it is not used).
+static int gz_tar_stats_verdict(const Options & opt, int rc, int err, bool moved,
+                                bool nodir = false)
+{
+  if (!moved && !err) return rc;
+  const std::string msg = moved
+      ? "--stats-json: " + opt.stats_json + " was written by the extraction (an archive "
+        "entry of that name?); the record was not written over it"
+      : "--stats-json: cannot write " + opt.stats_json + ": " + std::strerror(err)
+        + (nodir ? " (its directory did not exist when the extraction began)" : "");
+  if (rc == EXIT_OK) die_io(msg);
+  vlog(V_ERROR, opt, "gzstd: " + msg + "\n");
+  return rc;
 }
 
 /*======================================================================
@@ -44806,9 +45014,34 @@ static int extract_tar(const Options & opt, Meter * m)
     const int ofd = fileno(stdout);
     if (ofd >= 0 && std::fflush(stdout) == 0 && ::fstat(ofd, &ost) == 0 && S_ISREG(ost.st_mode))
       gz_refuse_stdout_alias(ost, opt.tar_sources, nullptr);
+    // The record would land inside the member stream (the same check as plain -c).
+    struct stat stats_st {};
+    if (!opt.stats_json.empty() && ofd >= 0 && ::fstat(ofd, &ost) == 0
+        && ::stat(opt.stats_json.c_str(), &stats_st) == 0
+        && gz_stats_target_holds_data(stats_st)
+        && stats_st.st_dev == ost.st_dev && stats_st.st_ino == ost.st_ino)
+      die_usage("--stats-json output is also redirected stdout: " + opt.stats_json);
     gz_stdout_will_be_written();
   }
 #endif
+  // --stats-json: one record for the run, rewritten after each archive (as
+  // plain -d is after each input), through the directory held here; see
+  // GzStatsTarget for why it is checked before every write.
+  GzStatsTarget stats_at;
+  int stats_err = 0;        // the LAST write's: the record on disk is that write's
+  bool stats_moved = false;
+  if (!opt.stats_json.empty()) stats_at.begin(opt.stats_json);
+  auto write_record = [&](const GzStatsMark & since) {
+    if (opt.stats_json.empty() || stats_moved) return;
+    if (!stats_at.dir.valid()) { stats_err = stats_at.dir_err; return; }
+    if (!stats_at.unchanged()) { stats_moved = true; return; }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - m->t0).count();
+    stats_err = write_stats_json(stats_at.dir.base, opt, *m, elapsed,
+                                 m->cpu_decode_threads.load(std::memory_order_relaxed), nullptr,
+                                 std::chrono::steady_clock::now(), &since, stats_at.dir.fd);
+    stats_at.capture();     // this write changed the file; compare from here
+  };
   int dest_fd = ::open(opt.tar_dest.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
   if (dest_fd < 0)
     die_io("cannot open extraction directory '" + opt.tar_dest + "': " + std::strerror(errno));
@@ -44859,6 +45092,7 @@ static int extract_tar(const Options & opt, Meter * m)
   int wpool_threads = 0, wpool_settled = 0;
   for (const std::string & arc : opt.tar_sources) {
     if (opt.keep_going) { g_damage.reset(); g_member_ranges.reset(); }  // damage reported per archive
+    const GzStatsMark arc_mark = gz_stats_mark(*m);
     FILE * in = open_input(arc);   // dies on failure
     if (arc != "-") {              // validate zstd magic (skip for unseekable stdin)
       unsigned char magic[4] = {0};
@@ -44913,7 +45147,10 @@ static int extract_tar(const Options & opt, Meter * m)
     };
     if (members.empty() && arc != "-" && !opt.keep_going && !opt.tar_to_stdout) {
       tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
-      if (tarx::build_full_parallel_plan(in, dest_fd, opt, m, pst, pbounds)) {
+      bool decoded_cpu = false;
+      const bool planned = tarx::build_full_parallel_plan(in, dest_fd, opt, pst, pbounds, &decoded_cpu);
+      if (decoded_cpu) m->note_cpu_decode_threads(1);
+      if (planned) {
         int Np = std::min<int>({resolve_cpu_threads(opt.cpu_threads), 16,
                                 (int)pbounds.size(), (int)(pst.c_off.size() - 1)});
         if (Np >= 2) {
@@ -44931,6 +45168,9 @@ static int extract_tar(const Options & opt, Meter * m)
           tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
           ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
           ex.run_parallel(in, pbounds, pst.c_off, pst.u_off, opt, m);
+          // The data frames were counted as they were read; the index and seek
+          // table the plan was built from are the archive's skippable frames.
+          m->skipped_input_bytes.fetch_add(pst.skippable_bytes, std::memory_order_relaxed);
           if (opt.verbosity >= V_VERBOSE) {
             agg_wbusy_ns    += ex.writer_busy_ns();
             agg_wstarved_ns += ex.writer_starved_ns();
@@ -44941,6 +45181,7 @@ static int extract_tar(const Options & opt, Meter * m)
           if (in && in != stdin) std::fclose(in);
           if (ex.had_error() && rc == EXIT_OK)
             rc = ex.had_data_error() ? EXIT_DATA : ex.had_io_error() ? EXIT_IO : EXIT_ERROR;
+          write_record(arc_mark);
           continue;   // this archive done; skip the serial FrameSink pipeline
         }
       }
@@ -44958,8 +45199,10 @@ static int extract_tar(const Options & opt, Meter * m)
       // No gzstd index — a foreign zstd-seekable archive (t2sz-style) still
       // carries the frame map: header-hop to find the members, then seek.
       plan = tarx::SeekPlan();
-      if (!tarx::build_foreign_seek_plan(in, members, opt, plan, m))
+      bool decoded_cpu = false;
+      if (!tarx::build_foreign_seek_plan(in, members, opt, plan, &decoded_cpu))
         plan = tarx::SeekPlan();
+      if (decoded_cpu) m->note_cpu_decode_threads(1);
     }
     if (plan.active) warn_indexed_direct_read();
     if (plan.active && opt.verbosity >= V_VERBOSE) {
@@ -45005,6 +45248,11 @@ static int extract_tar(const Options & opt, Meter * m)
       gz_require_usable_gpu(dopt, "--tar seek extract");       // CPU route
 #endif
       tarx::seek_feed(in, plan, &sink, dopt, m);
+      // seek_feed counts the frames the selection needs; planning also read
+      // the trailing index and seek table, and a foreign archive's header-hop
+      // decoded frames of its own (each counted once: see SeekPlan).
+      m->read_bytes.fetch_add(plan.scan_read_bytes, std::memory_order_relaxed);
+      m->skipped_input_bytes.fetch_add(plan.skippable_bytes, std::memory_order_relaxed);
     } else {
       int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
       // Named input with a huge or sizeless first frame (tar --zstd, zstd
@@ -45051,6 +45299,7 @@ static int extract_tar(const Options & opt, Meter * m)
       int sev = report_keep_going_damage_tar(opt);   // names damaged files; 6/7 or OK
       if (sev > rc) rc = sev;                         // recovery verdict outranks a plain error
     }
+    write_record(arc_mark);
   }
   for (int fd : roots) ::close(fd);   // [0] is dest_fd
 
@@ -45169,7 +45418,8 @@ static int extract_tar(const Options & opt, Meter * m)
       }
     }
   }
-  return rc;
+  return gz_tar_stats_verdict(opt, rc, stats_err, stats_moved,
+                              !stats_at.dir.valid() && stats_err == ENOENT);
 }
 
 // -t --tar: decompress each archive and STRUCTURALLY validate the tar inside it
@@ -45199,7 +45449,9 @@ static int verify_tar(const Options & opt, Meter * m)
   std::vector<VRes> vres;
 
   int rc = EXIT_OK;
+  int stats_err = 0;   // --stats-json, rewritten after each archive; the last write's
   for (const std::string & arc : opt.tar_sources) {
+    const GzStatsMark arc_mark = gz_stats_mark(*m);
     FILE * in = open_input(arc);   // dies on failure
     uint64_t comp = 0;
     if (arc != "-") {
@@ -45284,6 +45536,14 @@ static int verify_tar(const Options & opt, Meter * m)
     // "compressed => uncompressed (ratio)" is consistent with create.
     vres.push_back({arc == "-" ? "(stdin)" : arc, bad,
                     ex.validated_files(), ex.stream_bytes(), comp, secs});
+    // The same counters plain -t records (this test writes no files, so there
+    // is nothing for the record to collide with).
+    if (!opt.stats_json.empty())
+      stats_err = write_stats_json(opt.stats_json, opt, *m,
+                                   std::chrono::duration<double>(
+                                       std::chrono::steady_clock::now() - m->t0).count(),
+                                   m->cpu_decode_threads.load(std::memory_order_relaxed),
+                                   nullptr, std::chrono::steady_clock::now(), &arc_mark);
   }
 
   // Stop the progress bar, then print the per-archive results on clean lines.
@@ -45321,7 +45581,7 @@ static int verify_tar(const Options & opt, Meter * m)
     }
     std::fflush(stderr);
   }
-  return rc;
+  return gz_tar_stats_verdict(opt, rc, stats_err, false);
 }
 #endif  // !_WIN32  (extract_tar + verify_tar)
 
@@ -47209,12 +47469,18 @@ static int gzstd_main(int argc, char ** argv)
   // The stats writer opens its path with truncation.  It must not replace a
   // dictionary or reference that this run still needs, even if compression's
   // main -o destination is elsewhere.
-  if (g_dep_known && !opt.stats_json.empty()) {
+  // Nor a list or other side input read before the work (v0.18.28; see
+  // gz_stats_side_alias).
+  if (!opt.stats_json.empty()) {
     struct stat stats_st {};
-    if (::stat(opt.stats_json.c_str(), &stats_st) == 0
-        && gz_is_decode_dependency(stats_st))
-      die_usage("--stats-json would overwrite the " + g_dep_what
-                + " this run needs: " + g_dep_path);
+    if (::stat(opt.stats_json.c_str(), &stats_st) == 0) {
+      if (gz_is_decode_dependency(stats_st))
+        die_usage("--stats-json would overwrite the " + g_dep_what
+                  + " this run needs: " + g_dep_path);
+      const std::string via = gz_stats_side_alias(stats_st);
+      if (!via.empty())
+        die_usage("--stats-json output is also an input: " + opt.stats_json + " (" + via + ")");
+    }
   }
   // --stats-json is rewritten after EVERY input, so naming a later input
   // replaced that input with the previous file's JSON before it was read:
@@ -47222,7 +47488,12 @@ static int gzstd_main(int argc, char ** argv)
   // refused b (exit 2) -- whose data was already gone.  Compare against every
   // input up front, including a name dropped by the resolver or a recursive
   // walk; the per-file check below remains for the one opened.
-  if (!opt.stats_json.empty() && !opt.tar_mode) {
+  //
+  // --tar's extract and test write the record too since v0.18.28, after each
+  // archive: naming an archive would replace it before it was read, or after.
+  const bool tar_decode = opt.tar_mode
+      && (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST);
+  if (!opt.stats_json.empty() && (!opt.tar_mode || tar_decode)) {
     struct stat stats_st {};
     if (::stat(opt.stats_json.c_str(), &stats_st) == 0
         && gz_stats_target_holds_data(stats_st)) {
@@ -47239,9 +47510,11 @@ static int gzstd_main(int argc, char ** argv)
       // every walked entry: a superset of the inputs left, so one pass covers both
       // (a -r run over a large tree would otherwise stat each name twice).
       const std::vector<std::string> & names =
-          opt.stats_input_candidates.empty() ? opt.inputs : opt.stats_input_candidates;
+          tar_decode ? opt.tar_sources
+          : opt.stats_input_candidates.empty() ? opt.inputs : opt.stats_input_candidates;
       for (const std::string & in : names) refuse_stats_input(in);
-      for (const std::string & in : opt.skipped_named_symlinks) refuse_stats_input(in);
+      if (!tar_decode)
+        for (const std::string & in : opt.skipped_named_symlinks) refuse_stats_input(in);
     }
   }
 #ifndef _WIN32
@@ -48922,7 +49195,8 @@ static int gzstd_main(int argc, char ** argv)
     if (!opt.stats_json.empty()) {
       double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
           std::chrono::steady_clock::now() - t0).count();
-      stats_json_errno = write_stats_json(opt.stats_json, opt, meter, elapsed, 1);
+      stats_json_errno = write_stats_json(opt.stats_json, opt, meter, elapsed,
+                                          meter.cpu_decode_threads.load(std::memory_order_relaxed));
       stats_json_failed = stats_json_errno != 0;
     }
 

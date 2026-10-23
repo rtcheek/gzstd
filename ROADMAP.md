@@ -568,6 +568,21 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     (12.6 MB short of a 203 MB archive under `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST`, on `-d`,
     `--gpu-only`, `--direct-stage`, `-t`).  Fix the GPU delivery accounting with a cell on the hook,
     not in passing.
+    FIXED v0.18.28 (owner: write the record).  Both write plain `-d`'s record after each archive:
+    what the run read (a whole archive on every full route, the decoded frames plus the trailing
+    index and seek table on a seek), `output_bytes` the tar bytes handed to the extractor.  The
+    name an extraction writes is never overwritten (exit 3); naming an archive, or `-O`'s stdout, is
+    refused.  The GPU worker credits each frame in the commit that delivers it.  Left out: an entry
+    count, which each extract route counts its own way.
+28. **Decode `--stats-json` records say `"cpu": { "threads": 1 }`** (pre-existing; raised in the
+    v0.18.28 review).  Every decode route passes a literal 1 -- plain `-d -T 8`, a 16-partition
+    `-d --tar`, a hybrid run's CPU pool -- where compress has reported its actual pool since
+    v0.18.19.  v0.18.24 kept it "as before".  Either report the largest CPU decode pool started
+    (the review sketched a Meter high-water mark at each pool's spawn: the CPU pool, the hybrid
+    pool, the seek feeder, the partition workers and the decode pool, 1 for the streaming and
+    inline decoders, 0 under `--gpu-only`) or drop the field from decode records.  Owner's call;
+    no data is wrong but this one number.
+    FIXED v0.18.28 (owner: report the real pool): the largest CPU decode pool that frames reached.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
