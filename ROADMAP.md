@@ -583,6 +583,21 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     inline decoders, 0 under `--gpu-only`) or drop the field from decode records.  Owner's call;
     no data is wrong but this one number.
     FIXED v0.18.28 (owner: report the real pool): the largest CPU decode pool that frames reached.
+29. **`zstd -T0` beat gzstd on `-r` over mid-size files, both ways** (found 2026-10-23 on the
+    12-core workstation: 96 x 40 MiB base64, `-r` 3.39-3.51 s against ~5.5, `-d -r` 3.63-3.86 against
+    ~5.5, zstd decoding on one thread).  A 40 MiB input is 3 frames, so 3 workers ran.  Two causes,
+    two changes in v0.18.29 (CHANGELOG):
+    - **Compress: zstd's own workers inside each frame** when an input has fewer frames than CPUs.
+      Not smaller frames: they cost ratio, most at high levels (C headers at level 19: +13% at
+      8 MiB frames, +19% at 4 MiB), where 4 MiB jobs inside a 16 MiB frame cost at most +0.5%.
+    - **Both ways: a small pool runs inside one L3 cache.**  On the 16-cache server a 3-frame pool,
+      its reader and its writer were spread over caches, and each frame crossed between them.
+    **Still open, owner's call: the one-L3 workstation's decode.**  Placement does nothing there
+    (one cache), and its gap was measured as short decode bursts on cold cores plus whole-frame
+    hand-offs (pinned to ONE core, 96 files 5.1 s against zstd's 3.5).  Matching zstd needs a
+    cache-sized streaming route for small multi-frame inputs -- the route v0.18.24 did not take, as
+    it bypasses the seek-table checks, `--keep-going` reports and sparse output -- and beating it,
+    several inputs in flight at once (the per-input loop in gzstd_main is a redesign).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

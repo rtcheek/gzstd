@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.28";
+static constexpr const char * GZSTD_VERSION = "0.18.29";
 //
 // Architecture overview:
 //
@@ -15914,7 +15914,8 @@ static thread_local GzTlCCtx tl_cctx_owner;
 // Compresses one frame into `out` (a reusable per-thread buffer) and returns the
 // compressed size.  `out` is left sized to >= compressBound, NOT shrunk to csz —
 // the caller uses the returned size, and [csz, out.size()) is undefined padding.
-static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, FrameVec & out)
+static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, FrameVec & out,
+                                            int frame_workers = 0, size_t frame_job = 0)
 {
   ZSTD_CCtx *& tl_cctx = tl_cctx_owner.p;
   if (!tl_cctx) {
@@ -15928,6 +15929,14 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   // self-verifying so decompress/-t catches silent corruption / bit-rot.  ~4
   // bytes/frame; standard zstd, verified by any decoder.
   ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_checksumFlag, g_no_check ? 0 : 1);   // --no-check
+
+  // zstd's own workers (v0.18.29; see compress_cpu_mt).  Set on every call, 0
+  // included, and before apply_ultra_cctx, which applies --zstd=overlapLog only
+  // to a context that has workers: after it, the first frame of a thread would
+  // skip it and the rest would not.
+  st = ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_nbWorkers, frame_workers);
+  if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(nbWorkers) error: ") + ZSTD_getErrorName(st));
+  if (frame_workers > 0) ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_jobSize, (int)frame_job);
 
   // Ultra levels (20-22) need an explicit windowLog for the large window to take effect.
   // Without this, zstd silently clamps to its default window (~8 MiB), defeating ultra.
@@ -18044,6 +18053,8 @@ struct CpuAgg {
   uint64_t                     out_bytes = 0;
   double                       comp_ms  = 0.0;
   int                          threads  = 0;
+  int                          frame_workers = 0;   // zstd's own workers per frame (0 = none)
+  size_t                       frame_job     = 0;   // their job size (ZSTD_c_jobSize)
   std::vector<CpuThreadStats>  per_thread;
 };
 
@@ -19229,7 +19240,9 @@ static void cpu_worker(
     if (t.is_staged())
       die("internal error: a --gds-only frame reached a CPU compress worker; "
           "these name a file region and carry no host bytes");
-    const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
+    const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch,
+                                              cpuagg ? cpuagg->frame_workers : 0,
+                                              cpuagg ? cpuagg->frame_job : 0);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t in_size = t.len();
@@ -20115,6 +20128,9 @@ static bool needs_stream_decode(int64_t ff) {
 //                               shrinks under the readers fails instead of ending early)
 //   GZSTD_DEBUG_EXTRACT_*_GATE  around a duplicate-member writer/barrier handoff
 //                               (proves the later member waits for claimed work)
+//   GZSTD_DEBUG_POOL_GATE       in CPU compress and decompress, after the pool and the
+//                               writer start and before the first read (proves every
+//                               thread of a placed pool is on its cache; GzPoolPlacement)
 static void gz_fifo_gate(const char * env)
 {
   const char * fifo = ::getenv(env);
@@ -21576,6 +21592,48 @@ static void die_cpu_decompress_exception(const char * reason)
   die(message);
 }
 
+// A SMALL POOL RUNS INSIDE ONE L3 CACHE (v0.18.29).  When an input has fewer
+// frames than this process has CPUs, its pool is one worker per frame (v0.18.24),
+// and the scheduler spread those few threads, the reader and the writer over
+// whatever cores were idle: on the 2-socket server (16 L3 caches of 8 cores) each
+// frame was decoded in one cache and copied out from another.  `-d -r` over 80 x
+// 48 MiB text archives (3 frames each) took 4.33-4.46 s unpinned and 2.69-2.79 s
+// inside one cache; the same four cores spread over four caches were no faster
+// than unpinned, and two caches sat between.  -t, which writes nothing, gains as
+// much (16 frames: 0.65-0.69 s against 0.84-0.90).  Inside one cache is never
+// slower from 3 to 16 frames per input (24 and 32 tied), and the gain falls as
+// the pool grows.  So an
+// auto-sized pool that fits in one cache's hardware threads is placed in one: the
+// cache another gzstd process of this user has claimed least, then the one this
+// thread is running on, then the lowest.  No busy sample: it costs 20 ms, a large
+// share of a 40 MiB input, and unpinned load moves off a pinned cache by itself
+// (GzSwPlacement).  The calling thread's affinity is set before any pool, reader
+// or writer thread starts, so they inherit it, and restored when the holder goes
+// out of scope, after the local pipeline threads are joined.  A decode's
+// progress thread, --adapt's governor and the initial --verify worker start
+// before placement and keep their own masks.  Lazy DirectWriter drain threads
+// and extra --verify workers spawned by the placed writer inherit its mask;
+// their owners join them after this scope, before the next input (or rebuild).
+// The claims lock helper starts before affinity is narrowed, so even an
+// abandoned helper keeps the original mask.  A host whose CPUs share one L3 (the
+// 12-core workstation) has nothing to place.  GZSTD_DEBUG_POOL_PLACE=off is the
+// A/B control; GZSTD_DEBUG_L3_CLAIMS=off turns the claims off, as for
+// --sliding-window.
+struct GzPoolPlacement {
+  bool        placed = false;
+  unsigned    cache_threads = 0;     // the chosen cache's hardware threads, once placed
+  std::string note, detail;          // -v, -vv
+#ifdef __linux__
+  cpu_set_t   saved;
+  ~GzPoolPlacement() { if (placed) ::sched_setaffinity(0, sizeof saved, &saved); }
+#endif
+  GzPoolPlacement() = default;
+  GzPoolPlacement(const GzPoolPlacement &) = delete;
+  GzPoolPlacement & operator=(const GzPoolPlacement &) = delete;
+};
+// Defined with the L3 layout below.  Places `p` when `threads` fit in one cache.
+static void gz_pool_place(GzPoolPlacement & p, const Options & opt, unsigned threads);
+
 static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   TableCkScope tck_scope(in);   // seek-table checksums for THIS input
@@ -21612,6 +21670,7 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
   // never reach here (small_input_data_frames).
   bool run_inline = small_nf == 1 && small_decomp <= CPU_DECOMP_STREAM_MIN
                  && !g_tar_decomp_sink;
+  bool capped = false;               // one worker per frame: a pool small enough to place
   if (run_inline) {
     vlog(V_VERBOSE, opt, "[CPU] the input holds 1 frame; decoding it on this thread\n");
     threads = 1;
@@ -21619,6 +21678,7 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
     vlog(V_VERBOSE, opt, "[CPU] the input holds " + std::to_string(small_nf) + " frame"
          + (small_nf == 1 ? "" : "s") + "; one decompression thread per frame\n");
     threads = small_nf;
+    capped = true;
   } else if (small_nf == 0 && opt.cpu_threads == 0
              && g_input_geom_known.load(std::memory_order_relaxed)
              && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
@@ -21633,7 +21693,19 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
       vlog(V_VERBOSE, opt, "[CPU] the seek table lists " + std::to_string(nf) + " frame"
            + (nf == 1 ? "" : "s") + "; one decompression thread per frame\n");
       threads = (int)nf;
+      capped = true;
     }
+  }
+  // Before the writer and the pool start: they inherit it.  Not under --tar,
+  // whose frame sink is drained by extraction threads of its own.
+  // Even one worker: the frame it decodes is read and written by other threads.
+  // 128 x 12 MiB one-frame archives: -d -r 2.82-3.04 s unpinned, 1.83-1.90 in one
+  // cache, `zstd -d` 1.82-1.94.
+  GzPoolPlacement place;
+  if (capped && !g_tar_decomp_sink) {
+    gz_pool_place(place, opt, (unsigned)threads);
+    if (!place.detail.empty()) vlog(V_DEBUG, opt, place.detail);
+    if (!place.note.empty()) vlog(V_VERBOSE, opt, place.note);
   }
 
   CpuAgg cpuagg{};
@@ -21696,7 +21768,12 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
       if (opt.verbosity >= V_VERBOSE)
         std::cerr << "[CPU] " << threads << " decompression threads online\n";
     };
-    if (!run_inline) start_threads();
+    if (!run_inline) {
+      start_threads();
+#ifndef _WIN32
+      gz_fifo_gate("GZSTD_DEBUG_POOL_GATE");   // the pool and the writer started, nothing read
+#endif
+    }
 
     // Stream frames from input directly into the queue.
     // Workers start decompressing as soon as the first frame is pushed.
@@ -21946,9 +22023,9 @@ static CpuCompressChunk cpu_compress_chunk(const Options & opt, int threads,
 }
 
 static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Meter * m,
-                                size_t chunk_bytes)
+                                size_t chunk_bytes, int frame_workers = 0, size_t frame_job = 0)
 {
-  g_cpu_pass_threads.store(1, std::memory_order_relaxed);
+  g_cpu_pass_threads.store(std::max(1, frame_workers), std::memory_order_relaxed);
 
   // Plain-compress seek table (v0.14.92): pin the fixed-chunk geometry that
   // the per-frame csize recording pairs with; append_tar_index derives and
@@ -21984,6 +22061,11 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
   ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, g_no_check ? 0 : 1);  // self-verifying frames (see compress worker); --no-check
+  if (frame_workers > 0) {   // zstd's own workers for the one frame, before apply_ultra_cctx (see compress_cpu_mt)
+    st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, frame_workers);
+    if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(nbWorkers) error: ") + ZSTD_getErrorName(st));
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_jobSize, (int)frame_job);
+  }
 
   // Ultra levels need explicit windowLog for large windows to take effect
   {
@@ -22932,6 +23014,86 @@ private:
   }
 #endif
 };
+
+// The plan for a small pool; see GzPoolPlacement.  The layout is read once per
+// affinity mask: ~180 sysfs reads on the 256-CPU server, about a millisecond,
+// and `-r` asks again for every input.
+static void gz_pool_place(GzPoolPlacement & p, const Options & opt, unsigned threads)
+{
+#ifdef __linux__
+  (void)opt;
+  const std::string tag = "[CPU] placement: ";
+  if (const char * h = std::getenv("GZSTD_DEBUG_POOL_PLACE"); h && std::strcmp(h, "off") == 0) {
+    p.note = tag + "off: GZSTD_DEBUG_POOL_PLACE=off\n";
+    return;
+  }
+  CPU_ZERO(&p.saved);
+  if (::sched_getaffinity(0, sizeof p.saved, &p.saved) != 0) {
+    p.note = tag + "none: the CPU affinity cannot be read\n";
+    return;
+  }
+  static std::mutex layout_m;
+  static cpu_set_t layout_mask;
+  static bool layout_read = false;
+  static std::vector<GzL3Dom> layout;
+  std::vector<GzL3Dom> doms;
+  {
+    std::lock_guard<std::mutex> lk(layout_m);
+    if (!layout_read || !CPU_EQUAL(&layout_mask, &p.saved)) {
+      layout = gz_l3_layout(p.saved);
+      layout_mask = p.saved;
+      layout_read = true;
+    }
+    doms = layout;
+  }
+  if (doms.empty()) { p.note = tag + "none: the L3 cache layout cannot be read\n"; return; }
+  if (doms.size() == 1) { p.note = tag + "none: this process's CPUs share one L3 cache\n"; return; }
+  std::unique_ptr<GzClaims> claims =
+      gz_claims_open(GZ_CLAIMS_L3, std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+  for (auto & d : doms) {
+    const auto it = claims->live.find("L3-" + std::to_string(d.first));
+    if (it != claims->live.end()) d.claims = it->second;
+  }
+  const int here = ::sched_getcpu();
+  size_t best = doms.size();
+  size_t largest = 0;
+  for (size_t i = 0; i < doms.size(); ++i) {
+    largest = std::max(largest, doms[i].cpus.size());
+    if (doms[i].cpus.size() < threads) continue;
+    if (best == doms.size()) { best = i; continue; }
+    const bool mine = std::find(doms[i].cpus.begin(), doms[i].cpus.end(), here) != doms[i].cpus.end();
+    if (doms[i].claims < doms[best].claims || (doms[i].claims == doms[best].claims && mine)) best = i;
+  }
+  {
+    std::ostringstream os;
+    os << "[CPU] L3 caches (first CPU: hardware threads, claims):";
+    for (const auto & d : doms) os << " " << d.first << ":" << d.cpus.size() << "," << d.claims;
+    os << "; running on CPU " << here << "; claims: "
+       << (claims->why.empty() ? std::string("read") : claims->why) << "\n";
+    p.detail = os.str();
+  }
+  if (best == doms.size()) {
+    p.note = tag + "none: " + std::to_string(threads) + " threads fit no one L3 cache (the largest has "
+           + std::to_string(largest) + " hardware threads)\n";
+    return;
+  }
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  for (int c : doms[best].cpus) CPU_SET(c, &mask);
+  if (::sched_setaffinity(0, sizeof mask, &mask) != 0) {
+    const int e = errno;
+    p.note = tag + "none: the CPU affinity cannot be set (" + std::strerror(e) + ")\n";
+    return;
+  }
+  p.placed = true;
+  p.cache_threads = (unsigned)doms[best].cpus.size();
+  gz_claims_write(*claims, GZ_CLAIMS_L3, "L3-" + std::to_string(doms[best].first));
+  p.note = tag + std::to_string(threads) + " threads on one of " + std::to_string(doms.size())
+         + " L3 caches (CPUs " + gz_cpu_list_str(doms[best].cpus) + ")\n";
+#else
+  (void)p; (void)opt; (void)threads;
+#endif
+}
 
 #ifndef _WIN32
 static double adapt_path_residency(const std::string & path);   // defined below
@@ -32406,6 +32568,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // is already chosen, so the output is the same.  A file that grows after the
   // size is read gets more frames than workers, which is slower, not wrong.  -T,
   // --tar and a pipe keep their pool; GZSTD_DEBUG_NO_SMALL_SERIAL keeps it for A/B.
+  const int all_threads = threads;
+  bool capped = false;
   if (!chunk.serial && opt.cpu_threads == 0 && !opt.tar_mode
       && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
     const uint64_t sz = single_frame_size > 0 ? single_frame_size : known_input_size(opt, in);
@@ -32414,15 +32578,85 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, "[CPU] the input makes " + std::to_string(nf)
            + " frames; one compression thread per frame\n");
       threads = (int)nf;
+      capped = true;
     }
   }
-  g_cpu_pass_threads.store(threads, std::memory_order_relaxed);
+  // ZSTD'S OWN WORKERS INSIDE EACH FRAME (v0.18.29).  That cap leaves an input of
+  // fewer frames than CPUs few threads: a 40 MiB file is 3 frames, so 3 CPUs of
+  // 256 compressed it and the last 16 MiB frame set the wall -- `-r` over 96 such
+  // text files took 6.65-7.06 s, and `zstd -T0` 6.19-6.38.  Smaller frames would
+  // use more CPUs but cost ratio, most at high levels: C headers at level 19 grew
+  // 13% at 8 MiB frames and 19% at 4 MiB.  zstd's workers cut a frame into jobs
+  // and keep the frame and its seek-table entry: 4 MiB jobs cost at most 0.5% at
+  // levels 3, 9 and 19 over five corpora (none at 19, where zstd widens each job
+  // to its 8 MiB window).  So each frame takes the CPUs the pool leaves idle, up
+  // to one per 4 MiB job, and so does the one frame of an input of one chunk or
+  // less.  zstd writes the same frame for any count of its workers from one up:
+  // the archive depends only on whether a frame had at least two CPUs, never on
+  // how many.  The frame header is the same as one thread's; the blocks differ
+  // where a job starts, with only zstd's overlap of the window behind it (an
+  // incompressible input comes out the same).  -T N, --tar and a pipe keep one
+  // thread per frame; so does a libzstd without worker threads.  With the pool inside
+  // one L3 cache (below) the 96 files took 3.26-3.31 s, and 4.45-4.59 without it.
+  // Not at btultra2 (level 19 and up) or under a window asked for (--ultra, --long,
+  // --zstd=windowLog): zstd widens each job to its overlap, the whole window there,
+  // so a job re-reads what the one before it covered -- 12 x 40 MiB at level 19
+  // went 1.13x faster for 38% more CPU, and --ultra -20 makes each frame one job.
+  // Levels 9-16 went 1.7-1.9x faster.  MEMORY: zstd keeps a context and buffers
+  // per job, so a frame's 4 workers hold 4 contexts.  The total is bounded by the
+  // default worker count, as a large input's pool is (one 40 MiB input at level
+  // 3 peaked at 98 MB against 55; a 3 GiB input takes 4.0 GB either way), but
+  // `-r` starts new threads per input and glibc gives them new arenas: 96 x 40 MiB
+  // peaked at 630 MB against 141 (level 12, 48 files: 962 MB against 402).
+  // malloc_trim after each input cost 30% in refaults; MALLOC_ARENA_MAX=4 was
+  // 12% slower at level 12.  GZSTD_DEBUG_NO_FRAME_MT=1 is the A/B control and
+  // GZSTD_DEBUG_FRAME_JOB_MIB=<n> the job size.
+  int frame_workers = 0;
+  size_t frame_job = 4 * ONE_MIB;
+  uint64_t frame_job_cut = frame_job;   // what zstd cuts, for the -v line
+  if ((capped || small_serial) && gz_zstd_multithreaded()
+      && !std::getenv("GZSTD_DEBUG_NO_FRAME_MT")) {
+    if (const char * jm = std::getenv("GZSTD_DEBUG_FRAME_JOB_MIB"); jm && std::atoi(jm) > 0)
+      frame_job = (size_t)std::atoi(jm) * ONE_MIB;
+    const uint64_t frame_bytes = small_serial ? single_frame_size : (uint64_t)chunk.bytes;
+    const ZSTD_compressionParameters cp = ZSTD_getCParams(opt.level, frame_bytes, 0);
+    const int strat = g_zparams[6] ? g_zparams[6] : (int)cp.strategy;
+    // zstd raises a job to its overlap, window >> (9 - overlapLog), overlapLog
+    // defaulting by strategy (zstdmt_compress.c, ZSTDMT_computeOverlapSize):
+    // count the jobs it will cut, so --zstd=overlapLog=9 plans no idle workers.
+    // (Clamped to zstd's 0-9: a value outside is refused when the frame sets it.)
+    const int ovlog = g_zparams[7] ? std::clamp(g_zparams[7], 0, 9)
+                    : strat >= (int)ZSTD_btultra2 ? 9 : strat >= (int)ZSTD_btopt ? 8
+                    : strat >= (int)ZSTD_lazy2 ? 7 : 6;
+    const uint64_t overlap = 9 - ovlog >= 8 ? 0 : uint64_t(1) << (cp.windowLog - (9 - ovlog));
+    const uint64_t job = std::max<uint64_t>(frame_job, overlap);
+    const uint64_t jobs = (frame_bytes + job - 1) / job;
+    frame_job_cut = job;
+    const int spare = all_threads / (small_serial ? 1 : threads);
+    if (spare >= 2 && jobs >= 2 && strat < (int)ZSTD_btultra2
+        && ultra_window_log(opt.level, opt.ultra) == 0)
+      frame_workers = (int)std::min<uint64_t>((uint64_t)spare, jobs);
+  }
+  // Before the writer and the pool start: they inherit it (GzPoolPlacement).
+  // The pool is every compressing thread: one per frame, times zstd's workers.
+  const int compressing = (small_serial ? 1 : threads) * std::max(1, frame_workers);
+  GzPoolPlacement place;
+  if ((capped || small_serial) && compressing >= 2) {
+    gz_pool_place(place, opt, (unsigned)compressing);
+    if (!place.detail.empty()) vlog(V_DEBUG, opt, place.detail);
+    if (!place.note.empty()) vlog(V_VERBOSE, opt, place.note);
+  }
+  if (frame_workers > 0)
+    vlog(V_VERBOSE, opt, "[CPU] " + std::to_string(frame_workers)
+         + " zstd workers inside each frame ("
+         + std::to_string(frame_job_cut / ONE_MIB) + " MiB jobs)\n");
+  g_cpu_pass_threads.store(compressing, std::memory_order_relaxed);
   if (chunk.serial) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, small_serial
           ? "[CPU] single-thread streaming path (input fits in one frame)\n"
           : "[CPU] single-thread streaming path (-T 1)\n");
-    compress_cpu_stream(in, out, opt, m, chunk.bytes);
+    compress_cpu_stream(in, out, opt, m, chunk.bytes, frame_workers, frame_job);
     if (g_perf) {
       g_perf->print_summary("CPU-ONLY COMPRESS (single-thread)");
       g_perf = nullptr;
@@ -32432,6 +32666,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 
   CpuAgg cpuagg{};
   cpuagg.threads = threads;
+  cpuagg.frame_workers = frame_workers;
+  cpuagg.frame_job = frame_job;
   cpuagg.per_thread.resize((size_t)threads);
 
   const size_t chosen_mib = chunk.bytes / ONE_MIB;
@@ -32519,6 +32755,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 #endif
     &cpuagg, &throttle);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
+#ifndef _WIN32
+  gz_fifo_gate("GZSTD_DEBUG_POOL_GATE");   // the pool and the writer started, nothing read
+#endif
 
 #ifndef _WIN32
   // DECLARED BEFORE ThreadGuard DELIBERATELY -- do not move these down into the

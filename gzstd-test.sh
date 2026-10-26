@@ -622,8 +622,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=567
-$EXTENSIVE && EXPECTED_TESTS=867
+EXPECTED_TESTS=575
+$EXTENSIVE && EXPECTED_TESTS=875
+# v0.18.29: +8 default cells, no GPU (small inputs: each frame takes zstd's workers; the
+# same archive for 6 or 12 CPUs; -T N and a single-threaded zstd keep one thread per
+# frame; the pool placement cells -- off and one-cache, compress and decode threads on
+# the placed cache, undone between files, a second run takes the other cache; the last
+# four skip_host below two L3 caches): 567 -> 575, 867 -> 875.
 # v0.18.28: +3 default cells, no GPU (--stats-json for -d --tar and -t --tar counts what
 # each route read; --stats-json beside --tar never replaces an archive or an extracted
 # file; --stats-json cpu.threads on decode is the CPU pool that decoded): 564 -> 567,
@@ -13345,6 +13350,333 @@ else
   rm -rf "$swp_cl"
 fi
 rm -f "$TMPDIR"/swp*.err
+
+# ============================================================
+section "Small inputs: zstd's workers in each frame, the pool in one L3 (v0.18.29)"
+
+# An input with fewer frames than CPUs gives each frame zstd's own workers, and a
+# pool small enough to fit one L3 cache runs inside one (GzPoolPlacement).
+# pp-text.bin is medium.txt repeated to exactly 32 MiB: 2 frames, compressible
+# (zstd's jobs write an incompressible input exactly as one thread does).
+# Sized with head -c: medium.txt is about 0.7 MiB, not 1.  --cpu-only,
+# since the suite sends small inputs to the GPU (GZSTD_DEBUG_GPU_MIN_BYTES=0).  The placement cells need two whole
+# L3 caches in this suite's affinity (swp_caches, above) and skip_host otherwise.
+pp_in="$TMPDIR/pp-text.bin"
+for _ in $(seq 64); do cat "$TMPDIR/medium.txt"; done | head -c $((32 * 1048576)) > "$pp_in"
+pp_ncpu=$(nproc 2>/dev/null || echo 1)
+pp_mt=1
+"$GZSTD" -V 2>/dev/null | grep -q 'single-threaded\]' && pp_mt=0
+pp_line='zstd workers inside each frame'
+# The default worker count under a CPU list ($1; empty: this suite's own), capped
+# at 32: the workers a 32-frame input starts, since a pool is no larger than its
+# frames.  Measured, not derived: the count leaves out the I/O-pinned cores and
+# follows a CPU quota.  32 covers every demand below (at most 6 frames x 4).
+pp_default_workers() {
+  local tset=()
+  [[ -n "$1" ]] && tset=(taskset -c "$1")
+  "${tset[@]}" "$GZSTD" --cpu-only -v -f --chunk-size=1 -c "$TMPDIR/large.bin" 2>&1 >/dev/null \
+    | grep -aoE '\[CPU\] [0-9]+ worker threads online' | grep -oE '[0-9]+' | head -1
+}
+# Compression placement demand at level 3, or 0 when no placement is eligible.
+# $1 frames, $2 jobs per full frame, $3 the default worker count.
+pp_compress_demand() {
+  local nf=$1 jobs=$2 n=${3:-1} fw=1
+  if (( nf >= n )); then echo 0; return; fi
+  if (( pp_mt && jobs >= 2 && n / nf >= 2 )); then
+    fw=$((n / nf)); (( fw <= jobs )) || fw=$jobs
+  fi
+  n=$((nf * fw))
+  (( n >= 2 )) || n=0
+  echo "$n"
+}
+GZSTD_DEBUG_NO_FRAME_MT=1 "$GZSTD" -q -f --cpu-only -3 "$pp_in" -o "$TMPDIR/pp-st.zst" 2>/dev/null
+pp_rc_st=$?
+
+# 1. The frames carry zstd's workers: said at -v, a different archive from one
+#    thread per frame, and it decodes to the input, by gzstd and by zstd.  Two
+#    frames through the pool, and one 12 MiB frame through the one-frame route.
+head -c $((12 * 1048576)) "$pp_in" > "$TMPDIR/pp-one.bin"
+GZSTD_DEBUG_NO_FRAME_MT=1 "$GZSTD" -q -f --cpu-only -3 "$TMPDIR/pp-one.bin" -o "$TMPDIR/pp-one-st.zst" 2>/dev/null
+pp_rc_ost=$?
+"$GZSTD" -v -f --cpu-only -3 "$pp_in" -o "$TMPDIR/pp-mt.zst" 2>"$TMPDIR/pp1.err"
+pp_rc=$?
+"$GZSTD" -v -f --cpu-only -3 "$TMPDIR/pp-one.bin" -o "$TMPDIR/pp-one.zst" 2>"$TMPDIR/pp1b.err"
+pp_rc_o=$?
+pp_default=$(pp_default_workers ""); pp_default=${pp_default:-1}
+if (( pp_mt == 0 || pp_default < 4 )); then
+  skip_host "small inputs: each frame takes zstd's workers" "needs zstd worker threads and 4 default workers after I/O reserve and quota"
+else
+  pp_why=""
+  [[ $pp_rc -eq 0 && $pp_rc_st -eq 0 && $pp_rc_o -eq 0 && $pp_rc_ost -eq 0 ]] || pp_why+=" rc=$pp_rc/$pp_rc_st/$pp_rc_o/$pp_rc_ost"
+  grep -qa "$pp_line" "$TMPDIR/pp1.err" || pp_why+=" pool:no-line"
+  grep -qa "$pp_line" "$TMPDIR/pp1b.err" || pp_why+=" one-frame:no-line"
+  grep -qa 'single-thread streaming path (input fits in one frame)' "$TMPDIR/pp1b.err" || pp_why+=" one-frame:not-that-route"
+  cmp -s "$TMPDIR/pp-mt.zst" "$TMPDIR/pp-st.zst" && pp_why+=" pool:same-archive"
+  cmp -s "$TMPDIR/pp-one.zst" "$TMPDIR/pp-one-st.zst" && pp_why+=" one-frame:same-archive"
+  if command -v zstd >/dev/null 2>&1; then
+    zstd -q -t "$TMPDIR/pp-mt.zst" "$TMPDIR/pp-one.zst" 2>/dev/null || pp_why+=" zstd-t"
+    # With the same libzstd, the one frame is zstd's own -T -B4MiB frame, byte
+    # for byte (the seek table follows it): its workers, at 4 MiB jobs.
+    pp_zv=$(zstd --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ -n "$pp_zv" && $("$GZSTD" --version 2>/dev/null) == *"zstd ${pp_zv#v},"* ]]; then
+      zstd -q -f -3 -T4 -B4MiB "$TMPDIR/pp-one.bin" -o "$TMPDIR/pp-one-z.zst" 2>/dev/null \
+        && cmp -s <(head -c "$(stat -c %s "$TMPDIR/pp-one-z.zst")" "$TMPDIR/pp-one.zst") "$TMPDIR/pp-one-z.zst" \
+        || pp_why+=" one-frame:not-zstd-T4-B4MiB"
+      # The pool's first frame is the input's first 16 MiB, compressed the same way.
+      head -c $((16 * 1048576)) "$pp_in" > "$TMPDIR/pp-f0.bin"
+      zstd -q -f -3 -T4 -B4MiB "$TMPDIR/pp-f0.bin" -o "$TMPDIR/pp-f0-z.zst" 2>/dev/null \
+        && cmp -s <(head -c "$(stat -c %s "$TMPDIR/pp-f0-z.zst")" "$TMPDIR/pp-mt.zst") "$TMPDIR/pp-f0-z.zst" \
+        || pp_why+=" pool:frame0-not-zstd-T4-B4MiB"
+      rm -f "$TMPDIR/pp-one-z.zst" "$TMPDIR/pp-f0.bin" "$TMPDIR/pp-f0-z.zst"
+    fi
+  fi
+  "$GZSTD" -d -q -c --cpu-only "$TMPDIR/pp-mt.zst" 2>/dev/null | cmp -s - "$pp_in" || pp_why+=" pool:bytes"
+  "$GZSTD" -d -q -c --cpu-only "$TMPDIR/pp-one.zst" 2>/dev/null | cmp -s - "$TMPDIR/pp-one.bin" || pp_why+=" one-frame:bytes"
+  [[ -z "$pp_why" ]] && pass "small inputs: each frame takes zstd's workers" \
+    || fail "small inputs: each frame takes zstd's workers" "$pp_why"
+fi
+rm -f "$TMPDIR/pp-one.bin" "$TMPDIR/pp-one.zst" "$TMPDIR/pp-one-st.zst"
+
+# 2. zstd writes the same frame for any count of its workers, so the archive does
+#    not depend on how many CPUs there were, once there were enough.  6 CPUs make
+#    4-5 default workers, 2 zstd workers per frame here; 12 make 3 or 4.
+pp_cpus=$(taskset -pc $$ 2>/dev/null | sed 's/.*: //' | swp_expand 2>/dev/null | head -12 | tr '\n' ',' | sed 's/,$//')
+if (( pp_mt == 0 )) || ! command -v taskset >/dev/null 2>&1 || [[ $(tr ',' '\n' <<<"$pp_cpus" | wc -l) -lt 12 ]]; then
+  skip_host "small inputs: the same archive for 6 or 12 CPUs" "needs taskset, zstd worker threads and 12 CPUs"
+else
+  pp_c6=$(cut -d, -f1-6 <<<"$pp_cpus")
+  taskset -c "$pp_c6" "$GZSTD" -v -f --cpu-only -3 "$pp_in" -o "$TMPDIR/pp-6.zst" 2>"$TMPDIR/pp2a.err"
+  pp_rc_a=$?
+  taskset -c "$pp_cpus" "$GZSTD" -v -f --cpu-only -3 "$pp_in" -o "$TMPDIR/pp-12.zst" 2>"$TMPDIR/pp2b.err"
+  pp_rc_b=$?
+  pp_wa=$(grep -aoE "[0-9]+ $pp_line" "$TMPDIR/pp2a.err" | grep -oE '^[0-9]+')
+  pp_wb=$(grep -aoE "[0-9]+ $pp_line" "$TMPDIR/pp2b.err" | grep -oE '^[0-9]+')
+  pp_want_a=$(pp_compress_demand 2 4 "$(pp_default_workers "$pp_c6")")
+  pp_want_b=$(pp_compress_demand 2 4 "$(pp_default_workers "$pp_cpus")")
+  if [[ $pp_rc_a -eq 0 && $pp_rc_b -eq 0 ]] \
+     && (( pp_want_a < 4 || pp_want_b < 4 || pp_want_a == pp_want_b )); then
+    skip_host "small inputs: the same archive for 6 or 12 CPUs" "the CPU quota prevents two different frame-worker counts"
+  elif [[ $pp_rc_a -eq 0 && $pp_rc_b -eq 0 && -n "$pp_wa" && -n "$pp_wb" ]] \
+     && (( pp_wa >= 2 && pp_wb >= 2 && pp_wa != pp_wb )) \
+     && cmp -s "$TMPDIR/pp-6.zst" "$TMPDIR/pp-12.zst"; then
+    pass "small inputs: the same archive for 6 or 12 CPUs"
+  else
+    fail "small inputs: the same archive for 6 or 12 CPUs" "workers=$pp_wa/$pp_wb"
+  fi
+  rm -f "$TMPDIR/pp-6.zst" "$TMPDIR/pp-12.zst"
+fi
+
+# 3. -T N is a pool of N, and a libzstd without worker threads has none to give:
+#    both keep one thread per frame, so the archive of GZSTD_DEBUG_NO_FRAME_MT.
+"$GZSTD" -v -f --cpu-only -3 -T4 "$pp_in" -o "$TMPDIR/pp-t4.zst" 2>"$TMPDIR/pp3a.err"
+pp_rc_a=$?
+GZSTD_DEBUG_ZSTD_SINGLE_THREAD=1 "$GZSTD" -v -f --cpu-only -3 "$pp_in" -o "$TMPDIR/pp-zst1.zst" 2>"$TMPDIR/pp3b.err"
+pp_rc_b=$?
+if [[ $pp_rc_a -eq 0 && $pp_rc_b -eq 0 && $pp_rc_st -eq 0 ]] \
+   && ! grep -qa "$pp_line" "$TMPDIR/pp3a.err" "$TMPDIR/pp3b.err" \
+   && cmp -s "$TMPDIR/pp-t4.zst" "$TMPDIR/pp-st.zst" && cmp -s "$TMPDIR/pp-zst1.zst" "$TMPDIR/pp-st.zst"; then
+  pass "small inputs: -T N and a single-threaded zstd keep one thread per frame"
+else
+  fail "small inputs: -T N and a single-threaded zstd keep one thread per frame" \
+    "$(grep -ah "$pp_line" "$TMPDIR/pp3a.err" "$TMPDIR/pp3b.err" | tr '\n' ' ')"
+fi
+rm -f "$TMPDIR/pp-t4.zst" "$TMPDIR/pp-zst1.zst"
+
+# A run held at GZSTD_DEBUG_POOL_GATE (its pool and writer started, nothing read),
+# under the CPUs in $1; leaves its pid in pp_pid.  $2 is its stderr, the rest its
+# arguments.  The same FIFO handshake as swp_held.
+pp_cl="$TMPDIR/pp-claims"; rm -rf "$pp_cl"
+pp_hold_seq=0
+pp_held() {
+  local cpus=$1 err=$2; shift 2
+  pp_ready=0; pp_pid=""; pp_gate_fd=""
+  pp_hold_seq=$((pp_hold_seq + 1))
+  pp_fifo="$TMPDIR/pp.$pp_hold_seq.fifo"
+  mkfifo "$pp_fifo" || return 1
+  exec {pp_gate_fd}<>"$pp_fifo" || return 1
+  GZSTD_DEBUG_GPU_CLAIMS_DIR="$pp_cl" GZSTD_DEBUG_POOL_GATE="$pp_fifo" \
+    taskset -c "$cpus" "$GZSTD" "$@" 2>"$err" >/dev/null &
+  pp_pid=$!
+  for _ in $(seq 400); do
+    if grep -qa 'threads online' "$err" 2>/dev/null; then pp_ready=1; return 0; fi
+    kill -0 "$pp_pid" 2>/dev/null || return 1
+    sleep 0.05
+  done
+  return 1
+}
+pp_release() {
+  local rc=1
+  if (( pp_ready )) && [[ -n "$pp_gate_fd" ]]; then
+    printf x >&"$pp_gate_fd"
+    wait "$pp_pid"; rc=$?
+  elif [[ -n "$pp_pid" ]]; then
+    kill "$pp_pid" 2>/dev/null || true
+    wait "$pp_pid" 2>/dev/null || true
+  fi
+  [[ -z "$pp_gate_fd" ]] || exec {pp_gate_fd}>&-
+  rm -f "$pp_fifo"
+  return "$rc"
+}
+pp_threads() { for t in /proc/"$1"/task/*; do awk '/Cpus_allowed_list/{print $2}' "$t/status"; done | sort -u | tr '\n' ' '; }
+pp_cpus_of() { grep -ao 'L3 caches (CPUs [0-9,-]*)' "$1" | head -1 | sed -E 's/.*CPUs ([0-9,-]*).*/\1/'; }
+
+# 4. GZSTD_DEBUG_POOL_PLACE=off leaves every thread on the CPUs it was given, and
+#    a process whose CPUs share one L3 cache has nothing to place.
+pp_th=""
+if ! command -v taskset >/dev/null 2>&1 || (( ${#swp_caches[@]} < 1 )); then
+  skip_host "small inputs: unplaced when told, or inside one cache" "no usable L3 layout or taskset"
+else
+  pp_one=${swp_caches[0]}
+  pp_one_default=$(pp_default_workers "$pp_one"); pp_one_default=${pp_one_default:-1}
+  if (( pp_default <= 2 || pp_one_default <= 2 )); then
+    skip_host "small inputs: unplaced when told, or inside one cache" "the CPU allowance does not cap a two-frame decode pool on both masks"
+  else
+  pp_mask=$(taskset -pc $$ 2>/dev/null | sed 's/.*: //')
+  if GZSTD_DEBUG_POOL_PLACE=off pp_held "$pp_mask" "$TMPDIR/pp4a.err" -d -v -f --cpu-only -c "$TMPDIR/pp-st.zst"; then
+    pp_th=$(pp_threads "$pp_pid")
+  fi
+  pp_release; pp_rc_a=$?
+  pp_given=$(taskset -c "$pp_mask" awk '/Cpus_allowed_list/{print $2}' /proc/self/status)
+  taskset -c "$pp_one" "$GZSTD" -d -v -f --cpu-only -c "$TMPDIR/pp-st.zst" 2>"$TMPDIR/pp4b.err" >/dev/null
+  pp_rc_b=$?
+  if [[ $pp_rc_a -eq 0 && $pp_rc_b -eq 0 && "$pp_th" == "$pp_given " ]] \
+     && grep -qa 'placement: off: GZSTD_DEBUG_POOL_PLACE=off' "$TMPDIR/pp4a.err" \
+     && grep -qa "placement: none: this process's CPUs share one L3 cache" "$TMPDIR/pp4b.err"; then
+    pass "small inputs: unplaced when told, or inside one cache"
+  else
+    fail "small inputs: unplaced when told, or inside one cache" \
+      "threads=[$pp_th] given=[$pp_given] $(grep -ah 'placement' "$TMPDIR/pp4a.err" "$TMPDIR/pp4b.err" | tr '\n' ' ')"
+  fi
+  fi
+fi
+
+if (( ${#swp_caches[@]} < 2 )); then
+  for pp_t in "every thread of a compress pool is on its cache" "every thread of a decode pool is on its cache" \
+              "placement is undone between files" "a second simultaneous run takes the other cache"; do
+    skip_host "small inputs: $pp_t" "fewer than two L3 caches here"
+  done
+else
+  pp_two="${swp_caches[0]},${swp_caches[1]}"
+  pp_c1_n=$(swp_expand <<<"${swp_caches[0]}" | wc -l)
+  pp_c2_n=$(swp_expand <<<"${swp_caches[1]}" | wc -l)
+  pp_bcache=$pp_c1_n; (( pp_c2_n <= pp_bcache )) || pp_bcache=$pp_c2_n
+  pp_given=$(taskset -c "$pp_two" awk '/Cpus_allowed_list/{print $2}' /proc/self/status)
+  # $1 stderr, $2 independent demand, $3 number of inputs.  An uncapped
+  # pool has no placement attempt; an oversized capped pool explicitly declines.
+  pp_check_plan() {
+    local err=$1 demand=$2 count=${3:-1}
+    if (( demand == 0 )); then
+      ! grep -qa '\[CPU\] placement:' "$err"
+    elif (( demand > pp_bcache )); then
+      [[ $(grep -ac "placement: none: $demand threads fit no one L3 cache" "$err") -eq $count ]]
+    else
+      [[ $(grep -ac "placement: $demand threads on one of 2 L3 caches" "$err") -eq $count ]]
+    fi
+  }
+  # 5-6. Held at the gate, the calling thread, the writer and every worker have
+  #      the one cache the plan names.  Workers inherit it; zstd's own workers,
+  #      started later by them, inherit theirs.  --no-progress: a decode's progress
+  #      thread starts before the input is planned and keeps the CPUs it was given.
+  #      And a pool that does not fit one cache is not placed: 96 MiB is 6 frames,
+  #      times zstd's workers -- placed if that fits a cache's hardware threads.
+  pp_big_why=""
+  for _ in $(seq 3); do cat "$pp_in"; done > "$TMPDIR/pp-big.bin"   # 96 MiB
+  GZSTD_DEBUG_GPU_CLAIMS_DIR="$pp_cl" taskset -c "$pp_two" \
+    "$GZSTD" -v --no-progress -f --cpu-only -3 -c "$TMPDIR/pp-big.bin" 2>"$TMPDIR/pp5big.err" >/dev/null \
+    || pp_big_why+=" big:rc=$?"
+  pp_two_default=$(pp_default_workers "$pp_two"); pp_two_default=${pp_two_default:-1}
+  pp_bwant=$(pp_compress_demand 6 4 "$pp_two_default")
+  pp_check_plan "$TMPDIR/pp5big.err" "$pp_bwant" || pp_big_why+=" big:wrong-placement"
+  pp_decode_demand=0; (( pp_two_default <= 2 )) || pp_decode_demand=2
+  [[ -z "$pp_big_why" ]] || pp_big_why+=" ($(grep -ah placement "$TMPDIR/pp5big.err" | tr '\n' ' '))"
+  rm -f "$TMPDIR/pp-big.bin"
+  for pp_k in compress decode; do
+    pp_th=""
+    if [[ $pp_k == compress ]]; then pp_args=(-v --no-progress -f --cpu-only -3 -c "$pp_in")
+    else pp_args=(-d -v --no-progress -f --cpu-only -c "$TMPDIR/pp-st.zst"); fi
+    if pp_held "$pp_two" "$TMPDIR/pp5$pp_k.err" "${pp_args[@]}"; then pp_th=$(pp_threads "$pp_pid"); fi
+    pp_release; pp_rc=$?
+    pp_at=$(pp_cpus_of "$TMPDIR/pp5$pp_k.err")
+    pp_demand=$pp_decode_demand
+    [[ $pp_k != compress ]] || pp_demand=$(pp_compress_demand 2 4 "$pp_two_default")
+    pp_want_mask=$pp_at
+    pp_mask_ok=0
+    if (( pp_demand == 0 || pp_demand > pp_bcache )); then
+      pp_want_mask=$pp_given
+      [[ -z $pp_at ]] && pp_mask_ok=1
+    elif [[ "$pp_at" == "${swp_caches[0]}" || "$pp_at" == "${swp_caches[1]}" ]]; then
+      pp_mask_ok=1
+    fi
+    if [[ $pp_rc -eq 0 && $pp_mask_ok -eq 1 && "$pp_th" == "$pp_want_mask " ]] \
+       && [[ $pp_k == decode || -z "$pp_big_why" ]] \
+       && pp_check_plan "$TMPDIR/pp5$pp_k.err" "$pp_demand"; then
+      pass "small inputs: every thread of a $pp_k pool is on its cache"
+    else
+      fail "small inputs: every thread of a $pp_k pool is on its cache" \
+        "rc=$pp_rc plan=[$pp_at] threads=[$pp_th] caches=[${swp_caches[0]} | ${swp_caches[1]}]$([[ $pp_k == compress ]] && echo "$pp_big_why")"
+    fi
+  done
+
+  # 7. Two inputs in one run, on all three routes: the second is planned from
+  #    the CPUs the process was given, not from the first one's cache (which
+  #    would read as one cache).  Decode alone cannot catch a compress-only
+  #    restore regression; the one-frame compress route returns early.
+  cp "$TMPDIR/pp-st.zst" "$TMPDIR/pp-st2.zst"
+  GZSTD_DEBUG_GPU_CLAIMS_DIR="$pp_cl" taskset -c "$pp_two" \
+    "$GZSTD" -d -v -f --cpu-only -c "$TMPDIR/pp-st.zst" "$TMPDIR/pp-st2.zst" 2>"$TMPDIR/pp7.err" >/dev/null
+  pp_rc=$?
+  pp_why=""
+  pp_restore_exercised=0
+  (( pp_decode_demand == 0 || pp_decode_demand > pp_bcache )) || pp_restore_exercised=1
+  [[ $pp_rc -eq 0 ]] && pp_check_plan "$TMPDIR/pp7.err" "$pp_decode_demand" 2 \
+    || pp_why+=" decode:rc=$pp_rc $(grep -ah placement "$TMPDIR/pp7.err" | tr '\n' ' ')"
+  head -c $((8 * 1048576)) "$pp_in" > "$TMPDIR/pp-one.bin"
+  for pp_route in pool one-frame; do
+    pp_src=$pp_in
+    [[ $pp_route == one-frame ]] && pp_src="$TMPDIR/pp-one.bin"
+    GZSTD_DEBUG_GPU_CLAIMS_DIR="$pp_cl" taskset -c "$pp_two" \
+      "$GZSTD" -v --no-progress -f --cpu-only -3 -c "$pp_src" "$pp_src" \
+      2>"$TMPDIR/pp7-$pp_route.err" >/dev/null
+    pp_rc=$?
+    pp_nf=2; pp_jobs=4
+    [[ $pp_route != one-frame ]] || { pp_nf=1; pp_jobs=2; }
+    pp_demand=$(pp_compress_demand "$pp_nf" "$pp_jobs" "$pp_two_default")
+    (( pp_demand == 0 || pp_demand > pp_bcache )) || pp_restore_exercised=1
+    [[ $pp_rc -eq 0 ]] && pp_check_plan "$TMPDIR/pp7-$pp_route.err" "$pp_demand" 2 \
+      || pp_why+=" $pp_route:rc=$pp_rc $(grep -ah placement "$TMPDIR/pp7-$pp_route.err" | tr '\n' ' ')"
+  done
+  if [[ -z "$pp_why" && $pp_restore_exercised -eq 0 ]]; then
+    skip_host "small inputs: placement is undone between files" "none of these pools can be placed under this CPU allowance"
+  elif [[ -z "$pp_why" ]]; then
+    pass "small inputs: placement is undone between files"
+  else
+    fail "small inputs: placement is undone between files" "$pp_why"
+  fi
+  rm -f "$TMPDIR/pp-st2.zst" "$TMPDIR/pp-one.bin"
+
+  # 8. Claims: with the first run held at the gate, its cache claimed, a second
+  #    run takes the other one.
+  if (( pp_decode_demand == 0 || pp_c1_n < pp_decode_demand || pp_c2_n < pp_decode_demand )); then
+    skip_host "small inputs: a second simultaneous run takes the other cache" "the CPU allowance cannot place this decode pool"
+  else
+  pp_b=""
+  if pp_held "$pp_two" "$TMPDIR/pp8a.err" -d -v -f --cpu-only -c "$TMPDIR/pp-st.zst"; then
+    GZSTD_DEBUG_GPU_CLAIMS_DIR="$pp_cl" taskset -c "$pp_two" \
+      "$GZSTD" -d -v -f --cpu-only -c "$TMPDIR/pp-st.zst" 2>"$TMPDIR/pp8b.err" >/dev/null
+    pp_rc_b=$?
+    pp_b=$(pp_cpus_of "$TMPDIR/pp8b.err")
+  else pp_rc_b=1; fi
+  pp_release; pp_rc_a=$?
+  pp_a=$(pp_cpus_of "$TMPDIR/pp8a.err")
+  if [[ $pp_rc_a -eq 0 && $pp_rc_b -eq 0 && -n "$pp_a" && -n "$pp_b" && "$pp_a" != "$pp_b" ]]; then
+    pass "small inputs: a second simultaneous run takes the other cache"
+  else
+    fail "small inputs: a second simultaneous run takes the other cache" "first=[$pp_a] second=[$pp_b]"
+  fi
+  fi
+fi
+rm -rf "$pp_cl"
+rm -f "$TMPDIR"/pp*.err "$TMPDIR/pp-mt.zst" "$TMPDIR/pp-st.zst" "$pp_in"
 
 # The two zstd-compat command-line sections below are gated to --extensive:
 # they verify drop-in zstd/gzip flag compatibility (aliases, no-op acceptance,

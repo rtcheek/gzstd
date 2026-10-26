@@ -1,12 +1,160 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.28  
+**Covers:** v0.9.50 → v0.18.29  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.29 — an input of fewer frames than CPUs gives each frame zstd's own workers, and a pool that fits one L3 cache runs inside one: `-r` over 96 x 40 MiB text 2.0x faster to compress and 1.5x to decode, ahead of `zstd -T0` both ways on the server (ROADMAP 29)
+
+### The gap
+
+On the 12-core workstation `zstd -T0` beat gzstd on `-r` over 96 x 40 MiB files both ways (3.4-3.5 s
+against ~5.5 to compress; 3.6-3.9 against ~5.5 to decode, zstd decoding on one thread).  On the
+2-socket server it did not, but the same two causes cost gzstd as much there:
+
+- **Too few threads per input.**  Since v0.18.24 an auto-sized pool has one worker per frame, and
+  a 40 MiB input is 3 frames: 3 CPUs compressed it and the last 16 MiB frame set the wall.
+- **Threads spread over L3 caches.**  The server has 16 L3 caches of 8 cores.  The scheduler put
+  the few workers, the reader and the writer on whatever cores were idle, and each frame was
+  produced in one cache and consumed in another.  `-d -r` of 80 x 48 MiB text archives:
+  4.33-4.46 s unpinned, 2.69-2.79 inside one cache; the same four cores spread over four caches
+  were no faster than unpinned, two caches sat between, and `-t` (no writer) gained as much.
+
+### Frames carry zstd's workers
+
+Smaller frames would use more CPUs but cost ratio, most at high levels (5 corpora of 40 MiB):
+
+| size against 16 MiB frames | level 3 | 9 | 19 |
+|---|---|---|---|
+| C headers, 8 MiB frames | +0.2% | +0.6% | **+13%** |
+| C headers, 4 MiB frames | +0.4% | +1.4% | **+19%** |
+| Python, JSON, .so libraries, 4 MiB frames | +0.4-1.1% | +1.1-1.7% | +2.1-3.9% |
+| any of the five, 16 MiB frames cut into zstd's 4 MiB jobs | <= +0.2% | <= +0.5% | 0 |
+
+So the frame layout and the seek table stay, and when an input has fewer frames than the default
+worker count each frame is compressed with `ZSTD_c_nbWorkers` = the idle CPUs per frame, at most
+one per 4 MiB job (`ZSTD_c_jobSize`).  The one-frame route (an input of one chunk or less) takes
+them too.  zstd writes the same frame for any count of its workers from one up (checked at 1, 2, 4
+and 7), so an archive depends only on whether a frame had two CPUs or more, never on how many.
+The frame header is the same as one thread's; the blocks differ where a job starts, with only
+zstd's overlap behind it (an incompressible input comes out byte-identical).  Not under -T N,
+--tar, a pipe or a libzstd without worker threads, and not at btultra2 (level 19 and up) or under a
+window asked for (`--ultra`, `--long`, `--zstd=windowLog`): zstd widens each job to its overlap,
+the whole window there, so 12 x 40 MiB at level 19 went only 1.13x faster for 38% more CPU, and
+`--ultra -20` makes each frame one job.  Levels 9, 12 and 16 went 1.7-1.9x faster.  The jobs
+are counted as zstd cuts them: it raises a job to its overlap, `window >> (9 - overlapLog)`, so
+`-17 --zstd=ovlog=9` (an 8 MiB window) plans 2 workers of 8 MiB jobs, not 4 of which 2 would idle.
+
+### Small pools run inside one L3 cache
+
+When the pool was cut to the input's frames -- or is the one-frame route with workers, or a decode
+of one frame too large to decode inline -- and every compressing thread fits in one L3 cache's
+hardware threads, the calling thread is put on one cache before the writer and the pool start, so
+they inherit it, and put back after they are joined (`GzPoolPlacement`).  The cache is the one
+other gzstd processes of this user have claimed least (v0.18.18's `l3-claims` file), then the one
+this thread was running on, then the lowest.  No busy sample: it costs 20 ms, a large share of a
+40 MiB input, and unpinned load moves off a pinned cache by itself (measured for v0.18.18).  A
+host whose CPUs share one L3, like the 12-core workstation, has nothing to place.
+
+Inside one cache was never slower than unpinned from 3 to 16 frames per input (`-d -r`, about
+3.75 GiB of text per set; 24 and 32, beyond a cache's 16 hardware threads and not placed, tied),
+and the gain falls as the pool grows: 3 frames 1.6x, 6 1.33x, 12 1.1x, 16 1.07x.  Placing more than fits, by cutting each frame's zstd workers to fit, lost: 6 frames
+2.90-2.97 s against 2.53-2.61 unplaced at 4 workers each.  So placement asks for the whole pool.
+
+### Measured
+
+Server (2 x 64-core EPYC 9554, 16 L3 caches), v0.18.28 and v0.18.29 CPU-only builds, output to
+tmpfs, two ABBA rounds:
+
+| `-r -3`, text | v0.18.28 | v0.18.29 | `zstd -T0` | size |
+|---|---|---|---|---|
+| 96 x 40 MiB | 6.31-6.39 s | **3.09-3.22** | 6.41-6.71 | +0.16% |
+| 40 x 96 MiB | 3.53-3.90 | **2.42-2.50** | 3.36-3.91 | +0.34% |
+| 20 x 192 MiB | 2.23-2.47 | **1.66-1.87** | 2.16-2.91 | +0.34% |
+| 128 x 12 MiB (one frame each) | 5.52-5.61 | **2.40-2.70** | 7.20-7.46 | +0.29% |
+| 96 x 16 MiB (one frame each) | 5.55-5.58 | **2.24** | 5.39-5.86 | +0.31% |
+| 96 x 40 MiB base64 | 3.15-3.88 | **2.31-2.36** | 4.47-4.70 | 0 |
+
+| `-d -r` (`-t`) of those archives | v0.18.28 | v0.18.29 | `zstd -d` |
+|---|---|---|---|
+| 96 x 40 MiB text | 4.18-4.50 (2.22-2.37) | **2.89-3.00** (1.47-1.57) | 4.79-4.91 (3.17-3.21) |
+| 40 x 96 MiB | 2.66-3.02 (1.51-1.80) | **2.17-2.24** (0.97-1.04) | 4.69-4.89 (3.16-3.17) |
+| 20 x 192 MiB | 2.00-2.14 (0.97-1.06) | **1.89-1.95** (0.71-0.74) | 4.76-5.55 (3.15-3.21) |
+| 128 x 12 MiB, one frame | 3.01-3.21 (2.26-2.28) | **1.91-1.92** (1.34) | 1.96-2.03 (1.30-1.31) |
+| 96 x 40 MiB base64 | 4.67-5.37 (2.87-3.68) | **3.30-3.40** (2.09-2.11) | 5.30-5.66 (3.45-3.51) |
+
+The GPU build (what ships) takes the CPU path for these inputs: 96 x 40 MiB text compress
+3.22-3.35 s, decode 3.04-3.12.  Compress spends more CPU (96 x 40 MiB text: 17.6 s user against
+13.7; zstd 21.6).  At 16 and 24 frames per input (256 and 384 MiB) nothing moved, and `zstd -T0`
+is 5-12% ahead there; not chased.
+
+**Memory.**  zstd keeps a context and buffers per job, so a frame's 4 workers hold 4 contexts.
+The total is bounded by the default worker count, as one large input's pool already is (one 40
+MiB input at level 3 peaked at 98 MB against 55; a 3 GiB input takes 4.0 GB at level 3 and 7.8 GB
+at level 12, before and after).  But `-r` starts new threads for each input, and glibc gives them
+new arenas, so peak RSS grows with the input count until it levels off:
+
+| `-r`, text, peak RSS | 12 files | 48 | 96 |
+|---|---|---|---|
+| level 3, v0.18.28 | 105 MB | 122 | 141 |
+| level 3, v0.18.29 | 354 | 594 | 633 |
+| level 12, v0.18.28 / v0.18.29 | 346 / 823 | 402 / 970 | |
+
+`malloc_trim(0)` after each input brought 96 files to 283-377 MB and cost 30% of the wall in
+refaults; `MALLOC_ARENA_MAX=4` held 300 MB at level 3 and was 12% slower at level 12.  Neither is
+taken.  A zstd thread pool kept across inputs (`ZSTD_CCtx_refThreadPool`) would end the growth,
+but its threads keep the placement they were started with, so it needs one pool per cache.
+
+**`--stats-json`** `cpu.threads` for compress counts the threads that compressed (frames x zstd
+workers), as `--sliding-window` counts zstd's.
+
+### Found on the way
+
+`apply_ultra_cctx` applies `--zstd=overlapLog` only to a context that already has workers, so the
+per-frame compressor now sets `ZSTD_c_nbWorkers` before it: after it, a thread's first frame would
+have skipped the user's overlapLog and its later frames not.  A decode's progress thread starts
+before the input is planned and keeps the CPUs it was given (it redraws a line a few times a
+second); so do `--adapt`'s governor and the initial `--verify` worker.  Extra verify workers
+and lazy `DirectWriter` drain threads inherit the placed writer's mask and can outlive the
+placement holder; their owners join them before the next input or rebuild.
+
+**Still open (ROADMAP 29):** the one-L3 workstation's decode gap, which placement cannot reach.
+
+### Cells
+
+**Cells** (default run, no GPU; EXPECTED 575/875, no-GPU deltas unchanged), section "Small
+inputs: zstd's workers in each frame, the pool in one L3": each frame takes zstd's workers (a
+2-frame input through the pool and a 12 MiB one-frame input, said at -v, a different archive
+from GZSTD_DEBUG_NO_FRAME_MT, decoded by gzstd and checked by zstd); the same archive for 6 or 12
+CPUs (2 and 4 workers); -T N and a single-threaded zstd keep one thread per frame (the archive of
+NO_FRAME_MT); unplaced when told (GZSTD_DEBUG_POOL_PLACE=off: every thread keeps the given CPUs,
+read at GZSTD_DEBUG_POOL_GATE) or inside one cache; and, with two L3 caches in the suite's
+affinity (skip_host otherwise), every thread of a compress and of a decode pool on the planned
+cache at the gate, a 6-frame pool too large for one cache left unplaced (or placed, on a host
+whose cache holds it), placement undone between two inputs in one run (compress pool, one-frame
+compress and decode), and a second simultaneous run taking the other cache (claims).  With the
+same libzstd, the one-frame archive's frame and the pool archive's first frame are zstd's own
+`-3 -T4 -B4MiB` frames byte for byte.  Mutants, each caught: the restore dropped, and dropped
+for compress only; the placement undone at once; no claim written; zstd's workers forced to 0,
+never set on the context, counted from the pool instead of the CPUs, or not given to the
+one-frame route; 8 MiB jobs on either route; the fit counted on the outer pool alone; the
+single-threaded libzstd check dropped; the decode pool unplaced.  Not caught, by design: zstd
+given fewer workers than planned (its frame is the same for any count).  The expectations
+follow the host (Codex round 2): the default worker count is measured under each CPU list (the
+workers a 32-frame input starts), so a host whose quota or small caches leave a pool uncapped,
+unplaceable or with equal counts skips what it cannot exercise rather than failing; checked here
+under 2 CPUs, 4, one whole cache and two.  The fixtures are sized with head -c (medium.txt is
+about 0.7 MiB, which made a first 96 MiB arm 64 MiB inside the suite).
+
+**Suites** on the final tree (server, CUDA_VISIBLE_DEVICES unset): default 574/0/1 of 575 and
+CPU-only 427/0/122 of 549, both "as expected on this host"; the one default skip is the
+trivial-park cell (no trivial batch reached a GPU).  `-e` not run: no argument parsing changed.
+Codex (three rounds): SAFE TO COMMIT; it found the compress-only restore gap in the cells, the
+overlapLog planning case and the host-shape false failures above.
 
 ## v0.18.28 — `-d --tar` and `-t --tar` write `--stats-json` (what each route read; never over an extracted file); a GPU decompress fault no longer drops its delivered frames from `input_bytes`; decode records give the CPU pool that decoded
 
