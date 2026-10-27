@@ -617,11 +617,25 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     and partitions, and its frame sink and decode throttle split a quarter.  Found on the way:
     a hybrid compress marked its throttle done before joining the CPU pool (since v0.13.2), so
     a run whose GPUs were declined compressed the whole input into memory for a slow sink.
-    Still open: `-d --tar` below ~768 MB (the writer side holds four 64 MiB part windows --
-    building, two queued, one writing -- so going lower means a smaller window under a limit);
-    `--hybrid` / `--cpu-share` and a non-deferred bringup keep the GPU batch floor in the
-    throttle from the start; `--verify` and the pinned-host budgets (`--direct-stage`, GDS)
-    read the container's figure but were not run under a limit.
+    Left open then: `-d --tar` below ~768 MB (four 64 MiB part windows); `--cpu-share` and the
+    other synchronous bringups kept the GPU batch floor in the throttle from the start;
+    `--verify`, `--direct-stage` and GDS had not been run under a limit.
+    v0.18.31, the leftovers: a GPU's batches shrink to the memory before the GPU is declined
+    (`gz_mem_fit_gpu_batch`; it also fixed v0.18.30 declining every GPU of the default hybrid
+    in a 16 GB container), and `--cpu-share`/`--gpu-only` fit theirs from the start;
+    `--gds-only` reads the host's figure again (v0.18.30 shrank its registrations under a
+    limit, 4-7x slower, for no memory); the decode reader's block, `-d --tar`'s part window,
+    `--direct-stage`'s read-ahead and lanes and `--adapt`'s extract pool fit the memory.
+    Still open: decode below ~192 MB (one decoder's two 16 MiB frames, the throttle's two, the
+    reader's blocks, its carry buffer and the queue are ~140 MiB, and it peaked at 172-181 MiB
+    under 192); `-d --tar` below ~384 MB (CPU-only build): a part job
+    pins its whole decoded frames, so throttle, sink, queue, writers and the decoder's
+    recycling pool each hold a couple (~190 MiB), and a window smaller than a frame does not
+    help -- going lower means counting pinned frames, not window bytes; `--gpu-only` below
+    ~256 MB (the pooled reader's 8-buffer floor, whose lowering risks a GPU waiting on a full
+    batch with every buffer held); `-M` still does not bind the GPU batch floor (unchanged
+    semantics); and whether `gds_register_budget`'s /17 RSS policy bounds real memory on any
+    driver stack (on this one it does not).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

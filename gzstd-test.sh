@@ -622,8 +622,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=581
-$EXTENSIVE && EXPECTED_TESTS=881
+EXPECTED_TESTS=585
+$EXTENSIVE && EXPECTED_TESTS=885
+# v0.18.31: +1 default cell, no GPU (memory: a limit shrinks the decode reader's blocks,
+# never the frames) and +3 default GPU cells (memory: a limit fits the GPU batches before it
+# declines a GPU; --direct-stage fits its read-ahead and staging lanes to a limit; a
+# container's limit does not shrink a --gds-only registration -- the last also a GDS cell):
+# 581 -> 585, 881 -> 885; the no-GPU deltas +3 (150 -> 153, 216 -> 219), the no-GDS +1.
 # v0.18.30: +4 default cells, no GPU (memory: a cgroup limit decides the zstd workers in
 # each frame; the headroom is the tightest group's, memory.high and file cache counted, v1
 # too; a limit fits fewer workers, and a pool it cut takes no zstd workers; --tar under a
@@ -937,8 +942,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=150   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=216   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30
+EXPECTED_NOGPU_DELTA=153   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=219   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -956,8 +961,8 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=216   # 207 MEASURED 2026-10-14 (824 - 617); 
 # one of the 607 cells has now been exercised.
 # v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
 # cell that exists only under --extensive.
-EXPECTED_NOGDS_DELTA=16   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89, derived; the v0.17.82 cell moved to -e in v0.18.7
-$EXTENSIVE && EXPECTED_NOGDS_DELTA=18   # + the v0.17.83 --extensive cell
+EXPECTED_NOGDS_DELTA=17   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7
+$EXTENSIVE && EXPECTED_NOGDS_DELTA=19   # + the v0.17.83 --extensive cell
 
 # ============================================================
 # Banner & system info
@@ -13724,6 +13729,7 @@ pm_run() {    # $1 tree (or ""), $2 stderr, $3 archive: compress pp-text.bin at 
   "${root[@]}" "$GZSTD" -v -f --cpu-only -3 "$pp_in" -o "$3" 2>"$2"
 }
 pm_w() { grep -aoE "[0-9]+ $pp_line" "$1" | grep -oE '^[0-9]+' | head -1; }
+pm_thr() { grep -m1 -aoE '^\[THROTTLE\] [0-9]+ frames' "$1" | grep -oE '[0-9]+'; }
 # A limit far below the need: since the pool fits the memory as well (cell 4),
 # one that low cuts it to one worker first, and a pool the memory cut plans no
 # zstd workers.  Either line names the file that bound.
@@ -13971,7 +13977,6 @@ else
     2>"$TMPDIR/pm4.err" || pm_why+=" T2:rc=$?"
   ! grep -qa 'workers fit' "$TMPDIR/pm4.err" && grep -qa '\[CPU\] 2 worker threads online' "$TMPDIR/pm4.err" \
     || pm_why+=" T2:[$(grep -ah 'memory:\|threads online' "$TMPDIR/pm4.err" | tr '\n' ' ')]"
-  pm_thr() { grep -m1 -aoE '^\[THROTTLE\] [0-9]+ frames' "$1" | grep -oE '[0-9]+'; }
   "$GZSTD" -vv -f --cpu-only -3 -T 40 -M128M -c "$TMPDIR/pm-z.bin" 2>"$TMPDIR/pm4.err" >/dev/null \
     || pm_why+=" M:rc=$?"
   [[ "$(pm_thr "$TMPDIR/pm4.err")" == 32 ]] || pm_why+=" M:$(pm_thr "$TMPDIR/pm4.err")"
@@ -14025,10 +14030,14 @@ fi
 # 5. --tar under a limit.  Creating: a reader holds a chunk and the reorder
 #    window two more, an eighth of the memory (256 MiB: one).  Extracting, from
 #    1 GiB: a writer holds a 64 MiB part job and a bounce buffer, a partition the
-#    part job it builds and a frame, a quarter each (three of each).  From 512
-#    MiB no two partitions fit and the serial walk runs, where the decoder's
-#    throttle and the frame sink split a quarter: ram_cap is 4 frames, a plain
-#    decode's 8.  Four 20 MiB files are 6 frames and 5 entries.
+#    part job it builds and a frame, a quarter each (three of each).  Below ~850
+#    MiB the part window halves until a writer's job and the queue's two fit a
+#    quarter (v0.18.31): at 512 MiB 32 MiB windows, and two partitions and two
+#    writers fit; at 256 MiB 16 MiB windows, so each 20 MiB file is written in
+#    two parts, and no two partitions fit: the serial walk runs, where the
+#    decoder's throttle and the frame sink split a quarter -- ram_cap is 2
+#    frames, and a plain decode's under 512 MiB 8.  Four 20 MiB files are 6
+#    frames and 5 entries.
 pm_t5="memory: --tar under a limit runs fewer readers, writers and partitions"
 if (( pm_default < 4 )); then
   skip_host "$pm_t5" "fewer than 4 CPU workers by default"
@@ -14056,14 +14065,38 @@ else
     && grep -qaE 'memory: 3 of [0-9]+ extract partitions fit' "$TMPDIR/pm5x.err" \
     && grep -qa 'parallel-extract: 3 partitions' "$TMPDIR/pm5x.err" \
     || pm_why+=" parallel:[$(grep -ah 'memory:\|parallel-extract\|writer thread' "$TMPDIR/pm5x.err" | tr '\n' ' ')]"
-  pm_x serial $((512 << 20)) "$TMPDIR/pm5y.err"
-  ! grep -qa 'parallel-extract' "$TMPDIR/pm5y.err" && grep -qa '\[UNTAR\] 1 writer thread(s)' "$TMPDIR/pm5y.err" \
-    && grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm5y.err" | grep -q ' ram_cap=4,' \
-    || pm_why+=" serial:[$(grep -ah 'parallel-extract\|THROTTLE\] detail' "$TMPDIR/pm5y.err" | tr '\n' ' ')]"
+  ! grep -qa 'part windows' "$TMPDIR/pm5x.err" || pm_why+=" parallel:window"
+  pm_x window $((512 << 20)) "$TMPDIR/pm5w.err"
+  grep -qa '32 MiB part windows, not 64' "$TMPDIR/pm5w.err" \
+    && grep -qa 'parallel-extract: 2 partitions' "$TMPDIR/pm5w.err" \
+    && grep -qa '\[UNTAR\] 2 writer thread(s)' "$TMPDIR/pm5w.err" \
+    || pm_why+=" window:[$(grep -ah 'memory:\|parallel-extract\|writer thread' "$TMPDIR/pm5w.err" | tr '\n' ' ')]"
+  pm_x serial $((256 << 20)) "$TMPDIR/pm5y.err"
+  ! grep -qa 'parallel-extract' "$TMPDIR/pm5y.err" && grep -qa '16 MiB part windows, not 64' "$TMPDIR/pm5y.err" \
+    && grep -qa '\[UNTAR\] 2 writer thread(s)' "$TMPDIR/pm5y.err" \
+    && grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm5y.err" | grep -q ' ram_cap=2,' \
+    || pm_why+=" serial:[$(grep -ah 'parallel-extract\|part windows\|writer thread\|THROTTLE\] detail' "$TMPDIR/pm5y.err" | tr '\n' ' ')]"
+  pm_tree "$pm_d"; echo $((512 << 20)) > "$pm_g/memory.max"
   GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -vv -f -c "$TMPDIR/pm5.tzst" 2>"$TMPDIR/pm5z.err" >/dev/null \
     || pm_why+=" plain:rc=$?"
   grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm5z.err" | grep -q ' ram_cap=8,' \
     || pm_why+=" plain:[$(grep -ah 'THROTTLE\] detail' "$TMPDIR/pm5z.err" | tr '\n' ' ')]"
+  # --adapt's decode pool keeps its frames in flight without the throttle: 4 GiB
+  # of them, now no more than a quarter of the memory (v0.18.31; peak 5 GB on a
+  # 2 GiB archive, killed under 2 GB).  Two 20 MiB base64 files (zeros take the
+  # inline route, which has no pool): four 16 MiB frames, a quarter of 512 MiB
+  # holds four -- the budget a 4 GiB pool's four decoders would make eight.
+  rm -rf "$TMPDIR/pm-src"; mkdir -p "$TMPDIR/pm-src/d"
+  for pm_i in 1 2; do ( set +o pipefail
+    head -c $((15 << 20)) /dev/urandom | base64 -w0 | head -c $((20 << 20)) > "$TMPDIR/pm-src/d/a$pm_i" ); done
+  "$GZSTD" --tar -q -f -3 -o "$TMPDIR/pm5.tzst" -C "$TMPDIR/pm-src" d || pm_why+=" adapt:create"
+  pm_tree "$pm_d"; echo $((512 << 20)) > "$pm_g/memory.max"
+  rm -rf "$TMPDIR/pm-x"; mkdir -p "$TMPDIR/pm-x"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d --tar --adapt --no-profile -v -f -C "$TMPDIR/pm-x" "$TMPDIR/pm5.tzst" \
+    2>"$TMPDIR/pm5z.err" || pm_why+=" adapt:rc=$?"
+  diff -r "$TMPDIR/pm-src/d" "$TMPDIR/pm-x/d" >/dev/null 2>&1 || pm_why+=" adapt:tree"
+  grep -qaE 'decode pool: adaptive .*, 4-frame budget' "$TMPDIR/pm5z.err" \
+    || pm_why+=" adapt:[$(grep -ah 'decode pool\|parallel-extract' "$TMPDIR/pm5z.err" | tr '\n' ' ')]"
   rm -rf "$pm_d" "$TMPDIR/pm-src" "$TMPDIR/pm-x"; rm -f "$TMPDIR/pm5.tzst"
   [[ -z "$pm_why" ]] && pass "$pm_t5" || fail "$pm_t5" "$pm_why"
 fi
@@ -14097,6 +14130,179 @@ else
   rm -rf "$pm_d"; rm -f "$TMPDIR/pm-tile.bin" "$TMPDIR/pm-r.bin" "$TMPDIR/pm6.ok" "$TMPDIR/pm6.rss"
   [[ -z "$pm_why" ]] && pass "$pm_t6" || fail "$pm_t6" "$pm_why"
 fi
+
+# 7. The decode reader under a limit (v0.18.31).  It sheds readers first, but
+#    one reader kept two 64 MiB blocks and their overlap (~162 MiB at 16 MiB
+#    frames): a 2 GiB decode died under 256 MB.  The block now halves until two
+#    fit an eighth of the memory -- 8 MiB under 256 MiB, 4 MiB for the two of
+#    --read-threads=2 -- and a frame longer than a small block's overlap is
+#    carried, so the output is still the archive's.  160 MiB of random data at
+#    -1 is ten stored 16 MiB frames in a 160 MiB archive, the parallel reader's.
+pm_t7="memory: a limit shrinks the decode reader's blocks, never the frames"
+pm_why=""; pm_d="$TMPDIR/pm-cg"; pm_g="$pm_d/sys/fs/cgroup/job/step"
+head -c $((160 << 20)) /dev/urandom > "$TMPDIR/pm7.bin"
+"$GZSTD" -1 -q -f --cpu-only "$TMPDIR/pm7.bin" -o "$TMPDIR/pm7.zst"
+"$GZSTD" -d -v -f --cpu-only -c "$TMPDIR/pm7.zst" 2>"$TMPDIR/pm7.err" | cmp -s - "$TMPDIR/pm7.bin" \
+  || pm_why+=" free:bytes"
+if ! grep -qa 'parallel prefetch' "$TMPDIR/pm7.err"; then
+  skip_host "$pm_t7" "the parallel decode reader did not engage on this host"
+else
+  ! grep -qa 'MiB blocks' "$TMPDIR/pm7.err" || pm_why+=" free:shrunk"
+  pm_tree "$pm_d"; echo $((256 << 20)) > "$pm_g/memory.max"
+  for pm_arm in "8:" "4:--read-threads=2"; do
+    pm_mib=${pm_arm%%:*}; pm_fl=${pm_arm#*:}
+    GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -v -f --cpu-only $pm_fl -c "$TMPDIR/pm7.zst" 2>"$TMPDIR/pm7.err" \
+      | cmp -s - "$TMPDIR/pm7.bin" || pm_why+=" $pm_mib:bytes"
+    grep -qa "\[READER\] memory: $pm_mib MiB blocks, not 64" "$TMPDIR/pm7.err" \
+      && grep -qaE 'zero-copy: .* [1-9][0-9]* carried across block boundaries' "$TMPDIR/pm7.err" \
+      || pm_why+=" $pm_mib:[$(grep -ah 'READER\] memory\|zero-copy' "$TMPDIR/pm7.err" | tr '\n' ' ')]"
+  done
+  # The archive still holds 16 MiB frames whatever decode's --chunk-size.
+  # Its known geometry must size the CPU pool, throttle and --adapt growth:
+  # a quarter of this 256 MiB limit holds four frames, not 64 or one.
+  for pm_chunk in 1 64; do
+    GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -vv -f --cpu-only --adapt --no-profile \
+      --chunk-size="$pm_chunk" -c "$TMPDIR/pm7.zst" 2>"$TMPDIR/pm7.err" \
+      | cmp -s - "$TMPDIR/pm7.bin" || pm_why+=" geometry-$pm_chunk:bytes"
+    grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm7.err" | grep -q ' ram_cap=4,' \
+      || pm_why+=" geometry-$pm_chunk:[$(grep -ah 'THROTTLE\] detail' "$TMPDIR/pm7.err")]"
+    grep -qa '\[CPU\] 1 decompression threads online' "$TMPDIR/pm7.err" \
+      || pm_why+=" geometry-$pm_chunk:[$(grep -ah 'decompression threads online' "$TMPDIR/pm7.err")]"
+  done
+  rm -rf "$pm_d"
+  [[ -z "$pm_why" ]] && pass "$pm_t7" || fail "$pm_t7" "$pm_why"
+fi
+rm -f "$TMPDIR/pm7.bin" "$TMPDIR/pm7.zst" "$TMPDIR/pm7.err"
+
+# 8. GPU build: the GPU batches fit the memory before a GPU is declined
+#    (v0.18.31).  The throttle counted every stream's batch at the tuner's
+#    256-frame ceiling, and that floor overrode the memory: --cpu-share's
+#    synchronous bringup took 4,096 frames under a 4 GiB limit, and v0.18.30's
+#    deferred bringup declined every GPU under 16 GiB (one GPU's 8 GiB of
+#    batches against a quarter).  Now batches shrink first, then GPUs are cut,
+#    and the throttle stays within its quarter.  A synchronous bringup's
+#    throttle also counts the CPU pool the memory holds, not the whole pool:
+#    --gpu-only compress under 512 MiB took the 32-frame floor for 8 frames'
+#    room, -d --cpu-share 2,048 frames.  The hybrid arm runs one CPU worker at
+#    -19 so that the input outlasts CUDA's start (the suite engages every
+#    bringup; GZSTD_DEBUG_GPU_GUARD_SEC=0).
+pm_t8="memory: a limit fits the GPU batches before it declines a GPU"
+if ! has_gpu 2>/dev/null; then
+  skip "$pm_t8" "no GPU"
+else
+  pm_why=""; pm_d="$TMPDIR/pm-cg"; pm_g="$pm_d/sys/fs/cgroup/job/step"
+  ( set +o pipefail
+    head -c $((96 << 20)) /dev/urandom | base64 -w0 | head -c $((128 << 20)) > "$TMPDIR/pm8.bin" )
+  pm_g8() {   # $1 arm, $2 limit, $3 stderr, rest: gzstd arguments; compress pm8.bin, decode outside
+    pm_tree "$pm_d"; echo "$2" > "$pm_g/memory.max"
+    GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" "${@:4}" -c "$TMPDIR/pm8.bin" 2>"$3" \
+      | "$GZSTD" -d -q --cpu-only -c | cmp -s - "$TMPDIR/pm8.bin" || pm_why+=" $1:bytes"
+  }
+  pm_fit_re='GPU\] memory: .*up to [0-9]+ frames a stream, not [0-9]+'
+  pm_g8 share $((4 << 30)) "$TMPDIR/pm8.err" -v -f --cpu-share=0.5
+  pm_f=$(pm_thr "$TMPDIR/pm8.err")
+  grep -qaE "$pm_fit_re" "$TMPDIR/pm8.err" && [[ -n "$pm_f" ]] && (( pm_f <= 64 )) \
+    || pm_why+=" share:[$(grep -ah 'GPU\] memory\|^\[THROTTLE\] [0-9]' "$TMPDIR/pm8.err" | tr '\n' ' ')]"
+  pm_g8 hybrid $((16 << 30)) "$TMPDIR/pm8.err" -v -f -19 -T 1
+  grep -qaE "$pm_fit_re" "$TMPDIR/pm8.err" && grep -qaE '[0-9]+ device workers? online' "$TMPDIR/pm8.err" \
+    && ! grep -qa 'hybrid running CPU-only' "$TMPDIR/pm8.err" \
+    || pm_why+=" hybrid:[$(grep -ah 'GPU\] memory\|device worker\|CPU-only\|skipping GPU' "$TMPDIR/pm8.err" | tr '\n' ' ')]"
+  pm_g8 gpuonly $((512 << 20)) "$TMPDIR/pm8.err" -vv -f --gpu-only
+  pm_f=$(pm_thr "$TMPDIR/pm8.err")
+  [[ -n "$pm_f" ]] && (( pm_f <= 16 )) \
+    || pm_why+=" gpuonly:[$(grep -ah 'GPU\] memory\|^\[THROTTLE\] [0-9]' "$TMPDIR/pm8.err" | tr '\n' ' ')]"
+  "$GZSTD" -q -f --cpu-only -3 "$TMPDIR/pm8.bin" -o "$TMPDIR/pm8.zst"
+  pm_tree "$pm_d"; echo $((512 << 20)) > "$pm_g/memory.max"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -vv -f --cpu-share=0.5 -c "$TMPDIR/pm8.zst" 2>"$TMPDIR/pm8.err" \
+    | cmp -s - "$TMPDIR/pm8.bin" || pm_why+=" decode:bytes"
+  pm_f=$(pm_thr "$TMPDIR/pm8.err")
+  [[ -n "$pm_f" ]] && (( pm_f <= 8 )) || pm_why+=" decode:[$(grep -ah '^\[THROTTLE\] [0-9]' "$TMPDIR/pm8.err")]"
+  # A real GPU can be declined by the memory fit.  With no scheduler, CPU
+  # workers must still drain a full queue below --cpu-batch: this byte cap
+  # holds ~3 frames, never 64, and the producer cannot finish until they pop.
+  pm_tree "$pm_d"; echo $((256 << 20)) > "$pm_g/memory.max"
+  timeout 30s env GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -v -f -T1 \
+    --cpu-share=0.5 --cpu-batch=64 -c "$TMPDIR/pm8.zst" 2>"$TMPDIR/pm8.err" \
+    | cmp -s - "$TMPDIR/pm8.bin" || pm_why+=" declined-cpu-batch:bytes-or-timeout"
+  grep -qa 'hybrid running CPU-only' "$TMPDIR/pm8.err" \
+    || pm_why+=" declined-cpu-batch:GPU-not-declined"
+  # The GPU fit must count the archive's frames too, including its second
+  # fit on the real device count.  A smaller CLI chunk cannot create permits
+  # for 16 times the real host memory, and a larger one must not waste them.
+  for pm_chunk in 1 64; do
+    GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -vv -f --gpu-only --gpu-devices=1 \
+      --chunk-size="$pm_chunk" -c "$TMPDIR/pm8.zst" 2>"$TMPDIR/pm8.err" \
+      | cmp -s - "$TMPDIR/pm8.bin" || pm_why+=" geometry-$pm_chunk:bytes"
+    grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm8.err" | grep -q ' ram_cap=4,' \
+      || pm_why+=" geometry-$pm_chunk:[$(grep -ah 'THROTTLE\] detail' "$TMPDIR/pm8.err")]"
+  done
+  rm -rf "$pm_d"; rm -f "$TMPDIR/pm8.err"
+  [[ -z "$pm_why" ]] && pass "$pm_t8" || fail "$pm_t8" "$pm_why"
+fi
+
+# 9. GPU build: --direct-stage fits its read-ahead and staging lanes (v0.18.31).
+#    The read-ahead cache took at least 16 frames and could follow the batch up
+#    to 4 GiB, and eight 16 MiB lanes were pinned whatever the memory: -d
+#    --direct-stage was killed under 512 MB.  Each now takes an eighth: under
+#    512 MiB a cache of 3 frames that stays at 3 (want_frames follows the batch
+#    only up to the same ceiling) and 5 of 8 lanes, and every frame is still
+#    staged.  The archive is cell 8's (8 frames of ~12 MiB, with a seek table).
+pm_t9="memory: --direct-stage fits its read-ahead and staging lanes to a limit"
+if ! has_gpu 2>/dev/null || [[ ! -s "$TMPDIR/pm8.zst" ]]; then
+  skip "$pm_t9" "no GPU"
+else
+  pm_why=""; pm_d="$TMPDIR/pm-cg"; pm_g="$pm_d/sys/fs/cgroup/job/step"
+  pm_tree "$pm_d"; echo $((512 << 20)) > "$pm_g/memory.max"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -v -f --direct-stage "$TMPDIR/pm8.zst" -o "$TMPDIR/pm9.out" \
+    2>"$TMPDIR/pm9.err" || pm_why+=" rc=$?"
+  if grep -qa 'using the ordinary read path' "$TMPDIR/pm9.err"; then
+    skip_host "$pm_t9" "--direct-stage stood down here ($(grep -a -m1 'ordinary read path' "$TMPDIR/pm9.err"))"
+  else
+    cmp -s "$TMPDIR/pm9.out" "$TMPDIR/pm8.bin" || pm_why+=" bytes"
+    pm_fit=$(grep -aoE 'read-ahead of at most [0-9]+ frames' "$TMPDIR/pm9.err" | grep -oE '[0-9]+')
+    pm_cap=$(grep -aoE 'read-ahead \([0-9]+ frames\)' "$TMPDIR/pm9.err" | grep -oE '[0-9]+')
+    [[ -n "$pm_fit" && "$pm_cap" == "$pm_fit" ]] \
+      && grep -qaE 'DSTAGE\] memory: [0-9] of 8 staging lanes pinned' "$TMPDIR/pm9.err" \
+      && grep -qa '\[DSTAGE\] 8 frames,' "$TMPDIR/pm9.err" \
+      || pm_why+=" [$(grep -ah 'DSTAGE\]' "$TMPDIR/pm9.err" | tr '\n' ' ')]"
+    # The lanes' eighth belongs to the process.  Two streams at 512 MiB
+    # get two ~12 MiB lanes each, not five each.  The fitted throttle makes
+    # their pops at most four frames, so this eight-frame archive feeds both.
+    GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -vv -f --direct-stage --gpu-devices=1 \
+      --gpu-streams=2 "$TMPDIR/pm8.zst" -o "$TMPDIR/pm9.out" 2>"$TMPDIR/pm9.err" \
+      || pm_why+=" streams:rc=$?"
+    cmp -s "$TMPDIR/pm9.out" "$TMPDIR/pm8.bin" || pm_why+=" streams:bytes"
+    grep -qa 'DSTAGE\] memory: 2 of 8 staging lanes pinned' "$TMPDIR/pm9.err" \
+      && grep -qaE '\[GPU[0-9]+/S1\] take batch=[1-9]' "$TMPDIR/pm9.err" \
+      || pm_why+=" streams:[$(grep -ah 'staging lanes\|/S1\] take' "$TMPDIR/pm9.err" | tr '\n' ' ')]"
+    [[ -z "$pm_why" ]] && pass "$pm_t9" || fail "$pm_t9" "$pm_why"
+  fi
+  rm -rf "$pm_d"; rm -f "$TMPDIR/pm9.out" "$TMPDIR/pm9.err"
+fi
+
+# 10. GDS: a container's limit does not shrink a --gds-only registration
+#     (v0.18.31).  Its budget bounds RSS, and what a registration adds to RSS is
+#     the BAR1 mapping: measured, 4 GiB registered took RSS to 8.45 GB while a
+#     scope's memory.peak stayed at 56-72 MiB.  v0.18.30 read it through the
+#     container's figure and registered 3 frames (48 MiB) under 1 GiB, 5x slower.
+#     Now the host's: all 8 of cell 8's frames, ~129 MiB, on a host with 8 GiB
+#     free.
+pm_t10="memory: a container's limit does not shrink a --gds-only registration"
+if ! gds_testable; then
+  skip "$pm_t10" "GDS unavailable ($(gds_host_status))"
+elif [[ ! -s "$TMPDIR/pm8.zst" ]] || { [[ -n "$pm_host" ]] && (( pm_host < (8 << 30) )); }; then
+  skip_host "$pm_t10" "needs 8 GiB free on the host"
+else
+  pm_why=""; pm_d="$TMPDIR/pm-cg"; pm_g="$pm_d/sys/fs/cgroup/job/step"
+  pm_tree "$pm_d"; echo $((1 << 30)) > "$pm_g/memory.max"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -t -v --gds-only "$TMPDIR/pm8.zst" 2>"$TMPDIR/pm10.err" \
+    || pm_why+=" rc=$?"
+  pm_reg=$(grep -aoE 'cuFileBufRegister [0-9]+ MiB' "$TMPDIR/pm10.err" | head -1 | grep -oE '[0-9]+')
+  [[ -n "$pm_reg" ]] && (( pm_reg >= 96 )) || pm_why+=" registered ${pm_reg:-nothing} MiB"
+  rm -rf "$pm_d"; rm -f "$TMPDIR/pm10.err"
+  [[ -z "$pm_why" ]] && pass "$pm_t10" || fail "$pm_t10" "$pm_why"
+fi
+rm -f "$TMPDIR/pm8.bin" "$TMPDIR/pm8.zst"
 rm -f "$TMPDIR/pm-z.bin"
 rm -f "$TMPDIR"/pm*.err "$TMPDIR"/pm*.zst
 rm -f "$TMPDIR"/pp*.err "$TMPDIR/pp-mt.zst" "$TMPDIR/pp-st.zst" "$pp_in"

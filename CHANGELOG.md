@@ -1,12 +1,183 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.30  
+**Covers:** v0.9.50 → v0.18.31  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.31 — ROADMAP 30's leftovers: a GPU's batches shrink to the memory before the GPU is declined (v0.18.30 declined every GPU in a 16 GB container), a container's limit no longer shrinks --gds-only's registrations (v0.18.30 ran them 4-7x slower under one), and the decode reader, -d --tar's part windows, --direct-stage's read-ahead and lanes and --adapt's extract pool fit the memory (a 2 GiB decode under 192 MB, where v0.18.30 needed 384-512; -d --tar under 384, from 768)
+
+### Two v0.18.30 regressions
+
+**`--gds-only` under a container's limit.**  `gds_register_budget` keeps the cuFile
+registration near half the host's RSS (MemAvailable / 17, from a measured ~8.4x RSS per
+registered byte), and v0.18.30 had it read the container's figure with every other budget.  But
+the RSS a registration adds is the BAR1 mapping: on the server (driver 595, nvidia-fs 2.26.6) 4
+GiB registered for `-t` took RSS to 8.45 GB while MemAvailable fell ~290 MiB, and a scope's
+`memory.peak` stayed at 56-72 MiB whatever the size registered.  Read through a 1 GB limit the
+budget registered 3 frames at a time: `-t --gds-only` of a 2 GiB archive 2.8 -> 14 s (25 s under
+256 MB), `-d` 4.0 -> 15 s (30 s), for no memory at all.  It reads the host's figure again:
+2.4-2.6 s and 3.4-3.5 s under either limit, peaks 73 and 89 MiB, as v0.18.29.  (Whether the /17
+policy bounds anything on this driver stack is a separate question, left as it was.)
+
+**The default hybrid declined GPUs it could have run.**  v0.18.30's deferred bringup asked
+whether one GPU's batches fit a quarter of the memory -- at the tuner's 256-frame ceiling, two
+streams of 16 MiB frames, 8 GiB -- so a 16 GB container declined every GPU and a 48 GB one kept
+1 of 8: any host with less than ~32 GiB free per GPU ran its default compress and decode on the
+CPU.  The ceiling is headroom the tuner may explore, not what it runs (compress settles near 32
+frames at 16 MiB).  See the next section; `-3 -T 4` of 8 GiB of text, server: under 16 GB
+v0.18.29 6.45 s, v0.18.30 7.45 (CPU only), v0.18.31 4.76 with 8 GPUs at up to 14 frames a stream;
+48 GB 4.66 (8 GPUs at 46, where v0.18.30 kept one); 4 GB 4.91 (6 GPUs at 4).
+
+### The GPU batches the memory holds
+
+The throttle counts every GPU stream's whole batch (the GPU batch floor), and since the
+throttle came in that floor overrode the memory: `--cpu-share` and `--gpu-only`, whose bringup
+is synchronous, counted 8 GPUs x 2 streams x 256 frames from the start (4,096 frames, 64 GiB, under
+a 4 GiB limit), and `--cpu-share=0.5` decode was killed under 1 GB.  A throttle smaller than that
+floor no longer deadlocks -- a GPU intake takes a whole batch of the permits there are, or the
+writer's next frame (`acquire_batch_or_head`, v0.17.85), and the tuner never proposes past its
+share (`explore_max`, v0.17.80) -- so the floor can yield.  `gz_mem_fit_gpu_batch` fits it to what
+the throttle takes of the memory (a quarter, an eighth under a `--tar` sink), once each GPU's
+CUDA context (24 MiB; measured, a 1 MiB compress peaked at 30 MiB with one GPU and 155 with
+eight) and every CPU worker's frame are counted:
+
+- fewer frames a batch first, down to 4 a stream (an 11 GiB Turing card's compress kernel runs
+  best at 2-4 frames of 16 MiB);
+- then fewer GPUs, as many as hold 4 frames a stream;
+- then none: a hybrid runs on its CPU pool (`--cpu-share` hands the job to the CPU path before
+  anything is set up), and `--gpu-only`, which has no pool to fall back on, runs one GPU at
+  whatever batch fits.
+
+`-v`: "[GPU] memory: 2 of 8 GPUs, at up to 5 frames a stream, not 256, fit a quarter of the
+memory left (1.00 GiB)".  A deferred bringup checks one GPU before any CUDA call and fits the
+devices it finds; `--gpu-only` decode, whose throttle is built from a provisional 8 devices, fits
+again on the real count.  Not under `--gpu-batch` (kept, as -T N is), `--throttle-frames`, `-t`
+(its workers take no permits) or `--gds-only` decode (its frames are written from VRAM).  Nothing
+changes while the memory holds the whole floor: on the server uncapped, 350 GiB.
+
+A synchronous bringup's throttle also counts the CPU pool the memory holds, not the whole pool
+(a deferred one always did): counted at 96, `--cpu-share=0.5` decode under 512 MB took the
+32-frame floor with room for 7, and lived by timing.
+
+### The decode reader's block
+
+The parallel decode reader sheds readers first (v0.18.30), but one reader still kept two 64 MiB
+blocks and their overlap, ~162 MiB at 16 MiB frames: six times its eighth under 256 MB, where
+the decode died.  When even the pool's floor -- one reader, or a `--read-threads` count -- cannot
+keep two blocks in an eighth of the memory, the block halves, down to 4 MiB ("[READER] memory: 8
+MiB blocks, not 64").  It is the read size, not a frame: the archive and the output are the
+same, and a frame longer than a small block's overlap is carried, as one longer than the overlap
+always was.  This also lifted the GPU build's decode from 512 MB.
+
+### `-d --tar`
+
+- **The part window.**  A writer held a 64 MiB part job and its bounce buffer, and the queue two
+  jobs more; below ~850 MiB free the window now halves (to 4 MiB) until a quarter holds them, and
+  the bounce buffer is never larger than the window.  The partitions' fit uses the same window,
+  so under 512 MiB two partitions fit where the serial walk ran.  The files extracted are the
+  same, written in more pieces.
+- **Still a floor at ~384 MB (CPU-only build).**  A part job is a view that keeps its whole
+  decoded frames alive, so a window smaller than a frame pins as much as one frame: the
+  throttle, the frame sink, the queue, the writers and the decoder's recycling pool each hold a
+  couple of 16 MiB frames, ~190 MiB in all.  Measured: neither one writer nor the reader's views
+  off brings 256 MB within reach.
+
+### `--direct-stage` decode
+
+Its read-ahead cache started at 16 frames or more and followed the batch up to 4 GiB, and each
+stream pinned eight 16 MiB staging lanes, whatever the memory.  v0.18.30 survived 384 MB only by
+the GDS budget's accident above (1-frame batches, 19.7 s for 2 GiB); with that gone it was killed
+under 512 MB.  Each now takes an eighth: the cache's start and its ceiling (`want_frames` follows
+the batch only that far), and the lanes ("[DSTAGE] memory: 5 of 8 staging lanes pinned").  A
+frame the cache does not hold is read by its worker, as before the cache existed.
+
+### Found in review (Codex, three rounds at max effort)
+
+- **`--cpu-batch` could hang a decode left with no GPU.**  The CPU workers' queue floor waits
+  for N queued frames; the non-hybrid branch, which a decode runs when no GPU is left, had no
+  release for a producer stopped by the queue's byte cap (the hybrid branch had one), so with a
+  cap below N frames neither side moved.  v0.18.30's byte cap (an eighth of the memory) made it
+  reachable with no visible GPU under a limit (`CUDA_VISIBLE_DEVICES= gzstd -d -T1
+  --cpu-share=0.5 --cpu-batch=64` under 256 MB: hung), and the GPU fit above with a GPU
+  present.  A full queue now releases the floor in both directions' non-hybrid branch.
+- **Every `--direct-stage` stream took the whole lanes' eighth**: `--gpu-streams=8` was killed
+  under 1 GB and 512 MB.  The eighth is divided across devices and streams, one lane each at
+  least; it survives both (peaks 473 and 409 MiB).
+- **Decode budgets counted `--chunk-size`, not the archive's frames** (pre-existing): the CPU
+  pool's per-worker estimate, both decoders' throttles, the GPU fit and `--adapt`'s growth took
+  the size gzstd would WRITE.  `-d --chunk-size=1` of 16 MiB frames under 256 MiB took 64
+  permits, 1 GiB of frames labelled 64 MiB; an archive of 64 MiB frames decoded at the default
+  was budgeted at a quarter of its size.  They now read the seek table's largest frame
+  (`decomp_frame_cap`, which the GPU slabs already used), the CLI chunk only without a table.
+
+### `--adapt`'s extract pool
+
+`-d --tar --adapt`'s decode pool and the seek-extract path kept up to 4 GiB of frames in flight
+outside the throttle: peak 5 GB on a 2 GiB archive, killed under 2 GB (v0.18.29 the same).  Now
+the smaller of 4 GiB and a quarter of the memory; it survives 512 MB.
+
+### Lowest limit survived
+
+`systemd-run --scope -p MemoryMax=... -p MemorySwapMax=0`, server, output compared outside the
+scope; limits tried 1 GB, 768, 512, 384, 256, 192 and 128 MB; one run of each binary, back to back:
+
+| 2 GiB of text in 16 MiB frames (the 2 GiB `--tar` of v0.18.30's table) | v0.18.30 | v0.18.31 |
+|---|---|---|
+| decode, either build | 384-512 MB | **192** |
+| `-d --tar`, CPU-only build | 768 | **384** |
+| `-d --tar`, GPU build | 768 | **256** |
+| `-d --tar --adapt` | killed at 2 GB | **512** (the lowest tried) |
+| `--hybrid` decode | 384 | **192** |
+| `--cpu-share=0.5` compress | 768 | **128** |
+| `--cpu-share=0.5` decode | killed at 1 GB | **192** |
+| `--gpu-only` compress | 768 | **256** |
+| `--gpu-only` decode | killed at 1 GB | **256** |
+| `-d --direct-stage` | 384 (by 1-frame batches, 19.7 s) | **192** |
+
+Unchanged: `--hybrid` compress and `-t --direct-stage` at 128, `--direct-stage` compress at 192,
+`--verify` (both builds) and all three `--gds-only` operations at 128 -- the latter now at full
+speed again (2.4-3.5 s rather than 14-30).
+
+### Uncapped
+
+Server, tmpfs, interleaved, v0.18.30 against v0.18.31, within the noise everywhere measured:
+compress 8 GiB of text 0.89-1.28 s against 0.88-1.42; decode 16 GiB 0.84-1.94 against 0.65-1.07;
+`-t --gds-only` of 2 GiB 2.33-2.41 against 2.33-2.43; `-d --direct-stage` 3.05-3.19 against
+3.14-3.19; `-d --cpu-share=0.5` of 16 GiB 5.73-5.91 against 5.58-6.03.  An archive of 1 MiB frames
+(8 GiB), whose budgets now count 1 MiB frames rather than the 16 MiB default: CPU-only build
+0.21-0.24 s against 0.21-0.29, GPU build 0.22-0.23 against 0.21-0.27, `--gpu-only` 2.75-2.78
+against 2.71-2.75, peak RSS 2.1-3.0 GB either way.
+
+### Cells
+
+**Cells** (EXPECTED 585/885, no-GPU deltas 153/219, no-GDS 17/19), all on fake cgroup trees
+(`GZSTD_DEBUG_CGROUP_ROOT`), so any host runs them: "memory: a limit shrinks the decode reader's
+blocks, never the frames" (ten stored 16 MiB frames under 256 MiB: 8 MiB blocks, 4 MiB for
+`--read-threads=2`, frames carried, output equal; none uncapped; `--chunk-size=1` and `64` on decode
+budget the archive's 16 MiB frames: four throttle frames, one decoder), default run, no GPU;
+"memory: --tar under a limit runs fewer readers, writers and partitions" gains arms (512 MiB: 32
+MiB part windows, two partitions and two writers; 256 MiB: 16 MiB windows, each 20 MiB file in
+two parts, the serial walk with a 2-frame throttle; `--adapt`'s decode pool on two base64 files
+under 512 MiB: a 4-frame budget, where 4 GiB made it 8); and three GPU cells -- "memory: a limit
+fits the GPU batches before it declines a GPU" (`--cpu-share` under 4 GiB: the fit line and a
+throttle of 64 frames, not 4,096; the default hybrid under 16 GiB at -19 -T 1: GPUs online at a
+fitted batch, not declined; `--gpu-only` compress under 512 MiB within 16 frames, not the 32-frame
+floor; `-d --cpu-share` under 512 MiB within 8, not 2,048; `--cpu-batch=64` under 256 MiB with
+the GPUs declined completes; `--gpu-only` decode with `--chunk-size=1` and `64` takes four
+frames), "memory: --direct-stage fits its read-ahead and staging lanes to a limit" (512 MiB: a
+3-frame cache that stays at 3, 5 of 8 lanes, every frame staged; two streams get two lanes each)
+and "memory: a container's limit does not shrink a --gds-only registration" (1 GiB: all 8
+frames registered, ~129 MiB, not 48), the last also a GDS cell.  Every new arm fails on v0.18.30
+or on the tree before the review fix it guards; 13 mutants of the new code, each caught (the GDS
+budget back on the container's figure; no block shrink, a one-reader floor whatever
+`--read-threads`; no synchronous GPU fit, a fit that declines unless the whole floor fits, no fit
+on decode, either direction's throttle counting the unfitted pool; the read-ahead's 4 GiB
+ceiling, eight lanes always; a fixed 64 MiB part window, the partitions fitting it; a fixed 4 GiB
+for the bypass pools).
 
 ## v0.18.30 — gzstd fits the memory a container allows: every budget reads a cgroup limit, and a run that will not fit takes fewer workers, never smaller frames (2 GiB of random data compresses under 128 MB, where v0.18.29 was killed at 2 GB); zstd's workers inside each frame take only what is left; the GPU build compresses an input of fewer frames than CPU workers on the CPU (30 x 128 MiB 1.5x faster)
 
