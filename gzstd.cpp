@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.29";
+static constexpr const char * GZSTD_VERSION = "0.18.30";
 //
 // Architecture overview:
 //
@@ -1195,6 +1195,7 @@ static const int GDS_READ_FANOUT = 8;
 
 static const size_t GDS_VERIFY_REGISTER_BUDGET = 4096ull * 1024u * 1024u;
 
+static uint64_t get_available_ram_bytes();   // defined below
 static size_t gds_register_budget()
 {
   static const size_t v = []() -> size_t {
@@ -1203,17 +1204,8 @@ static size_t gds_register_budget()
       const long long mib = std::atoll(e);
       if (mib > 0) return (size_t)mib * 1048576ull;
     }
-    size_t avail = 0;
-    if (FILE * f = std::fopen("/proc/meminfo", "re")) {
-      char line[256];
-      while (std::fgets(line, sizeof line, f)) {
-        unsigned long long kb = 0;
-        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-          avail = (size_t)kb * 1024ull; break;
-        }
-      }
-      std::fclose(f);
-    }
+    // A container's limit included (v0.18.30; this read the host's MemAvailable).
+    const size_t avail = (size_t)get_available_ram_bytes();
     // CANNOT TELL IS NOT PERMISSION TO ASSUME THE MOST.  Returning the ceiling
     // here would put the 4 GiB default back on exactly the hosts whose memory
     // could not be read, which is the footgun this function exists to remove.
@@ -6926,13 +6918,34 @@ struct GzCpuAllowance {
 };
 
 #ifdef __linux__
-// The smallest cgroup CPU quota, as CPUs' worth of time (quota / period),
-// between this process's cgroup and the root of each hierarchy that limits
-// CPU; 0 when none is set or none can be read.  /proc/self/cgroup names the
+// A small file's whole contents, by open/read/close: the memory headroom reads a
+// dozen cgroup files for every input, and a std::ifstream apiece was most of
+// that reading's cost.  Empty when unreadable.
+static std::string gz_read_small_file(const std::string & path)
+{
+  std::string out;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return out;
+  char buf[4096];
+  for (;;) {
+    const ssize_t n = ::read(fd, buf, sizeof buf);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0 || out.size() + (size_t)n > (1u << 20)) break;
+    out.append(buf, (size_t)n);
+  }
+  ::close(fd);
+  return out;
+}
+
+// Every directory between this process's cgroup and the root of each mounted
+// hierarchy that carries `v1_ctl` (the v2 hierarchy carries every controller),
+// the group first, each passed to visit(v2, dir).  /proc/self/cgroup names the
 // group ("0::/path" for v2, "N:cpu,cpuacct:/path" for v1) and
 // /proc/self/mountinfo where that hierarchy is mounted and which part of it
 // the mount shows (a container sees its own group as the mount's root).
-static double gz_cgroup_cpu_quota()
+// Shared by the CPU quota (v0.18.19) and the memory limit (v0.18.30).
+static void gz_cgroup_walk(const char * v1_ctl,
+                           const std::function<void(bool v2, const std::string & dir)> & visit)
 {
   // Test hook: read a fake tree instead -- DIR/proc/self/cgroup,
   // DIR/proc/self/mountinfo, and each mount point under DIR -- so the suite can
@@ -6941,7 +6954,7 @@ static double gz_cgroup_cpu_quota()
   const std::string pre = fake ? fake : "";
   std::string v2_group, v1_group;
   {
-    std::ifstream cg(pre + "/proc/self/cgroup");
+    std::istringstream cg(gz_read_small_file(pre + "/proc/self/cgroup"));
     std::string line;
     while (std::getline(cg, line)) {
       const size_t a = line.find(':');
@@ -6951,36 +6964,10 @@ static double gz_cgroup_cpu_quota()
       if (line.compare(0, a, "0") == 0 && ctl.empty()) { v2_group = line.substr(b + 1); continue; }
       std::stringstream ss(ctl);
       for (std::string c; std::getline(ss, c, ',');)
-        if (c == "cpu") v1_group = line.substr(b + 1);
+        if (c == v1_ctl) v1_group = line.substr(b + 1);
     }
   }
-  if (v2_group.empty() && v1_group.empty()) return 0;
-  // A quota file's value as CPUs, or 0 for none ("max", -1) or unreadable.
-  auto read_v2 = [](const std::string & dir) -> double {
-    std::ifstream f(dir + "/cpu.max");
-    std::string q, p;
-    if (!(f >> q >> p) || q == "max") return 0;
-    std::string extra;
-    if (f >> extra) return 0;
-    auto decimal = [](const std::string & s) -> unsigned long long {
-      if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) return 0;
-      errno = 0;
-      const unsigned long long n = std::strtoull(s.c_str(), nullptr, 10);
-      return errno == ERANGE ? 0 : n;
-    };
-    const auto quota = decimal(q), period = decimal(p);
-    return quota && period ? double(quota) / double(period) : 0;
-  };
-  auto read_v1 = [](const std::string & dir) -> double {
-    std::ifstream fq(dir + "/cpu.cfs_quota_us"), fp(dir + "/cpu.cfs_period_us");
-    long long quota = 0, period = 0;
-    if (!(fq >> quota) || !(fp >> period) || quota <= 0 || period <= 0) return 0;
-    std::string extra;
-    if ((fq >> extra) || (fp >> extra)) return 0;
-    return double(quota) / double(period);
-  };
-  double best = 0;
-  auto take = [&best](double q) { if (q > 0 && (best == 0 || q < best)) best = q; };
+  if (v2_group.empty() && v1_group.empty()) return;
   // mountinfo escapes whitespace and backslashes in ROOT and MOUNTPOINT.
   auto unescape_mount = [](std::string s) {
     for (size_t i = 0; i + 3 < s.size(); ++i) {
@@ -7007,24 +6994,48 @@ static double gz_cgroup_cpu_quota()
     }
     return true;
   };
-  std::ifstream mi(pre + "/proc/self/mountinfo");
-  std::string line;
-  const bool parse_all = std::getenv("GZSTD_DEBUG_CGROUP_PARSE_ALL") != nullptr;
-  while (std::getline(mi, line)) {
-    // Only cgroup mounts can constrain the CPU allowance.  mountinfo can have
-    // thousands of other rows in a container; do not copy/tokenise every field
-    // of those rows on every process start.  The kernel spells the separator
-    // " - ".  Retain the general parser below for a differently spaced row.
-    const size_t sep = line.find(" - ");
-    if (!parse_all && sep != std::string::npos) {
-      const size_t fspos = sep + 3;
-      auto is_type = [&](const char * name, size_t n) {
-        return line.compare(fspos, n, name) == 0
-            && (fspos + n == line.size()
-                || std::isspace(static_cast<unsigned char>(line[fspos + n])));
-      };
-      if (!is_type("cgroup", 6) && !is_type("cgroup2", 7)) continue;
+  // MOUNTINFO'S CGROUP ROWS ARE READ ONCE A PROCESS (v0.18.30).  The memory
+  // headroom walks the hierarchy for every input, and mountinfo was the costliest
+  // file it read (87 us of ~200 here; thousands of rows in some containers).
+  // Mounts do not move under a run; the group, from /proc/self/cgroup above, is
+  // read every time, so a process moved between groups is still followed.
+  static std::mutex mi_mx;
+  static std::string mi_pre;
+  static bool mi_read = false;
+  static std::vector<std::string> mi_rows;
+  std::vector<std::string> rows;
+  {
+    std::lock_guard<std::mutex> lk(mi_mx);
+    if (!mi_read || mi_pre != pre) {
+      mi_rows.clear();
+      // mountinfo is not a small file: thousands of mounts can put the
+      // cgroup row past gz_read_small_file's 1 MiB ceiling.  Stream it once
+      // so that a large mount table cannot hide the container's limits.
+      std::ifstream mi(pre + "/proc/self/mountinfo");
+      std::string row;
+      const bool parse_all = std::getenv("GZSTD_DEBUG_CGROUP_PARSE_ALL") != nullptr;
+      while (std::getline(mi, row)) {
+        // Only cgroup mounts can constrain an allowance.  mountinfo can have
+        // thousands of other rows in a container; do not copy/tokenise every
+        // field of those rows.  The kernel spells the separator " - ".  Retain
+        // the general parser below for a differently spaced row.
+        const size_t sep = row.find(" - ");
+        if (!parse_all && sep != std::string::npos) {
+          const size_t fspos = sep + 3;
+          auto is_type = [&](const char * name, size_t n) {
+            return row.compare(fspos, n, name) == 0
+                && (fspos + n == row.size()
+                    || std::isspace(static_cast<unsigned char>(row[fspos + n])));
+          };
+          if (!is_type("cgroup", 6) && !is_type("cgroup2", 7)) continue;
+        }
+        mi_rows.push_back(row);
+      }
+      mi_pre = pre; mi_read = true;
     }
+    rows = mi_rows;
+  }
+  for (const std::string & line : rows) {
     // "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS"
     std::istringstream ls(line);
     std::vector<std::string> f;
@@ -7036,7 +7047,7 @@ static double gz_cgroup_cpu_quota()
     bool v1 = false;
     if (fstype == "cgroup" && f.end() - dash >= 4) {        // SUPEROPTS names the controllers
       std::stringstream ss(*(dash + 3));
-      for (std::string o; std::getline(ss, o, ',');) if (o == "cpu") v1 = true;
+      for (std::string o; std::getline(ss, o, ',');) if (o == v1_ctl) v1 = true;
     }
     const std::string & group = v2 ? v2_group : v1_group;
     if ((!v2 && !v1) || group.empty()) continue;
@@ -7052,16 +7063,52 @@ static double gz_cgroup_cpu_quota()
       rel = group.substr(root.size());
     else continue;
     if (!safe_rel(rel)) continue;
-    // Walk from the group up to the mount: a parent's quota limits its children.
+    // Walk from the group up to the mount: a parent's limit binds its children.
     std::string dir = base + (rel == "/" ? "" : rel);
     while (true) {
-      take(v2 ? read_v2(dir) : read_v1(dir));
+      visit(v2, dir);
       if (dir.size() <= base.size()) break;
       const size_t s = dir.find_last_of('/');
       if (s == std::string::npos || s < base.size()) break;
       dir.resize(s);
     }
   }
+}
+
+// The smallest cgroup CPU quota, as CPUs' worth of time (quota / period),
+// between this process's cgroup and the root of each hierarchy that limits
+// CPU; 0 when none is set or none can be read.
+static double gz_cgroup_cpu_quota()
+{
+  // A quota file's value as CPUs, or 0 for none ("max", -1) or unreadable.
+  auto read_v2 = [](const std::string & dir) -> double {
+    std::ifstream f(dir + "/cpu.max");
+    std::string q, p;
+    if (!(f >> q >> p) || q == "max") return 0;
+    std::string extra;
+    if (f >> extra) return 0;
+    auto decimal = [](const std::string & s) -> unsigned long long {
+      if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) return 0;
+      errno = 0;
+      const unsigned long long n = std::strtoull(s.c_str(), nullptr, 10);
+      return errno == ERANGE ? 0 : n;
+    };
+    const auto quota = decimal(q), period = decimal(p);
+    return quota && period ? double(quota) / double(period) : 0;
+  };
+  auto read_v1 = [](const std::string & dir) -> double {
+    std::ifstream fq(dir + "/cpu.cfs_quota_us"), fp(dir + "/cpu.cfs_period_us");
+    long long quota = 0, period = 0;
+    if (!(fq >> quota) || !(fp >> period) || quota <= 0 || period <= 0) return 0;
+    std::string extra;
+    if ((fq >> extra) || (fp >> extra)) return 0;
+    return double(quota) / double(period);
+  };
+  double best = 0;
+  gz_cgroup_walk("cpu", [&](bool v2, const std::string & dir) {
+    const double q = v2 ? read_v2(dir) : read_v1(dir);
+    if (q > 0 && (best == 0 || q < best)) best = q;
+  });
   return best;
 }
 #endif
@@ -7099,6 +7146,91 @@ static const GzCpuAllowance & gz_cpu_allowance()
     return r;
   }();
   return a;
+}
+
+/*======================================================================
+ THE MEMORY A CONTAINER ALLOWS (v0.18.30)
+
+ Every RAM budget here read /proc/meminfo's MemAvailable, which inside a
+ container is the HOST's: 1.4 TiB in a group capped at 512 MB on the 256-CPU
+ server.  Past a cgroup's memory.max the kernel kills the process -- exit 137,
+ no message, the output cut short -- and v0.18.29's zstd workers inside each
+ frame raised what a run needs: one 512 MiB file went from surviving a 384 MB
+ cap to dying at 768 MB, and `-r` over 96 x 40 MiB from surviving 384 MB to
+ dying at 512 MB (systemd-run --scope -p MemoryMax=... -p MemorySwapMax=0).
+
+ The headroom is the smallest, over this process's group and each ancestor the
+ walk reaches (gz_cgroup_walk), of the group's limit less what the group uses:
+ v2 the lower of memory.max (the kill) and memory.high (reclaim, then stalls)
+ less memory.current, v1 memory.limit_in_bytes less memory.usage_in_bytes.
+ Inactive file cache counts as free, the first thing the kernel reclaims
+ (memory.stat inactive_file; v1 total_inactive_file).  Usage moves, so it is
+ read on every call: a `-r` sees the arenas earlier inputs left behind.  The
+ hierarchy is resolved again for each input: a process can move cgroups during
+ a multi-input run.  An empty file name means no cgroup limit was found; zero
+ is a valid limit (in particular for memory.high).
+======================================================================*/
+struct GzMemHeadroom {
+  uint64_t limit = 0;      // the binding cgroup limit in bytes (zero is valid)
+  uint64_t headroom = 0;   // that group's limit less its usage (less inactive file cache)
+  std::string file;        // empty = no limit found; otherwise its file, for -v
+};
+
+static GzMemHeadroom gz_cgroup_mem_headroom()
+{
+  GzMemHeadroom r;
+#ifdef __linux__
+  const std::vector<std::pair<bool, std::string>> dirs = [] {
+    std::vector<std::pair<bool, std::string>> v;
+    try {
+      gz_cgroup_walk("memory", [&](bool v2, const std::string & d) { v.emplace_back(v2, d); });
+    } catch (...) { v.clear(); }
+    return v;
+  }();
+  // A whole-file decimal value; "max", a v1 "unlimited" (2^63 rounded to a
+  // page) or anything unreadable is absent.  Keep a real zero distinct.
+  auto value = [](const std::string & path, uint64_t & result) -> bool {
+    std::istringstream f(gz_read_small_file(path));
+    std::string t, extra;
+    if (!(f >> t) || (f >> extra) || t.empty()
+        || t.find_first_not_of("0123456789") != std::string::npos) return false;
+    errno = 0;
+    const unsigned long long n = std::strtoull(t.c_str(), nullptr, 10);
+    if (errno == ERANGE || n >= (1ULL << 60)) return false;
+    result = (uint64_t)n;
+    return true;
+  };
+  auto stat_field = [](const std::string & path, const char * key) -> uint64_t {
+    std::istringstream f(gz_read_small_file(path));
+    std::string k;
+    unsigned long long n = 0;
+    while (f >> k >> n)
+      if (k == key) return (uint64_t)n;
+    return 0;
+  };
+  for (const auto & [v2, d] : dirs) {
+    uint64_t limit = 0, used = 0, inactive = 0;
+    std::string file;
+    if (v2) {
+      for (const char * name : {"/memory.max", "/memory.high"}) {
+        uint64_t v = 0;
+        if (value(d + name, v) && (file.empty() || v < limit)) { limit = v; file = d + name; }
+      }
+      if (file.empty()) continue;
+      value(d + "/memory.current", used);
+      inactive = stat_field(d + "/memory.stat", "inactive_file");
+    } else {
+      if (!value(d + "/memory.limit_in_bytes", limit)) continue;
+      file = d + "/memory.limit_in_bytes";
+      value(d + "/memory.usage_in_bytes", used);
+      inactive = stat_field(d + "/memory.stat", "total_inactive_file");
+    }
+    used = used > inactive ? used - inactive : 0;
+    const uint64_t head = limit > used ? limit - used : 0;
+    if (r.file.empty() || head < r.headroom) { r.limit = limit; r.headroom = head; r.file = file; }
+  }
+#endif
+  return r;
 }
 
 // Cores this process can actually expect to get, right now.
@@ -10195,6 +10327,45 @@ static bool gz_input_below_gpu_batch(const Options & opt, uint64_t work)
   const uint64_t bound = gpu_min_useful_bytes(opt);   // 0 (the suite's hook): no gate
   return bound > 0 && work < bound;
 }
+
+// FEWER FRAMES THAN CPU WORKERS, AT ANY SIZE (v0.18.30).  Above one GPU batch the
+// default compress still took the hybrid pipeline, whose CPU pool is cut to the
+// frames (v0.18.25): every frame went to a CPU worker at once, before any GPU
+// could be ready (should_cpu_take is true until one is), and the bringup then
+// skipped the GPU -- "CPU pool will finish before GPU init could" -- at every
+// size measured from 128 MiB to 2 GiB, level 3 and 19 alike (level 19's output
+// byte for byte that of --cpu-only).  But that pool has none of compress_cpu_mt's
+// zstd workers inside the frames or its placement (v0.18.29): 30 x 128 MiB took
+// 3.00-3.54 s against --cpu-only's 2.09-2.18, 8 x 512 MiB 1.62-1.81 against
+// 1.25-1.37, and from 1 GiB, as many frames as workers, they tie.  Only a slow
+// producer (a cold read) leaves frames for a GPU that comes up meanwhile, and that
+// run waits on the read.  So such an input takes the CPU path, which decides from
+// the memory there is (v0.18.30) whether its frames get zstd's workers.  The same
+// default it moves as gz_input_below_gpu_batch, an auto-sized pool (-T N keeps
+// its pool), and not with the suite's GZSTD_DEBUG_GPU_MIN_BYTES=0, which keeps
+// small inputs on the GPU paths.  The frames are the ones the hybrid pipeline
+// makes (`frame_bytes`, after its 16 MiB GPU clamp and its RAM budget), and the
+// CPU path is handed that geometry, so a --chunk-size=1024 run is still the same
+// 16 MiB frames.  Not under a window asked for (--ultra, --long,
+// --zstd=windowLog): zstd's workers never run there, and the hybrid route's
+// clamp and its warning stay as they were.  GZSTD_DEBUG_NO_FEW_FRAMES_CPU=1 is
+// the A/B control.
+static int ultra_window_log(int level, bool ultra);   // defined below
+static bool gz_input_one_cpu_wave(const Options & opt, uint64_t work, size_t frame_bytes,
+                                  uint64_t * frames_out = nullptr)
+{
+  if (opt.backend_user_set || opt.cpu_only || opt.gpu_only || !opt.hybrid
+      || opt.cpu_share >= 0.0 || opt.tar_mode || opt.cpu_threads != 0 || work == 0
+      || gpu_min_useful_bytes(opt) == 0 || ultra_window_log(opt.level, opt.ultra) != 0
+      || std::getenv("GZSTD_DEBUG_NO_FEW_FRAMES_CPU"))
+    return false;
+  // The caller has applied both the GPU's 16 MiB cap and check_ram_budget.
+  // Count the frames the pipeline actually makes, rather than the request.
+  const uint64_t chunk = std::max<size_t>(1, frame_bytes);
+  const uint64_t frames = work / chunk + (work % chunk != 0);
+  if (frames_out) *frames_out = frames;
+  return frames < (uint64_t)resolve_cpu_threads(0);
+}
 #ifndef _WIN32
 static uint64_t adapt_decomp_uncompressed_est(int fd, uint64_t comp_size);
 #endif
@@ -11980,8 +12151,9 @@ static int resolve_cpu_threads(int opt_threads)
   return std::min(n, 96);                   // auto: capped at 96
 }
 
-// Query available host RAM (returns 0 if unknown)
-static uint64_t get_available_ram_bytes()
+// The host's MemAvailable (0 if unknown).  Inside a container this is the
+// HOST's figure; every budget asks get_available_ram_bytes() instead.
+static uint64_t gz_host_mem_available()
 {
 #ifdef __linux__
   FILE * f = std::fopen("/proc/meminfo", "r");
@@ -11996,6 +12168,47 @@ static uint64_t get_available_ram_bytes()
 #else
   return 0;  // unknown on non-Linux
 #endif
+}
+
+// READ ONCE AN INPUT (v0.18.30).  Every budget of an input shares one reading,
+// taken at its first ask after gz_mem_new_input().  Each reading walks the
+// cgroup hierarchy (mountinfo, /proc/self/cgroup, 10 files here) and the
+// budgets ask a dozen times an input: -r over 256 x 6 MiB decoded 10% slower
+// re-reading (1.59-1.81 s against 1.61-1.66 for v0.18.29; once an input,
+// 1.55-1.63).  One reading is also the coherent one: a budget asked later in
+// the run (the hybrid bringup's GPU fit, its throttle growth) would otherwise
+// count the pools sized from the first reading as used and shrink again.
+static std::atomic<uint64_t> g_mem_epoch{1};
+static void gz_mem_new_input() { g_mem_epoch.fetch_add(1, std::memory_order_relaxed); }
+
+// The memory this process may still take: the host's MemAvailable or, under
+// a cgroup memory limit, that limit's headroom when smaller (gz_cgroup_mem_headroom).
+// 0 can mean exhausted headroom; cg_out->file distinguishes it from unknown.
+static uint64_t gz_ram_available(GzMemHeadroom * cg_out = nullptr)
+{
+  static std::mutex mx;
+  static uint64_t read_epoch = 0, host = 0;
+  static GzMemHeadroom cg;
+  std::lock_guard<std::mutex> lk(mx);
+  if (const uint64_t e = g_mem_epoch.load(std::memory_order_relaxed); e != read_epoch) {
+    host = gz_host_mem_available();
+    cg = gz_cgroup_mem_headroom();
+    read_epoch = e;
+  }
+  if (cg_out) *cg_out = cg;
+  if (cg.file.empty()) return host;
+  return host ? std::min(host, cg.headroom) : cg.headroom;
+}
+
+// What every RAM budget reads (v0.18.30: a container's limit included; it was
+// the host's MemAvailable).  0 means unknown to its callers, so a limit with no
+// headroom left reads as 1 byte -- the smallest budget each allows -- never as
+// "unknown", which several of them answer generously.
+static uint64_t get_available_ram_bytes()
+{
+  GzMemHeadroom cg;
+  const uint64_t avail = gz_ram_available(&cg);
+  return cg.file.empty() ? avail : std::max<uint64_t>(1, avail);
 }
 
 #ifdef HAVE_NVCOMP
@@ -12142,7 +12355,19 @@ static int compute_throttle_budget(size_t frame_bytes,
 
   int slack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
   int pipeline_frames = pipeline_parallelism * slack;
-  size_t ram_cap_frames = (avail / 2) / frame_bytes;
+  // A quarter of the memory left (v0.18.30; it was half).  The frames in flight
+  // are not all the frames a pool holds: every worker's recycling pool keeps two
+  // more (cpu_worker's and cpu_decomp_worker's out_pool), and gz_mem_fit_pool
+  // fits those to their own share.  Half for the throttle as well overran a
+  // container's limit: decode under a 1 GB cap peaked at 1.04 GB.  Only a host
+  // whose memory, not its pipeline, sets the budget sees the change.  A --tar
+  // sink buffers every frame this throttle releases, so under one the two split
+  // the quarter: an eighth here, an eighth in tar_sink_budget.
+  size_t ram_cap_frames = (avail / (g_tar_decomp_sink ? 8 : 4)) / frame_bytes;
+  // -M tightens the in-flight cap, not the CPU pool.  It must not make an
+  // otherwise roomy host take the small-RAM pool-plus-one floor: -M128M
+  // with 96 workers would raise the old 32-frame floor to 97 frames.
+  const bool small_ram = ram_cap_frames < (size_t)THROTTLE_MIN_FRAMES;
   // zstd-compat: --memlimit / --memory / -M# tightens the RAM cap on the
   // compress side to `mem_limit_bytes` total in-flight (matches the
   // spirit of zstd's memory cap flag, which is decompress-only in stock
@@ -12187,14 +12412,25 @@ static int compute_throttle_budget(size_t frame_bytes,
     }
   } else {
     frames = std::min(pipeline_frames, ram_frames);
-    frames = std::max(frames, THROTTLE_MIN_FRAMES);
+    // The floor keeps a small pool from stalling on writer jitter, but it must
+    // not overrule the memory itself (v0.18.30): 32 frames are 512 MiB at the
+    // default size, more than a small container holds.  Where RAM binds below
+    // it, the floor is RAM's figure and never under every consumer holding one
+    // frame plus one more (a budget below the pool starves it; see the sink
+    // cap's floor below).
+    // Never above the old 32-frame floor: a pool pinned by -T 96 under a small
+    // limit would otherwise take 97 frames.
+    const int floor_frames = small_ram
+        ? std::min(THROTTLE_MIN_FRAMES, std::max(ram_frames, pipeline_parallelism + 1))
+        : THROTTLE_MIN_FRAMES;
+    frames = std::max(frames, floor_frames);
     if (gpu_batch_floor > 0 && frames < gpu_batch_floor) {
       // Defensive: the default formula should always clear this, but guard
       // against unusual configurations (tiny parallelism + huge batch_cap).
       frames = gpu_batch_floor;
     }
-    source = (frames == THROTTLE_MIN_FRAMES && pipeline_frames < THROTTLE_MIN_FRAMES)
-           ? "floor"
+    source = (frames == floor_frames && pipeline_frames < floor_frames)
+           ? (floor_frames == THROTTLE_MIN_FRAMES ? "floor" : "ram-floor")
            : (pipeline_frames <= ram_frames ? "pipeline" : "ram");
     // A DECOMPRESS PIPELINE IS BOUNDED BY ITS SINK, NOT BY WHAT ITS CONSUMERS
     // CAN HOLD.  The parallelism formula sizes the budget from consumer
@@ -12376,13 +12612,23 @@ static int apply_ultra_cctx(ZSTD_CCtx * cctx, int level, bool ultra)
   return wlog;
 }
 
-// Pre-flight RAM check: estimate memory needed for N threads × chunk_mib.
-// Each thread needs: input buffer (chunk) + output buffer (ZSTD_compressBound(chunk))
+// Pre-flight RAM check: estimate the memory ONE worker needs at chunk_mib.
+// It needs: input buffer (chunk) + output buffer (ZSTD_compressBound(chunk))
 // plus queue overhead, result store, etc.
-// If estimated usage exceeds 75% of available RAM, auto-reduce chunk_mib.
+// If that exceeds 75% of available RAM, auto-reduce chunk_mib.
 // Returns the (possibly reduced) chunk_mib.
+// FEWER WORKERS FIRST (v0.18.30).  This counted every worker of the pool and
+// halved the frame until they fit -- a ratio cost the archive keeps -- and a
+// container's limit, now read (get_available_ram_bytes), would have cut a
+// 512 MiB file's frames to 1 MiB under 1 GB.  An auto pool is cut to what the
+// memory holds instead (gz_mem_fit_pool), so callers pass 1 and the frame
+// shrinks only when even one worker would not fit.  A pool pinned by -T N or -T0
+// cannot be cut, so they pass its count and its frames shrink as before:
+// -T 32 --chunk-size=1024 on a 16 GiB host keeps 64 MiB frames, not 32 workers
+// each holding gigabytes.
 static size_t check_ram_budget(int threads, size_t chunk_mib, const Options & opt)
 {
+  threads = std::max(1, threads);
   uint64_t avail = get_available_ram_bytes();
   if (avail == 0) return chunk_mib;  // can't determine  skip check
 
@@ -14909,7 +15155,7 @@ public:
 
   // --adapt sink budget grow (M4 action 4).  Armed per-operation with a
   // ceiling (permits) derived from the same guards as the initial budget:
-  // min(available RAM / 2, 32 GiB hard cap, --memlimit), never armed for a
+  // min(available RAM / 4, 32 GiB hard cap, --memlimit), never armed for a
   // user-pinned --throttle-frames or a disabled throttle.  Consumed on the
   // release path: one bounded step (+25% of current max, >= 1) per governor
   // tick that observed bursty SINK_BOUND.  Growth never disturbs the FIFO
@@ -14982,6 +15228,25 @@ public:
   }
 
   int grow_ceiling() const { return grow_ceiling_; }
+
+  // Raise the budget to `n` at once (v0.18.30): a deferred GPU bringup, before
+  // its first GPU worker, adds the GPU batch floor to a throttle that started
+  // at the CPU pool's RAM-capped budget.  Growth keeps the FIFO argument intact
+  // (permits only ever get more plentiful), and every GPU intake sees the full
+  // floor because none exists until this returns.
+  void grow_to(int n) {
+    if (disabled_) return;
+    int added = 0;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (n <= max_) return;
+      added = n - max_;
+      permits_ += added;
+      max_ = n;
+    }
+    for (int i = 0; i < added; ++i) cv_.notify_one();
+    bcv_.notify_all();
+  }
 
   // Deferred GPU bringup reads this while --adapt's writer may grow max_.
   // Take the same lock as release(), so exploration sees a coherent budget.
@@ -15123,7 +15388,7 @@ private:
 // action 4).  Same guards as the initial budget: a user-pinned
 // --throttle-frames never grows, --memlimit stays authoritative, and the
 // tar-extract sink keeps its deliberate 16 GiB cap (its FrameSink has its
-// own v0.14.74 grow mechanism).  Ceiling = min(available RAM / 2, 32 GiB
+// own v0.14.74 grow mechanism).  Ceiling = min(available RAM / 4, 32 GiB
 // hard cap, --memlimit) / frame_bytes.
 static void adapt_arm_throttle_grow(FrameThrottle & t, size_t frame_bytes,
                                     const Options & opt)
@@ -15132,7 +15397,7 @@ static void adapt_arm_throttle_grow(FrameThrottle & t, size_t frame_bytes,
   if (g_tar_decomp_sink) return;
   size_t avail = get_available_ram_bytes();
   if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
-  size_t cap_bytes = std::min<size_t>(avail / 2,
+  size_t cap_bytes = std::min<size_t>(avail / 4,
       (size_t)std::min<uint64_t>(32ULL << 30, SIZE_MAX));
   if (opt.mem_limit_bytes > 0)
     cap_bytes = (size_t)std::min<uint64_t>(cap_bytes, opt.mem_limit_bytes);
@@ -15154,14 +15419,19 @@ static void adapt_arm_throttle_grow(FrameThrottle & t, size_t frame_bytes,
 // next in-order batch finishes — with a 256 MiB sink the consumer drained dry
 // in those gaps and the extract writer pool sat starved (~9% of an extract-
 // bound gpu-only run vs ~1% cpu-only).  Budget roughly one completion wave,
-// clamped to a quarter of available RAM for small boxes.  The deque only
+// clamped to an eighth of available RAM for small boxes.  The deque only
 // holds frames when the consumer lags, so an unused budget costs nothing.
 static size_t tar_sink_budget(const Options & opt) {
-  if (opt.cpu_only) return 256 * ONE_MIB;
   uint64_t avail = get_available_ram_bytes();
-  uint64_t cap = avail ? avail / 4 : 4096ull * ONE_MIB;
-  return (size_t)std::min<uint64_t>(4096ull * ONE_MIB,
-                                    std::max<uint64_t>(256 * ONE_MIB, cap));
+  // An eighth, the decoder's throttle the other (compute_throttle_budget); was a
+  // quarter on top of the throttle's.  The 256 MiB floor yields to a known limit
+  // (v0.18.30): under 2 GiB an eighth of what is left is all the sink may hold.
+  // It admits a frame into an empty queue whatever its size, so a small budget
+  // slows, never stalls.  Unchanged wherever 32 GiB are free (the 4 GiB cap).
+  uint64_t cap = avail ? avail / 8 : 4096ull * ONE_MIB;
+  const uint64_t floor = std::min<uint64_t>(256 * ONE_MIB, cap);
+  if (opt.cpu_only) return (size_t)floor;
+  return (size_t)std::min<uint64_t>(4096ull * ONE_MIB, std::max<uint64_t>(floor, cap));
 }
 
 // End-of-run throttle stats; one line at V_DEBUG.  Shows how often producers
@@ -16125,6 +16395,124 @@ static void apply_compress_dict(ZSTD_CCtx * cctx, int level)
     st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 0);
   if (ZSTD_isError(st))
     die(std::string("could not attach the -D dictionary to a compressor: ") + ZSTD_getErrorName(st));
+}
+
+// One compression context's memory for a frame of `frame_bytes` at this run's
+// settings (v0.18.30): the level's parameters for that size and the -D
+// dictionary, any --zstd= table sizes, and an --ultra / --long window (with
+// --long's matcher).  A single-threaded context; UINT64_MAX if zstd cannot say.
+static uint64_t gz_cctx_mem_estimate(const Options & opt, uint64_t frame_bytes)
+{
+  ZSTD_compressionParameters cp = ZSTD_getCParams(opt.level, frame_bytes, g_dict_len);
+  if (const int w = ultra_window_log(opt.level, opt.ultra)) cp.windowLog = (unsigned)w;
+  if (g_zparams[1]) cp.chainLog = (unsigned)g_zparams[1];
+  if (g_zparams[2]) cp.hashLog = (unsigned)g_zparams[2];
+  if (g_zparams[3]) cp.searchLog = (unsigned)g_zparams[3];
+  if (g_zparams[4]) cp.minMatch = (unsigned)g_zparams[4];
+  if (g_zparams[5]) cp.targetLength = (unsigned)g_zparams[5];
+  if (g_zparams[6]) cp.strategy = (ZSTD_strategy)g_zparams[6];
+  ZSTD_CCtx_params * p = ZSTD_createCCtxParams();
+  if (!p) return UINT64_MAX;
+  size_t e = ZSTD_CCtxParams_init(p, opt.level);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_windowLog, (int)cp.windowLog);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_chainLog, (int)cp.chainLog);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_hashLog, (int)cp.hashLog);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_searchLog, (int)cp.searchLog);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_minMatch, (int)cp.minMatch);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_targetLength, (int)cp.targetLength);
+  if (!ZSTD_isError(e)) e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_strategy, (int)cp.strategy);
+  if (!ZSTD_isError(e) && g_long_wlog)
+    e = ZSTD_CCtxParams_setParameter(p, ZSTD_c_enableLongDistanceMatching, 1);
+  if (!ZSTD_isError(e)) e = ZSTD_estimateCCtxSize_usingCCtxParams(p);
+  ZSTD_freeCCtxParams(p);
+  return ZSTD_isError(e) ? UINT64_MAX : (uint64_t)e;
+}
+
+// THE POOL THE MEMORY HOLDS (v0.18.30).  Every pool was sized from the CPUs,
+// so inside a container capped below what that many workers hold the kernel
+// killed the run (exit 137): on the 256-CPU server a 2 GiB text file (128
+// frames, 96 workers) died under a 768 MB cap and survived 1 GB, 2 GiB of
+// random data died under 2 GB, and its archive's decode died under 2 GB.  An
+// auto-sized pool now has no more workers than its share of what this process
+// may still take holds at `per_worker` each (the worst case, as the caller
+// counts it), less `reserve` workers, and never fewer than one: fewer workers
+// cost time, where smaller frames would cost ratio that stays in the archive
+// (check_ram_budget shrinks the frame only when one worker cannot fit).  The
+// shares, at most three quarters together: compress, each worker's scratch,
+// the two finished frames its recycling pool keeps and its context half, and
+// the throttle's frames in flight a quarter (compute_throttle_budget); decode,
+// the workers' pools of two decoded frames a quarter, the throttle a quarter,
+// and the reader's ring, views and queue an eighth each.  Unknown memory
+// changes nothing.  -T N is the user's count, kept.
+static int gz_mem_fit_pool(int threads, uint64_t per_worker, uint64_t share_num, uint64_t share_den,
+                           int reserve, const char * what, const Options & opt, bool log = true)
+{
+  if (threads <= 1 || per_worker == 0) return threads;
+  GzMemHeadroom cg;
+  const uint64_t avail = gz_ram_available(&cg);
+  if (avail == 0 && cg.file.empty()) return threads;
+  const uint64_t usable = avail / share_den * share_num;
+  const uint64_t fit = per_worker == UINT64_MAX ? 0 : usable / per_worker;
+  const int w = (int)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)threads,
+                                            fit > (uint64_t)reserve ? fit - (uint64_t)reserve : 0));
+  if (w < threads && log && opt.verbosity >= V_VERBOSE) {
+    char a[32], b[32], c[32];
+    human_bytes(double(per_worker == UINT64_MAX ? 0 : per_worker), a, sizeof a);
+    human_bytes(double(usable), b, sizeof b);
+    human_bytes(double(cg.limit), c, sizeof c);
+    vlog(V_VERBOSE, opt, "[CPU] memory: " + std::to_string(w) + " of " + std::to_string(threads)
+         + " " + what + " fit (" + a + " each at most, " + b + " usable"
+         + (!cg.file.empty() && cg.headroom <= avail   // avail = min(host, headroom): the limit binds
+            ? std::string("; ") + cg.file + " " + c : std::string()) + ")\n");
+  }
+  return w;
+}
+
+// An input queue's byte ceiling, no more than an eighth of the memory left
+// (v0.18.30): the parallelism formulas alone allowed 256 MiB (decode, at the
+// 32-frame floor) to 17 GiB (hybrid decode on 8 GPUs) of queued frames.
+static size_t gz_queue_bytes_cap(size_t bytes)
+{
+  if (const uint64_t ram = get_available_ram_bytes())
+    return (size_t)std::max<uint64_t>(8 * ONE_MIB, std::min<uint64_t>(bytes, ram / 8));
+  return bytes;
+}
+
+#ifdef HAVE_NVCOMP
+// As many GPUs as a quarter of the memory left holds the batches of (v0.18.30):
+// `per_device` is one device's streams times its batch of frames, the in-flight
+// frames its throttle permits must cover.  0 when not even one fits -- a
+// deferred hybrid bringup then leaves the run to its CPU pool.
+static int gz_mem_fit_gpus(int devices, uint64_t per_device, const Options & opt)
+{
+  if (devices <= 0 || per_device == 0) return devices;
+  const uint64_t ram = get_available_ram_bytes();
+  if (!ram) return devices;
+  const uint64_t fit = std::min<uint64_t>((uint64_t)devices, ram / 4 / per_device);
+  if ((int)fit < devices) {
+    char a[32], b[32];
+    human_bytes(double(per_device), a, sizeof a);
+    human_bytes(double(ram / 4), b, sizeof b);
+    vlog(V_VERBOSE, opt, fit ? "[GPU] memory: " + std::to_string(fit) + " of " + std::to_string(devices)
+                             + " GPUs' batches fit (" + a + " each, " + b + " for frames in flight)\n"
+                             : std::string("[GPU] memory: one GPU's batches (") + a + ") are more than the "
+                               + b + " for frames in flight; hybrid running CPU-only\n");
+  }
+  return (int)fit;
+}
+#endif
+
+// One decode worker at its worst (v0.18.30): its recycling pool keeps at least
+// two decoded frames (cpu_decomp_worker's out_pool, max(2, budget / workers)
+// slots) whether or not they are in flight, and a context.  The frame is the
+// run's chunk size, as the decode throttle counts it.  Its compressed input is
+// a view into the reader's ring, which the reader fits on its own.  MEASURED:
+// counting one frame a worker, 30 decoders and a 31-frame throttle under a
+// 1 GB limit still died -- 30 pools of two 16 MiB frames are 960 MiB.
+static uint64_t gz_decomp_worker_mem(const Options & opt)
+{
+  const uint64_t frame = (uint64_t)std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+  return 2 * frame + ZSTD_estimateDCtxSize();
 }
 
 static void attach_verify_dict(ZSTD_DCtx * d)
@@ -20276,6 +20664,21 @@ static size_t stream_frames_to_queue_mt(
       : std::min(BLOCK / 2, ((ZSTD_compressBound((size_t)first_frame_decomp) + ONE_MIB - 1)
                              / ONE_MIB) * ONE_MIB);
   const size_t BUF = BLOCK + OV;              // bytes one block buffer holds
+  // THE RING THE MEMORY HOLDS (v0.18.30).  Every reader keeps two blocks in the
+  // ring (n_slots below), 12 readers about 1.7 GB of 64 MiB blocks: a 2 GiB
+  // archive's decode died under a 2 GB container limit before a frame was
+  // written.  An eighth of the memory left for the ring, as the --adapt ceiling
+  // below already allowed it; fewer readers, never smaller blocks.  A user's
+  // --read-threads is kept.
+  if (const uint64_t ram = opt.read_threads == 0 ? get_available_ram_bytes() : 0) {
+    const int fit = (int)std::max<uint64_t>(1, ram / 8 / (2 * BUF));
+    if (fit < n_readers) {
+      vlog(V_VERBOSE, opt, "[READER] memory: " + std::to_string(fit) + " of "
+           + std::to_string(n_readers) + " parallel readers fit an eighth of the memory left\n");
+      n_readers = fit;
+      if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
+    }
+  }
 
   // --adapt reader scale-up (M4 action 3): size the slot ring for the CAP up
   // front — the modulo geometry is frozen at spawn, so a late-woken reader
@@ -21696,6 +22099,12 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
       capped = true;
     }
   }
+  // The pool the memory holds (v0.18.30, gz_mem_fit_pool).
+  if (opt.cpu_threads == 0 && threads > 1) {
+    const int fit = gz_mem_fit_pool(threads, gz_decomp_worker_mem(opt), 1, 4, 0,
+                                    "decompression workers", opt);
+    if (fit < threads) { threads = fit; capped = true; }
+  }
   // Before the writer and the pool start: they inherit it.  Not under --tar,
   // whose frame sink is drained by extraction threads of its own.
   // Even one worker: the frame it decodes is read and written by other threads.
@@ -21734,7 +22143,7 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
     // compressible run does.  ~8 MiB/slot = half a standard 16 MiB frame (≈ half
     // the floor's worst-case bytes; measured throughput-neutral on Gen3 — should
     // be validated on a Gen4+ host).  Soft cap — push() still admits a frame when empty.
-    queue.set_max_bytes(qfloor * (8 * ONE_MIB));
+    queue.set_max_bytes(gz_queue_bytes_cap(qfloor * (8 * ONE_MIB)));
   }
 
   std::thread wthr;
@@ -21986,8 +22395,10 @@ struct CpuCompressChunk {
 };
 
 // Resolve the geometry once, before choosing a serial stream or a worker pool.
-// A possible one-frame input gets the serial RAM budget.  If that budget makes
-// the frame too small, fall back to the pool and apply its larger worker budget.
+// The RAM budget is one worker's for a resizable auto pool, otherwise the
+// requested pool's (including -T0, whose resolved count is kept).
+// If it makes the frame smaller than a possible one-frame input, the input
+// takes the pool.
 static CpuCompressChunk cpu_compress_chunk(const Options & opt, int threads,
                                            uint64_t single_frame_size)
 {
@@ -22014,10 +22425,11 @@ static CpuCompressChunk cpu_compress_chunk(const Options & opt, int threads,
 
   bool serial = !opt.tar_mode && (threads == 1
       || (single_frame_size > 0 && single_frame_size <= chosen_mib * ONE_MIB));
-  chosen_mib = check_ram_budget(serial ? 1 : threads, chosen_mib, opt);
+  const int pinned = opt.cpu_threads != 0 ? threads : 1;   // see check_ram_budget
+  chosen_mib = check_ram_budget(serial ? 1 : pinned, chosen_mib, opt);
   if (serial && threads > 1 && single_frame_size > chosen_mib * ONE_MIB) {
     serial = false;
-    chosen_mib = check_ram_budget(threads, chosen_mib, opt);
+    chosen_mib = check_ram_budget(pinned, chosen_mib, opt);
   }
   return {std::max<size_t>(1, chosen_mib) * ONE_MIB, serial};
 }
@@ -26748,6 +27160,30 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   int nreaders = opt.read_threads > 0 ? (int)opt.read_threads
                                       : std::max(3, std::min(12, hw / 8));
   nreaders = std::max(1, std::min<int>(nreaders, (int)nchunks));
+  int mem_readers = INT_MAX;
+  size_t mem_window = SIZE_MAX;
+  // THE READERS THE MEMORY HOLDS (v0.18.30).  Each reader assembles a chunk,
+  // and the reorder window below holds two more a reader: 12 readers at 16 MiB
+  // are ~576 MiB of input before a frame is compressed, and --tar creation
+  // under a 1 GB container limit died at once.  An eighth of the memory left,
+  // as the decode readers take; fewer readers, never smaller chunks.  A user's
+  // --read-threads is kept.
+  if (opt.read_threads == 0 && chunk_size)
+    if (const uint64_t ram = get_available_ram_bytes()) {
+      const uint64_t chunks = ram / 8 / chunk_size;
+      const int fit = (int)std::min<uint64_t>(INT_MAX, std::max<uint64_t>(1, chunks / 3));
+      mem_readers = fit;
+      // The claim window bounds assembling + ready chunks together.  The
+      // pusher advances push_next before queue.push(), so reserve its held
+      // chunk too.  A one-reader pool must not retain the old eight-chunk
+      // window, and --adapt must not grow past the same memory fit.
+      mem_window = (size_t)std::max<uint64_t>(1, chunks > 0 ? chunks - 1 : 0);
+      if (fit < nreaders) {
+        vlog(V_VERBOSE, opt, "[TAR] memory: " + std::to_string(fit) + " of " + std::to_string(nreaders)
+             + " parallel readers fit an eighth of the memory left\n");
+        nreaders = fit;
+      }
+    }
   if (opt.verbosity >= V_VERBOSE)
     vlog(V_VERBOSE, opt, "[TAR] " + std::to_string(nreaders) + " parallel reader(s), "
          + std::to_string(nchunks) + " chunks\n");
@@ -26780,7 +27216,8 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   // holds which chunk in which state plus the frontier and reorder-buffer head —
   // what gdb would have shown.  Kept: it found this in one run.
   const bool  rd_ad_t   = opt.adapt && opt.read_threads == 0;
-  const int   rd_ceil_t = rd_ad_t ? std::max(nreaders, std::min(nreaders * 3, 32)) : nreaders;
+  const int   rd_ceil_t = std::min(mem_readers,
+      rd_ad_t ? std::max(nreaders, std::min(nreaders * 3, 32)) : nreaders);
   const int   rd_floor_t = std::max(1, nreaders / 2);
   const int rd_seed_t = rd_ad_t ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
   ReaderPoolCtl rd_ctl_t(nreaders, rd_floor_t, rd_ceil_t, rd_seed_t);
@@ -26795,7 +27232,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   std::vector<std::atomic<size_t>> rd_hold((size_t)rd_ceil_t);
   for (int i = 0; i < rd_ceil_t; ++i) { rd_st[(size_t)i].store(RD_START); rd_hold[(size_t)i].store(SIZE_MAX); }
   std::atomic<int> pusher_st{0};          // 0 = waiting for head, 1 = pushing
-  const size_t window = std::max<size_t>(8, (size_t)rd_ceil_t * 2);
+  const size_t window = std::min(mem_window, std::max<size_t>(8, (size_t)rd_ceil_t * 2));
   std::mutex rb_mx;
   std::condition_variable rb_cv;        // signals: chunk arrived / frontier advanced
   std::map<size_t, Task> ready;
@@ -27842,6 +28279,28 @@ static int match_tar_member(const std::string & rel,
   return -1;
 }
 
+// A large file's part job: the Extractor's LARGE_WINDOW.
+static constexpr uint64_t TAR_PART_WINDOW = 64 * 1024 * 1024;
+
+// THE PARTITIONS THE MEMORY HOLDS (v0.18.30).  A parallel-extract partition
+// holds the frames of the part job it is building (a large file's window spans
+// several frames, all pinned until the job is queued) or the frame it is
+// parsing, plus the next frame and its compressed bytes: 16 partitions of 16
+// MiB frames held ~1.5 GiB before a byte was written.  A quarter of the memory
+// left; INT_MAX when nothing limits it.  The caller keeps its own floor: under
+// two partitions the serial walk runs.
+static int par_extract_mem_fit(const std::vector<uint64_t> & c_off,
+                               const std::vector<uint64_t> & u_off)
+{
+  const uint64_t ram = get_available_ram_bytes();
+  if (!ram) return INT_MAX;
+  uint64_t usz = 1, csz = 0;
+  for (size_t k = 0; k + 1 < u_off.size(); ++k) usz = std::max<uint64_t>(usz, u_off[k + 1] - u_off[k]);
+  for (size_t k = 0; k + 1 < c_off.size(); ++k) csz = std::max<uint64_t>(csz, c_off[k + 1] - c_off[k]);
+  const uint64_t per_part = std::max<uint64_t>(usz, TAR_PART_WINDOW) + usz + csz;
+  return (int)std::min<uint64_t>(INT_MAX, std::max<uint64_t>(1, ram / 4 / per_part));
+}
+
 // Defined below (after the seek machinery); forward-declared so Extractor::
 // run_parallel can decode its partition's frames with the same verified path
 // seek_feed uses.  decode_seek_frame is the fused pread+decompress used by the
@@ -28423,6 +28882,11 @@ public:
     int N = std::max(1, std::min(resolve_cpu_threads(dopt.cpu_threads), 16));
     N = std::min<int>(N, (int)nent);
     N = std::min<int>(N, (int)nframes);
+    if (const int fit = par_extract_mem_fit(c_off, u_off); fit < N) {
+      vlog(V_VERBOSE, dopt, "[TAR] memory: " + std::to_string(fit) + " of " + std::to_string(N)
+           + " extract partitions fit a quarter of the memory left\n");
+      N = fit;
+    }
     struct Part { size_t a, b; };            // entries [a, b)
     std::vector<Part> parts;
     {
@@ -30256,7 +30720,7 @@ private:
     uint64_t off = 0;               // part: absolute file offset of segs[0]
     int root = 0;                   // roots_ index (member selection's -C)
   };
-  static constexpr uint64_t LARGE_WINDOW = 64 * 1024 * 1024;  // part-job size
+  static constexpr uint64_t LARGE_WINDOW = TAR_PART_WINDOW;   // part-job size
   std::mutex q_m_; std::condition_variable q_cv_prod_, q_cv_cons_;
   // Jobs POPPED but not yet written.  "q_ is empty" is not "the writes landed":
   // a writer pops under the lock and writes outside it, so a producer that waits
@@ -30266,6 +30730,8 @@ private:
   std::condition_variable q_cv_idle_;
   std::deque<Job> q_; size_t q_bytes_ = 0; bool q_done_ = false;
   size_t q_max_bytes_ = 256 * 1024 * 1024;   // raised in start_pool for part jobs
+  size_t mem_q_cap_ = SIZE_MAX;              // ...but never past this (start_pool: the memory)
+  int    mem_writers_ = INT_MAX;             // writers the memory holds, base + extras
   std::vector<std::thread> writers_;
   // Small-file writer-pool timing for the -v [WRITER] diagnosis (gated to -v):
   // busy = time in write_small (create+write+meta), starved = time blocked
@@ -30368,6 +30834,28 @@ private:
       n = auto_n;
     }
     n = std::max(1, n);
+    // THE WRITERS THE MEMORY HOLDS (v0.18.30).  A writer has a job in hand -- a
+    // large file's part job is a LARGE_WINDOW view of decoded frames -- and an
+    // O_DIRECT bounce buffer, and the queue below holds two windows more per
+    // writer: 16 writers pinned up to 3 GiB of tar stream, and -d --tar under a
+    // 1 GB container limit died within 80 ms.  A quarter of the memory left for
+    // the writers' jobs and buffers, an eighth for the queue; fewer writers,
+    // never smaller windows.  --write-threads is kept, but its queue still fits.
+    mem_q_cap_ = SIZE_MAX; mem_writers_ = INT_MAX;
+    if (const uint64_t ram = get_available_ram_bytes()) {
+      mem_q_cap_ = (size_t)std::min<uint64_t>(SIZE_MAX, std::max<uint64_t>(LARGE_WINDOW, ram / 8));
+      if (opt_.write_threads == 0) {
+        mem_writers_ = (int)std::min<uint64_t>(INT_MAX,
+            std::max<uint64_t>(1, ram / 4 / (LARGE_WINDOW + BOUNCE_CAP)));
+        if (mem_writers_ < n + seed_extra) {
+          if (mem_writers_ < n)
+            vlog(V_VERBOSE, opt_, "[UNTAR] memory: " + std::to_string(mem_writers_) + " of "
+                 + std::to_string(n) + " writer threads fit a quarter of the memory left\n");
+          n = std::min(n, mem_writers_);
+          seed_extra = std::max(0, mem_writers_ - n);
+        }
+      }
+    }
     if (opt_.adapt && prior > 0 && opt_.write_threads == 0
         && opt_.verbosity >= V_VERBOSE) {
       char b[176];
@@ -30385,8 +30873,8 @@ private:
     // Enough queued part-jobs to keep every writer busy on large files (the
     // 256 MiB floor covers the many-small-files case).  This bounds pinned
     // frame memory: ~2 windows per writer + one frame per queued job.
-    q_max_bytes_ = std::max<size_t>(256 * 1024 * 1024,
-                                    (size_t)n * 2 * LARGE_WINDOW);
+    q_max_bytes_ = std::min(mem_q_cap_, std::max<size_t>(256 * 1024 * 1024,
+                                                         (size_t)n * 2 * LARGE_WINDOW));
     {
       // Widest the pool can get.  This MUST match the supervisor's own ceiling,
       // which is max(max(n, cpu - n), seed_extra) -- the seed_extra term matters:
@@ -30431,7 +30919,8 @@ private:
     // pin and made the flag untrustworthy for exactly the hand-tuning it exists
     // for ("the optimum is hardware-dependent — tune it on the target box").
     if (opt_.adapt && opt_.write_threads == 0) {
-      ewgrow_cap_ = std::max(std::max(n, cpu - n), seed_extra);
+      ewgrow_cap_ = std::min(std::max(std::max(n, cpu - n), seed_extra),
+                             std::max(0, mem_writers_ - n));
       g_adapt_ewgrow_cap.store(ewgrow_cap_, std::memory_order_relaxed);
       ewsup_stop_ = false;
       ewsup_ = std::thread([this] { ewriter_supervisor(); });
@@ -30611,8 +31100,8 @@ private:
         // what growing was for.
         {
           std::lock_guard<std::mutex> qlk(q_m_);
-          q_max_bytes_ = std::max<size_t>(256 * 1024 * 1024,
-                                          (size_t)(n_writers_ + target) * 2 * LARGE_WINDOW);
+          q_max_bytes_ = std::min(mem_q_cap_, std::max<size_t>(256 * 1024 * 1024,
+                                          (size_t)(n_writers_ + target) * 2 * LARGE_WINDOW));
         }
         q_cv_prod_.notify_all();   // a wider budget may admit a waiting producer
         for (int i = active; i < target; ++i) {
@@ -32569,7 +33058,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // size is read gets more frames than workers, which is slower, not wrong.  -T,
   // --tar and a pipe keep their pool; GZSTD_DEBUG_NO_SMALL_SERIAL keeps it for A/B.
   const int all_threads = threads;
-  bool capped = false;
+  bool capped = false;              // the pool is smaller than the CPUs: placeable
+  bool frames_capped = false;       // ...because the input has fewer frames: room for zstd's workers
   if (!chunk.serial && opt.cpu_threads == 0 && !opt.tar_mode
       && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
     const uint64_t sz = single_frame_size > 0 ? single_frame_size : known_input_size(opt, in);
@@ -32579,7 +33069,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
            + " frames; one compression thread per frame\n");
       threads = (int)nf;
       capped = true;
+      frames_capped = true;
     }
+  }
+  // The pool the memory holds (gz_mem_fit_pool), --tar included: a worker holds
+  // its output scratch, the two finished frames its recycling pool keeps, and a
+  // context.
+  if (!chunk.serial && opt.cpu_threads == 0) {
+    const int fit = gz_mem_fit_pool(threads, 3 * (uint64_t)ZSTD_compressBound(chunk.bytes)
+                                    + gz_cctx_mem_estimate(opt, chunk.bytes), 1, 2, 0,
+                                    "compression workers", opt);
+    if (fit < threads) { threads = fit; capped = true; frames_capped = false; }
   }
   // ZSTD'S OWN WORKERS INSIDE EACH FRAME (v0.18.29).  That cap leaves an input of
   // fewer frames than CPUs few threads: a 40 MiB file is 3 frames, so 3 CPUs of
@@ -32614,7 +33114,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   int frame_workers = 0;
   size_t frame_job = 4 * ONE_MIB;
   uint64_t frame_job_cut = frame_job;   // what zstd cuts, for the -v line
-  if ((capped || small_serial) && gz_zstd_multithreaded()
+  // Only where the frames left CPUs idle -- never in a pool the memory cut.
+  if ((frames_capped || small_serial) && gz_zstd_multithreaded()
       && !std::getenv("GZSTD_DEBUG_NO_FRAME_MT")) {
     if (const char * jm = std::getenv("GZSTD_DEBUG_FRAME_JOB_MIB"); jm && std::atoi(jm) > 0)
       frame_job = (size_t)std::atoi(jm) * ONE_MIB;
@@ -32636,6 +33137,61 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     if (spare >= 2 && jobs >= 2 && strat < (int)ZSTD_btultra2
         && ultra_window_log(opt.level, opt.ultra) == 0)
       frame_workers = (int)std::min<uint64_t>((uint64_t)spare, jobs);
+    // AS MANY AS THE MEMORY HOLDS (v0.18.30).  The worst case, every byte
+    // incompressible: one thread per frame holds its output scratch, one
+    // finished frame and a context (the one-frame route: the input buffer,
+    // the output and a context); zstd's workers add, per frame, the round
+    // buffer it fills -- w + 3 jobs (ZSTDMT_initCStream_internal: w sections,
+    // 3 slack with a prefix) -- and per worker an output buffer and a context.
+    // That must fit three quarters of what this process may still take, as
+    // check_ram_budget's frames do; past it, fewer workers, then none.  The
+    // estimate runs about twice the measured peak on text (one 512 MiB input,
+    // 3 workers a frame: +0.71 GB measured, +1.28 GB estimated).
+    if (frame_workers > 0) {
+      GzMemHeadroom cg;
+      const uint64_t avail = gz_ram_available(&cg);
+      if (avail > 0 || !cg.file.empty()) {
+        const uint64_t usable = avail / 4 * 3;
+        const uint64_t frames = small_serial ? 1 : (uint64_t)threads;
+        // An explicit hashLog/chainLog can make each worker's tables much larger
+        // than the level's defaults (gz_cctx_mem_estimate counts them).  A CDict is
+        // already built before this budget and is included in the observed usage.
+        const uint64_t cctx = gz_cctx_mem_estimate(opt, frame_bytes);
+        // An estimator error or an unrepresentable need must reject workers,
+        // never wrap to a small allocation that appears to fit.
+        auto add = [](uint64_t a, uint64_t b) { return b > UINT64_MAX - a ? UINT64_MAX : a + b; };
+        auto mul = [](uint64_t a, uint64_t b) { return a && b > UINT64_MAX / a ? UINT64_MAX : a * b; };
+        const uint64_t bound = ZSTD_compressBound(frame_bytes);
+        const uint64_t base = small_serial ? add(add(frame_bytes, bound), cctx)
+                                           : mul(frames, add(mul(2, bound), cctx));
+        auto need = [&](int w) {
+          return add(base, mul(frames, add(mul((uint64_t)w + 3, job),
+                                          mul((uint64_t)w, add(ZSTD_compressBound(job), cctx)))));
+        };
+        const int planned = frame_workers;
+        if (opt.verbosity >= V_DEBUG) {
+          std::ostringstream os;
+          os << "[CPU] memory: " << usable << " bytes usable; estimated need by zstd workers per frame:";
+          for (int w = 2; w <= planned; ++w) os << " " << w << "=" << need(w);
+          vlog(V_DEBUG, opt, os.str() + "\n");
+        }
+        while (frame_workers >= 2 && need(frame_workers) > usable) --frame_workers;
+        if (frame_workers < 2) frame_workers = 0;
+        if (frame_workers != planned && opt.verbosity >= V_VERBOSE) {
+          char a[32], b[32], c[32];
+          human_bytes(double(need(frame_workers ? frame_workers : 2)), a, sizeof a);
+          human_bytes(double(usable), b, sizeof b);
+          human_bytes(double(cg.limit), c, sizeof c);
+          vlog(V_VERBOSE, opt, std::string("[CPU] memory: ")
+               + (frame_workers ? std::to_string(frame_workers) + " of " + std::to_string(planned)
+                                  + " zstd workers per frame fit (" + a
+                                : std::string("no zstd workers inside the frames (2 a frame would need ") + a)
+               + " of " + b + " usable"
+               + (!cg.file.empty() && cg.headroom <= avail   // avail = min(host, headroom)
+                  ? std::string("; ") + cg.file + " " + c : std::string()) + ")\n");
+        }
+      }
+    }
   }
   // Before the writer and the pool start: they inherit it (GzPoolPlacement).
   // The pool is every compressing thread: one per frame, times zstd's workers.
@@ -32733,7 +33289,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.throttle_frames != 0) {
     int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
     size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, threads * qslack);
-    queue.set_max_bytes(qfloor * (host_chunk / 2));
+    queue.set_max_bytes(gz_queue_bytes_cap(qfloor * (host_chunk / 2)));
   }
   ResultStore results;
   // Size the throttle from the *resolved* chunk (host_chunk = chosen_mib),
@@ -38036,8 +38592,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   {
     struct stat ist{};
     const int ifd = in ? ::fileno(in) : -1;
-    if (!opt.tar_mode && ifd >= 0 && ::fstat(ifd, &ist) == 0 && S_ISREG(ist.st_mode)
-        && gz_input_below_gpu_batch(opt, (uint64_t)ist.st_size)) {
+    const bool sized = !opt.tar_mode && ifd >= 0 && ::fstat(ifd, &ist) == 0 && S_ISREG(ist.st_mode);
+    if (sized && gz_input_below_gpu_batch(opt, (uint64_t)ist.st_size)) {
       if (opt.verbosity >= V_VERBOSE) {
         char b[176];
         std::snprintf(b, sizeof(b),
@@ -38172,10 +38728,39 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
   }
 
-  // Pre-flight: check we won't OOM (CPU rescue threads also need buffers)
+  // Pre-flight: the frame one worker can hold (the CPU pool is fit to memory
+  // below), or every worker of a pool pinned by -T N / -T0.  Count that pool
+  // under --gpu-only too: a failed GPU bringup can start CPU rescue in place.
   int cpu_threads_est = opt.cpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
-  chosen_mib = check_ram_budget(std::max(1, cpu_threads_est), chosen_mib, opt);
+  chosen_mib = check_ram_budget(opt.cpu_threads != 0 ? cpu_threads_est : 1, chosen_mib, opt);
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+  // Ask after resolving the geometry, as the hybrid CPU-pool cap does below.
+  // For eligible default adaptive runs detection above is deferred: no CUDA
+  // call has been made.  A requested 1 GiB chunk can still mean 16 MiB frames,
+  // and a host RAM budget can shrink those again.
+#ifndef _WIN32
+  {
+    struct stat ist{};
+    const int ifd = in ? ::fileno(in) : -1;
+    uint64_t nf = 0;
+    if (!opt.tar_mode && ifd >= 0 && ::fstat(ifd, &ist) == 0 && S_ISREG(ist.st_mode)
+        && gz_input_one_cpu_wave(opt, (uint64_t)ist.st_size, host_chunk, &nf)) {
+      vlog(V_VERBOSE, opt, "[GPU] this input's " + std::to_string(nf) + " frames are fewer than the "
+           + std::to_string(resolve_cpu_threads(0)) + " CPU workers; compressing it on the CPU "
+           "(every frame starts at once, before a GPU could be ready)\n");
+      Options cpu_opt = opt;
+      cpu_opt.cpu_only = true;
+      cpu_opt.hybrid = false;
+      // Preserve the hybrid pipeline's resolved frame geometry.  Letting the
+      // CPU route restore a requested 1 GiB chunk (or an ultra window) can
+      // turn a bounded mmap/pool run into a huge serial input allocation.
+      cpu_opt.chunk_mib = host_chunk / ONE_MIB;
+      cpu_opt.chunk_user_set = true;
+      compress_cpu_mt(in, out, cpu_opt, m);
+      return;
+    }
+  }
+#endif
   // The GPU frame is the subchunk: what a --adapt batch prior is keyed by.
   const size_t tune_frame_bytes = std::min(host_chunk, GPU_SUBCHUNK_MAX);
 
@@ -38277,11 +38862,29 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.throttle_frames != 0) {
     int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
     size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, comp_parallelism * qslack);
-    queue.set_max_bytes(qfloor * (host_chunk / 2));
+    queue.set_max_bytes(gz_queue_bytes_cap(qfloor * (host_chunk / 2)));
   }
+  // THE THROTTLE A GPU JOINS (v0.18.30).  The budget used to count the GPU batch
+  // floor of the provisional device count from the start, so while the GPUs were
+  // still being considered (and on the many runs whose bringup then skips them)
+  // nothing but that floor bounded the frames in flight: 2,144 frames, 33.5 GiB,
+  // and a sink slower than the CPU pool filled a container's limit within 0.3 s.
+  // With a deferred bringup it now starts at the CPU pool's RAM-capped budget and
+  // grows to the full one in the bringup, after the real device count is known
+  // and before the first GPU worker exists (grow_to) -- every GPU intake still
+  // sees the whole floor.  A user's --throttle-frames keeps its old shape.
+  // The CPU pool counted as the memory will hold it (the pool itself is fit
+  // below): the floor of a RAM-bound throttle is that pool plus one, and 96 + 1
+  // frames were 1.5 GiB under a 1 GB limit.
+  const int cpu_threads_fit = opt.cpu_threads == 0
+      ? gz_mem_fit_pool(cpu_threads_est, 3 * (uint64_t)ZSTD_compressBound(host_chunk)
+                        + gz_cctx_mem_estimate(opt, host_chunk), 1, 2, 0, "", opt, false)
+      : cpu_threads_est;
+  const bool gpu_joins_later = defer_detect && opt.throttle_frames < 0;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
-      comp_gpu_batch_floor, opt));
+      std::max<size_t>(1, chosen_mib) * ONE_MIB,
+      gpu_joins_later ? cpu_threads_fit : comp_parallelism,
+      gpu_joins_later ? 0 : comp_gpu_batch_floor, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, chosen_mib) * ONE_MIB, opt);
   queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
 
@@ -38443,6 +39046,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       const uint64_t nf = (total_in + host_chunk - 1) / host_chunk;
       if (nf < (uint64_t)cpu_threads) cpu_threads = (int)nf;
     }
+    // The pool the memory holds (v0.18.30, gz_mem_fit_pool), as compress_cpu_mt's.
+    if (opt.cpu_threads == 0)
+      cpu_threads = gz_mem_fit_pool(cpu_threads, 3 * (uint64_t)ZSTD_compressBound(host_chunk)
+                                    + gz_cctx_mem_estimate(opt, host_chunk), 1, 2, 0,
+                                    "hybrid CPU workers", opt);
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
 
@@ -38541,6 +39149,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
       }
+      // Before any CUDA call: the memory must hold one GPU's batches at least
+      // (v0.18.30).  A pool cut to the memory compresses slower, so the sample
+      // above says yes more often, and loading CUDA under a container's limit
+      // was where those runs died.
+      if (gpu_joins_later
+          && gz_mem_fit_gpus(1, std::max<size_t>(1, opt.gpu_streams) * per_stream_budget
+                                * (std::max<size_t>(1, chosen_mib) * ONE_MIB), opt) <= 0) {
+        g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
+        return;
+      }
       const int dc = gz_cuda_usable_count(opt, "hybrid bringup thread");
       if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old)
         vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
@@ -38566,6 +39184,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                              "during init; skipping GPU\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
+      }
+      // As many GPUs as the memory holds their batches, then the throttle they
+      // join (see gpu_joins_later).
+      if (gpu_joins_later) {
+        const size_t frame = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+        device_count = gz_mem_fit_gpus(device_count, std::max<size_t>(1, opt.gpu_streams)
+                                       * per_stream_budget * frame, opt);
+        if (device_count <= 0) { g_adapt_gpu_declined.store(true, std::memory_order_relaxed); return; }
+        const int floor = device_count * (int)std::max<size_t>(1, opt.gpu_streams) * (int)per_stream_budget;
+        throttle.grow_to(compute_throttle_budget(frame, cpu_threads_fit + floor, floor, opt));
       }
     }
     if (device_count <= 0) return;
@@ -39366,7 +39994,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // A failed setup has no staged work to inspect and must reach its refusal.
     if (!stage_setup_failure) dstage_debug_gate();
   }
-  throttle.set_done();  // safe now: all workers exited
+  // THE CPU POOL IS JOINED FIRST (v0.18.30), as decompress_nvcomp always has.
+  // Since FrameThrottle came in (v0.13.2) this called set_done() here, "safe
+  // now: all workers exited" -- but only the GPU
+  // workers had; the hybrid CPU pool is joined below, and a throttle that is
+  // done lets every acquire through.  Whenever the bringup skipped the GPU it
+  // joined at once, so from ~0.3 s on the CPU pool compressed with no
+  // backpressure and buffered its whole output: 2 GiB of random data to a pipe
+  // peaked at 1.45 GB of heap against 0.5 GB paced (permits climbing to 105 of
+  // 16).  An abandoned pass still wakes the pool now: its writer has stopped
+  // draining, and a worker waiting for a permit would never get one.
+  if (run_abandoned()) throttle.set_done();
 
   // Report GPU failures.  Even when ALL GPUs failed in --gpu-only mode the
   // job is already complete: the last failing worker ran
@@ -39394,6 +40032,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   queue.notify_cpu_waiters();
   if (!cpu_pool.empty())
     for (auto & th : cpu_pool) th.join();
+  throttle.set_done();  // safe now: every worker, GPU and CPU, has exited
 #ifndef _WIN32
   g_direct_read_pool = nullptr;  // all release() callers joined; safe to drop the pool
   perf_mark(PerfCounters::HM_WORKERS_JOINED);
@@ -43328,9 +43967,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       * (int)std::max<size_t>(1, opt.gpu_streams)
       * (int)decomp_per_stream_budget;
   const int decomp_parallelism = decomp_cpu_threads_est + decomp_gpu_batch_floor;
+  // The throttle a GPU joins (v0.18.30; see compress_nvcomp): the CPU pool's
+  // RAM-capped budget until the bringup adds the real GPU batch floor.
+  const bool gpu_joins_later = defer_detect && !opt.gpu_only && opt.throttle_frames < 0;
+  const int decomp_cpu_threads_fit = opt.cpu_threads == 0
+      ? gz_mem_fit_pool(decomp_cpu_threads_est, gz_decomp_worker_mem(opt), 1, 4, 0, "", opt, false)
+      : decomp_cpu_threads_est;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,
-      decomp_gpu_batch_floor, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB,
+      gpu_joins_later ? decomp_cpu_threads_fit : decomp_parallelism,
+      gpu_joins_later ? 0 : decomp_gpu_batch_floor, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
   queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
@@ -43362,7 +44008,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     queue_depth_ceiling = qfloor;
     // Byte ceiling — see decompress_cpu_mt: bounds queued RAM independent of
     // compressibility (~8 MiB/slot).  Soft cap; tune via --throttle-factor.
-    queue.set_max_bytes(qfloor * (8 * ONE_MIB));
+    queue.set_max_bytes(gz_queue_bytes_cap(qfloor * (8 * ONE_MIB)));
   }
 
   // ---- Output sink ----
@@ -43758,6 +44404,10 @@ gds_out_declined:
       const uint64_t nf = g_input_frames.load(std::memory_order_relaxed);
       if (nf > 0 && nf < (uint64_t)cpu_threads) cpu_threads = (int)nf;
     }
+    // The pool the memory holds (v0.18.30), as decompress_cpu_mt's.
+    if (opt.cpu_threads == 0)
+      cpu_threads = gz_mem_fit_pool(cpu_threads, gz_decomp_worker_mem(opt), 1, 4, 0,
+                                    "hybrid CPU decoders", opt);
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
 
@@ -43962,6 +44612,13 @@ gds_out_declined:
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
       }
+      // Before any CUDA call: one GPU's batches must fit (v0.18.30; see compress_nvcomp).
+      if (gpu_joins_later
+          && gz_mem_fit_gpus(1, std::max<size_t>(1, opt.gpu_streams) * decomp_per_stream_budget
+                                * (std::max<size_t>(1, opt.chunk_mib) * ONE_MIB), opt) <= 0) {
+        g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
+        return;
+      }
       // Deferred device detection (the ~2s cuInit, off the critical path).
       const int dc = gz_cuda_usable_count(opt, "decompress bringup thread");
       // A prior input may have left a worker stuck on one card.  The optional
@@ -43998,6 +44655,14 @@ gds_out_declined:
         vlog(V_VERBOSE, opt, "[GPU] file already decompressed by CPU during init; skipping GPU\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
+      }
+      if (gpu_joins_later) {
+        const size_t frame = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+        device_count = gz_mem_fit_gpus(device_count, std::max<size_t>(1, opt.gpu_streams)
+                                       * decomp_per_stream_budget * frame, opt);
+        if (device_count <= 0) { g_adapt_gpu_declined.store(true, std::memory_order_relaxed); return; }
+        const int floor = device_count * (int)std::max<size_t>(1, opt.gpu_streams) * (int)decomp_per_stream_budget;
+        throttle.grow_to(compute_throttle_budget(frame, decomp_cpu_threads_fit + floor, floor, opt));
       }
     }
     if (device_count <= 0) return;
@@ -45391,7 +46056,8 @@ static int extract_tar(const Options & opt, Meter * m)
       if (decoded_cpu) m->note_cpu_decode_threads(1);
       if (planned) {
         int Np = std::min<int>({resolve_cpu_threads(opt.cpu_threads), 16,
-                                (int)pbounds.size(), (int)(pst.c_off.size() - 1)});
+                                (int)pbounds.size(), (int)(pst.c_off.size() - 1),
+                                tarx::par_extract_mem_fit(pst.c_off, pst.u_off)});
         if (Np >= 2) {
           warn_indexed_direct_read();   // this route really is page-cached
           if (opt.verbosity >= V_VERBOSE) {
@@ -45690,6 +46356,7 @@ static int verify_tar(const Options & opt, Meter * m)
   int rc = EXIT_OK;
   int stats_err = 0;   // --stats-json, rewritten after each archive; the last write's
   for (const std::string & arc : opt.tar_sources) {
+    gz_mem_new_input();   // each archive's budgets read the memory afresh, once
     const GzStatsMark arc_mark = gz_stats_mark(*m);
     FILE * in = open_input(arc);   // dies on failure
     uint64_t comp = 0;
@@ -47997,6 +48664,7 @@ static int gzstd_main(int argc, char ** argv)
   for (size_t file_idx = 0; file_idx < opt.inputs.size(); ++file_idx) {
   // --- Per-file setup ---
   opt.input = opt.inputs[file_idx];
+  gz_mem_new_input();   // this input's budgets read the memory afresh, once
   if (opt.keep_going) g_damage.reset();   // damage is reported per input file
 
   // For multi-file with no explicit -o, derive output per file

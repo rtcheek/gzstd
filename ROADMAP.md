@@ -598,6 +598,30 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     cache-sized streaming route for small multi-frame inputs -- the route v0.18.24 did not take, as
     it bypasses the seek-table checks, `--keep-going` reports and sparse output -- and beating it,
     several inputs in flight at once (the per-input loop in gzstd_main is a redesign).
+    v0.18.30: the frame workers take only the memory there is (cgroup limits included), and the
+    GPU build sends an input of fewer frames than CPU workers to the CPU path, where they run.
+    The "zstd 5-12% ahead at 256-384 MiB" seen in the v0.18.29 sweep was the GPU build's hybrid
+    route, not zstd: the CPU-only build was ahead there.
+30. **FIXED v0.18.30: every RAM budget reads a container's limit, and a run that will not fit
+    takes fewer workers** (found 2026-10-26).  Every budget read the host's MemAvailable (1.4
+    TiB inside a 512 MB group on the server); past `memory.max` the kernel killed the run, exit
+    137 and no message.  On v0.18.29 a 2 GiB text file was killed at 768 MB, 2 GiB of random
+    data and its decode at 2 GB, `--tar` create and extract at 1 GB.  The owner's call: fewer
+    workers, never smaller frames.  `get_available_ram_bytes` is now the container's figure;
+    `check_ram_budget` counts one worker (the frame shrinks only when one cannot fit); the
+    compress, decode and hybrid CPU pools fit their share (`gz_mem_fit_pool`); the throttle
+    takes a quarter (was half) and its 32-frame floor yields to the memory; the decode readers'
+    ring and the input queues an eighth; a deferred hybrid bringup starts its throttle at the
+    CPU pool's budget, declines a GPU whose batches would not fit before any CUDA call, and
+    grows the throttle for the GPUs it keeps; `--tar` fits its readers, extract writers, queue
+    and partitions, and its frame sink and decode throttle split a quarter.  Found on the way:
+    a hybrid compress marked its throttle done before joining the CPU pool (since v0.13.2), so
+    a run whose GPUs were declined compressed the whole input into memory for a slow sink.
+    Still open: `-d --tar` below ~768 MB (the writer side holds four 64 MiB part windows --
+    building, two queued, one writing -- so going lower means a smaller window under a limit);
+    `--hybrid` / `--cpu-share` and a non-deferred bringup keep the GPU batch floor in the
+    throttle from the start; `--verify` and the pinned-host budgets (`--direct-stage`, GDS)
+    read the container's figure but were not run under a limit.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

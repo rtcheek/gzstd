@@ -1,12 +1,223 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.29  
+**Covers:** v0.9.50 → v0.18.30  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.30 — gzstd fits the memory a container allows: every budget reads a cgroup limit, and a run that will not fit takes fewer workers, never smaller frames (2 GiB of random data compresses under 128 MB, where v0.18.29 was killed at 2 GB); zstd's workers inside each frame take only what is left; the GPU build compresses an input of fewer frames than CPU workers on the CPU (30 x 128 MiB 1.5x faster)
+
+### Nothing read a container's limit, and v0.18.29 raised what a run needs
+
+Every RAM budget in gzstd read `/proc/meminfo`'s MemAvailable, which inside a container is the
+host's (1.4 TiB inside a group capped at 512 MB on the server).  Past a cgroup's `memory.max`
+the kernel kills the process: exit 137, no message, the output cut short (a named output is
+left as a 0-byte file under its name; SIGKILL, as with zstd).  Every pool was sized from the
+CPUs alone, and v0.18.29's zstd workers inside each frame added contexts and buffers that no
+budget counted.  Under `systemd-run --scope -p MemoryMax=... -p MemorySwapMax=0` on the server,
+output piped out of the scope and compared (v0.18.30: both builds unless one is named):
+
+| lowest limit survived (lowest tried: 128 MB; 32 MB for 40 MiB) | v0.18.28 | v0.18.29 | v0.18.30 |
+|---|---|---|---|
+| one 2 GiB text file (128 frames) | 1 GB (768 killed) | 1 GB (768 killed) | **128 MB** |
+| 2 GiB of random data | killed at 2 GB | killed at 2 GB | **128 MB** |
+| decode of the 2 GiB text's archive | killed at 2 GB | killed at 2 GB | **384 MB** CPU-only build, **512 MB** GPU build |
+| one 512 MiB text file | 384 MB (256 killed) | 1 GB (768 killed) | **128 MB** |
+| one 40 MiB file | 48 MB, the lowest tried then | 96 MB (64 killed) | **32 MB** |
+| `-r` over 96 x 40 MiB | 256 MB, the lowest tried then | 768 MB (survived 512 in a later run) | **128 MB** |
+| `--tar` create, 16 x 128 MiB | killed at 2 GB | killed at 2 GB | **128 MB** CPU-only, **192 MB** GPU build |
+| `-d --tar` of that archive | killed at 2 GB | killed at 2 GB | **768 MB** |
+
+### The memory a container allows
+
+`gz_cgroup_mem_headroom`: over this process's cgroup and each ancestor the walk reaches, the
+group's limit less what the group uses -- v2 the lower of `memory.max` (the kill) and
+`memory.high` (reclaim, then stalls) less `memory.current`, v1 `memory.limit_in_bytes` less
+`memory.usage_in_bytes`, inactive file cache counted as free (`memory.stat`) -- and the smallest
+of those.  A limit of zero is a limit, and none left means none: an exhausted group gets no
+workers, never "unknown".  The hierarchy walk is the CPU quota's (v0.18.19), now shared
+(`gz_cgroup_walk`); the CPU quota reads the same as before on the suite's v1 and v2 trees.  The
+memory is read once for each input (`gz_mem_new_input`), and every budget of that input shares
+the reading: a `-r` sees what earlier inputs left behind -- the run's own retained heap counts
+as used, so 4 x 512 MiB under 3 GB fit 31, 28, 27 and 27 of 32 workers -- and a process moved to
+another group between inputs.  Read at every ask, the dozen budgets of an input cost `-d -r` over
+256 x 6 MiB 10% (1.59-1.81 s against v0.18.29's 1.61-1.66); one reading an input, with
+mountinfo's cgroup rows read once a process and each file by open/read rather than an
+`ifstream`, it is 1.63-1.67 (compress 4.03-4.10 against 3.99-4.11): ~10 small file reads an
+input.  One reading is also the coherent one: a budget asked later in a run (the hybrid
+bringup's GPU fit) no longer counts the pools sized from the first as used.  Inactive file cache
+counts as free and active cache does not; on this kernel (MGLRU) cache filled by `read()` stays
+inactive (a 512 MiB file read three times: 512 MiB inactive, none active), while pages mmap'd
+and touched again turn active.
+
+### zstd's workers inside each frame, as many as the memory holds
+
+The worst case, every byte incompressible: one thread per frame holds its output scratch, one
+finished frame and a context; zstd's workers add, per frame, the round buffer it fills (w + 3
+jobs, `ZSTDMT_initCStream_internal`) and, per worker, an output buffer and a context
+(`gz_cctx_mem_estimate`, with any `--zstd=` table sizes and the `-D` dictionary's size
+applied; the sums saturate).  That must fit three quarters of the smaller of
+MemAvailable and the cgroup headroom, as `check_ram_budget`'s frames do; past it, fewer workers,
+then none (`-v`: "memory: 2 of 4 zstd workers per frame fit" / "no zstd workers inside the
+frames", naming the file that binds; `-vv` prints the estimate for each count).  The estimate
+runs high on purpose: one 512 MiB input, 3 workers a frame, measured +0.71 GB on text and +0.85
+on random data against +1.28 estimated; the one-thread base 145 MB (text) and 0.45 GB (random)
+against 1.07.  So under a 2 GB limit that file gets no workers (its pool is cut first, to 20 of
+32 workers; see below), under 4 GB three.  Uncapped nothing changes: one 12 MiB input or 128 of them,
+v0.18.29 2.62-2.72 s, v0.18.30 2.55-2.75.
+
+### Fewer workers, never smaller frames (ROADMAP 30)
+
+The owner's call: a run that will not fit takes fewer workers, never smaller frames -- smaller
+frames are a ratio cost that stays in the archive.  `get_available_ram_bytes`, which every
+budget reads, is now the container's figure (an exhausted limit reads as 1 byte, the smallest
+budget each allows, never as "unknown"), and each consumer takes a share of it:
+
+- **`check_ram_budget`** counts one worker, not the whole pool (by its old formula a 1 GB limit
+  would have cut a 512 MiB file's frames to 1 MiB): the frame shrinks only when one worker
+  cannot hold it, under ~86 MiB for 16 MiB frames.  A pool pinned by `-T N` or `-T0` cannot be
+  cut, so it is still counted whole and its frames shrink as before (`-T 32 --chunk-size=1024` under a
+  16 GB limit: 64 MiB frames; the auto pool keeps 1 GiB frames on 2 workers).
+- **The pools** (`gz_mem_fit_pool`): compression workers, each its output scratch, the two
+  finished frames its recycling pool keeps and a context (`gz_cctx_mem_estimate`: level,
+  dictionary, `--zstd=` tables, `--ultra` and `--long` windows), take half; decoders, two
+  decoded frames and a context each, a quarter; the hybrid CPU pools the same.  `-v`: "[CPU]
+  memory: 1 of 4 compression workers fit (49.43 MiB each at most, 64.00 MiB usable; ...
+  memory.max 128.00 MiB)".  `-T N` is kept.  A pool the memory cut gets no zstd workers inside
+  its frames; those go only where the frames left CPUs idle.
+- **The throttle** takes a quarter, not half, and its 32-frame floor yields when the memory
+  binds (to the pool plus one, never above 32 -- a pinned `-T 40` under a limit, or `-M128M`
+  with the default pool, would otherwise have taken 41 or 97 frames).  `--adapt`'s growth of it
+  stays inside the same quarter (it could grow to half).  Only a host whose memory, not its
+  pipeline, sets the budget sees the quarter: 96 workers with 16 GiB free, 384 -> 256 frames.  Half overran a limit: decode under 1 GB peaked at
+  1.04 GB.  Under a `--tar` frame sink the throttle and the sink take an eighth each; the sink
+  took a quarter on top, with a 256 MiB floor.  Unchanged wherever 32 GiB are free.
+- **Readers and queues**: the decode reader's ring (two blocks of up to 64 MiB and their overlap
+  per reader; 12 readers were ~1.7 GB) and `--tar` creation's readers and reorder window (it
+  kept at least 8 chunks whatever the readers, and the pusher holds one more) an eighth each,
+  the input queues' byte caps an eighth.  `--read-threads` is kept.
+- **`-d --tar`**: partitions (the 64 MiB part job each builds, a frame and its compressed
+  bytes; 16 held ~1.5 GiB before a byte was written) a quarter, the serial walk below two;
+  writers (a part job in hand and an O_DIRECT bounce buffer) a quarter, their queue an eighth.
+  `--write-threads` is kept and its queue still fits.
+- **A deferred hybrid bringup** starts the throttle at the CPU pool's budget, declines a GPU
+  whose batches the memory cannot hold before any CUDA call ("[GPU] memory: one GPU's batches
+  (8.00 GiB) are more than the 64.00 MiB for frames in flight; hybrid running CPU-only"), and
+  grows the throttle for the GPUs it keeps before the first GPU worker exists (`grow_to`).  The
+  provisional floor bound nothing until then, and uncapped too: a GPU build with no usable GPU
+  compressing 16 GiB of random data to a sink 8 s late held a 16,768-frame (262 GiB) throttle,
+  now 384 frames (6 GiB); peak 18.3 -> 11.7 GB, 14.41 -> 14.56 s.
+
+Decode's floor is now the reader's block: one reader holds two 64 MiB blocks (~130 MiB), so 256
+MB fails.  `-d --tar` stops at ~768 MB: its writer side holds four 64 MiB part jobs (one being
+built, two queued, one being written).  Going lower means smaller blocks or windows under a
+limit; neither was built.
+
+### A hybrid compress stopped pacing its CPU pool when its GPU workers were joined
+
+`compress_nvcomp` marked its throttle done once the GPU workers were joined, before joining the
+hybrid CPU pool, since the throttle came in (v0.13.2); `decompress_nvcomp` always joined the
+pool first.  A throttle that is done lets every acquire through, and a bringup that skipped or
+declined the GPU joins at once, so from then on the CPU pool compressed with no backpressure
+and buffered its whole output for a slow sink.  Under a 1 GB limit, 2 GiB of random data to a
+pipe was killed (heap 1.45 GB, permits climbing to 105 of 16) at the default verbosity and
+survived at `-v`, by timing.  The pool is now joined first; an abandoned pass still wakes it.
+
+### Uncapped
+
+Server, tmpfs, interleaved, v0.18.29 against v0.18.30: within the noise everywhere measured.
+Compress 8 GiB text 0.69-0.92 s both, both builds; decode 16 GiB 0.60-1.04 both; `-r -3` over
+96 x 40 MiB 1.44-1.58 against 1.46-1.60, its decode 1.93-2.12 against 1.85-2.05; `--tar` create
+of 2 GiB 0.60-0.72 against 0.60-0.66, extract 0.42-0.50 against 0.40-0.49; peak RSS 5.5-12 GB on
+the large inputs either version.
+
+### The GPU build: fewer frames than CPU workers goes to the CPU
+
+v0.18.29's CHANGELOG measured CPU-only builds, and its gain did not reach the GPU build above
+one GPU batch (128 MiB): there the default compress took the hybrid pipeline, whose CPU pool,
+cut to the frames since v0.18.25, has no zstd workers inside frames and no placement.  Every
+frame went to a CPU worker at once (`should_cpu_take` is true until a GPU is ready), and the
+bringup skipped the GPU ("CPU pool will finish before GPU init could") at every size measured
+from 128 MiB to 2 GiB, level 3 and 19 alike -- level 19's archive byte for byte that of
+`--cpu-only`.  So an input of fewer frames than the default CPU workers now takes the CPU path
+(`gz_input_one_cpu_wave`), which decides from the memory there is whether its frames get zstd's
+workers.  The frames counted are the hybrid pipeline's own, after its 16 MiB GPU clamp and RAM
+budget (no CUDA call has been made by then on this default), and the CPU path is handed that
+geometry: `--chunk-size=1024` still makes 16 MiB frames, as before, rather than one frame per
+GiB.  Not under a window asked for (`--ultra`): zstd's workers never run there, and the hybrid
+route's clamp and its warning stay as they were.  Only a slow producer (a cold read) used to leave frames for a GPU that came up
+meanwhile, and that run waits on the read.  Not under -T N, `--hybrid`, `--cpu-share`,
+`--gpu-batch`, `--gpu-streams`, `--tar`, or the suite's `GZSTD_DEBUG_GPU_MIN_BYTES=0`;
+`GZSTD_DEBUG_NO_FEW_FRAMES_CPU=1` is the A/B control.  Decompress needed nothing: its gate
+counts compressed bytes, and the GPU build already matched `--cpu-only` there.
+
+| GPU build, `-r -3`, server, tmpfs | v0.18.29 route | v0.18.30 | peak RSS |
+|---|---|---|---|
+| 30 x 128 MiB text | 3.04-3.09 s | **1.95-2.08** | 0.25 -> 1.2 GB |
+| 20 x 192 MiB | 2.21-2.26 | **1.71-1.74** | 0.46 -> 1.8 GB |
+| 8 x 512 MiB | 1.55-1.82 | **1.32-1.46** | 1.0 -> 3.5 GB |
+| 4 x 1 GiB (64 frames, no worker to spare) | 1.12-1.20 | 1.08-1.19 | equal |
+
+The same 512 MiB file through the GPU build under a cap: survives down to 128 MB, the lowest
+tried (the table above).
+(The 5-12% that `zstd -T0` seemed to hold at 256-384 MiB in the v0.18.29 sweep was this route:
+the CPU-only build was ahead of it there, 1.36-1.42 s against 2.46-3.35 for 10 x 384 MiB.)
+
+### Cells
+
+**Cells** (EXPECTED 581/881, no-GPU deltas 150/216): "memory: a cgroup limit decides the zstd workers in each frame"
+(fake v2 trees: a limit far above the estimate gives every planned worker, one far below none
+-- 96 MiB, since below ~86 MiB the frame itself shrinks -- and one between the need of one
+fewer and of all gives one fewer, read from -vv; every arm's archive that of its worker count)
+and "memory: the headroom is the tightest group's, memory.high and file cache counted, v1 too"
+(a parent's limit binds, memory.high binds, usage near the limit leaves none, the same usage
+with inactive file cache leaves all, max is no limit; a v1 container view binds, v1 unlimited
+is none; a limit that low now cuts the pool first, and either line names the file that bound;
+a mount table past 1 MiB still finds the limit); "memory: a limit fits fewer workers and a
+smaller throttle, and a pool it cut takes no zstd workers" (128 MiB: one compression worker and
+one decoder, the archive -T 1's, a 2-frame throttle; -T 2 keeps its pool, and -T 8 its frames
+shrink where the auto pool's do not; -T 40 under -M128M or a limit takes 32 frames, not 41;
+--adapt under 512 MiB does not grow past 8 frames; 64 GiB cuts nothing) and "memory: --tar under a limit runs fewer readers, writers and
+partitions" (256 MiB: one creation reader; 1 GiB: 3 writers and 3 partitions; 512 MiB: the
+serial walk, one writer, a 4-frame throttle against a plain decode's 8; every tree compared),
+default run, no GPU; "an input with fewer frames than CPU workers is compressed on the CPU"
+(GPU: 6 frames over a 4 MiB bound take the CPU path; the A/B hook, -T 4 and the suite's hook
+keep the hybrid; every arm decodes) and "memory: a hybrid compress whose GPUs the memory
+declines still paces its CPU pool" (GPU: 384 MiB of random data under a 128 MiB fake limit to a
+sink 2 s late, peak under half the input: 70 MB, 406 with the old join order), default GPU
+cells.  Codex (round 1) found three defects, fixed above -- the route counted `--chunk-size`'s
+frames rather than the pipeline's, an exhausted group skipped the budget, and `--zstd=` tables
+were left out of the estimate -- and added arms: zero and exhausted limits, memory.high under
+max and above it, usage below inactive cache, v1 usage and cache, a host with v1 memory and a
+v2 hierarchy, a process moved between groups between two inputs (held at GZSTD_DEBUG_POOL_GATE),
+the CPU quota kept in each fake tree, `--chunk-size=1024` keeping 16 MiB frames (a wide input
+stays hybrid, a two-frame one goes to the CPU as two frames), and the placement cells skipping
+where the memory budget legitimately cuts the plan; and an arm for `--zstd=hashLog=22` raising
+the estimate.  Codex (round 3, on the pools and budgets) found four more, each reproduced
+before and after and given an arm: mountinfo was read through a 1 MiB small-file ceiling (a
+1.3 MB mount table hid a 128 MiB limit: 4 workers with zstd's inside, now 1), `-M128M` with the
+default pool raised the throttle floor to 97 frames, `--adapt` could grow the throttle to half
+the memory, and `--tar` creation's reorder window kept 8 chunks under any limit (creation's
+floor 384/768 MB -> 128/192).  Mine on top of its fixes: the floor never above 32 frames, and a
+pinned -T counted whole by `check_ram_budget`; its round 4 found `-T0` (stored as -1) left out of
+that, and added a `-T0` arm and a `-T 40` decode arm.  Mutants, each caught: the cgroup ignored, memory.high ignored, inactive cache not
+counted free, the leaf group only, v1 ignored, the budget loop removed, a zero limit read as
+none, `--zstd=hashLog` left out of the estimate, the hierarchy cached for the whole run, the
+memory not read again for a new input; the old join order; a memory-cut pool keeping zstd's
+workers; the throttle at half, and not split under a `--tar` sink; the `--tar` readers, the
+extract writers and the partitions not cut, the partitions counted without their part job, and
+the parallel route's own count not fitted; the floor uncapped, a pinned pool counted as one
+worker, `-T0` not counted as pinned; on a GPU build the route removed, the route under
+-T, the route under the suite's hook, the route counting `--chunk-size`'s frames, and the CPU
+path not handed the pipeline's geometry.  Not caught: v1's unlimited value read as an 8 EiB
+limit (equivalent: MemAvailable binds first), an exhausted group read as unknown by the frame
+workers' budget (equivalent now: an exhausted limit shrinks the frame and cuts the pool to one
+worker before that budget is asked), and the `--ultra` exclusion (a cell would hold contexts of
+hundreds of MiB per worker; its effect is the old route's warning).  `--read-threads` kept under
+a limit has no cell.
 
 ## v0.18.29 — an input of fewer frames than CPUs gives each frame zstd's own workers, and a pool that fits one L3 cache runs inside one: `-r` over 96 x 40 MiB text 2.0x faster to compress and 1.5x to decode, ahead of `zstd -T0` both ways on the server (ROADMAP 29)
 
