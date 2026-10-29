@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.31";
+static constexpr const char * GZSTD_VERSION = "0.18.32";
 //
 // Architecture overview:
 //
@@ -1196,6 +1196,17 @@ static const int GDS_READ_FANOUT = 8;
 static const size_t GDS_VERIFY_REGISTER_BUDGET = 4096ull * 1024u * 1024u;
 
 static uint64_t gz_host_mem_available();     // defined below
+static uint64_t get_available_ram_bytes();   // defined below
+// What a cuFile registration costs in host memory, in bytes per 1000 registered,
+// as the --gds-only preflight measured it (v0.18.32); -1 = not measured.  Below
+// GDS_REG_COST_FREE_PERMILLE the mapping is not memory at all.
+static std::atomic<int> g_gds_reg_cost_permille{-1};
+static constexpr int GDS_REG_COST_FREE_PERMILLE = 62;   // under 1/16 of a byte a byte
+static int gds_reg_cost_permille()
+{
+  if (const char * e = std::getenv("GZSTD_DEBUG_GDS_REG_COST_PERMILLE")) return std::atoi(e);
+  return g_gds_reg_cost_permille.load(std::memory_order_acquire);
+}
 static size_t gds_register_budget()
 {
   static const size_t v = []() -> size_t {
@@ -1203,6 +1214,23 @@ static size_t gds_register_budget()
     if (const char * e = std::getenv("GZSTD_DEBUG_GDS_BUDGET_MIB")) {
       const long long mib = std::atoll(e);
       if (mib > 0) return (size_t)mib * 1048576ull;
+    }
+    // COUNT WHAT IT COSTS (v0.18.32, the owner's call).  The rule below assumes a
+    // registered byte costs ~8.4 of host RSS, but on the server (driver 595,
+    // nvidia-fs 2.26.6) that RSS is the BAR1 mapping, RssFile: 4 GiB registered,
+    // VmRSS 8.65 GB, RssAnon 33 MiB, MemAvailable down ~290 MiB.  So the preflight
+    // measures the real cost -- anonymous and shmem pages, and the cgroup's own
+    // count -- across one registration, and the budget holds THAT to half of what
+    // is available, a container's limit included (real pages are charged to it).
+    // A stack whose mapping is not memory gets the ceiling; one whose mapping is
+    // real stays bounded.  Without a preflight (--direct-stage pins its batch
+    // here too, and registers nothing) the rule below stands.
+    const int cost = gds_reg_cost_permille();
+    if (cost >= 0) {
+      if (cost < GDS_REG_COST_FREE_PERMILLE) return ceiling;
+      const uint64_t avail = get_available_ram_bytes();
+      if (avail == 0) return 1024ull * 1048576ull;   // see CANNOT TELL below
+      return (size_t)std::min<uint64_t>(ceiling, avail / 2 * 1000 / (uint64_t)cost);
     }
     // THE HOST'S FIGURE, NOT A CONTAINER'S (v0.18.31).  What this budget bounds
     // is RSS, and the RSS a registration adds is the BAR1 mapping: MEASURED on
@@ -3994,6 +4022,8 @@ static void gds_cu_or_throw(cudaError_t e, const char * what)
 // GDS's gates.
 static void gz_refuse_all_old_before_cuda(const Options & opt);
 static void gz_select_usable_gds_preflight_device(const Options & opt);
+static uint64_t gz_self_charged_bytes();    // RssAnon + RssShmem, defined below
+static uint64_t gz_self_cgroup_current();   // this process's group's charge, defined below
 
 // IS THE LOADED nvidia-fs BUILT FOR THE RUNNING DRIVER?  Empty = yes, or cannot
 // tell; otherwise the reason it is not.
@@ -4129,6 +4159,39 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
   bool ok;
   { GdsBuf b; ok = b.reg(probe, probe_bytes, &rwhy); }
   cudaFree(probe);
+  // WHAT A REGISTRATION COSTS THIS HOST (v0.18.32; see gds_register_budget).  A
+  // second, larger probe, after the first has paid cuFile's one-time setup: the
+  // larger of this process's anonymous + shmem growth and its cgroup's, read
+  // while the buffer is registered.  ~10 ms, once a run.
+  if (ok) {
+    void * cal = nullptr;
+    const size_t cal_bytes = 16 * ONE_MIB;
+    if (cudaMalloc(&cal, cal_bytes) == cudaSuccess) {
+      const uint64_t a0 = gz_self_charged_bytes(), c0 = gz_self_cgroup_current();
+      uint64_t a1 = 0, c1 = 0;
+      std::string cwhy;
+      bool cok;
+      { GdsBuf b; cok = b.reg(cal, cal_bytes, &cwhy);
+        a1 = gz_self_charged_bytes(); c1 = gz_self_cgroup_current(); }
+      cudaFree(cal);
+      if (cok) {
+        const uint64_t da = a1 > a0 ? a1 - a0 : 0;
+        const uint64_t dc = (c0 && c1 > c0) ? c1 - c0 : 0;
+        const int permille = (int)std::min<uint64_t>(1000000, std::max(da, dc) * 1000 / cal_bytes);
+        g_gds_reg_cost_permille.store(permille, std::memory_order_release);
+        if (opt.verbosity >= V_VERBOSE) {
+          char b[176];
+          std::snprintf(b, sizeof b, "[GDS] a registration costs %d.%03d bytes of host memory a byte "
+                        "(measured over %zu MiB)%s\n", permille / 1000, permille % 1000,
+                        cal_bytes >> 20, permille < GDS_REG_COST_FREE_PERMILLE
+                          ? ": the mapping is not memory, registrations take the ceiling" : "");
+          vlog(V_VERBOSE, opt, b);
+        }
+      }
+    } else {
+      (void)cudaGetLastError();   // no room for the larger probe: the old rule stands
+    }
+  }
   if (!ok)
     die_usage("--gds-only is not usable on this host: " + rwhy
               + ".\n  GPUDirect Storage needs a GPU whose BAR1 aperture covers its VRAM"
@@ -5699,13 +5762,13 @@ static void print_help_long()
 "     default, 128 MiB (this said \"no limit\" until v0.18.8; it never was\n"
 "     for those).  Before v0.17.89 the limit was set but never\n"
 "     applied to frames decoded in one piece, which is nearly all of them.\n"
-"     On COMPRESSION it is NOT a hard process-memory limit: it constrains\n"
-"     only the AUTOMATIC frame-throttle calculation.  Effective in-flight\n"
-"     memory can still exceed the limit, because the 32-frame safety floor and\n"
-"     the GPU batch floor are applied afterwards, and an explicit\n"
-"     --throttle-frames bypasses the memory calculation entirely.\n"
-"     Useful on shared machines where the default `min(pipeline, RAM/4)`\n"
-"     is too generous; not a guarantee.\n"
+"     On COMPRESSION it caps the frames in flight: the automatic budget,\n"
+"     `min(pipeline, RAM/4)`, takes no more than N bytes of frames, and\n"
+"     since v0.18.32 neither the 32-frame safety floor nor the GPU batch\n"
+"     floor overrides it (GPU batches shrink to fit it, then GPUs are left\n"
+"     out; --gpu-only keeps one).  It is not a process-memory limit:\n"
+"     workers' contexts and buffers are not counted, and an explicit\n"
+"     --throttle-frames bypasses the calculation entirely.\n"
 "\n"
 "  -D FILE, -D=FILE, --dict FILE, --dictionary FILE    [all modes]\n"
 "     Compress or decode with the zstd dictionary FILE (zstd-compatible;\n"
@@ -7181,6 +7244,41 @@ struct GzMemHeadroom {
   uint64_t headroom = 0;   // that group's limit less its usage (less inactive file cache)
   std::string file;        // empty = no limit found; otherwise its file, for -v
 };
+
+#ifdef HAVE_NVCOMP
+// The --gds-only preflight's two measures (gds_register_budget).
+// This process's anonymous and shmem pages (RssAnon + RssShmem): what a
+// container charges it for, unlike the file and device mappings in VmRSS.
+static uint64_t gz_self_charged_bytes()
+{
+  std::istringstream f(gz_read_small_file("/proc/self/status"));
+  std::string line;
+  uint64_t kb = 0;
+  while (std::getline(f, line))
+    if (line.compare(0, 8, "RssAnon:") == 0 || line.compare(0, 9, "RssShmem:") == 0)
+      kb += std::strtoull(line.c_str() + line.find(':') + 1, nullptr, 10);
+  return kb * 1024;
+}
+
+// What this process's own cgroup is charged now (v2 memory.current, v1
+// memory.usage_in_bytes); 0 if unknown.  The group's other members are counted
+// too, which can only overstate a cost measured across it.
+static uint64_t gz_self_cgroup_current()
+{
+#ifdef __linux__
+  std::string leaf; bool leaf_v2 = false;
+  try {
+    gz_cgroup_walk("memory", [&](bool v2, const std::string & d) {
+      if (leaf.empty()) { leaf = d; leaf_v2 = v2; } });
+  } catch (...) { return 0; }
+  if (leaf.empty()) return 0;
+  const std::string t = gz_read_small_file(leaf + (leaf_v2 ? "/memory.current" : "/memory.usage_in_bytes"));
+  return t.empty() ? 0 : std::strtoull(t.c_str(), nullptr, 10);
+#else
+  return 0;
+#endif
+}
+#endif
 
 static GzMemHeadroom gz_cgroup_mem_headroom()
 {
@@ -12348,11 +12446,16 @@ static size_t compute_verify_queue_depth(size_t frame_bytes, const Options & opt
 class FrameSink;
 static FrameSink * g_tar_decomp_sink = nullptr;
 
+// `ram_bound` (optional): set when the memory, not the pipeline or the floor,
+// sized the automatic budget -- the case a --tar sink must count its downstream
+// frames in (writer_run).
 static int compute_throttle_budget(size_t frame_bytes,
                                    int pipeline_parallelism,
                                    int gpu_batch_floor,
-                                   const Options & opt)
+                                   const Options & opt,
+                                   bool * ram_bound = nullptr)
 {
+  if (ram_bound) *ram_bound = false;
   size_t avail = get_available_ram_bytes();
   if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
   frame_bytes = std::max<size_t>(frame_bytes, 1);
@@ -12366,10 +12469,16 @@ static int compute_throttle_budget(size_t frame_bytes,
   // more (cpu_worker's and cpu_decomp_worker's out_pool), and gz_mem_fit_pool
   // fits those to their own share.  Half for the throttle as well overran a
   // container's limit: decode under a 1 GB cap peaked at 1.04 GB.  Only a host
-  // whose memory, not its pipeline, sets the budget sees the change.  A --tar
-  // sink buffers every frame this throttle releases, so under one the two split
-  // the quarter: an eighth here, an eighth in tar_sink_budget.
-  size_t ram_cap_frames = (avail / (g_tar_decomp_sink ? 8 : 4)) / frame_bytes;
+  // whose memory, not its pipeline, sets the budget sees the change.  Under a
+  // --tar sink the quarter too, since v0.18.32: a frame's permit now goes with
+  // it into the sink and returns when its last part job is written (see
+  // writer_run), so this bounds the sink and the extractor's views as well.
+  // v0.18.30 split the quarter with the sink while the views were unbounded.
+  size_t ram_cap_frames = (avail / 4) / frame_bytes;
+  // Preserve the actual RAM reading before -M tightens the historical budget
+  // calculation below.  On decode -M is a window limit, not evidence that the
+  // host needs to count the tar extractor's downstream frames in the throttle.
+  const int available_ram_frames = (int)std::min<size_t>(ram_cap_frames, (size_t)INT_MAX);
   // -M tightens the in-flight cap, not the CPU pool.  It must not make an
   // otherwise roomy host take the small-RAM pool-plus-one floor: -M128M
   // with 96 workers would raise the old 32-frame floor to 97 frames.
@@ -12384,6 +12493,17 @@ static int compute_throttle_budget(size_t frame_bytes,
     if (mem_cap_frames < ram_cap_frames) ram_cap_frames = mem_cap_frames;
   }
   int ram_frames = (int)std::min<size_t>(ram_cap_frames, (size_t)INT_MAX);
+  // -M IS A CAP ON COMPRESS (v0.18.32, the owner's call): the floors below no
+  // longer override it.  -M128M with the default pool took the 32-frame floor,
+  // 512 MiB, and on a GPU build the GPU batch floor besides -- gigabytes.  The
+  // GPU batches are fit to it first (gz_mem_fit_gpu_batch); what is left of a
+  // floor above it is cut here.  A pool larger than the cap waits for permits
+  // (the head-of-line overdraft keeps it moving).  Decode's -M is zstd's window
+  // limit and keeps the floors.
+  const int mem_cap = (opt.mem_limit_bytes > 0 && opt.mode == Mode::COMPRESS)
+      ? (int)std::min<uint64_t>((uint64_t)INT_MAX,
+                                std::max<uint64_t>(1, opt.mem_limit_bytes / frame_bytes))
+      : INT_MAX;
 
   int frames;
   const char * source;
@@ -12488,6 +12608,8 @@ static int compute_throttle_budget(size_t frame_bytes,
         source = g_tar_decomp_sink ? "tar-extract" : "sink";
       }
     }
+    if (frames > mem_cap) { frames = mem_cap; source = "memlimit"; }   // see mem_cap
+    if (ram_bound) *ram_bound = available_ram_frames < std::max(pipeline_frames, THROTTLE_MIN_FRAMES);
   }
 
   // One-line summary at -v (informational).
@@ -13739,9 +13861,15 @@ public:
     used_[(size_t)s] = 1;
     return s;
   }
-  void release(int slot) {
+  // A timed pass may now end AFTER acquire but before touching the buffer.
+  // Preserve its fresh state so the next pass excludes its first touch too.
+  void release(int slot, bool unused_fresh = false) {
     if (slot < 0) return;
-    { std::lock_guard<std::mutex> lk(m_); free_.push_back(slot); }
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (unused_fresh) used_[(size_t)slot] = 0;
+      free_.push_back(slot);
+    }
     cv_.notify_one();
   }
   // Abort escape (GPU-fault shutdown): pool-as-backpressure means the reader
@@ -14948,6 +15076,10 @@ public:
       disabled_(max_in_flight <= 0) {}
 
   bool disabled() const { return disabled_; }
+  // The memory sized this budget (compute_throttle_budget's ram_bound): a --tar
+  // sink then carries each frame's permit until its last part job is written.
+  void set_ram_bound(bool b) { ram_bound_.store(b, std::memory_order_relaxed); }
+  bool ram_bound() const { return ram_bound_.load(std::memory_order_relaxed); }
 
   // Acquire ONE permit, OR OVERDRAFT when the frame at the head of the queue is
   // the one the in-order writer is waiting for.
@@ -15240,11 +15372,15 @@ public:
   // at the CPU pool's RAM-capped budget.  Growth keeps the FIFO argument intact
   // (permits only ever get more plentiful), and every GPU intake sees the full
   // floor because none exists until this returns.
-  void grow_to(int n) {
+  void grow_to(int n, bool ram_bound = false) {
     if (disabled_) return;
     int added = 0;
     {
       std::lock_guard<std::mutex> lk(m_);
+      // A GPU may make RAM bind even when the CPU's starting budget did not.
+      // Publish that before workers start, including when the numeric budget
+      // stays the same.  Once carrying starts, never clear it during this run.
+      if (ram_bound) set_ram_bound(true);
       if (n <= max_) return;
       added = n - max_;
       permits_ += added;
@@ -15290,6 +15426,7 @@ private:
   bool done_ = false;
   mutable std::mutex m_;
   std::condition_variable cv_;    // CPU workers, acquire(): any one permit will do
+  std::atomic<bool> ram_bound_{false};
   std::condition_variable bcv_;   // acquire_batch_or_head: GPU intakes (v0.17.90)
   int batch_waiters_ = 0;         // parked on bcv_; guarded by m_
   std::atomic<int>      peak_in_flight_{0};
@@ -15332,6 +15469,22 @@ inline void TaskQueue::notify_throttle_(size_t head)
 class FrameSink {
 public:
   explicit FrameSink(size_t max_bytes) : max_bytes_(max_bytes) {}
+
+  // Only writer_run's frames carry throttle permits.  Streaming and seek
+  // producers do not, and must keep their ordinary zero-copy read_segs path.
+  void set_permit_bound(size_t permits) {
+    std::lock_guard<std::mutex> lk(m_);
+    permit_budget_ = permits;
+  }
+  bool would_wait_with_permits(size_t retained_frames) {
+    std::lock_guard<std::mutex> lk(m_);
+    // An empty queue can just mean the decoder is a frame behind.  Copy only
+    // when this unfinished job itself holds the frame budget: any other jobs
+    // can drain independently, and an already decoded/decoding successor does
+    // not need another permit.  At the budget, release these views before
+    // asking for another frame, without relying on the one-frame overdraft.
+    return permit_budget_ && retained_frames >= permit_budget_ && q_.empty() && !closed_;
+  }
 
   // Producer (writer_thread): enqueue one decompressed frame, in order.
   void push(FrameBuf f) {
@@ -15387,6 +15540,7 @@ private:
   size_t bytes_ = 0;
   size_t max_bytes_;
   bool closed_ = false;
+  size_t permit_budget_ = 0;   // last published budget; growth can only make it conservative
   std::atomic<uint64_t> prod_wait_ns_{0}, cons_wait_ns_{0};
 };
 
@@ -15429,8 +15583,9 @@ static void adapt_arm_throttle_grow(FrameThrottle & t, size_t frame_bytes,
 // holds frames when the consumer lags, so an unused budget costs nothing.
 static size_t tar_sink_budget(const Options & opt) {
   uint64_t avail = get_available_ram_bytes();
-  // An eighth, the decoder's throttle the other (compute_throttle_budget); was a
-  // quarter on top of the throttle's.  The 256 MiB floor yields to a known limit
+  // An eighth: the frames it holds are inside the decoder's throttle (their
+  // permits go with them, v0.18.32), so this bounds only how many of them wait
+  // here rather than in the extractor.  The 256 MiB floor yields to a known limit
   // (v0.18.30): under 2 GiB an eighth of what is left is all the sink may hold.
   // It admits a frame into an empty queue whatever its size, so a small budget
   // slows, never stalls.  Unchanged wherever 32 GiB are free (the 4 GiB cap).
@@ -15926,6 +16081,60 @@ static void writer_run(FILE * out, ResultStore & results,
   // -t/-d --tar: hand decompressed frames to the in-process tar parser instead
   // of a kernel pipe.  Set by verify_tar()/extract_tar() for this archive.
   FrameSink * const sink = g_tar_decomp_sink;
+  // THE PERMIT GOES WITH THE FRAME (v0.18.32).  Under a sink the permit used to
+  // be released as the frame entered it, so the throttle bounded only the frames
+  // not yet handed over: the sink, the tar parser, the extractor's queued part
+  // jobs and its writers -- all views that keep their whole frames alive -- held
+  // whatever their own byte budgets allowed, and -d --tar under 256 MB died with
+  // 9 decoded 16 MiB frames alive against a 2-frame throttle.  Now each pushed
+  // frame carries its permit, released when its last reference drops (its last
+  // part job written), so the throttle bounds every decoded frame alive.  The
+  // parser may need more frames to finish one job than the throttle permits:
+  // StreamReader::read_segs copies a partial job before waiting on an empty
+  // sink when that job already holds the frame budget, returning its permits.
+  // A momentarily empty sink alone does not require a copy.  A window byte budget
+  // alone cannot bound the number of frames it spans.  The home is cleared
+  // when this writer exits -- no worker then waits on a permit, and a frame released
+  // after the decoder's throttle is gone must not touch it.
+  // `alive` counts permit-carrying frames handed to the sink.  Frames still in
+  // the decoder/results remain covered by the throttle's own in-flight count;
+  // this peak checks downstream retention (-v at the writer's exit).
+  struct PermitHome {
+    std::mutex m; FrameThrottle * t = nullptr;
+    std::atomic<int> alive{0}, peak{0};
+  };
+  struct PermitHomeClose {
+    std::shared_ptr<PermitHome> h;
+    FrameSink * sink = nullptr;
+    const Options * opt = nullptr;
+    ~PermitHomeClose() {
+      int permits = 0;
+      if (h) {
+        std::lock_guard<std::mutex> lk(h->m);
+        // Deferred GPU bringup may have grown the budget since this writer
+        // started.  Read it under the same lifetime lock as the deleter.
+        if (h->t) permits = h->t->max_permits();
+        h->t = nullptr;
+      }
+      if (sink) sink->set_permit_bound(0);   // a streaming fallback tail has no permits
+      if (h && opt && opt->verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, *opt, "[THROTTLE] tar sink: peak " + std::to_string(h->peak.load())
+             + " decoded frames alive against " + std::to_string(permits) + " permits\n");
+    }
+  } permit_home;
+  // Only when the memory sized the throttle: on a roomy host the sink and the
+  // extractor's own budgets bound their frames, and counting them here only
+  // stalled the decoder -- uncapped -d --tar -T1, serial, 2.0-2.3 s -> 3.0-3.6.
+  auto update_sink_permits = [&] {
+    if (sink && bp && !bp->disabled() && bp->ram_bound()) {
+      if (!permit_home.h) {
+        permit_home.h = std::make_shared<PermitHome>(); permit_home.h->t = bp;
+        permit_home.opt = &opt; permit_home.sink = sink;
+      }
+      sink->set_permit_bound((size_t)bp->max_permits());
+    }
+  };
+  update_sink_permits();
 
   // Create async write pool for double-buffered I/O
   AsyncWritePool * aio = nullptr;
@@ -16119,19 +16328,40 @@ static void writer_run(FILE * out, ResultStore & results,
            + " frames (" + bs + ")\n");
     }
     if (sink) {
+      // Deferred GPU bringup can make RAM bind after the writer started.
+      // Start carrying on this batch, or refresh an existing home's budget.
+      // Already delivered frames retain their old release-at-sink ownership.
+      update_sink_permits();
       // -t/-d --tar: hand frames to the in-process tar parser (no kernel pipe).
       // Account per frame, NOT once per batch: when the (write-bound) Extractor
       // drains slowly, push() blocks and a big batch can take seconds to hand
       // off — a per-batch fetch_add then makes the progress bar sit, then jump
       // by the whole batch.  Counting each frame as it is accepted advances the
       // bar smoothly at the drain rate (the old aio path likewise updated every
-      // 16 MiB inside the write).  Release the throttle permit per frame too, so
-      // workers refill as the batch drains instead of all at once at the end.
+      // 16 MiB inside the write).  Each frame returns its permit only after its
+      // last downstream reference drops, independently of the rest of the batch.
       for (auto & fb : batch) {
         const size_t fsz = fb->size();
+        if (permit_home.h && fb && !fb->empty()) {
+          // The deleter keeps the pooled buffer alive until the last view drops,
+          // then returns it and the permit.  A deleter is a noexcept boundary.
+          FrameVec * const raw = fb.get();
+          const int now_alive = permit_home.h->alive.fetch_add(1, std::memory_order_relaxed) + 1;
+          int pk = permit_home.h->peak.load(std::memory_order_relaxed);
+          while (now_alive > pk && !permit_home.h->peak.compare_exchange_weak(pk, now_alive)) {}
+          fb = FrameBuf(raw, [keep = std::move(fb), home = permit_home.h](FrameVec *) mutable {
+            keep.reset();
+            home->alive.fetch_sub(1, std::memory_order_relaxed);
+            try {
+              std::lock_guard<std::mutex> lk(home->m);
+              if (home->t) home->t->release(1);
+            } catch (...) {}
+          });
+        } else if (bp) {
+          bp->release(1);   // no carrying, or an empty frame the sink drops
+        }
         sink->push(std::move(fb));
         if (m) m->wrote_bytes.fetch_add(fsz, std::memory_order_relaxed);
-        if (bp) bp->release(1);
       }
     } else if (aio) {
       aio->submit(std::move(batch));
@@ -16509,7 +16739,7 @@ static constexpr size_t GPU_MEM_MIN_BATCH = 4;
 // (acquire_batch_or_head), and the tuner never proposes past its share
 // (explore_max).  So fewer frames a batch first, then fewer GPUs:
 //   - the batches that fit what the throttle takes of the memory (a quarter,
-//     an eighth under a --tar sink, as compute_throttle_budget) once each GPU's
+//     as compute_throttle_budget takes it) once each GPU's
 //     context and every CPU worker's frame are counted, down to
 //     GPU_MEM_MIN_BATCH frames a stream;
 //   - below that, as many GPUs as hold that minimum;
@@ -16524,22 +16754,27 @@ static size_t gz_mem_fit_gpu_batch(int * devices, size_t streams, size_t per_str
 {
   if (*devices <= 0 || per_stream == 0 || opt.gpu_batch_user_set) return per_stream;
   const uint64_t ram = get_available_ram_bytes();
-  if (!ram) return per_stream;
+  // -M on compress caps the frames in flight too (v0.18.32; compute_throttle_budget).
+  const bool by_m = opt.mem_limit_bytes > 0 && opt.mode == Mode::COMPRESS;
+  if (!ram && !by_m) return per_stream;
   streams = std::max<size_t>(1, streams);
   frame = std::max<size_t>(1, frame);
-  const uint64_t share = ram / (g_tar_decomp_sink ? 8 : 4);
+  const uint64_t share = ram ? ram / 4 : UINT64_MAX;
+  const uint64_t m_frames = by_m ? std::max<uint64_t>(1, opt.mem_limit_bytes / frame) : UINT64_MAX;
   const uint64_t cpu = (uint64_t)std::max(0, cpu_frames);
   auto room = [&](int d) -> uint64_t {      // frames d GPUs' streams may hold
     const uint64_t ctx = (uint64_t)d * GPU_CTX_HOST_BYTES;
-    const uint64_t frames = share > ctx ? (share - ctx) / frame : 0;
+    uint64_t frames = share == UINT64_MAX ? UINT64_MAX : share > ctx ? (share - ctx) / frame : 0;
+    frames = std::min(frames, m_frames);   // -M counts frames, not contexts
     return frames > cpu ? frames - cpu : 0;
   };
   const int want = *devices;
   if (room(want) >= (uint64_t)want * streams * per_stream) return per_stream;
   char shb[32];
-  human_bytes(double(share), shb, sizeof shb);
-  const std::string of = std::string(" fit ") + (g_tar_decomp_sink ? "an eighth" : "a quarter")
-                       + " of the memory left (" + shb + ")";
+  const bool m_binds = by_m && (share == UINT64_MAX || m_frames * frame < share);
+  human_bytes(double(m_binds ? opt.mem_limit_bytes : share), shb, sizeof shb);
+  const std::string of = m_binds ? std::string(" fit -M's ") + shb
+                                 : std::string(" fit a quarter of the memory left (") + shb + ")";
   for (int d = want; d >= 1; --d) {
     const uint64_t per = room(d) / ((uint64_t)d * streams);
     if (per < GPU_MEM_MIN_BATCH) continue;
@@ -17356,6 +17591,18 @@ static inline size_t decomp_out_slot(size_t n, bool gds_out)
 {
   if (gds_out) n = (n + 4095) & ~size_t(4095);
   return (n + 7u) & ~size_t(7);
+}
+
+// A measured, charged byte budget covers BOTH registrations on a P2P decode:
+// ensure_buffers keeps the input and output slabs registered together.  The
+// unmeasured /17 rule already allowed for both; the free-mapping ceiling keeps
+// its existing input-slab meaning.  --direct-stage registers neither slab.
+static inline size_t gds_budget_slot(const Options & opt, bool gds_out)
+{
+  size_t slot = gds_reg_slot(opt);
+  if (opt.gds_only && gds_out && gds_reg_cost_permille() >= GDS_REG_COST_FREE_PERMILLE)
+    slot += decomp_out_slot(decomp_frame_cap(opt), true);
+  return slot;
 }
 
 // `staged` IS A PARAMETER, NOT A GLOBAL READ.  The worker freezes C.gds_read at
@@ -20757,6 +21004,8 @@ static size_t stream_frames_to_queue_mt(
          + " MiB blocks, not 64: two of them per reader fit an eighth of the memory left\n");
   const size_t n_blocks = (size_t)((file_size + BLOCK - 1) / BLOCK);
   const size_t OV = std::min(BLOCK / 2, OV_WANT);
+  // A shrunk block carries most frames; see emit() for why they are copied out then.
+  const bool carry_exact = BLOCK < (size_t)64 * ONE_MIB;
   const size_t BUF = BLOCK + OV;              // bytes one block buffer holds
   // THE RING THE MEMORY HOLDS (v0.18.30).  Every reader keeps two blocks in the
   // ring (n_slots below), 12 readers about 1.7 GB of 64 MiB blocks: a 2 GiB
@@ -20900,11 +21149,16 @@ static size_t stream_frames_to_queue_mt(
   // (~2,900 blocks on that host) never binds, and a small box degrades toward the
   // copy path instead of toward swap -- a cap of 64 still kept +32%.  No floor:
   // a fixed floor could exceed the whole budget on a small machine.
+  // Under a limit that shrank the block (carry_exact), no views at all (v0.18.32):
+  // a view pins its whole block, which the queue's byte cap does not count, while
+  // a copy is exact and counted -- at 128 MB the two views a 16 MiB eighth allowed
+  // were the margin between surviving and not.
   const uint64_t zc_ram = get_available_ram_bytes();
-  size_t zc_cap = zc_ram ? (size_t)(zc_ram / 8 / BUF) : (size_t)n_slots * 2;
+  size_t zc_cap = carry_exact ? 0 : zc_ram ? (size_t)(zc_ram / 8 / BUF) : (size_t)n_slots * 2;
   if (const char * e = std::getenv("GZSTD_DEBUG_ZC_MAX_BLOCKS"))
     zc_cap = (size_t)std::strtoull(e, nullptr, 10);
   size_t zc_views = 0, zc_carried = 0, zc_copied = 0, zc_peak = 0, max_frame_comp = 0;
+  size_t zc_carry_kept = 0;       // carried frames copied out of a kept carry (carry_exact)
   size_t zc_overlap = 0;          // frames that ended in their block's overlap
   uint64_t zc_wait_ns = 0;        // consumer time spent waiting for its next block
   struct Slot { std::shared_ptr<BlockBuf> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
@@ -21184,6 +21438,14 @@ static size_t stream_frames_to_queue_mt(
     if (fc > max_frame_comp) max_frame_comp = fc;
     uint64_t cp = m ? now_ns() : 0;
     if (view_of)        { t.view_ptr = p; t.view_len = fc; t.block = *view_of; ++zc_views; }
+    else if (take_from && carry_exact) {
+      // Under a limit the carry is not handed over (v0.18.32): it was reserved at
+      // twice the largest frame plus a step, and that capacity went with the frame
+      // into the queue -- five carried 4 MiB frames held 111 MiB, and with the small
+      // blocks below most frames are carried.  Copy the frame out, keep the buffer.
+      t.data.assign(take_from->data(), take_from->data() + fc); take_from->clear();
+      ++zc_carried; ++zc_carry_kept;
+    }
     else if (take_from) { take_from->resize(fc); t.data = std::move(*take_from); take_from->clear(); ++zc_carried; }
     else                { t.data.assign(p, p + fc); ++zc_copied; }
     if (m) m->reader_copy_ns.fetch_add(now_ns() - cp, std::memory_order_relaxed);
@@ -21224,7 +21486,9 @@ static size_t stream_frames_to_queue_mt(
     // appends below never regrow -- a regrowth is a hidden copy of everything so far.
     auto start_carry = [&](const char * src, size_t n) {
       uint64_t c0 = m ? now_ns() : 0;
-      const size_t want = std::max(n, 2 * max_frame_comp + STEP);
+      // Kept for reuse under a limit (carry_exact), the buffer needs one largest
+      // frame and a step, not two: it regrows only for a frame larger than any yet.
+      const size_t want = std::max(n, (carry_exact ? 1 : 2) * max_frame_comp + STEP);
       if (carry.capacity() < want) carry.reserve(want);
       carry.assign(src, src + n);
       if (m) m->reader_copy_ns.fetch_add(now_ns() - c0, std::memory_order_relaxed);
@@ -21363,17 +21627,20 @@ static size_t stream_frames_to_queue_mt(
 
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   if (opt.verbosity >= V_VERBOSE) {
-    char zb[384];
+    char zb[448];
+    char kept[64] = "";
+    if (zc_carry_kept)
+      std::snprintf(kept, sizeof kept, "; %zu carried copied out of a kept carry", zc_carry_kept);
     std::snprintf(zb, sizeof zb,
       "[READER] zero-copy: %zu frames as views, %zu carried across block boundaries, "
       "%zu copied%s; %zu ended in the %zu MiB overlap; peak %zu blocks (%.1f GiB%s) alive, "
-      "cap %zu; consumer waited %.2f s for blocks\n",
+      "cap %zu; consumer waited %.2f s for blocks%s\n",
       zc_views, zc_carried, zc_copied,
       zc_off ? " (GZSTD_DEBUG_READER_COPY)" : " past the memory cap",
       zc_overlap, (size_t)(OV / ONE_MIB),
       zc_peak, double(zc_peak) * double(BUF) / double(1ULL << 30),
       blk_thp ? ", huge pages advised" : "", zc_cap,
-      double(zc_wait_ns) / 1e9);
+      double(zc_wait_ns) / 1e9, kept);
     vlog(V_VERBOSE, opt, zb);
   }
   readers_done_early.store(true, std::memory_order_relaxed);
@@ -22218,8 +22485,10 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
   TaskQueue queue;
   ResultStore results;
   const size_t decomp_frame = std::max<size_t>(1, decomp_frame_cap(opt));
+  bool thr_ram_bound = false;
   FrameThrottle throttle(compute_throttle_budget(
-      decomp_frame, threads, 0, opt));
+      decomp_frame, threads, 0, opt, &thr_ram_bound));
+  throttle.set_ram_bound(thr_ram_bound);
   adapt_arm_throttle_grow(throttle, decomp_frame, opt);
   queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
   // Disable throttle in test mode: no disk I/O means permits are never released.
@@ -24348,6 +24617,7 @@ static bool pooled_read_chunks(size_t host_chunk,
   std::atomic<size_t> next_idx{0};
   std::atomic<bool>   done{false};
   std::atomic<bool>   io_error{false};
+  std::mutex win_claim_mx;   // bounded passes must accept a contiguous prefix of chunks
   auto read_loop = [&](int k) {
     for (;;) {
       if (done.load(std::memory_order_relaxed)) break;
@@ -24358,35 +24628,65 @@ static bool pooled_read_chunks(size_t host_chunk,
         if (!rd_ctl.wait_turn(k, [&] { return done.load(std::memory_order_relaxed); }))
           break;
       }
-      const size_t rel = next_idx.fetch_add(1, std::memory_order_relaxed);
-      if (win) {
-        // Stop claiming work when the pass is full or its time is up.  Setting
-        // `done` ends the pass for every reader thread, not just this one — the
-        // caller needs them all parked before it can time the next path.
-        // min_chunks wins over the clock so a very fast device still yields a
-        // usable sample; max_chunks is the hard ceiling either way.
-        // target_secs <= 0 means NO time limit — the final unbounded pass uses a
-        // window only to carry its start offset, and must not stop at once.
-        if (rel >= win->max_chunks
-            || (win->target_secs > 0.0 && rel >= win->min_chunks
-                && win_elapsed() - double(win->touch_ns.load(std::memory_order_relaxed))
-                                   / (1e9 * n_readers) >= win->target_secs)) {
-          done.store(true, std::memory_order_relaxed);
-          break;
-        }
-      }
-      const size_t idx = (win ? win->start_chunk : 0) + rel;
+      // A BUFFER BEFORE A CHUNK (v0.18.32).  The chunk used to be claimed first,
+      // so a reader parked here for a buffer held the writer's next frame while
+      // every buffer held a LATER frame: those frames take no permit until a GPU
+      // pops them, and a GPU waiting for a whole batch of permits -- every one
+      // held by compressed frames waiting on that same next frame -- never pops.
+      // Harmless while the throttle dwarfed the pool (2,432 permits against 513
+      // buffers); under a memory limit the throttle can be smaller than the pool.
+      // Holding the buffer first, a reader claims only a chunk it can read now.
       int slot = -1;
-      char * buf;
+      bool fresh = false;
       if (pool) {                           // blocks when all bufs in flight = backpressure
+        // GZSTD_DEBUG_POOL_ACQUIRE_STALL=MS (test hook): the first reader to get
+        // here sleeps MS before it asks for a buffer -- where the old order held a
+        // claimed chunk, and so the window for the cycle described above.
+        static const long acq_stall_ms = [] {
+          const char * e = std::getenv("GZSTD_DEBUG_POOL_ACQUIRE_STALL");
+          return e ? std::strtol(e, nullptr, 10) : 0L; }();
+        static std::atomic<bool> acq_stalled{false};
+        if (acq_stall_ms > 0 && !acq_stalled.exchange(true))
+          std::this_thread::sleep_for(std::chrono::milliseconds(acq_stall_ms));
         const uint64_t a_t0 = m ? now_ns() : 0;
-        bool fresh = false;
         slot = pool->acquire(win_bounded ? &fresh : nullptr);
         if (m) m->reader_blocked_ns.fetch_add(now_ns() - a_t0, std::memory_order_relaxed);
         if (slot < 0) {                     // pool set_done(): GPU-fault abort, stop reading
           done.store(true, std::memory_order_relaxed);
           break;
         }
+        if (done.load(std::memory_order_relaxed)) { pool->release(slot, fresh); break; }
+      }
+      size_t rel;
+      if (win_bounded) {
+        // Decide BEFORE claiming, under one lock.  A claimed k could otherwise
+        // pause while k+1 passed its clock check, then reject k at the deadline:
+        // chunks counted the reads, not their extent, and the next pass skipped
+        // k and repeated a later chunk.  A stopped pass stays stopped even if
+        // an outstanding first touch later changes the adjusted elapsed time.
+        bool stop_pass;
+        {
+          std::lock_guard<std::mutex> lk(win_claim_mx);
+          rel = next_idx.load(std::memory_order_relaxed);
+          stop_pass = done.load(std::memory_order_relaxed)
+              || rel >= win->max_chunks
+              || (win->target_secs > 0.0 && rel >= win->min_chunks
+                  && win_elapsed() - double(win->touch_ns.load(std::memory_order_relaxed))
+                                     / (1e9 * n_readers) >= win->target_secs);
+          if (stop_pass) done.store(true, std::memory_order_relaxed);
+          else next_idx.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (stop_pass) {
+          if (pool) pool->release(slot, fresh);
+          break;
+        }
+      } else {
+        // No clock/ceiling in a normal pass (including a probe's remainder).
+        rel = next_idx.fetch_add(1, std::memory_order_relaxed);
+      }
+      const size_t idx = (win ? win->start_chunk : 0) + rel;
+      char * buf;
+      if (pool) {
         buf = pool->buf(slot);
         if (fresh) {                        // a timed pass: fault it in outside the read
           // GZSTD_DEBUG_PROBE_TOUCH_MS=N (test hook): each first touch also takes N ms,
@@ -28286,6 +28586,9 @@ struct StreamReader {
   void refill() {
     pos = 0; fill = 0;
     if (src || prod) {
+      // Return the spent frame's permit BEFORE waiting for its successor.
+      // Assignment alone keeps cur alive while pop()/prod() blocks.
+      cur.reset(); base = nullptr;
       cur = src ? src->pop() : prod();
       if (!cur) { eof = true; return; }
       base = cur->data(); fill = cur->size();
@@ -28307,8 +28610,9 @@ struct StreamReader {
   }
   // Zero-copy read: hand out n bytes as views into the current frame(s).
   // Sink AND producer mode append one DataSeg per frame touched (shared_ptr
-  // copy, no byte copy).  Only fd mode has no owning frames, so it falls back to
-  // one copied, owned segment — same downstream interface either way.
+  // copy, no byte copy).  A permit-bound sink materialises a partial job only
+  // when it retains the frame budget and more input is not ready, so it cannot
+  // retain the permits needed to produce that input.  Fd mode always copies.
   //
   // The `!prod` half was missing: this test was written in v0.14.72, before
   // producer mode existed (v0.14.86), and was never taught about it.  Every
@@ -28324,13 +28628,33 @@ struct StreamReader {
       out.push_back(DataSeg{own, own->data(), (size_t)n});
       return true;
     }
+    FrameBuf copied;
+    const size_t requested = (size_t)n;
     while (n) {
       if (at_limit()) return false;
-      if (pos == fill) { refill(); if (pos == fill) return false; }
+      if (pos == fill) {
+        // This call appends exactly one segment per distinct frame touched:
+        // out.size() is the number of permits this unfinished job retains.
+        if (src && !out.empty() && src->would_wait_with_permits(out.size())) {
+          // This unfinished job can pin EVERY permit (and the one overdraft),
+          // leaving the decoder unable to produce the frame refill needs.
+          // Materialise just this job, once, before waiting.  Its size is still
+          // bounded by the small-file cap / part window and the writer budgets;
+          // available input, streaming, parallel and seek producers stay views.
+          copied = std::make_shared<FrameVec>();
+          copied->reserve(requested);
+          for (const DataSeg & s : out)
+            copied->insert(copied->end(), s.p, s.p + s.n);
+          out.clear();
+        }
+        refill(); if (pos == fill) return false;
+      }
       size_t k = (size_t)cap(n);
-      out.push_back(DataSeg{cur, base + pos, k});
+      if (copied) copied->insert(copied->end(), base + pos, base + pos + k);
+      else out.push_back(DataSeg{cur, base + pos, k});
       pos += k; n -= k; consumed_total += k;
     }
+    if (copied) out.push_back(DataSeg{copied, copied->data(), copied->size()});
     return true;
   }
   // Advance n bytes without copying: just move the cursor, refilling (which in
@@ -31875,11 +32199,13 @@ private:
           Job j; j.rel = rel; j.mode = e.mode; j.mtime = e.mtime; j.uid = e.uid; j.gid = e.gid;
           j.ext = e.ext;
           j.size = e.size; j.root = root;
-          // Zero-copy: views into the decompressed frame(s), no memcpy on this
-          // serial thread (see DataSeg).
+          // Views into the decompressed frames; a permit-bound wait may copy
+          // this partial job so the decoder can progress (see read_segs).
           if (e.size && !r.read_segs(e.size, j.segs)) { fail_data(rel, "truncated file data"); return; }
-          r.skip(pad);
           enqueue(std::move(j));
+          // Padding can cross another frame too: let a writer release this
+          // job's permits before waiting for it.
+          r.skip(pad);
         } else {
           // Large file: windowed zero-copy part jobs on the writer pool.
           // Timing: subtract the nested enqueue-block and sink-wait deltas so
@@ -33576,11 +33902,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       // resident.  A larger --chunk-size raises that bound proportionally.  The
       // preflight RAM check does not account for this pool, so it must bound
       // itself: at most a quarter of what is available, never below 8 buffers.
+      // The 8-buffer floor yields to a known limit (v0.18.32): 8 x 16 MiB was the
+      // whole of --gpu-only's floor under 192 MB.  Never under 2 -- one buffer
+      // read while one is consumed -- and safe at any size since a reader takes
+      // its buffer before it claims a chunk (pooled_read_chunks).
       const uint64_t ram_avail = get_available_ram_bytes();
+      const size_t pool_floor = ram_avail
+          ? (size_t)std::max<uint64_t>(2, std::min<uint64_t>(8, ram_avail / 4 / cap)) : 8;
       if (ram_avail > 0)
         pool_n = std::min<size_t>(pool_n,
-                                  std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
-      if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
+                                  std::max<size_t>(pool_floor, (size_t)(ram_avail / 4 / cap)));
+      if (pool_n < pool_floor) pool_n = std::min<size_t>(pool_floor, std::max<size_t>(file_chunks + 1, 1));
       // Huge pages for an explicit O_DIRECT read only.  The cold read probe's
       // first pass is O_DIRECT too, but its pool also serves the buffered arm and
       // whichever remainder wins, and plain pages measured better for both
@@ -39894,10 +40226,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t pool_n = std::min<size_t>(
         (size_t)cpu_threads + 32 * (size_t)n_readers + 1024,  // CPU pool + reader lead + GPU window
         file_chunks + 1);
+    // The floor yields to a known limit as the generic pooled reader's does.
     const uint64_t ram_avail = get_available_ram_bytes();
+    const size_t pool_floor = ram_avail
+        ? (size_t)std::max<uint64_t>(2, std::min<uint64_t>(8, ram_avail / 4 / cap)) : 8;
     if (ram_avail > 0)
-      pool_n = std::min<size_t>(pool_n, std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
-    if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
+      pool_n = std::min<size_t>(pool_n, std::max<size_t>(pool_floor, (size_t)(ram_avail / 4 / cap)));
+    if (pool_n < pool_floor) pool_n = std::min<size_t>(pool_floor, std::max<size_t>(file_chunks + 1, 1));
     // Huge pages for O_DIRECT only, and plain unprefaulted pages for the
     // buffered pool on a 6.4+ kernel (see DirectReadPool::init, v0.18.7).
     const bool pool_ok = nv_pool.init(cap, pool_n,
@@ -41282,7 +41617,8 @@ static void gpu_decomp_worker(
       // fix: 4 GiB budget -> batch 256 -> 4112 MiB registered, over by exactly
       // 16 MiB.  Budgeting by one size and registering at another is the same
       // mismatch that made est_temp useless.
-      const size_t reg_slot  = gds_reg_slot(opt);
+      const size_t reg_slot  = gds_budget_slot(opt,
+                                g_gds_out_active.load(std::memory_order_relaxed));
       const size_t fit       = std::max<size_t>(1, budget / std::max<size_t>(1, reg_slot));
       if (fit < per_stream_cap) per_stream_cap = fit;
       // SAY IT WHEN THE FLOOR WINS.  One frame is the smallest registrable unit,
@@ -44181,10 +44517,12 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       * (int)decomp_per_stream_budget;
   const int decomp_parallelism = decomp_cpu_threads_est + decomp_gpu_batch_floor;
   // The pool as the memory holds it in either case (see compress_nvcomp).
+  bool thr_ram_bound = false;
   FrameThrottle throttle(compute_throttle_budget(
       decomp_frame,
       decomp_cpu_threads_fit + (gpu_joins_later ? 0 : decomp_gpu_batch_floor),
-      gpu_joins_later ? 0 : decomp_gpu_batch_floor, opt));
+      gpu_joins_later ? 0 : decomp_gpu_batch_floor, opt, &thr_ram_bound));
+  throttle.set_ram_bound(thr_ram_bound);
   adapt_arm_throttle_grow(throttle, decomp_frame, opt);
   queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
@@ -44677,7 +45015,8 @@ gds_out_declined:
     // this device last actually ran", persisting 256 for a run whose every full
     // batch was 255.  (A locked tuner now publishes nothing; the read-ahead
     // cache is the only consumer of the pin.)
-    const size_t fit = std::max<size_t>(1, share / gds_reg_slot(opt));
+    const size_t fit = std::max<size_t>(1, share / gds_budget_slot(opt,
+        g_gds_out_active.load(std::memory_order_relaxed)));
     tune_pinned_decomp = std::min<size_t>(fit, HARD_BATCH_CAP);
     tune_run_decomp.locked.store(true);
   }
@@ -44878,7 +45217,9 @@ gds_out_declined:
                                                 decomp_frame, cpu, opt.gpu_only, opt);
         if (device_count <= 0) { g_adapt_gpu_declined.store(true, std::memory_order_relaxed); return; }
         const int floor = device_count * (int)std::max<size_t>(1, opt.gpu_streams) * (int)per;
-        throttle.grow_to(compute_throttle_budget(decomp_frame, cpu + floor, floor, opt));
+        bool gpu_ram_bound = false;
+        const int budget = compute_throttle_budget(decomp_frame, cpu + floor, floor, opt, &gpu_ram_bound);
+        throttle.grow_to(budget, gpu_ram_bound);
       }
     }
     if (device_count <= 0) return;

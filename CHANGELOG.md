@@ -1,12 +1,180 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.31  
+**Covers:** v0.9.50 → v0.18.32  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.32 — ROADMAP 30 closed: -d --tar's frames carry their throttle permit until written, a pooled reader takes its buffer before it claims a chunk (a hang under a limit since v0.18.30), -M caps the frames in flight on compress, and --gds-only's registrations are bounded by what they measurably cost (a 2 GiB decode under 128 MB; -d --tar and --gpu-only under 192)
+
+### Found by profiling, not by guessing
+
+Each floor v0.18.31 left was taken apart with an LD_PRELOAD profiler of large live allocations
+(every allocation of 1 MiB or more, by call stack, snapshot at the peak) on a `-g` build:
+
+| route, server, at the limit it died | what held the memory |
+|---|---|
+| decode, 128 MB | five carried frames holding the carry's capacity (2 x the largest frame + 4 MiB each, 111 MiB), the decoder's two frames (32), the blocks (24) |
+| `-d --tar`, 256 MB | nine decoded 16 MiB frames alive (144 MiB) against a 2-frame throttle, carried frames (57), blocks (48) |
+| `--gpu-only` compress, 192 MB | the pooled reader's 8-buffer floor (128 MiB), the CUDA context (32) |
+
+### The decode reader under a limit
+
+When the memory shrank the reader's block (v0.18.31), most frames cross a block boundary and
+are assembled in `carry`, which was then handed to the frame by move -- with its capacity,
+reserved at twice the largest frame plus a step so the appends never regrow.  Under such a limit
+a carried frame is now copied out of a carry kept for reuse (reserved at one largest frame plus
+the step), and no frame is a view: a view pins its whole block, which the queue's byte cap does
+not count, while a copy is exact and counted.  A 2 GiB decode survives 128 MB on the CPU-only
+build (6 of 6; 0 of 6 with the carry handed over) and 144 MB on the GPU build (6 of 6; at 128
+its 1-2 MiB of extra threads and libraries leave it 1 in 6).  Below that every consumer is at
+its floor -- one decoder's two frames, the throttle's two, the blocks, the queue -- and what is
+left is the heap's high-water.  Uncapped the block is 64 MiB and nothing changes.  `-v`: "...;
+N carried copied out of a kept carry".
+
+### `-d --tar` under a limit: a frame's permit returns when its last part job is written
+
+Under a `--tar` frame sink the throttle permit was released as the frame entered the sink, so
+the throttle bounded only frames not yet handed over.  The sink, the tar parser, the
+extractor's queued part jobs and its writers hold views that keep their whole frames alive, and
+each was bounded only by its own byte budget: nine frames alive under 256 MB.  Now, when the
+memory sized the throttle, each pushed frame carries its permit until its last reference drops,
+and the throttle takes the full quarter under a sink (it split it with the sink, whose eighth now
+bounds only how many of them wait there).  `-v`: "[THROTTLE] tar sink: peak 5 decoded frames alive
+against 4 permits" -- never more than the permits and the head-of-line overdraft.  Released at
+the sink instead, `-d --tar` dies under a real 256 MB limit 3 of 3; carried, it survives 256 and
+192 MB 3 of 3 on both builds.
+
+Two things keep it from wedging, both found in review.  A part job can span more frames than
+there are permits -- a 64 MiB window over 1 MiB frames is 64 of them, and without a seek table the
+throttle assumes 16 MiB frames -- so when the unfinished job the parser holds already has the
+whole budget and the sink is empty, the parser copies just that job into owned memory (its
+frames, and their permits, go back) before it waits; it also drops the spent frame before
+waiting, and hands a finished small file over before reading its padding.  (Submitted without
+that, `-d --tar -T1` of a 1 MiB-frame archive hung, uncapped.)  And frames carry permits only
+when the memory, not the pipeline or the floor, sized the throttle: on a roomy host counting
+them made the 32-frame floor the bound for every downstream frame, and uncapped serial
+`-d --tar -T1` of 2 GiB slowed from 2.0-2.3 s to 3.0-3.6.  There, as before, the sink and the
+extractor's own budgets bound them; after the change 1.94-2.03 s against v0.18.31's 1.80-2.11.
+
+### A pooled reader takes its buffer before it claims a chunk
+
+The pooled reader (`--gpu-only` compress, and `--mmap=off` or a redirected stdin on the CPU
+path) claimed its chunk index and then waited for a buffer.  While it waited, later chunks could
+hold every buffer -- they take no throttle permit until a worker pops them -- and their
+compressed frames every permit, all waiting on the waiting reader's chunk.  The throttle used to
+dwarf the pool (the 32-frame floor against 8 buffers, 2,432 permits against 513 on a GPU run),
+so the cycle could not close; since v0.18.30 a container's limit can cut the throttle to 2-4
+frames, below the pool, and it could, by timing.  Reproduced with a hook that holds the first
+reader before it asks for a buffer (`GZSTD_DEBUG_POOL_ACQUIRE_STALL`), a 1-frame throttle
+(`-M16M`) and 3 buffers: hung 3 of 3 on the CPU path and on the GPU intake alike; holding the
+buffer first, a reader claims only a chunk it can read now, 3 of 3 complete.  With that the
+pool's 8-buffer floor yields to a known limit, to what a quarter holds and never under 2 (3
+under 192 MiB): `--gpu-only` compress survives 192 MB.
+
+### `-M` caps the frames in flight on compress (the owner's call)
+
+`-M` tightened the automatic budget but the 32-frame floor and the GPU batch floor were applied
+after it, so `-M128M` took 512 MiB on a CPU run and gigabytes on a GPU one.  It is now a cap
+after every floor (`source=memlimit`), and `gz_mem_fit_gpu_batch` fits the GPU batches to it
+first, then leaves GPUs out (`--gpu-only` keeps one): `-T 40 -M128M` 8 frames, not 32; a hybrid
+`-M256M` one GPU at up to 7 frames a stream within 16; `--gpu-only -M64M` 4 frames, 2 a stream;
+`--cpu-share=0.5 -M32M` on the CPU.  It is still not a process-memory limit (contexts and
+buffers are not counted) and `--throttle-frames` still bypasses it.  Decode's `-M`, zstd's
+window limit, is unchanged.  `--help` says so.
+
+### `--gds-only`'s registrations are bounded by what they cost (the owner's call)
+
+`gds_register_budget` assumed a registered byte costs ~8.4 of host RSS (MemAvailable / 17), but
+on the server's stack (driver 595, nvidia-fs 2.26.6) that RSS is the BAR1 mapping: 4 GiB
+registered, VmRSS 8.65 GB, of it RssFile 8.6 GB, RssAnon 33 MiB.  The preflight, after its 4 MiB
+probe has paid cuFile's setup, now registers a 16 MiB calibration buffer and measures the larger
+of this process's anonymous + shmem growth and its cgroup's own count while it is registered
+(~10 ms, once a run); the budget holds that cost to half of what is available, a container's
+limit included.  Here: "[GDS] a registration costs 0.015 bytes of host memory a byte (measured
+over 16 MiB): the mapping is not memory, registrations take the ceiling".  A stack whose mapping
+is real memory stays bounded (a cost of 4.2 injected with `GZSTD_DEBUG_GDS_REG_COST_PERMILLE`:
+112 MiB under 1 GiB, 7 frames, rather than 129).  Without a preflight (`--direct-stage` pins its
+batch from this budget too and registers nothing) the old host rule stands.
+
+### Found in review (Codex, three rounds at max effort)
+
+Besides the wedge and the over-eager copy above: a `-d --gds-only` registers two slabs at once
+and the measured budget covered one (112 MiB each against ~122 for both; both now fit it); a read
+probe that ended after taking a buffer marked the untouched buffer used, so the next pass timed
+its page faults (it is handed back fresh); a timed probe pass could skip a chunk -- a reader that
+claimed chunk k and paused could reject it at the deadline after another accepted k+1, and the
+next pass resumed from the COUNT of chunks read, stranding the writer on k (bounded passes now
+decide and claim under one lock; pre-existing); and the `-v` peak line compared with the
+throttle's starting budget after a GPU bringup had grown it; a deferred GPU bringup that made the
+memory bind only after the writer had started never turned carrying on (the writer now looks
+again each batch, and `grow_to` says so); and decode's `-M`, zstd's window limit, read as memory
+pressure, so a roomy host with `-M64M` carried permits (the memory figure is now taken before -M).
+It also caught that moving the
+`--adapt` profile section to `-e` took the shared `AQ` and `PROFILE_SCHEMA` setup with it, which
+later default cells use.
+
+### Lowest limit survived
+
+`systemd-run --scope -p MemoryMax=... -p MemorySwapMax=0`, server, output compared outside the
+scope, limits tried 1 GB down to 128 MB, both binaries back to back:
+
+| 2 GiB of text in 16 MiB frames (the 2 GiB `--tar` of v0.18.30's table) | v0.18.31 | v0.18.32 |
+|---|---|---|
+| decode, CPU-only build | 192 MB | **128** |
+| decode, GPU build | 192 | **144** (6 of 6; 128: 1 of 6) |
+| `-d --tar`, either build | 384 (CPU-only), 256 (GPU) | **192** |
+| `--hybrid` decode | 192 | **128** |
+| `--gpu-only` compress and decode | 256 | **192** |
+
+Unchanged: compress at 128 on every route, `--cpu-share=0.5` decode and `-d --direct-stage` at
+192, `-t --direct-stage`, `--verify` and the three `--gds-only` operations at 128.
+
+### Uncapped
+
+Server, interleaved ABBA x2, v0.18.31 against v0.18.32, within the noise: parallel `-d --tar` of
+2 GiB 0.88-1.19 s against 0.87-0.94; serial (no index) 0.82-0.83 against 0.79-0.83, at `-T1`
+1.80-2.11 against 1.94-2.03; compress of 8 GiB through a redirected stdin (the pooled reader)
+0.94-0.98 against 0.97-0.98; `--gpu-only` compress 3.73-4.13 against 3.62-4.09; `-t --gds-only`
+2.22-2.78 against 2.41-2.77 (its calibration probe included).
+
+### 42 stable tests moved from the default suite to `--extensive`
+
+At the owner's request, as in v0.18.7: the seek-table content checksums, GPU VRAM pressure,
+`--adapt` persistent profile, GPU failure handling and single-frame archive sections, the GPU
+stall-guard cell, and `--patch-from`'s byte-identity at -19 and -22 (that cell stays, at -1 -3).
+The criteria: the newest change each guards is v0.18.16 or older, and none touches v0.18.29-32's
+code.  About 130 s of the default run's 12 minutes.  Each block is marked `moved to -e in
+v0.18.32`; `-e` still runs everything.  Default 585 -> 543 (no-GPU delta 153 -> 141, CPU-only
+432 -> 402; GDS delta 17 -> 15); `--extensive` unchanged at 885.
+
+### Cells
+
+No new cells; arms in five (EXPECTED 543/885 after the move above).  "memory: a limit shrinks the
+readers' blocks and pools, never the frames" (was "...the decode reader's blocks..."): under
+256 MiB no frame is a view and carried frames come out of a kept carry (2 MiB frames, which fit a
+shrunk block, are all copied; 44 were views); the compress pooled reader's pool is 3 buffers under
+192 MiB, and a reader held 0.5 s before asking for one, with a 1-frame throttle, completes (the old
+claim order wedged 3 of 3).  "memory: --tar under a limit..." : 512 MiB now runs two partitions on
+32 MiB windows, 256 MiB the serial walk on 16 MiB windows with a 4-frame throttle; 128 MiB of
+random data through the serial walk peaks at no more decoded frames than its permits and the
+overdraft; a --no-index archive of 1 MiB frames extracts at -T1 automatic, under 256 MiB, and with
+--throttle-frames=1 (plain, --keep-going, --direct, a failed small-file write, -t --tar) without
+wedging.  "memory: a limit fits the GPU batches..." : -M256M fits the GPU batches to -M within 16
+frames; --gpu-only -M64M within 4; --gpu-only's pool is 3 buffers under 192 MiB and the held reader
+completes there too.  "memory: -T 40 -M128M" now takes 8 frames (source=memlimit), not 32.  "memory:
+a container's limit does not shrink a --gds-only registration": the preflight's "registration
+costs ... the mapping is not memory" line; an injected cost of 4.2 bounds -t to 7 frames and -d's
+two slabs together to the same budget.  Mutants, every one caught: the carry handed over, views
+under a shrunk block, the permit released at the sink, the sink's eighth, the copy escape
+removed, a chunk claimed before its buffer, the 8-buffer floors (both sites), -M uncapped, the GPU
+fit ignoring -M, the GDS cost ignored, one GDS slab counted, decode's -M read as memory
+pressure.  Not caught by a cell: the read probe's fresh flag and its claim lock (they need a cold
+timed pass of 4 GiB or more), and carrying that starts after a GPU bringup (an input large enough
+to outlast CUDA's start at -T1: checked by hand on 2 GiB under a fake 4 GiB budget).
 
 ## v0.18.31 — ROADMAP 30's leftovers: a GPU's batches shrink to the memory before the GPU is declined (v0.18.30 declined every GPU in a 16 GB container), a container's limit no longer shrinks --gds-only's registrations (v0.18.30 ran them 4-7x slower under one), and the decode reader, -d --tar's part windows, --direct-stage's read-ahead and lanes and --adapt's extract pool fit the memory (a 2 GiB decode under 192 MB, where v0.18.30 needed 384-512; -d --tar under 384, from 768)
 

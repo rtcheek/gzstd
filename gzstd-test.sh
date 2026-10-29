@@ -622,8 +622,16 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=585
+EXPECTED_TESTS=543
 $EXTENSIVE && EXPECTED_TESTS=885
+# v0.18.32, at the owner's request, as in v0.18.7: stable, slow default cells moved to
+# --extensive (each marked "moved to -e in v0.18.32"): seek-table content checksums,
+# GPU VRAM pressure, --adapt persistent profile, GPU failure handling, single-frame
+# archives, the GPU stall-guard cell, and --patch-from's -19/-22 byte-identity arms
+# (that cell stays, at -1 -3).  The criteria: the newest change each guards is v0.18.16
+# or older, and none touches v0.18.29-32's code.  42 tests (12 GPU-only, 2 of those GDS
+# cells): default 585 -> 543, no-GPU delta 153 -> 141 (CPU-only 432 -> 402), GDS delta
+# 17 -> 15; --extensive unchanged.  ~130 s of the default's ~12 min.  DERIVED.
 # v0.18.31: +1 default cell, no GPU (memory: a limit shrinks the decode reader's blocks,
 # never the frames) and +3 default GPU cells (memory: a limit fits the GPU batches before it
 # declines a GPU; --direct-stage fits its read-ahead and staging lanes to a limit; a
@@ -942,7 +950,7 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=153   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31
+EXPECTED_NOGPU_DELTA=141   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=219   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
@@ -961,7 +969,7 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=219   # 207 MEASURED 2026-10-14 (824 - 617); 
 # one of the 607 cells has now been exercised.
 # v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
 # cell that exists only under --extensive.
-EXPECTED_NOGDS_DELTA=17   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7
+EXPECTED_NOGDS_DELTA=15   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7, two seek-table-section cells in v0.18.32
 $EXTENSIVE && EXPECTED_NOGDS_DELTA=19   # + the v0.17.83 --extensive cell
 
 # ============================================================
@@ -2339,6 +2347,12 @@ fi
 section "Dictionaries (-D, --patch-from)"
 
 DICTD="$TMPDIR/dict"
+# --patch-from's byte-identity at -19 and -22 moved to -e in v0.18.32 (stable,
+# untouched, and most of the cell's 16 s); -1 and -3 stay in the default run.
+pz_levels="1 3"; pz_t="--patch-from compress: byte-identical to zstd --patch-from (-1 -3)"
+if $EXTENSIVE; then
+  pz_levels="1 3 19 22"; pz_t="--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)"
+fi
 if command -v zstd &>/dev/null && command -v python3 &>/dev/null; then
   mkdir -p "$DICTD/s"
   for i in $(seq 1 200); do
@@ -2599,7 +2613,7 @@ PYEOF
   if [[ $(zstd --version 2>/dev/null) == *v1.5.7* \
         && $("$GZSTD" --version 2>/dev/null) == *"zstd 1.5.7"* ]]; then
   t0=$(now_ms); why=""
-  for lv in 1 3 19 22; do
+  for lv in $pz_levels; do
     zstd -q -f -$lv --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" -o "$DICTD/pzz.$lv.zst" 2>/dev/null
     rc=0; "$GZSTD" -q -f -$lv --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" -o "$DICTD/pzg.$lv.zst" 2>"$DICTD/err" || rc=$?
     { [[ $rc -eq 0 ]] && cmp -s "$DICTD/pzz.$lv.zst" "$DICTD/pzg.$lv.zst"; } || why+=" -$lv(rc=$rc)"
@@ -2651,16 +2665,16 @@ PY
       && why+=" $pz_flag did not change zstd's bytes (NOT TESTED)"
   done
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
-  if cmp -s "$DICTD/pzz.19.zst" "$DICTD/pzz.22.zst"; then
-    fail "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" \
+  if $EXTENSIVE && cmp -s "$DICTD/pzz.19.zst" "$DICTD/pzz.22.zst"; then
+    fail "$pz_t" \
          "control: zstd's -19 and -22 patches are equal -- the fixture does not discriminate, NOT TESTED"
   elif [[ -z "$why" ]]; then
-    pass "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)"
+    pass "$pz_t"
   else
-    fail "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" "differs at$why $(head -c 160 "$DICTD/err")"
+    fail "$pz_t" "differs at$why $(head -c 160 "$DICTD/err")"
   fi
   else
-    skip "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" \
+    skip "$pz_t" \
       "requires zstd CLI and linked library 1.5.7"
     "$GZSTD" -q -f -3 --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" \
       -o "$DICTD/pzg.3.zst" 2>"$DICTD/err"
@@ -2917,7 +2931,7 @@ else
            "compress -D refuses --hybrid (exit 2)" \
            "-d --patch-from=OLD decodes a zstd --patch-from patch" \
            "--patch-from reads a magic-prefixed reference as raw content" \
-           "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" \
+           "$pz_t" \
            "--patch-from compress: gzstd -d and zstd -d rebuild NEW from a small patch" \
            "--patch-from compress refuses several files, stdin, --tar, and -o OLD (exit 2)" \
            "--train: same dictionary bytes as zstd --train" \
@@ -4568,6 +4582,7 @@ fi
 # ============================================================
 # 18a. Seek-table content checksums (ALL backends, not just GPU)
 # ============================================================
+if $EXTENSIVE; then
 section "Seek-table content checksums"
 
 # v0.17.30: a zstd-seekable table may carry a per-frame content checksum, and
@@ -4825,6 +4840,8 @@ else
     skip "--gds-only refuses an nvidia-fs built for another driver, before any GPU pin" "needs a host where --gds-only runs"
   fi
 fi
+fi  # $EXTENSIVE (seek-table content checksums: moved to -e in v0.18.32 -- stable, untouched, and slow)
+
 
 # ============================================================
 # 18b. --verify (background decompress-verify on write)
@@ -5034,6 +5051,7 @@ rm -f "$fbsrc" "$fbz" "$fbt" "$fbo" "$TMPDIR/fb.err"
 # ============================================================
 # 19. GPU VRAM pressure tests
 # ============================================================
+if $EXTENSIVE; then
 section "GPU VRAM pressure"
 
 if has_gpu 2>/dev/null; then
@@ -5171,6 +5189,8 @@ else
   skip "hybrid decompress under VRAM pressure" "no GPU"
   skip "gpu-only decompress under VRAM pressure" "no GPU"
 fi
+fi  # $EXTENSIVE (GPU VRAM pressure: moved to -e in v0.18.32 -- stable, untouched, and slow)
+
 
 # ============================================================
 # 19b. GPU stream/batch exhaustion (regression tests for v0.12.7)
@@ -8589,6 +8609,19 @@ rm -f "$TMPDIR/adapt.zst" "$TMPDIR/adapt.dec" "$TMPDIR/adapt-plain.zst" \
       "$TMPDIR/adapt-on.zst" "$TMPDIR/adapt-v.err" "$TMPDIR/adapt-q.err" "$TMPDIR/adapt-off.err"
 
 # ────────────────────────────────────────────────────────────
+AQ="GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0"
+ACB="GZSTD_DEBUG_CALIBRATE_BYTES=8388608"
+# Shared by the default crafted-profile cells as well as the extensive profile
+# tests.  Read the binary's epoch once in either mode, never a hardcoded schema.
+aprof_read_schema() {
+  local probe_dir
+  probe_dir=$(mktemp -d "$TMPDIR/aprof-schema.XXXXXX") || return
+  env XDG_CACHE_HOME="$probe_dir" $AQ "$GZSTD" --adapt --cpu-only \
+      -q -f -k "$1" -o "$probe_dir/probe.zst" >/dev/null 2>&1
+  sed -n 's/.*"gzstd_profile": *\([0-9]*\).*/\1/p' "$probe_dir/gzstd/profile.json" 2>/dev/null | head -1
+  rm -rf "$probe_dir"
+}
+if $EXTENSIVE; then
 section "--adapt persistent profile"
 
 # All profile tests point XDG_CACHE_HOME at a scratch dir — never the user's
@@ -8600,8 +8633,6 @@ section "--adapt persistent profile"
 #   $ACB — GZSTD_DEBUG_CALIBRATE_BYTES shrinks the calibrate corpus 1 GiB -> 8 MiB.
 # Neither is ever set in a real run.  Test 5 deliberately sets NEITHER — it
 # asserts the REAL 3 s gate blocks a sub-3 s run.
-AQ="GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0"
-ACB="GZSTD_DEBUG_CALIBRATE_BYTES=8388608"
 APROF_XDG="$TMPDIR/xdg-cache"
 APROF="$APROF_XDG/gzstd/profile.json"
 APROF_SRC="$TMPDIR/aprof-src.txt"
@@ -8658,13 +8689,7 @@ fi
 # or the test would be measuring the reset path instead of what it means to test.
 # Learn the value from the binary under test rather than hardcoding it, so bumping
 # ADAPT_PROFILE_SCHEMA does not silently invalidate these tests.
-PROFILE_SCHEMA=$(
-  _d=$(mktemp -d)
-  env XDG_CACHE_HOME="$_d" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt --cpu-only \
-      -q -f -k "$APROF_SRC" -o "$_d/probe.zst" >/dev/null 2>&1
-  sed -n 's/.*"gzstd_profile": *\([0-9]*\).*/\1/p' "$_d/gzstd/profile.json" 2>/dev/null | head -1
-  rm -rf "$_d"
-)
+PROFILE_SCHEMA=$(aprof_read_schema "$APROF_SRC")
 [[ -n "$PROFILE_SCHEMA" ]] && pass "profile schema epoch readable from a written profile ($PROFILE_SCHEMA)" \
                           || fail "profile schema epoch readable from a written profile"
 [[ -n "$PROFILE_SCHEMA" ]] || PROFILE_SCHEMA=1
@@ -8832,6 +8857,12 @@ done
 
 rm -rf "$APROF_XDG" "$TMPDIR/aprof.zst" "$TMPDIR/aprof-fast.zst" "$TMPDIR/aprof-bad.zst" \
        "$TMPDIR/aprof-cal.err"
+else
+  # Setup only: the profile test cells remain extensive, with unchanged counts.
+  PROFILE_SCHEMA=$(aprof_read_schema "$TMPDIR/small.txt")
+  [[ -n "$PROFILE_SCHEMA" ]] || PROFILE_SCHEMA=1
+fi  # $EXTENSIVE (--adapt persistent profile: moved to -e in v0.18.32 -- stable, untouched, and slow)
+
 
 # ────────────────────────────────────────────────────────────
 section "--adapt GPU device count (--gpu-only compress)"
@@ -11276,6 +11307,7 @@ fi
 rm -rf "$zc"
 
 # ────────────────────────────────────────────────────────────
+if $EXTENSIVE; then
 section "GPU failure handling (v0.17.87 review)"
 
 # THE --tar GPU DECODE POOL CHECKS THE CONTENT CHECKSUM.  It did not: a frame the
@@ -11411,6 +11443,8 @@ if has_gpu 2>/dev/null; then
 else
   skip "a GPU batch published in the writer's blind window still wakes it" "no GPU"
 fi
+fi  # $EXTENSIVE (GPU failure handling: moved to -e in v0.18.32 -- stable, untouched, and slow)
+
 
 # ────────────────────────────────────────────────────────────
 section "Decisions from the review (v0.17.89)"
@@ -11635,6 +11669,8 @@ done
 
 # 6-8 need a GPU.
 if has_gpu 2>/dev/null; then
+  # 6 moved to -e in v0.18.32 -- stable, untouched, and slow (its pauses alone are ~15 s).
+  if $EXTENSIVE; then
   # 6. THE GPU STALL GUARD.  A driver call that never returns cannot be recovered
   # from, and such a run used to sit there forever.  It is now stopped (exit 5,
   # loud, partial output removed) once one batch has been inside the driver for
@@ -11664,6 +11700,7 @@ if has_gpu 2>/dev/null; then
     || rv_why+=" [a run stopped for 7 s (limit 5 s) and continued: exit $rc, want 0]"
   [[ -z "$rv_why" ]] && pass "a GPU that stops answering ends the run instead of hanging it" \
     || fail "a GPU that stops answering ends the run instead of hanging it" "$rv_why"
+  fi  # $EXTENSIVE (6)
 
   # 7. --calibrate must not record a CPU rescue as the GPU's speed.  A decompress
   # fault finishes on the CPU and returns normally, so the "gpu decompress" row
@@ -11677,7 +11714,7 @@ if has_gpu 2>/dev/null; then
          "exit $rc; $(grep -a 'gpu decompress' "$rv/c.err" | head -1 | cut -c1-80)"
   fi
 else
-  skip "a GPU that stops answering ends the run instead of hanging it" "no GPU"
+  $EXTENSIVE && skip "a GPU that stops answering ends the run instead of hanging it" "no GPU"
   skip "--calibrate discards a GPU decompress row that finished on the CPU" "no GPU"
 fi
 
@@ -11700,6 +11737,7 @@ fi
 rm -rf "$rv"
 
 # ────────────────────────────────────────────────────────────
+if $EXTENSIVE; then
 section "Single-frame archives: --sliding-window and pipes (v0.17.91)"
 
 # A single-frame archive (zstd's own output, gzstd --sliding-window, tar --zstd)
@@ -12319,6 +12357,7 @@ grep -q "has no multithreading" "$TMPDIR/zv.err" || zv_why+=" [no warning that i
 [[ -z "$zv_why" ]] && pass "--version names the zstd library; --sliding-window copes with one that has no threads" \
   || fail "--version names the zstd library; --sliding-window copes with one that has no threads" "$zv_why"
 rm -f "$TMPDIR/zv.in" "$TMPDIR/zv.zst" "$TMPDIR/zv.err"
+fi  # $EXTENSIVE (single-frame archives: moved to -e in v0.18.32 -- stable, untouched, and slow)
 
 if $EXTENSIVE; then
 section "Decompress tail-aware GPU intake (pinned rates)"
@@ -13947,8 +13986,10 @@ fi
 #    keeps its pool, and its frames shrink to fit it instead (8 workers at 64
 #    MiB under 512 MiB: 8 MiB frames); a limit far above the need cuts nothing.
 #    The throttle's floor yields to the memory but never rises above the old 32
-#    frames, under -M or a pinned -T 40 alike, and --adapt's growth stays inside
-#    the same quarter (512 MiB: 8 frames, no growth past them).
+#    frames under a pinned -T 40, and --adapt's growth stays inside the same
+#    quarter (512 MiB: 8 frames, no growth past them).  -M on compress is a cap
+#    since v0.18.32: -T 40 -M128M takes 128 MiB of 16 MiB frames, 8, not the
+#    floor's 32 (source=memlimit).
 pm_t4="memory: a limit fits fewer workers and a smaller throttle, and a pool it cut takes no zstd workers"
 if (( pm_default < 2 )); then
   skip_host "$pm_t4" "one CPU worker by default"
@@ -13979,7 +14020,8 @@ else
     || pm_why+=" T2:[$(grep -ah 'memory:\|threads online' "$TMPDIR/pm4.err" | tr '\n' ' ')]"
   "$GZSTD" -vv -f --cpu-only -3 -T 40 -M128M -c "$TMPDIR/pm-z.bin" 2>"$TMPDIR/pm4.err" >/dev/null \
     || pm_why+=" M:rc=$?"
-  [[ "$(pm_thr "$TMPDIR/pm4.err")" == 32 ]] || pm_why+=" M:$(pm_thr "$TMPDIR/pm4.err")"
+  [[ "$(pm_thr "$TMPDIR/pm4.err")" == 8 ]] && grep -qa '^\[THROTTLE\] 8 frames.*source=memlimit' "$TMPDIR/pm4.err" \
+    || pm_why+=" M:$(pm_thr "$TMPDIR/pm4.err")"
   GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -vv -f --cpu-only -3 -T 40 -c "$TMPDIR/pm-z.bin" \
     2>"$TMPDIR/pm4.err" >/dev/null || pm_why+=" T40:rc=$?"
   [[ "$(pm_thr "$TMPDIR/pm4.err")" == 32 ]] || pm_why+=" T40:$(pm_thr "$TMPDIR/pm4.err")"
@@ -14034,10 +14076,14 @@ fi
 #    MiB the part window halves until a writer's job and the queue's two fit a
 #    quarter (v0.18.31): at 512 MiB 32 MiB windows, and two partitions and two
 #    writers fit; at 256 MiB 16 MiB windows, so each 20 MiB file is written in
-#    two parts, and no two partitions fit: the serial walk runs, where the
-#    decoder's throttle and the frame sink split a quarter -- ram_cap is 2
-#    frames, and a plain decode's under 512 MiB 8.  Four 20 MiB files are 6
-#    frames and 5 entries.
+#    two parts, and no two partitions fit: the serial walk runs, whose throttle
+#    takes a quarter -- ram_cap is 4 frames, and a plain decode's under 512 MiB
+#    8 -- and since v0.18.32 bounds every decoded frame alive: a frame's permit
+#    goes with it into the sink and returns when its last part job is written.
+#    The serial walk then holds no more decoded frames than its permits and
+#    the one overdraft (a part job the parser cannot finish without another
+#    frame is copied out first -- frames of 1 MiB at -T1 otherwise wedged it).
+#    Four 20 MiB files are 6 frames and 5 entries.
 pm_t5="memory: --tar under a limit runs fewer readers, writers and partitions"
 if (( pm_default < 4 )); then
   skip_host "$pm_t5" "fewer than 4 CPU workers by default"
@@ -14074,13 +14120,86 @@ else
   pm_x serial $((256 << 20)) "$TMPDIR/pm5y.err"
   ! grep -qa 'parallel-extract' "$TMPDIR/pm5y.err" && grep -qa '16 MiB part windows, not 64' "$TMPDIR/pm5y.err" \
     && grep -qa '\[UNTAR\] 2 writer thread(s)' "$TMPDIR/pm5y.err" \
-    && grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm5y.err" | grep -q ' ram_cap=2,' \
+    && grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm5y.err" | grep -q ' ram_cap=4,' \
     || pm_why+=" serial:[$(grep -ah 'parallel-extract\|part windows\|writer thread\|THROTTLE\] detail' "$TMPDIR/pm5y.err" | tr '\n' ' ')]"
   pm_tree "$pm_d"; echo $((512 << 20)) > "$pm_g/memory.max"
   GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -vv -f -c "$TMPDIR/pm5.tzst" 2>"$TMPDIR/pm5z.err" >/dev/null \
     || pm_why+=" plain:rc=$?"
   grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm5z.err" | grep -q ' ram_cap=8,' \
     || pm_why+=" plain:[$(grep -ah 'THROTTLE\] detail' "$TMPDIR/pm5z.err" | tr '\n' ' ')]"
+  # The permit goes with the frame: the serial walk never has more decoded frames
+  # alive than the throttle's permits and its one head-of-line overdraft (-v
+  # prints the peak at the writer's exit).  128 MiB of random data is 8 stored
+  # frames, twice the 4 permits a quarter of 256 MiB holds.  Released at the sink
+  # instead, -d --tar died under a real 256 MB limit 3 of 3 (it survives 192).
+  rm -rf "$TMPDIR/pm-src"; mkdir -p "$TMPDIR/pm-src/d"
+  head -c $((128 << 20)) /dev/urandom > "$TMPDIR/pm-src/d/r1"
+  "$GZSTD" --tar -q -f -1 -o "$TMPDIR/pm5.tzst" -C "$TMPDIR/pm-src" d || pm_why+=" alive:create"
+  pm_tree "$pm_d"; echo $((256 << 20)) > "$pm_g/memory.max"
+  rm -rf "$TMPDIR/pm-x"; mkdir -p "$TMPDIR/pm-x"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d --tar -v -f -C "$TMPDIR/pm-x" "$TMPDIR/pm5.tzst" \
+    2>"$TMPDIR/pm5z.err" || pm_why+=" alive:rc=$?"
+  cmp -s "$TMPDIR/pm-src/d/r1" "$TMPDIR/pm-x/d/r1" || pm_why+=" alive:bytes"
+  ! grep -qa 'parallel-extract' "$TMPDIR/pm5z.err" || pm_why+=" alive:not-serial"
+  pm_al=$(grep -aoE 'tar sink: peak [0-9]+ decoded frames alive against [0-9]+ permits' "$TMPDIR/pm5z.err" | head -1)
+  pm_pk=$(sed -E 's/.*peak ([0-9]+) .*/\1/' <<<"$pm_al"); pm_pm=$(sed -E 's/.*against ([0-9]+) .*/\1/' <<<"$pm_al")
+  [[ "$pm_pk" =~ ^[0-9]+$ && "$pm_pm" =~ ^[0-9]+$ ]] && (( pm_pk >= 1 && pm_pk <= pm_pm + 1 )) \
+    || pm_why+=" alive:[${pm_al:-no peak line}]"
+  # A serial job can span more frames than the throttle plus its one overdraft:
+  # 4 MiB in 1 MiB frames with one permit, or a 64 MiB part window with 32
+  # permits at -T1.  No index keeps every arm on the serial walk.
+  # A partial job must give up its views before waiting for another frame.
+  rm -rf "$TMPDIR/pm-src"; mkdir -p "$TMPDIR/pm-src"
+  # Random bytes, not zeros: a run of zeros is extracted as a hole and pins no
+  # frame, so the wedge never formed (with the escape removed, zeros passed).
+  head -c $((4 << 20)) /dev/urandom > "$TMPDIR/pm-src/small"
+  head -c $((80 << 20)) /dev/urandom > "$TMPDIR/pm-src/large"
+  "$GZSTD" --tar --cpu-only --no-index --chunk-size=1 -T1 -1 -q -f \
+    -C "$TMPDIR/pm-src" small large -o "$TMPDIR/pm5-parts.tzst" || pm_why+=" parts:create"
+  # Frames carry permits only when the memory sized the throttle (uncapped they
+  # did, and -T1 extraction ran 40% slower), so the arm that needs the escape is
+  # `limit`: under 256 MiB with no seek table the throttle assumes 16 MiB frames
+  # (4 permits) while a 16 MiB part window spans 16 real ones.  The others keep
+  # the uncapped paths, where nothing carries, extracting the same archive.
+  # Decode's -M is a window limit: on a roomy host it must not enable carrying.
+  # Run that arm when the host has room for its fake 8 GiB budget; otherwise
+  # actual RAM pressure can legitimately enable carrying despite the fake tree.
+  pm_host_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+  pm_tree "$pm_d"; echo $((256 << 20)) > "$pm_g/memory.max"
+  for pm_arm in limit window automatic one keep-going direct; do
+    pm_args=(--throttle-frames=1); pm_env=()
+    case "$pm_arm" in
+      limit) pm_args=(); pm_env=(env GZSTD_DEBUG_CGROUP_ROOT="$pm_d") ;;
+      window)
+        [[ "$pm_host_kb" =~ ^[0-9]+$ ]] && (( pm_host_kb >= 8 * 1024 * 1024 )) || continue
+        echo $((8 << 30)) > "$pm_g/memory.max"
+        pm_args=(-M64M -v); pm_env=(env GZSTD_DEBUG_CGROUP_ROOT="$pm_d") ;;
+      automatic) pm_args=() ;;
+      keep-going) pm_args+=(--keep-going) ;;
+      direct) pm_args+=(--direct) ;;
+    esac
+    rm -rf "$TMPDIR/pm-x"; mkdir -p "$TMPDIR/pm-x"
+    timeout --foreground -k 10 30 "${pm_env[@]}" "$GZSTD" -d --tar --cpu-only -T1 -q -f "${pm_args[@]}" \
+      -C "$TMPDIR/pm-x" "$TMPDIR/pm5-parts.tzst" 2>"$TMPDIR/pm5z.err" \
+      || pm_why+=" parts-$pm_arm:rc=$?"
+    if [[ "$pm_arm" == window ]]; then
+      grep -qa '\[THROTTLE\] [0-9].*frames' "$TMPDIR/pm5z.err" || pm_why+=" parts-window:no-throttle"
+      ! grep -qa 'tar sink: peak' "$TMPDIR/pm5z.err" || pm_why+=" parts-window:window-limit-carried-permits"
+    fi
+    for pm_file in small large; do
+      cmp -s "$TMPDIR/pm-src/$pm_file" "$TMPDIR/pm-x/$pm_file" || pm_why+=" parts-$pm_arm:$pm_file"
+    done
+  done
+  timeout --foreground -k 10 30 "$GZSTD" -t --tar --cpu-only -T1 --throttle-frames=1 -q \
+    "$TMPDIR/pm5-parts.tzst" 2>"$TMPDIR/pm5z.err" || pm_why+=" parts-verify:rc=$?"
+  # A failed small-file write must release its frames and let the large file run.
+  rm -rf "$TMPDIR/pm-x"; mkdir -p "$TMPDIR/pm-x/small"
+  timeout --foreground -k 10 30 "$GZSTD" -d --tar --cpu-only -T1 --throttle-frames=1 -q \
+    -C "$TMPDIR/pm-x" "$TMPDIR/pm5-parts.tzst" 2>"$TMPDIR/pm5z.err"
+  pm_rc=$?
+  [[ "$pm_rc" == 1 ]] && cmp -s "$TMPDIR/pm-src/large" "$TMPDIR/pm-x/large" \
+    || pm_why+=" parts-write-error:rc=$pm_rc"
+  rm -f "$TMPDIR/pm5-parts.tzst"
   # --adapt's decode pool keeps its frames in flight without the throttle: 4 GiB
   # of them, now no more than a quarter of the memory (v0.18.31; peak 5 GB on a
   # 2 GiB archive, killed under 2 GB).  Two 20 MiB base64 files (zeros take the
@@ -14136,9 +14255,14 @@ fi
 #    frames): a 2 GiB decode died under 256 MB.  The block now halves until two
 #    fit an eighth of the memory -- 8 MiB under 256 MiB, 4 MiB for the two of
 #    --read-threads=2 -- and a frame longer than a small block's overlap is
-#    carried, so the output is still the archive's.  160 MiB of random data at
-#    -1 is ten stored 16 MiB frames in a 160 MiB archive, the parallel reader's.
-pm_t7="memory: a limit shrinks the decode reader's blocks, never the frames"
+#    carried, so the output is still the archive's.  Under such a limit
+#    (v0.18.32) a carried frame is copied out of a carry kept for reuse, not
+#    handed the carry's twice-the-largest-frame capacity, and no frame is a view
+#    (a view pins its whole block, which the queue's byte cap does not count):
+#    a 2 GiB decode then survives 128 MB (0 of 6 with the carry handed over).
+#    160 MiB of random data at -1 is ten stored 16 MiB frames in a 160 MiB
+#    archive, the parallel reader's.
+pm_t7="memory: a limit shrinks the readers' blocks and pools, never the frames"
 pm_why=""; pm_d="$TMPDIR/pm-cg"; pm_g="$pm_d/sys/fs/cgroup/job/step"
 head -c $((160 << 20)) /dev/urandom > "$TMPDIR/pm7.bin"
 "$GZSTD" -1 -q -f --cpu-only "$TMPDIR/pm7.bin" -o "$TMPDIR/pm7.zst"
@@ -14154,7 +14278,8 @@ else
     GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -v -f --cpu-only $pm_fl -c "$TMPDIR/pm7.zst" 2>"$TMPDIR/pm7.err" \
       | cmp -s - "$TMPDIR/pm7.bin" || pm_why+=" $pm_mib:bytes"
     grep -qa "\[READER\] memory: $pm_mib MiB blocks, not 64" "$TMPDIR/pm7.err" \
-      && grep -qaE 'zero-copy: .* [1-9][0-9]* carried across block boundaries' "$TMPDIR/pm7.err" \
+      && grep -qaE 'zero-copy: 0 frames as views, [1-9][0-9]* carried across block boundaries' "$TMPDIR/pm7.err" \
+      && grep -qaE '; [1-9][0-9]* carried copied out of a kept carry' "$TMPDIR/pm7.err" \
       || pm_why+=" $pm_mib:[$(grep -ah 'READER\] memory\|zero-copy' "$TMPDIR/pm7.err" | tr '\n' ' ')]"
   done
   # The archive still holds 16 MiB frames whatever decode's --chunk-size.
@@ -14169,6 +14294,28 @@ else
     grep -qa '\[CPU\] 1 decompression threads online' "$TMPDIR/pm7.err" \
       || pm_why+=" geometry-$pm_chunk:[$(grep -ah 'decompression threads online' "$TMPDIR/pm7.err")]"
   done
+  # Small frames fit a shrunk block, so only this archive tells a view from a
+  # copy: 2 MiB frames under 256 MiB are all copied (44 were views before).
+  "$GZSTD" -1 -q -f --cpu-only --chunk-size=2 "$TMPDIR/pm7.bin" -o "$TMPDIR/pm7s.zst"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -v -f --cpu-only -c "$TMPDIR/pm7s.zst" 2>"$TMPDIR/pm7.err" \
+    | cmp -s - "$TMPDIR/pm7.bin" || pm_why+=" small:bytes"
+  grep -qaE 'zero-copy: 0 frames as views, [0-9]+ carried across block boundaries, [1-9][0-9]* copied' "$TMPDIR/pm7.err" \
+    || pm_why+=" small:[$(grep -ah 'zero-copy' "$TMPDIR/pm7.err")]"
+  rm -f "$TMPDIR/pm7s.zst"
+  # The compress side's pooled reader (--mmap=off, or a redirected stdin): its
+  # 8-buffer floor yields to a limit -- 3 under 192 MiB (v0.18.32) -- and a
+  # reader takes its buffer before it claims a chunk.  Claimed first, a reader
+  # held 0.5 s before asking for a buffer, with a 1-frame throttle (-M16M) and
+  # 3 buffers, wedged 3 of 3: later chunks held every buffer and their
+  # compressed frames every permit, all waiting on the held chunk.  A container
+  # limit that cut the throttle below the old 8 buffers (v0.18.30) opened the
+  # same cycle by timing.
+  pm_tree "$pm_d"; echo $((192 << 20)) > "$pm_g/memory.max"
+  timeout --foreground -k 10 60 env GZSTD_DEBUG_CGROUP_ROOT="$pm_d" GZSTD_DEBUG_POOL_ACQUIRE_STALL=500 \
+    "$GZSTD" -v -f -3 --cpu-only --mmap=off -M16M -c "$TMPDIR/pm7.bin" 2>"$TMPDIR/pm7.err" \
+    | "$GZSTD" -d -q --cpu-only -c | cmp -s - "$TMPDIR/pm7.bin" || pm_why+=" pool:bytes-or-timeout"
+  grep -qa 'zero-copy pool 3 buffers' "$TMPDIR/pm7.err" \
+    || pm_why+=" pool:[$(grep -aoE 'zero-copy pool [0-9]+ buffers' "$TMPDIR/pm7.err")]"
   rm -rf "$pm_d"
   [[ -z "$pm_why" ]] && pass "$pm_t7" || fail "$pm_t7" "$pm_why"
 fi
@@ -14236,6 +14383,33 @@ else
     grep -m1 -a 'THROTTLE\] detail' "$TMPDIR/pm8.err" | grep -q ' ram_cap=4,' \
       || pm_why+=" geometry-$pm_chunk:[$(grep -ah 'THROTTLE\] detail' "$TMPDIR/pm8.err")]"
   done
+  # -M on compress caps the frames in flight, the GPU batches fit to it first
+  # (v0.18.32): -M256M runs GPUs at a fitted batch within 16 frames, and
+  # --gpu-only -M64M one GPU within 4.
+  pm_g8m() {   # $1 arm, rest: gzstd arguments; no memory tree
+    "$GZSTD" "${@:2}" -c "$TMPDIR/pm8.bin" 2>"$TMPDIR/pm8.err" \
+      | "$GZSTD" -d -q --cpu-only -c | cmp -s - "$TMPDIR/pm8.bin" || pm_why+=" $1:bytes"
+  }
+  pm_g8m M-hybrid -v -f -19 -T 1 -M256M
+  pm_f=$(pm_thr "$TMPDIR/pm8.err")
+  grep -qaE "GPU\] memory: .*up to [0-9]+ frames a stream, not [0-9]+, fit -M's 256.00 MiB" "$TMPDIR/pm8.err" \
+    && grep -qaE '[0-9]+ device workers? online' "$TMPDIR/pm8.err" && [[ -n "$pm_f" ]] && (( pm_f <= 16 )) \
+    || pm_why+=" M-hybrid:[$(grep -ah 'GPU\] memory\|device worker\|^\[THROTTLE\] [0-9]' "$TMPDIR/pm8.err" | tr '\n' ' ')]"
+  pm_g8m M-gpuonly -v -f --gpu-only -M64M
+  pm_f=$(pm_thr "$TMPDIR/pm8.err")
+  grep -qa "batches of 4 do not fit -M's 64.00 MiB" "$TMPDIR/pm8.err" && [[ -n "$pm_f" ]] && (( pm_f <= 4 )) \
+    || pm_why+=" M-gpuonly:[$(grep -ah 'GPU\] memory\|^\[THROTTLE\] [0-9]' "$TMPDIR/pm8.err" | tr '\n' ' ')]"
+  # --gpu-only's pooled reader: the 8-buffer floor yields to a limit, 3 under
+  # 192 MiB.  A reader takes its buffer before it claims a chunk: a reader held
+  # 0.5 s before it asks for one, a 1-frame throttle (-M16M) and 3 buffers
+  # wedged the old order 3 of 3 -- later chunks held every buffer, their
+  # compressed frames every permit, all waiting on the held reader's chunk.
+  pm_tree "$pm_d"; echo $((192 << 20)) > "$pm_g/memory.max"
+  timeout --foreground -k 10 60 env GZSTD_DEBUG_CGROUP_ROOT="$pm_d" GZSTD_DEBUG_POOL_ACQUIRE_STALL=500 \
+    "$GZSTD" -v -f --gpu-only -M16M -c "$TMPDIR/pm8.bin" 2>"$TMPDIR/pm8.err" \
+    | "$GZSTD" -d -q --cpu-only -c | cmp -s - "$TMPDIR/pm8.bin" || pm_why+=" pool:bytes-or-timeout"
+  grep -qa 'zero-copy pool 3 buffers' "$TMPDIR/pm8.err" \
+    || pm_why+=" pool:[$(grep -aoE 'zero-copy pool [0-9]+ buffers' "$TMPDIR/pm8.err")]"
   rm -rf "$pm_d"; rm -f "$TMPDIR/pm8.err"
   [[ -z "$pm_why" ]] && pass "$pm_t8" || fail "$pm_t8" "$pm_why"
 fi
@@ -14285,8 +14459,10 @@ fi
 #     the BAR1 mapping: measured, 4 GiB registered took RSS to 8.45 GB while a
 #     scope's memory.peak stayed at 56-72 MiB.  v0.18.30 read it through the
 #     container's figure and registered 3 frames (48 MiB) under 1 GiB, 5x slower.
-#     Now the host's: all 8 of cell 8's frames, ~129 MiB, on a host with 8 GiB
-#     free.
+#     Since v0.18.32 the preflight measures what a registration really costs
+#     (anonymous and shmem pages, and the cgroup's count) and the budget holds
+#     that to half of what is available: here ~0, so all 8 of cell 8's frames,
+#     ~129 MiB; with a cost injected, fewer.
 pm_t10="memory: a container's limit does not shrink a --gds-only registration"
 if ! gds_testable; then
   skip "$pm_t10" "GDS unavailable ($(gds_host_status))"
@@ -14298,7 +14474,33 @@ else
   GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -t -v --gds-only "$TMPDIR/pm8.zst" 2>"$TMPDIR/pm10.err" \
     || pm_why+=" rc=$?"
   pm_reg=$(grep -aoE 'cuFileBufRegister [0-9]+ MiB' "$TMPDIR/pm10.err" | head -1 | grep -oE '[0-9]+')
-  [[ -n "$pm_reg" ]] && (( pm_reg >= 96 )) || pm_why+=" registered ${pm_reg:-nothing} MiB"
+  [[ -n "$pm_reg" ]] && (( pm_reg >= 128 )) || pm_why+=" registered ${pm_reg:-nothing} MiB"
+  grep -qa 'registration costs .* the mapping is not memory' "$TMPDIR/pm10.err" \
+    || pm_why+=" cost:[$(grep -ah 'registration costs' "$TMPDIR/pm10.err")]"
+  # A stack whose registrations cost real memory stays bounded: at an injected
+  # 4.2 bytes a byte, half of 1 GiB holds ~122 MiB of registration, 7 frames.
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" GZSTD_DEBUG_GDS_REG_COST_PERMILLE=4200 \
+    "$GZSTD" -t -v --gds-only "$TMPDIR/pm8.zst" 2>"$TMPDIR/pm10.err" || pm_why+=" costly:rc=$?"
+  pm_reg=$(grep -aoE 'cuFileBufRegister [0-9]+ MiB' "$TMPDIR/pm10.err" | head -1 | grep -oE '[0-9]+')
+  [[ -n "$pm_reg" ]] && (( pm_reg < 128 )) || pm_why+=" costly:registered ${pm_reg:-nothing} MiB"
+  # -d registers BOTH slabs at once.  With the same cost and headroom their
+  # SUM must fit ~122 MiB, not ~112 MiB apiece (the old seven-frame batch).
+  rm -f "$TMPDIR/pm10.out"
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" GZSTD_DEBUG_GDS_REG_COST_PERMILLE=4200 \
+    "$GZSTD" -d -v --gds-only "$TMPDIR/pm8.zst" -o "$TMPDIR/pm10.out" \
+    2>"$TMPDIR/pm10.err" || pm_why+=" costly-decode:rc=$?"
+  cmp -s "$TMPDIR/pm8.bin" "$TMPDIR/pm10.out" || pm_why+=" costly-decode:bytes"
+  pm_reg=$(awk '
+    match($0, /cuFileBufRegister [0-9]+ MiB/) {
+      split(substr($0, RSTART, RLENGTH), a, " ")
+      if ($0 ~ /\(verify input\)/ && !ri) ri = a[2]
+      if ($0 ~ /\(decompress\)/ && !ro) ro = a[2]
+    }
+    END { if (ri && ro) print ri + ro }' "$TMPDIR/pm10.err")
+  pm_reg_budget=$(( (1 << 30) / 2 * 1000 / 4200 / (1 << 20) ))
+  [[ -n "$pm_reg" ]] && (( pm_reg <= pm_reg_budget )) \
+    || pm_why+=" costly-decode:registered ${pm_reg:-no paired slabs} MiB (budget $pm_reg_budget)"
+  rm -f "$TMPDIR/pm10.out"
   rm -rf "$pm_d"; rm -f "$TMPDIR/pm10.err"
   [[ -z "$pm_why" ]] && pass "$pm_t10" || fail "$pm_t10" "$pm_why"
 fi

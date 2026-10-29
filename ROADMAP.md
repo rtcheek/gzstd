@@ -602,8 +602,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     GPU build sends an input of fewer frames than CPU workers to the CPU path, where they run.
     The "zstd 5-12% ahead at 256-384 MiB" seen in the v0.18.29 sweep was the GPU build's hybrid
     route, not zstd: the CPU-only build was ahead there.
-30. **FIXED v0.18.30: every RAM budget reads a container's limit, and a run that will not fit
-    takes fewer workers** (found 2026-10-26).  Every budget read the host's MemAvailable (1.4
+30. **CLOSED v0.18.32 (fixed v0.18.30-32): every RAM budget reads a container's limit, and a run
+    that will not fit takes fewer workers** (found 2026-10-26).  Every budget read the host's MemAvailable (1.4
     TiB inside a 512 MB group on the server); past `memory.max` the kernel killed the run, exit
     137 and no message.  On v0.18.29 a 2 GiB text file was killed at 768 MB, 2 GiB of random
     data and its decode at 2 GB, `--tar` create and extract at 1 GB.  The owner's call: fewer
@@ -636,6 +636,18 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     batch with every buffer held); `-M` still does not bind the GPU batch floor (unchanged
     semantics); and whether `gds_register_budget`'s /17 RSS policy bounds real memory on any
     driver stack (on this one it does not).
+    v0.18.32 closed them, each taken apart first with a profiler of large live allocations: the
+    decode reader copies a carried frame out of a kept carry and makes no views once the memory
+    shrank its block (a 2 GiB decode under 128 MB on the CPU-only build, 144 on the GPU build);
+    `-d --tar`'s frames carry their throttle permit until their last part job is written when the
+    memory sized the throttle, a part job holding the whole budget copied out before the parser
+    waits (192 MB, both builds); a pooled reader takes its buffer before it claims a chunk -- a hang
+    under a limit since v0.18.30 -- and its 8-buffer floor yields (`--gpu-only` 192 MB); `-M` caps the
+    frames in flight on compress, GPU batches fit to it first (the owner's call); and `--gds-only`'s
+    registration budget counts what a registration measurably costs this host (the owner's call;
+    here 0.015 bytes a byte, so the ceiling).  What remains at each route's floor -- one decoder's
+    two frames, the throttle's minimum, a CUDA context, the heap's high-water -- is the working
+    set, not a budget: going lower would take smaller frames, which the owner's rule excludes.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
