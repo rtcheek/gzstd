@@ -663,50 +663,91 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     here 0.015 bytes a byte, so the ceiling).  What remains at each route's floor -- one decoder's
     two frames, the throttle's minimum, a CUDA context, the heap's high-water -- is the working
     set, not a budget: going lower would take smaller frames, which the owner's rule excludes.
-31. **`--gds-only` keeps two gaps `--direct-stage` closed in v0.18.33 (owner's call).**  (a) A seek
-    table entry that merges two frames whose contents are IDENTICAL decodes to one copy at exit 0:
-    the producer walks only checksumless frames, and the swallowed frame's trailer equals the first's.
-    `--direct-stage` now proves every extent with ZSTD_findFrameCompressedSize on the pinned host copy
-    it already makes; `--gds-only` reads drive -> VRAM with no host copy, and the walk that would close
-    it cost 28.6 -> 111.6 s on a cold 65 GiB archive when it existed.  Options: walk only under a
-    flag, prove the extent on the device, or accept it for an EXPERIMENTAL path that needs a forged
-    table.  (b) One GPU stream by design (cuFile registration per stream, the peer-to-peer output
-    packer): 64 GiB cold compress 34 s, 22 with `--gpu-streams=2`, 16.8 for `--direct-stage`.  The
-    registration cost that justified it was 490 ms/GiB; it measures 169 ms on driver 595.
-32. **Hybrid decode on a small budget still runs too many CPU decoders.**  Sweep (v0.18.32 binary,
-    48.87 GiB archive, two runs): at 4 CPUs one worker instead of three, cold 24.2-24.8 -> 15.9 s,
-    warm 15.1-15.3 -> 11.2-11.8; at 6, two or three instead of five; at 8, about the same.  v0.18.33's
-    cold-archive O_DIRECT readers already take hybrid at 4 CPUs to 12.8-13.6 s; what is left is
-    mostly a warm archive.  Deferred: the
-    pool is sized before the deferred GPU detection answers, and nothing grows it if the GPU never
-    comes up, so a GPU-less or failed-GPU host would decode on one worker.  Needs a pool that grows
-    on GPU loss first.  And it may not be worth it: a second sweep with the reader fix in place
-    (two runs) found fewer workers add nothing cold -- 4 CPUs, O_DIRECT readers alone 12.9-13.0 s,
-    with one worker 14.5 -- and little warm (4 CPUs 13.1-13.5 -> 12.6 s; 6 and 8 the same).
-33. **Automatic staging covers compression only, at one host's thresholds.**  4 CPUs, 16 GiB of
-    input, PCIe Gen4+.  Unmeasured: a Gen4 consumer card (the floor admits it), the Gen3 workstation
-    (excluded; its staged compress was last measured at 1.04 GiB/s, before compress had two
-    streams), --tar, several files.  --adapt's budget prior moves the choice per machine once it has
-    measured.  The staged path's fixed start (about 2 s: CUDA, the pinned pool) sets the size floor.
-    DECODE IS NOT STAGED BY DEFAULT, and why: v0.18.33 first staged it too (up to 6 CPUs for a cold
-    archive), then measured the built binary.  The automatic choice confirms a usable device with
-    CUDA before it commits (decode under --gpu-only has no CPU pool to fall back to), and that
-    serialises cuInit ahead of the reads an explicit `-d --direct-stage` overlaps it with: 4 CPUs,
-    cold, automatic 14.72-14.88 s against explicit 13.69-13.70 -- while hybrid with v0.18.33's
-    cold-archive readers took 13.09-14.04.  Re-enabling it needs (a) the confirmation overlapped with
-    the first reads and a CPU restart for the no-device case (nothing has been written then), and (b)
-    a fix to the dormant recovery code: the automatic decode's CPU-tail recovery after a dishonest
-    seek table keeps the table's checksums keyed by the REJECTED table's decompressed offsets, which
-    the CPU decoder looks up by actual offsets (the production review's last finding, unconfirmed by
-    a run: frames P X X Y Z with the X's merged and Y/Z carrying only table checksums would fail Y
-    against Z's hash).  Those paths (`direct_stage_auto` in the decode producer, the table retry, the
-    CPU tail) are unreachable while gz_auto_stage_decline declines every decode; remove them or fix
-    them before relying on them.
-34. **Hybrid at full width wastes CPU on a drive-bound input.**  Cold compress of 64.84 GiB on all
-    256 CPUs: 13.6 s and 257 CPU-seconds (139 user, 118 system) against 13.8 s and 90 on 16 CPUs --
-    96 workers and 12 O_DIRECT readers for a drive that 14 workers saturate.  v0.18.33 fixed the
-    decode side for a cold archive (three readers); compress is untouched.  Not a wall-time defect,
-    but on a shared host it takes ~10 cores of kernel time from the neighbours.
+31. **CLOSED v0.18.34: `--gds-only` proves every extent in VRAM and compresses on two streams.**
+    Found open in v0.18.33: (a) a seek-table entry merging two frames whose contents are IDENTICAL
+    decoded to one copy at exit 0 (v0.18.33: 2 of 3 MiB written, `-t` OK), because the producer walked
+    only checksumless frames and the swallowed frame's trailer equals the first's; (b) one GPU stream
+    by design (per-stream cuFile registration, and a peer-to-peer output packer per stream).  (a): a
+    kernel (`gzx_launch_extent`, gpuverify.cu) walks each frame's block headers in VRAM, where the read
+    already put it, and the batch is checked before any of it is written -- a dishonest entry exits 4,
+    `--keep-going` decodes every byte; 48.87 GiB cold `-t` 13.58 -> 13.43 s, i.e. free.  With every
+    staged extent proven where the worker holds the frame (`--direct-stage` on its host copy since
+    v0.18.33), the producer's host walk of checksumless frames is gone outside `--keep-going`: an 8 GiB
+    checksumless archive's `-t` 8.84 -> 4.05 s (66,048 preads in 5.41 s before the first batch -> 512 in
+    0.05).  (b): a device's streams share stream 0's pack buffer, driven on its own CUDA stream (a
+    device's batches drain in submit order, so the file stays in order); `--gds-only` compress defaults
+    to two streams and keeps peer-to-peer output, byte-identical to one stream and to the ordinary
+    writer.  64.84 GiB cold: to /dev/null 34.4 -> 22.4 s; to a file on the same NVMe 45.4-49.9 ->
+    38.0-38.5 s.  Several GPUs still use the ordinary writer; `-d`/`-t` keep one stream.
+    And the pack is double-buffered with a write-behind thread (owner's request, kept because it
+    measured faster): the drain fills one pack while a thread writes the other.  To a file on the same
+    NVMe, three runs: synchronous 39.16-39.25 s, write-behind 35.80-35.91, the ordinary writer
+    35.81-36.80 -- level with it at a third of its user CPU (5 s against 13).
+32. **CLOSED v0.18.34: hybrid decode on a small budget takes one CPU decoder for a cached
+    archive while the GPU runs.**  On 4 CPUs the hybrid pool is three decoders beside three
+    buffered readers, the GPU worker and the writer; the decoders took the CPU the readers'
+    page-cache copies need.  MEASURED (48.87 GiB, one H100, 4 CPUs, warm, eight interleaved runs
+    each -- two identical arms differ by up to 8% at this budget): three decoders 13.1-16.6 s,
+    median 15.8, 50-55 CPU-s; one 12.0-15.0, median 13.85, 38-42; two median 14.0.  Cold it is
+    the reverse (v0.18.33's O_DIRECT readers need little CPU): three 12.95-14.36 s, one
+    13.77-14.53, so a cold archive keeps them all.  The design question recorded here -- a pool
+    sized before the GPU answers, which nothing grew on GPU loss -- is answered by WHERE the cap
+    lives: the producer sets it when it keeps buffered readers for a cached archive on 4 CPUs or
+    fewer (g_hyb_decomp_cpu_cap), and the hybrid decoders' take predicate applies it only while a
+    GPU stream is active; unregister_gpu_stream already wakes them, so a GPU that fails or never
+    comes up leaves every decoder working.  -T names the decoders and turns it off.
+33. **CLOSED v0.18.34: several inputs and --tar stage by default; the dormant decode code is gone.**
+    Measured at 4 CPUs, 64.84 GiB cold, one H100: two inputs 31.8-32.0 s staged against hybrid's
+    39.5-43.2 (29-30 CPU-s against 138-154; the fixed start is paid once per process), a --tar of
+    one such member 17.6-17.8 against 24.3-25.5.  So the default stages a compress of several
+    named inputs when EVERY one is a regular file of 16 GiB or more, and a --tar when its sources
+    reach 16 GiB within the first 4,096 entries of a bounded walk (gz_auto_stage_tar_reaches: -C
+    and --exclude applied, symlinks not followed; a bigger tree of small files keeps the default
+    after a few milliseconds of lstat).  --adapt's budget prior stays single-input (its buckets
+    are keyed by one input's residency); several inputs and --tar take the static rule.  The
+    rebuild contract is the existing one per pass, --tar from its sources.  The unreachable
+    automatic-decode recovery code (GzAutoStageDecodeRetry, the table retry, the CPU tail, the
+    decode-only direct_stage_auto branches) is removed, with the suspected checksum-offset P1 in
+    it: decode is not staged by default (v0.18.33), and if it ever is, it starts from v0.18.33's
+    measurements and needs the confirmation overlapped with the first reads.
+    STILL OPEN, not measurable here: a Gen4 consumer card (the floor admits it) and the Gen3
+    workstation (excluded: its staged compress measured 1.04 GiB/s, before compress had two
+    streams) -- the workstation check.  Each staged input re-pinned its 512 MiB staging pool (~280
+    ms) and unpinned it at the end; a finished input's pool now waits for the next of the same size
+    (owner's request, kept because it measured faster): four staged 8 GiB inputs at 4 CPUs
+    11.57-12.87 s re-pinned, 10.30-10.95 reused.
+34. **CLOSED v0.18.34: a cold compress reads O_DIRECT through three readers, and a probe tie goes
+    to O_DIRECT.**  Found: cold compress of 64.84 GiB on all 256 CPUs, 13.6 s and 257 CPU-seconds
+    (139 user, 118 system) against 13.8 s and 90 on 16 CPUs.  NOT the worker count: the system time
+    was bimodal (11-13 s or 115-210 s, the same binary and flags) because the cold-input read probe
+    (O_DIRECT against buffered over ~0.2 s each) gave a tie to buffered -- O_DIRECT had to win by 5%
+    -- and the two measured within 3% (4.77-4.80 against 3.86-4.91 GiB/s).  Buffered input cost
+    115-210 s of kernel CPU, left the whole input in the page cache, and its wall swung 13.7-18.1 s.
+    O_DIRECT read through ONE reader (a v0.13.46 rule from INDEPENDENT partitioned streams), which
+    left the drive idle between reads: 14.1-14.4 s.  Now (MEASURED, three interleaved runs):
+    O_DIRECT through three interleaved readers 13.20-13.27 s (hybrid 13.39-13.45) at 160-166
+    CPU-s, faster than buffered's best (13.73, 13.87-13.95) at 260-355; the probe's O_DIRECT pass
+    reads 5.3-5.7 GiB/s through them against buffered's 3.8; buffered must beat O_DIRECT by more
+    than 10% to be taken; `--read-threads` sets the O_DIRECT count; spinning media keep one.
+    Found on the way: an explicit `--direct-read` still asked for huge pages and prefaulted its whole
+    pool on one thread, which stalled where memory is mostly page cache (14.4, 15.0, 23.5 s; hybrid
+    16.0, 28.1, 29.4 with a 23.5 GiB pool); plain pages 14.08-14.61, as the probe has used since
+    v0.18.16.  Decode's cold-archive readers (v0.18.33) are unchanged.
+
+35. **Follow-ups found while closing 31-34 (v0.18.34), none a defect.**
+    - **The workstation check of 34's read path.**  Three interleaved O_DIRECT readers and the 10%
+      buffered margin were measured on one drive (the server's Gen5 NVMe, 256 CPUs).  The Gen3
+      workstation (24 CPUs, its own NVMe) should confirm the cold-compress choice and the reader
+      count there; its last O_DIRECT measurement predates both (1.42x over buffered, one reader).
+      Also seen: --cpu-only at 8 CPUs (compute-bound) 17.33-18.36 s against 17.14-17.93 -- within
+      noise, possibly 1% for the extra reader threads.
+    - **--gds-only decode could read each frame's trailer on the device.**  The producer still
+      preads each frame's 4-byte checksum trailer on the host before any batch (the -d note in
+      gds_staged_frames_to_queue: ~1.2 s of a ~21 s -d on a 65 GiB archive).  The device extent walk
+      (gzx_launch_extent) now reaches each frame's real end, so it could return the trailer too,
+      leaving only the header read on the host.
+    - **A pre-6.4 kernel's explicit --direct-read keeps huge pages.**  v0.18.34 moved it to plain
+      pages on 6.4+ after measuring the stall here; nothing has measured a pre-6.4 host either way.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

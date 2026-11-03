@@ -165,6 +165,10 @@ declare -a ALLOW_CALLEE=(
 # Whole-text exemptions for things the callee list cannot express. Comment the
 # exemption at the SITE as well, so it is visible where someone edits it.
 declare -a ALLOW=(
+  # Reader configuration, not an integer destination.  The ternary's buffered
+  # arm contains threads / 8, which gives this Options-pointer call the read
+  # shape despite neither argument receiving bytes.  Exempt only this call.
+  'gz_direct_read_streams(&opt, borrowed_fd)'
   # Word-wise all-zero scan: the value is only ever compared against 0, which is
   # the same in every byte order, and it reads a data block, not an integer FIELD.
   'std::memcpy(&w, p + i * sizeof(size_t), sizeof(w));'

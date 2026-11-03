@@ -361,3 +361,81 @@ extern "C" void gzp_launch_finalize(void * pack,
       (const unsigned long long *)d_csz,
       (const unsigned int *)d_ck, n);
 }
+
+/*======================================================================
+ gzx_extent — where each frame REALLY ends, walked in VRAM (v0.18.34)
+ -----------------------------------------------------------------------
+ --gds-only reads a frame drive -> VRAM by the extent the seek table claims,
+ and the table's claim is not evidence.  An entry that swallows the next frame
+ reads that frame's trailer as its own checksum; when the two frames' contents
+ are identical (zeroed regions, repeated blocks) the trailer IS the first's, the
+ device XXH64 matches, and the second frame vanished at exit 0.  --direct-stage
+ closed this in v0.18.33 with ZSTD_findFrameCompressedSize on its pinned host
+ copy; --gds-only has no host copy, so the same walk runs here, on the bytes
+ the read already put in VRAM.
+
+ THE SAME WALK AS gds_frame_extent_matches (gzstd.cpp): frame header, then one
+ 3-byte block header per block, then the optional 4-byte checksum.  It never
+ reads past `claimed`: a frame that would run past the claim reports ~0ULL,
+ and one that ends early reports where it ends.  The host compares the result
+ with the claim; anything else is the table's defect.
+
+ One thread per frame.  A 16 MiB frame is ~128 blocks, so a thread makes ~128
+ dependent 3-byte loads -- tens of microseconds, with every frame of the batch
+ walking at once.
+======================================================================*/
+__device__ unsigned long long gzx_frame_extent(const unsigned char * p,
+                                               unsigned long long claimed)
+{
+  const unsigned long long BAD = ~0ULL;
+  if (!p || claimed < 9) return BAD;
+  if (p[0] != 0x28 || p[1] != 0xB5 || p[2] != 0x2F || p[3] != 0xFD) return BAD;
+  const unsigned fhd = p[4];
+  if (fhd & 0x08u) return BAD;                      // reserved descriptor bit
+  unsigned long long pos = 5;                       // magic + descriptor
+  if (!(fhd & 0x20u)) ++pos;                        // Window_Descriptor
+  const unsigned did = fhd & 3u;                    // Dictionary_ID: 0/1/2/4 bytes
+  pos += (did == 3u) ? 4u : did;
+  const unsigned fcs_code = fhd >> 6;               // Frame_Content_Size
+  pos += fcs_code == 0 ? ((fhd & 0x20u) ? 1u : 0u) : (1ull << fcs_code);
+  if (pos > claimed) return BAD;
+  for (;;) {
+    if (claimed - pos < 3) return BAD;
+    const unsigned bh = (unsigned)p[pos] | ((unsigned)p[pos + 1] << 8)
+                      | ((unsigned)p[pos + 2] << 16);
+    const unsigned type = (bh >> 1) & 3u;           // 0 raw, 1 RLE, 2 compressed
+    const unsigned long long bsize = bh >> 3;
+    if (type == 3u || bsize > 128ull * 1024ull) return BAD;
+    const unsigned long long stored = type == 1u ? 1ull : bsize;
+    pos += 3;
+    if (stored > claimed - pos) return BAD;
+    pos += stored;
+    if (bh & 1u) break;                             // Last_Block
+  }
+  if (fhd & 0x04u) {                                // Content_Checksum_flag
+    if (claimed - pos < 4) return BAD;
+    pos += 4;
+  }
+  return pos;
+}
+
+__global__ void gzx_extent_kernel(const unsigned char * const * __restrict__ ptrs,
+                                  const size_t * __restrict__ sizes,
+                                  int n, unsigned long long * __restrict__ out)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = gzx_frame_extent(ptrs[i], (unsigned long long)sizes[i]);
+}
+
+// Launch on `stream`, after the reads that filled the frames and the upload of
+// their device pointers and claimed sizes (the same arrays nvCOMP is given).
+extern "C" void gzx_launch_extent(const void * d_ptrs, const size_t * d_sizes,
+                                  int n, unsigned long long * d_out, void * stream)
+{
+  if (n <= 0) return;
+  const int threads = 64;
+  const int blocks  = (n + threads - 1) / threads;
+  gzx_extent_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+      (const unsigned char * const *)d_ptrs, d_sizes, n, d_out);
+}

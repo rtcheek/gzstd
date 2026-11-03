@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.33";
+static constexpr const char * GZSTD_VERSION = "0.18.34";
 //
 // Architecture overview:
 //
@@ -1131,6 +1131,9 @@ static std::atomic<uint64_t> g_gdsv_read_ns{0};
 static std::atomic<uint64_t> g_gdsv_read_bytes{0};
 static std::atomic<uint64_t> g_gdsv_kernel_ns{0};
 static std::atomic<uint64_t> g_gdsv_reads{0};
+// --gds-only frames whose extent the device walk proved (gzx_launch_extent);
+// reported with the verify reads at -v, and what a cell counts.
+static std::atomic<uint64_t> g_gds_extent_frames{0};
 // The generic -vvv "D2H" bucket on staged decompress starts before the
 // device checksum and ends after every cuFileWrite, so it cannot answer how
 // much of that phase is integrity work and how much is the output device.
@@ -1301,6 +1304,7 @@ static void gds_decomp_read_close()
   g_gdsv_read_bytes.store(0, std::memory_order_relaxed);
   g_gdsv_kernel_ns.store(0, std::memory_order_relaxed);
   g_gdsv_reads.store(0, std::memory_order_relaxed);
+  g_gds_extent_frames.store(0, std::memory_order_relaxed);
   g_gdsd_post_ns.store(0, std::memory_order_relaxed);
   g_gdsd_write_ns.store(0, std::memory_order_relaxed);
   g_gdsd_writes.store(0, std::memory_order_relaxed);
@@ -1350,18 +1354,6 @@ static unsigned long long g_gds_bar1_before = 0;
 // whole file.
 static std::atomic<uint64_t> g_dstage_bytes{0};
 static std::atomic<uint64_t> g_dstage_frames{0};
-#ifdef HAVE_NVCOMP
-// Automatic decode may reject an index after earlier batches were written.
-// Its sole GPU/stream publishes the start of the wholly undelivered batch;
-// the ordered writer drains only the proven prefix, then the caller streams
-// the remaining file on CPU.  Nothing already written needs to be discarded,
-// so this also works with a pipe or an append-only output.
-struct GzAutoStageDecodeRetry {
-  uint64_t seq = 0, off = 0;
-  std::atomic<bool> pending{false};
-};
-static GzAutoStageDecodeRetry g_auto_stage_decode_retry;
-#endif
 // --tar --direct-stage: MEMBER bytes by how they were read.  g_dstage_bytes
 // counts whole frames (headers and padding included) moved host -> VRAM; these
 // say whether the member data under them came through O_DIRECT or through the
@@ -1456,7 +1448,16 @@ static std::atomic<uint64_t> g_gds_cout_writes{0};    // aligned cuFileWrite cou
 static std::atomic<uint64_t> g_gds_cout_bytes{0};
 static std::atomic<uint64_t> g_gds_cout_drain_ns{0};  // whole P2P pack branch
 static std::atomic<uint64_t> g_gds_cout_sync_ns{0};   // pack/finalize/carry GPU wait
-static std::atomic<uint64_t> g_gds_cout_write_ns{0};  // synchronous cuFileWrite only
+static std::atomic<uint64_t> g_gds_cout_write_ns{0};  // cuFileWrite (the writer's, with write-behind)
+static std::atomic<uint64_t> g_gds_cout_wb_wait_ns{0}; // drain waiting for the write-behind
+static std::atomic<uint64_t> g_gds_cout_wb_writes{0};  // writes the write-behind thread issued
+// GZSTD_DEBUG_GDS_COUT_SYNC=1 (A/B control, v0.18.34): write every pack flush on
+// the drain thread, as before the write-behind.
+static bool gds_cout_write_behind_on()
+{
+  static const bool on = ::getenv("GZSTD_DEBUG_GDS_COUT_SYNC") == nullptr;
+  return on;
+}
 // The peer-to-peer path bypasses the writer thread, which is what normally
 // advances the progress meter.  gpu_drain_batch has no Meter parameter, so the
 // one owner (compress_nvcomp) publishes it here for the duration of the run.
@@ -1549,6 +1550,7 @@ public:
       return false;
     }
     for (size_t i = 0; i < n_bufs; ++i) free_.push_back((int)i);
+    n_bufs_ = n_bufs;
     return true;
   }
   bool init(size_t buf_size, size_t n_bufs, std::string * why) {
@@ -1574,6 +1576,7 @@ public:
       return false;
     }
     for (size_t i = 0; i < n_bufs; ++i) free_.push_back((int)i);
+    n_bufs_ = n_bufs;
     return true;
   }
   // Blocks until a buffer is free; -1 after set_done() (abort: no buffer is
@@ -1596,6 +1599,13 @@ public:
   }
   int    device() const { return device_; }
   bool   host() const { return host_; }                        // init_host() pool
+  size_t count() const { return n_bufs_; }
+  // A HOST pool a finished run can hand to the next input (v0.18.34): every slot
+  // back, never aborted.  Pinning is the expensive part (~280 ms for 512 MiB).
+  bool   reusable() {
+    std::lock_guard<std::mutex> lk(m_);
+    return host_ && base_ && !done_ && free_.size() == n_bufs_;
+  }
   void * base() const { return base_; }                       // the REGISTERED base
   size_t stride() const { return buf_size_; }
   off_t  offset_of(int slot) const { return (off_t)((size_t)slot * buf_size_); }
@@ -1609,6 +1619,7 @@ private:
   size_t   buf_size_ = 0;
   int      device_ = 0;
   bool     host_ = false;
+  size_t   n_bufs_ = 0;
   GdsBuf   reg_;
   std::vector<int> free_;
   std::mutex m_;
@@ -1620,6 +1631,14 @@ private:
 // outlives every releaser (cleared after the joins, destroyed after that).  Same
 // shape and same reasoning as g_direct_read_pool.
 static std::atomic<GdsStagePool *> g_gds_stage_pool{nullptr};
+// THE STAGED COMPRESS'S PINNED POOL OUTLIVES ITS INPUT (v0.18.34, ROADMAP 33).
+// Each staged input pinned its own ~512 MiB pool, ~280 ms before its first
+// read, and freed it at the end.  A finished run's pool waits here for the next
+// input of the same frame size and depth (several inputs, automatic staging of
+// each, or the -r/--tar inputs of one invocation).  A raw pointer, never
+// destroyed at exit: cudaFreeHost in a static destructor can run after the CUDA
+// runtime has gone.  GZSTD_DEBUG_DSTAGE_NO_REUSE=1 pins afresh (A/B control).
+static GdsStagePool * g_dstage_pool_cache = nullptr;
 static void gz_gds_stage_release(int slot) {
   GdsStagePool * p = g_gds_stage_pool.load(std::memory_order_acquire);
   if (p) p->release(slot);
@@ -4532,16 +4551,17 @@ static void print_help()
 "                      hybrid/GPU run stalls SECS s (default 30), dump JSON\n"
 "                      and abort)\n"
 "  --direct-read / --no-direct-read\n"
-"                      O_DIRECT input: single stream on compress; parallel on\n"
-"                      eligible decompress inputs; bypasses the page cache\n"
-"                      (auto-chosen for a COLD compress after measuring both\n"
-"                      read paths on the real data, and for a COLD archive's\n"
-"                      decode on 8 CPUs or fewer; --no- pins it off)\n"
+"                      O_DIRECT input: 3 interleaved readers on compress;\n"
+"                      parallel on eligible decompress inputs; bypasses the\n"
+"                      page cache (auto-chosen for a COLD compress unless\n"
+"                      buffered reads measure 10% faster on the real data,\n"
+"                      and for a COLD archive's decode on 8 CPUs or fewer;\n"
+"                      --no- pins it off)\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
-"  --read-threads N    parallel readers for buffered input and O_DIRECT\n"
-"                      decompress (default: auto 3..12 by -T, and at most 3\n"
-"                      for a cold archive, where more only add kernel time;\n"
-"                      1 = single; n/a for pipes and O_DIRECT compress)\n"
+"  --read-threads N    parallel readers for buffered and O_DIRECT input\n"
+"                      (default: auto 3..12 by -T for buffered, 3 for\n"
+"                      O_DIRECT, at most 3 for a cold archive, where more\n"
+"                      only add kernel time; 1 = single; n/a for pipes)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -5078,9 +5098,19 @@ static void print_help_long()
 "     reads cold from disk, with no cache to drop, so no kcompactd\n"
 "     compaction stall and no eviction of other users' cached data\n"
 "     (unlike --cold, which drops the cache via fadvise).\n"
-"     On COMPRESS it is a single stream: it cannot use --read-threads\n"
-"     and cannot go through mmap.  When the input is already cached the\n"
-"     buffered path is faster, which is why this is not the default.\n"
+"     On COMPRESS it reads through THREE readers (v0.18.34; one before)\n"
+"     pulling interleaved chunks, so the drive still sees one sequential\n"
+"     stream with a request always queued; --read-threads sets the count\n"
+"     (1 on spinning media).  It cannot go through mmap.  When the input\n"
+"     is already cached the buffered path is faster, which is why this\n"
+"     is not the default for a cached input.  A COLD input of 4 GiB or\n"
+"     more is read O_DIRECT by default unless buffered reads measure\n"
+"     more than 10% faster over its first ~0.2 s (v0.18.34; before, a\n"
+"     tie went to buffered, which costs about ten times the kernel CPU\n"
+"     and leaves the whole input in the page cache).  MEASURED on the\n"
+"     8-GPU server, 64.84 GiB cold, 256 CPUs: 13.2-13.3 s with three\n"
+"     readers against 14.1-14.4 with one and buffered's 13.7-18.1, and\n"
+"     160 CPU-seconds against 260-350.\n"
 "     --sliding-window honours it too since v0.18.4 (before, the flag was\n"
 "     ignored there).  MEASURED on the 8-GPU server, 19.5 GiB, level 3,\n"
 "     cache dropped, medians of 3: 5.1-5.3 s against 8.2-9.3 s buffered,\n"
@@ -5130,7 +5160,7 @@ static void print_help_long()
 "\n"
 "  --read-threads N    (default: 0 = auto)\n"
 "     Number of parallel reader threads for buffered input and for the\n"
-"     O_DIRECT decompress prefetch path.  A\n"
+"     O_DIRECT input.  A\n"
 "     single reader's per-frame copy and read syscalls can cap throughput\n"
 "     on a fast box; spreading them over N threads lifts that ceiling.\n"
 "     Applies to compress (the pooled reader — used when mmap is declined,\n"
@@ -5141,8 +5171,10 @@ static void print_help_long()
 "     starting point: it may contract to half the start or grow to as much as\n"
 "     min(3*start, 32), and a matching per-machine profile entry may seed\n"
 "     the starting count.  N > 0 PINS the pool and disables that search.\n"
-"     1 = force a single reader.  Ignored for pipes and for O_DIRECT\n"
-"     compress; a seekable stdin redirect (gzstd < FILE) does use it.\n"
+"     1 = force a single reader.  O_DIRECT compress (--direct-read, or\n"
+"     a cold input the read probe gave to O_DIRECT) takes 3 readers, or\n"
+"     N when given (v0.18.34; it ignored the flag before).  Ignored for\n"
+"     pipes; a seekable stdin redirect (gzstd < FILE) does use it.\n"
 "\n"
 "  --cold    (default: off)\n"
 "     Drop the input from the page cache (posix_fadvise DONTNEED) before\n"
@@ -5538,6 +5570,11 @@ static void print_help_long()
 "     and a smaller batch would make it, not the drive, the bottleneck.\n"
 "     An explicit --gpu-batch overrides that raised default (the VRAM\n"
 "     fit search still clamps it if the card cannot hold it).\n"
+"     v0.18.34: every frame's extent is proven on the GPU before decode\n"
+"     writes it (a dishonest seek table exits 4), and compression runs\n"
+"     two streams that share one double-buffered pack written behind the\n"
+"     drains (64 GiB cold to /dev/null 34.4 -> 22.4 s, to a file on the\n"
+"     same NVMe 45-50 -> 35.8 s); decompression keeps one stream.\n"
 "\n"
 "     SETUP AND DIAGNOSIS.  GDS.md covers the four requirements, how to\n"
 "     install nvidia-fs, and the version gate that matters most: before\n"
@@ -5674,14 +5711,18 @@ static void print_help_long()
 "\n"
 "     THE DEFAULT ON A SMALL CPU BUDGET (v0.18.33).  When this process may\n"
 "     use few CPUs (a container's cpuset or quota, a taskset) and a GPU\n"
-"     is available, a plain COMPRESS of one named file takes this path\n"
-"     WITHOUT the flag: up to 4 CPUs, 16 GiB or more of input (below that\n"
-"     the staged path's fixed start, about 2 s, outweighs its gain), PCIe\n"
-"     Gen4 or newer, and no option that names a backend, tunes the GPU or\n"
-"     hybrid, or sets a compression level or zstd parameter (the GPU has\n"
-"     one fixed level).  The input must be regular and accept O_DIRECT.\n"
-"     --verify, --keep-going, --no-check, --chunk-size, --mmap=on,\n"
-"     --no-direct-read, --tar and calibration keep the ordinary path.  Hybrid\n"
+"     is available, a COMPRESS of named files takes this path WITHOUT the\n"
+"     flag: up to 4 CPUs, 16 GiB or more in EVERY input (below that the\n"
+"     staged path's fixed start, about 2 s, outweighs its gain) -- or, for\n"
+"     --tar (v0.18.34), sources that reach 16 GiB between them within the\n"
+"     first 4,096 entries -- PCIe Gen4 or newer, and no option that names a\n"
+"     backend, tunes the GPU or hybrid, or sets a compression level or zstd\n"
+"     parameter (the GPU has one fixed level).  Inputs must be regular and\n"
+"     accept O_DIRECT.  --verify, --keep-going, --no-check, --chunk-size,\n"
+"     --mmap=on, --no-direct-read and calibration keep the ordinary path.\n"
+"     Several inputs and --tar stage since v0.18.34: 4 CPUs, two 64 GiB\n"
+"     inputs 31.8-32.0 s against hybrid's 39.5-43.2; a 64 GiB --tar\n"
+"     17.6-17.8 against 24.3-25.5.  Hybrid\n"
 "     cannot use so few CPUs well: its CPU workers compete with its own\n"
 "     readers.  MEASURED on the 8-GPU server, 64 GiB cold on NVMe, one\n"
 "     H100, three runs each, compress hybrid against staged:\n"
@@ -5693,7 +5734,10 @@ static void print_help_long()
 "     a cold archive (see --read-threads) hybrid decodes as fast on a\n"
 "     small budget (4 CPUs: 13.0-14.0 s against 13.6-13.8), and the\n"
 "     automatic choice would have to start CUDA before reading where an\n"
-"     explicit -d --direct-stage overlaps the two.\n"
+"     explicit -d --direct-stage overlaps the two.  A CACHED archive on\n"
+"     4 CPUs or fewer decodes on one hybrid CPU worker while the GPU runs\n"
+"     (v0.18.34; 48.87 GiB warm: median 15.8 -> 13.85 s), all of them\n"
+"     when it does not; -T names the decoders.\n"
 "     The automatic choice keeps the default's promise to finish: it is\n"
 "     made only after CUDA confirms the device, and a compress whose GPU\n"
 "     then fails, whose staging memory cannot be pinned, or whose input\n"
@@ -10031,8 +10075,7 @@ static int adapt_backend_used(const Options & opt)
   if (opt.gpu_only)
     return (opt.direct_stage && !opt.gds_only
             && g_adapt_budget_slot.load(std::memory_order_relaxed) >= 0
-            && g_dstage_frames.load(std::memory_order_relaxed) > 0
-            && !g_auto_stage_decode_retry.pending.load(std::memory_order_acquire)) ? 3 : 0;
+            && g_dstage_frames.load(std::memory_order_relaxed) > 0) ? 3 : 0;
 #else
   if (opt.gpu_only) return 0;
 #endif
@@ -14012,9 +14055,17 @@ public:
   // placement), so there is no test to make, only a default to choose.
   // The workstation figure above (3.10 vs 3.85 s) compared huge pages with
   // the MEMSET path, whose 4 GiB memset costs ~1.8 s on its own here; plain
-  // and unprefaulted is owed an A/B there.  Explicit O_DIRECT keeps huge pages (its DMA
-  // segments need them), and a pre-6.4 kernel keeps the memset (its faults
-  // during reads contend on mmap_lock).
+  // and unprefaulted is owed an A/B there.  A pre-6.4 kernel keeps the memset
+  // (its faults during reads contend on mmap_lock).
+  //
+  // v0.18.34: AN EXPLICIT --direct-read TAKES PLAIN PAGES TOO, on a 6.4+ kernel.
+  // It kept huge pages "for its DMA segments" after the probe's pool dropped
+  // them -- and the probe's O_DIRECT remainder was already faster on plain pages
+  // (v0.18.16).  The same stall struck it: MEASURED on the 8-GPU server, 64.84 GiB
+  // cold, three runs after a buffered run had refilled the page cache, huge pages
+  // 14.4, 15.0 and 23.5 s (hybrid 16.0, 28.1, 29.4: a 23.5 GiB pool prefaulted on
+  // one thread), plain pages 14.08-14.56 (14.21-14.61), the reader 64% busy on
+  // the slow runs against 98%.
   bool init(size_t buf_size, size_t n_bufs, bool want_thp, bool prefault_plain = true) {
     buf_size_ = buf_size;
     // Allocate the WHOLE pool as one big region (not n_bufs small ones) and slice it.
@@ -14205,7 +14256,7 @@ public:
     q_.insert(it, std::move(t));
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in wait_for_batch_or_cap
-    cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
+    notify_cpu_work_locked();  // capped decoders have different take predicates
     const size_t head = q_.front().seq;
     lk.unlock();           // MUST precede the poke — see notify_throttle_()
     notify_throttle_(head);
@@ -14220,20 +14271,6 @@ public:
   {
     std::lock_guard<std::mutex> lk(m_);
     return !q_.empty() && q_.front().seq <= s;
-  }
-
-  // Last-GPU handoff for automatic staged decode.  Wait for its first owed
-  // Task without taking it: the caller will close the queue and stream from
-  // this boundary.  A producer that stood down supplies host Tasks instead,
-  // which still belong to the ordinary CPU rescue pool.
-  bool wait_staged_front(uint64_t & seq, uint64_t & off)
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [&] { return done_ || !q_.empty(); });
-    if (q_.empty() || q_.front().src_off < 0) return false;
-    seq = q_.front().seq;
-    off = (uint64_t)q_.front().src_off;
-    return true;
   }
 
   // A worker parked in the throttle with zero permits cannot see that a push
@@ -14307,7 +14344,7 @@ public:
     }
     batch.clear();
     cv_.notify_all();
-    cpu_cv_.notify_one();
+    notify_cpu_work_locked();
     const size_t head = q_.front().seq;
     lk.unlock();
     notify_throttle_(head);   // these are the OLDEST frames — the writer may want one
@@ -14505,13 +14542,20 @@ public:
     cpu_cv_.notify_all();
   }
 
-  // Wake ONE CPU worker.  Used by the high-frequency gpu_got_data() path
-  // to avoid thundering herd: each CPU pops one frame then loops back,
-  // so waking all N threads just causes N-1 to contend on m_, check the
-  // predicate, and go back to sleep.
+  // A decoder cap makes the waiters' take predicates differ.  A work wake
+  // must then include the eligible worker: notify_one may choose a capped
+  // worker, which goes back to sleep while worker 0 never sees the work.
+  // Set before the capped input's first push; this queue lives for one input.
+  void set_cpu_wake_all() { cpu_wake_all_.store(true, std::memory_order_relaxed); }
+
+  // Normally wake ONE CPU worker to avoid a thundering herd.  The small
+  // capped pool needs all its waiters woken, on pushes, requeues and GPU pops.
   void notify_cpu_one()
   {
-    cpu_cv_.notify_one();
+    // gpu_got_data changes its semaphore outside m_.  With only one eligible
+    // decoder a wake lost between that decoder's check and wait is fatal too.
+    if (cpu_wake_all_.load(std::memory_order_relaxed)) notify_cpu_waiters_fenced();
+    else cpu_cv_.notify_one();
   }
 
   // State snapshot passed to CPU worker predicates.  Lets the predicate
@@ -14658,6 +14702,14 @@ public:
   }
 
 private:
+  // Push/requeue already hold m_; using the fenced public notifier here would
+  // lock it twice.  The state change and this wake share the waiter's mutex.
+  void notify_cpu_work_locked()
+  {
+    if (cpu_wake_all_.load(std::memory_order_relaxed)) cpu_cv_.notify_all();
+    else cpu_cv_.notify_one();
+  }
+
   // Shared by push(), the --adapt backlog probe, and CPU predicates.  A CPU
   // --cpu-batch floor cannot wait for more frames once this cap stops the producer.
   // CALLER MUST HOLD m_.
@@ -14705,6 +14757,7 @@ private:
   mutable std::mutex      m_;        // mutable: front_seq_at_most() is a const probe
   std::condition_variable cv_;
   std::condition_variable cpu_cv_;   // dedicated CV for CPU workers (avoids spurious wakes from GPU pops)
+  std::atomic<bool> cpu_wake_all_{false};  // waiters with different take predicates need a broadcast
   std::condition_variable space_cv_; // producer waits here when a bounded queue is full
   FrameThrottle *         throttle_ = nullptr;  // optional; poked after each push
   const std::atomic<size_t> * cursor_ = nullptr;  // the writer's next frame (ResultStore::next_pub)
@@ -20299,6 +20352,30 @@ static thread_local GzTlDCtx tl_dctx_owner;
 static constexpr size_t CPU_DECOMP_STREAM_MIN = 64 * ONE_MIB;
 
 
+#ifdef HAVE_NVCOMP
+// HYBRID DECODE ON A SMALL BUDGET TAKES ONE CPU DECODER WHILE A GPU RUNS, when
+// its archive is read through the page cache (v0.18.34, ROADMAP 32).  On 4 CPUs
+// the hybrid CPU pool is three decoders, beside three buffered readers, the GPU
+// worker and the writer: the decoders take the CPU the readers' page-cache
+// copies need, and the GPU waits on its intake.  MEASURED, 48.87 GiB archive,
+// one H100, 4 CPUs, warm, eight interleaved runs each: three decoders (the
+// default) 13.1-16.6 s, median 15.8, 50-55 CPU-s; one 12.0-15.0, median 13.85,
+// 38-42 CPU-s; two 12.9-15.2, median 14.0 (two identical arms differed by up to
+// 8% at this budget, so it took eight).
+// Cold it is the reverse (O_DIRECT readers need little CPU, and three decoders
+// are faster: 13.2 s against 14.5 with one), so the producer sets this only
+// where it chose buffered readers for a cached archive.  0 = no cap.  It is read
+// by the hybrid decoders' take predicate, so it applies to workers already
+// running, and ONLY WHILE A GPU STREAM IS ACTIVE: before the GPU is up, after it
+// fails, or if it never comes up, every decoder takes work -- the pool that
+// grows on GPU loss that ROADMAP 32 asked for, since unregister_gpu_stream wakes
+// the waiting decoders.
+static std::atomic<int> g_hyb_decomp_cpu_cap{0};
+// Takes the cap refused while a GPU stream ran: -v reports it, and it is what a
+// cell counts -- the cap's -v line alone says it was set, not that it bit.
+static std::atomic<uint64_t> g_hyb_decomp_cap_waits{0};
+#endif
+
 static void cpu_decomp_worker(
   int worker_id,
   TaskQueue * tq,
@@ -20437,6 +20514,14 @@ static void cpu_decomp_worker(
         if (qs.done && !sched->any_gpu_active()) return true;
         // Normal scheduling: respect GPU priority and queue depth threshold
         if (!sched->should_cpu_take()) return false;
+        // A small budget's cached archive: decoders past the cap wait while a
+        // GPU stream is active (g_hyb_decomp_cpu_cap).
+        if (const int cap = g_hyb_decomp_cpu_cap.load(std::memory_order_relaxed);
+            cap > 0 && worker_id >= cap && !sched->is_fixed_mode()
+            && sched->any_gpu_active()) {
+          g_hyb_decomp_cap_waits.fetch_add(1, std::memory_order_relaxed);
+          return false;
+        }
         // Floor only in adaptive mode — fixed-share would deadlock here.
         if (!sched->is_fixed_mode()) {
           size_t floor = sched->cpu_queue_floor();
@@ -20559,6 +20644,22 @@ static void cpu_decomp_worker(
         die(gz_stage_name(*opt)
             + ": short read re-reading frame " + std::to_string(t.seq)
             + " on the CPU rescue path", EXIT_IO);
+      // The GPU may fail before its extent walk.  Prove the same boundary on
+      // the bytes rescue already read, before either CPU decoder can deliver
+      // them.  Capacity is not an extent proof: a one-shot decode also accepts
+      // concatenated empty frames, and a streaming decode stops at the first
+      // frame without consuming the rest of a merged seek-table entry.
+      const size_t fc = ZSTD_findFrameCompressedSize(host.data(), host.size());
+      if (ZSTD_isError(fc) || fc != host.size()) {
+        const std::string why =
+            "this archive's seek table gives frame " + std::to_string(t.seq)
+          + " a compressed extent of " + std::to_string(host.size())
+          + " bytes, but " + (ZSTD_isError(fc) ? std::string("no single frame fits it")
+                              : "the frame there ends after " + std::to_string(fc))
+          + ", so the table does not account for every frame in the file";
+        gds_table_defect(*opt, why);
+        die(why, EXIT_DATA);
+      }
       t.data.swap(host);
       t.src_off = -1;                 // now an ordinary host-backed Task
       t.src_len = 0;
@@ -20928,23 +21029,6 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   const bool staged_input_unreadable = decompress
       && g_gds_read_active.load(std::memory_order_relaxed)
       && g_gds_verify_plain_fd < 0;
-  if (decompress && opt.direct_stage_auto
-      && g_gds_read_active.load(std::memory_order_acquire)) {
-    uint64_t seq = 0, off = 0;
-    if (queue->wait_staged_front(seq, off)) {
-      // Index-derived Tasks have not all proved their extents yet.  A CPU
-      // rescue must find real boundaries too, rather than decoding an entry
-      // which could contain two frames into a buffer sized for just one.
-      g_auto_stage_decode_retry.seq = seq;
-      g_auto_stage_decode_retry.off = off;
-      g_auto_stage_decode_retry.pending.store(true, std::memory_order_release);
-      queue->set_done();
-      { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
-      vlog(V_NORMAL, opt, "WARNING: the staged GPU could not finish; decoding the "
-                          "remaining stream on the CPU\n");
-      return;
-    }
-  }
   // THE DEFAULT'S STAGING REBUILDS INSTEAD (v0.18.33).  A compress that staged
   // only because the CPU budget was small has no CPU rescue either, but it has
   // the driver's: abort this pass exactly as a GPU fault does, and the driver
@@ -22155,6 +22239,20 @@ static size_t stream_frames_to_queue(
       }
       const bool cold_direct = cold == 1 && !opt.gpu_only
                             && gz_cpu_allowance().allowed() <= 8;
+      // A CACHED archive on 4 CPUs or fewer keeps its buffered readers, and the
+      // hybrid pool decodes on one CPU worker while a GPU runs
+      // (g_hyb_decomp_cpu_cap).  Not under -T, which names the decoders.
+#ifdef HAVE_NVCOMP
+      if (cold == 0 && !opt.direct_read && opt.hybrid && opt.cpu_share < 0.0
+          && opt.cpu_threads == 0 && !opt.cpu_only && !opt.gpu_only
+          && gz_cpu_allowance().allowed() <= 4) {
+        queue.set_cpu_wake_all();
+        g_hyb_decomp_cpu_cap.store(1, std::memory_order_relaxed);
+        vlog(V_VERBOSE, opt, "[HYBRID] the archive is cached and " + std::to_string(
+             gz_cpu_allowance().allowed()) + " CPUs are allowed: one CPU decoder while "
+             "the GPU runs, the rest when it does not\n");
+      }
+#endif
       // -T chooses decoders, not an explicit reader count.  Keep the automatic
       // cold setting at three even with a large -T on a small CPU allowance.
       // This also bounds a direct pool that later falls back after EINVAL.
@@ -24798,13 +24896,11 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 // default.  Returns the page-cache-resident fraction, or -1 if unknowable.
 static double adapt_path_residency(const std::string & path);
 
-static bool device_is_rotational(const std::string & path)
+static bool device_is_rotational_st(const struct stat & st)
 {
 #ifdef _WIN32
-  (void)path; return false;
+  (void)st; return false;
 #else
-  struct stat st{};
-  if (::stat(path.c_str(), &st) != 0) return false;
   char p[128];
   std::snprintf(p, sizeof p, "/sys/dev/block/%u:%u/queue/rotational",
                 (unsigned)major(st.st_dev), (unsigned)minor(st.st_dev));
@@ -24822,6 +24918,45 @@ static bool device_is_rotational(const std::string & path)
   std::fclose(f);
   return got && v == 1;
 #endif
+}
+static bool device_is_rotational(const std::string & path)
+{
+#ifdef _WIN32
+  (void)path; return false;
+#else
+  struct stat st{};
+  if (::stat(path.c_str(), &st) != 0) return false;
+  return device_is_rotational_st(st);
+#endif
+}
+
+// O_DIRECT READS TAKE THREE INTERLEAVED READERS (v0.18.34, ROADMAP 34).  A
+// compress read O_DIRECT through ONE reader since v0.13.46, on a measurement of
+// four INDEPENDENT streams (partitioned regions, ~3.0 GB/s against one stream's
+// 4.5).  The pooled readers are not that: they pull interleaved chunk indices
+// from one counter, so the offsets in flight are adjacent and the device still
+// sees a sequential stream -- the buffered pool has run that way since
+// v0.13.63.  One reader leaves the drive idle between its reads (the buffer
+// hand-off, a first touch of each pool buffer), and two or three keep a request
+// queued.  MEASURED, 64.84 GiB cold compress to /dev/null, 256 CPUs, three
+// interleaved runs (dd reads the drive at 4.84-5.03 GiB/s with one stream and
+// the same with two):
+//   O_DIRECT 1 reader  14.14-14.39 s   (hybrid 14.32-14.69)   154-162 CPU-s
+//            2 readers 13.49-13.62     (13.71-13.85)          160-170
+//            3 readers 13.20-13.27     (13.39-13.45)          160-166
+//   buffered 12 readers 13.73 at best  (13.87-13.95), 17.7-18.1 in a third to
+//                      two thirds of runs, 260-355 CPU-s, and the whole input
+//                      left in the page cache
+// The read probe's O_DIRECT pass reads through the same three: 5.34-5.67 GiB/s
+// against buffered's 3.77-3.84.  --read-threads sets the count (it used to
+// leave O_DIRECT at one); spinning media keep one, as a queue-depth-1 stream.
+static const int DIRECT_READ_STREAMS = 3;
+static int gz_direct_read_streams(const Options * optp, int fd)
+{
+  if (optp && optp->read_threads > 0) return (int)optp->read_threads;
+  struct stat st{};
+  if (fd >= 0 && ::fstat(fd, &st) == 0 && device_is_rotational_st(st)) return 1;
+  return DIRECT_READ_STREAMS;
 }
 
 // A bounded pass over the input, so the same reader can be run twice at the
@@ -24862,15 +24997,39 @@ struct ReadWindow {
 };
 
 // Both producers grade the same two timed passes.  Leave first touch out of
-// each rate and require a 5% gain over buffered input; the test hook and the
-// diagnostic must describe that same decision on CPU and GPU/hybrid paths.
+// each rate; the test hook and the diagnostic must describe that same decision
+// on CPU and GPU/hybrid paths.
+//
+// A TIE GOES TO O_DIRECT (v0.18.34, ROADMAP 34).  It went to buffered: O_DIRECT
+// had to win by 5%.  The two are not equal-cost paths.  Buffered input copies
+// every byte through the page cache -- MEASURED, 64.84 GiB cold on 256 CPUs:
+// 115-210 s of kernel CPU against 10-20 for O_DIRECT, the whole input left
+// cached in place of other work's pages, and a run time that swung 13.7 to
+// 18.1 s with that kernel time -- and its probe window is the noisier of the
+// two (3.77-4.91 GiB/s across runs here, O_DIRECT within 1%).  The tie used to
+// flip on that noise: the bimodal 13 s / 118 s system time of full-width cold
+// compress (ROADMAP 34) was this choice.  So buffered must now be faster by
+// more than its own noise, 10%, to be taken.
+static const double READ_PROBE_BUFFERED_MARGIN = 1.10;
 static bool read_probe_take_direct(const ReadWindow & a, const ReadWindow & b,
                                     const Options & opt)
 {
-  const double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
-  const double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
+  double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
+  double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
+  // GZSTD_DEBUG_READ_PROBE_RATES=D:B (test hook, v0.18.34): grade these two rates,
+  // in GiB/s, instead of the measured ones -- the only way a cell can put the
+  // margin's two sides in front of the rule on a device that measures what it
+  // measures.  Both passes still run; the -v line says the rates were given.
+  static const std::pair<double, double> given = [] {
+    double d = -1, bb = -1;
+    if (const char * e = std::getenv("GZSTD_DEBUG_READ_PROBE_RATES"))
+      if (std::sscanf(e, "%lf:%lf", &d, &bb) != 2 || d < 0 || bb < 0) d = bb = -1;
+    return std::make_pair(d, bb);
+  }();
+  if (given.first >= 0) { ra = given.first * 1073741824.0; rb = given.second * 1073741824.0; }
   const int forced = read_probe_forced_pick();
-  const bool take_direct = forced ? forced == 1 : ra > rb * 1.05;
+  const bool take_direct = forced ? forced == 1
+                                  : !(rb > ra * READ_PROBE_BUFFERED_MARGIN);
   if (opt.verbosity >= V_VERBOSE) {
     char pb[288];
     std::snprintf(pb, sizeof pb,
@@ -24878,7 +25037,9 @@ static bool read_probe_take_direct(const ReadWindow & a, const ReadWindow & b,
       "(first touch %.0f/%.0f ms left out) -> %s for the remainder%s\n",
       ra / 1073741824.0, rb / 1073741824.0, a.secs * 1000.0, b.secs * 1000.0,
       a.secs_touch * 1000.0, b.secs_touch * 1000.0,
-      take_direct ? "O_DIRECT" : "buffered", forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
+      take_direct ? "O_DIRECT" : "buffered",
+      forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)"
+             : given.first >= 0 ? " (GZSTD_DEBUG_READ_PROBE_RATES)" : "");
     vlog(V_VERBOSE, opt, pb);
   }
   return take_direct;
@@ -24914,7 +25075,10 @@ static bool pooled_read_chunks(size_t host_chunk,
   // anyway), and the loop keeps its loud failure in that case.
   off_t fsize = 0;
   { struct stat st{}; if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) fsize = st.st_size; }
-  if (o_direct || !pool) n_readers = 1;     // O_DIRECT contends; scratch path has one buffer
+  // O_DIRECT's count is decided here, for every caller and every pass of the
+  // read probe, so the two producers cannot disagree (see DIRECT_READ_STREAMS).
+  if (o_direct) n_readers = gz_direct_read_streams(optp, fd);
+  if (!pool) n_readers = 1;                 // scratch path has one buffer
   if (n_readers < 1) n_readers = 1;
   if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
   g_adapt_src_path.store(o_direct ? "direct" : "pread", std::memory_order_relaxed);
@@ -24924,9 +25088,9 @@ static bool pooled_read_chunks(size_t host_chunk,
     if (posix_memalign(&scratch, ALIGN, cap) != 0 || !scratch) return false;
   }
 
-  // Adaptive sizing applies only to the buffered pool: O_DIRECT is single-stream
-  // by settled design, a user pin is final, and without a pool there is nothing
-  // to park.  A BOUNDED window (the read probe's two timed passes) is excluded
+  // Adaptive sizing applies only to the buffered pool: O_DIRECT's count is fixed
+  // (DIRECT_READ_STREAMS), a user pin is final, and without a pool there is
+  // nothing to park.  A BOUNDED window (the read probe's two timed passes) is excluded
   // too — its whole point is to time ONE configuration, and resizing underneath
   // it would measure a moving target.  The probe's last pass is not one of them:
   // it carries a window only for its start offset (no chunk cap, no clock), and
@@ -34255,7 +34419,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     // pool: measured optima are 3 on a 24-thread box and 12 on a 96-worker
     // dual-socket server (7.46 -> 18.74 GiB/s from 3 -> 12 there);
     // --read-threads overrides.
-    const int n_readers = o_direct ? 1
+    // O_DIRECT's count is pooled_read_chunks' (DIRECT_READ_STREAMS); asked here
+    // too so the pool below is sized for the readers it will really have.
+    // check-endian-reads exemption: &opt supplies reader configuration, never
+    // an integer destination; the buffered arm's / 8 is a reader-count policy.
+    const int n_readers = o_direct ? gz_direct_read_streams(&opt, borrowed_fd)
                         : (opt.read_threads > 0 ? (int)opt.read_threads
                                                 : std::max(3, std::min(12, threads / 8)));
     if (!dr_pool_tried) {
@@ -34301,8 +34469,10 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       // A pre-6.4 kernel keeps huge pages here, as before: a plain pool there is
       // memset-prefaulted (up to 4 GiB, one thread), and nothing has measured the
       // probe on one.
-      const bool probe_plain = win != nullptr && kernel_has_per_vma_locks();
-      dr_pool_ok = dr_pool.init(cap, pool_n, /*want_thp=*/o_direct && !probe_plain,
+      // v0.18.34: an explicit --direct-read takes plain pages too on a 6.4+
+      // kernel (DirectReadPool::init); only a pre-6.4 one keeps huge pages.
+      dr_pool_ok = dr_pool.init(cap, pool_n,
+                                /*want_thp=*/o_direct && !kernel_has_per_vma_locks(),
                                 /*prefault_plain=*/!kernel_has_per_vma_locks());
       if (dr_pool_ok) g_direct_read_pool = &dr_pool;
       if (opt.verbosity >= V_VERBOSE)
@@ -35612,6 +35782,10 @@ extern "C" void gzp_launch_finalize(void * pack, const void * d_off,
 extern "C" void gzx_launch_xxh64(const void * base, size_t stride,
                                  const size_t * sizes, size_t n_chunks,
                                  unsigned int * out, cudaStream_t stream);
+// Each frame's real compressed extent, walked over its block headers in VRAM
+// (gpuverify.cu, v0.18.34): ~0ULL where no single frame fits the claimed size.
+extern "C" void gzx_launch_extent(const void * d_ptrs, const size_t * d_sizes,
+                                  int n, unsigned long long * d_out, void * stream);
 
 // GZSTD_DEBUG_XXH_SELFTEST=1 — prove gzx_xxh64_kernel agrees with xxh::hash BIT
 // FOR BIT before trusting it to stamp a frame.  This is not decoration: the GPU
@@ -35795,7 +35969,29 @@ struct StreamCtx {
   // flushed in 4 KiB multiples.  Registered with cuFile so the NVMe can DMA
   // straight out of it.  d_pack_scratch carries the sub-block remainder across
   // a flush (a device-to-device copy cannot overlap source and destination).
+  //
+  // ONE PACK PER DEVICE, OWNED BY STREAM 0 (v0.18.34, ROADMAP 31).  It used to
+  // be one per stream, and the output offset is the run's: stream 0 could hold
+  // frame 0's tail while stream 1 flushed frame 64 ahead of it, so peer-to-peer
+  // output demanded exactly one stream -- and one stream serialises read and
+  // compute (64 GiB cold: 34 s against 22 at two).  A device's batches drain in
+  // submit order on its one drain thread, so a single pack every stream copies
+  // into keeps the file in order.  pack_owner is set before the buffers are
+  // sized; pack points at the owner (itself for stream 0) once the device's
+  // streams are up.  pack_stream is the owner's own CUDA stream for every pack
+  // operation, so a copy out of stream 1's output never queues behind stream
+  // 0's next kernel.
+  bool                pack_owner     = false;
+  StreamCtx *         pack           = nullptr;
+  cudaStream_t        pack_stream    = nullptr;
   void *              d_pack_base    = nullptr;
+  // WRITE-BEHIND'S STANDBY PACK (v0.18.34): the owner fills d_pack_base while
+  // the write-behind thread writes this one, and a flush swaps them.  Both are
+  // registered for the whole run (gds_pack_reg / gds_pack_alt_reg each hold one
+  // registration; a swap moves only the pointers).  nullptr = no standby: every
+  // flush writes on the drain thread.
+  void *              d_pack_alt     = nullptr;
+  GdsBuf              gds_pack_alt_reg;
   size_t              d_pack_cap     = 0;
   size_t              d_pack_used    = 0;
   void *              d_pack_scratch = nullptr;   // 8 KiB
@@ -35913,6 +36109,7 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   // cudaMalloc can hang on some drivers if the request exceeds VRAM,
   // so we fail fast here instead of letting the driver block.
   size_t temp_bytes = 0;
+  bool allocate_pack_alt = false;
   {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -35952,13 +36149,25 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
     // The peer-to-peer pack buffer and the staged checksum array, on the same
     // resolved predicates the outer search uses -- omitted here while the outer
     // search counted them, so the two mirrors disagreed about the same bringup.
-    if (g_gds_cout_active.load(std::memory_order_relaxed)) {
-      est_needed += ((per_stream_batch * max_out_chunk + 8u * ONE_MIB) + 4095u) & ~size_t(4095);
+    size_t pack_bytes = 0;
+    if (g_gds_cout_active.load(std::memory_order_relaxed) && C.pack_owner) {
+      pack_bytes = ((per_stream_batch * max_out_chunk + 8u * ONE_MIB) + 4095u) & ~size_t(4095);
+      allocate_pack_alt = gds_cout_write_behind_on();
+      est_needed += pack_bytes * (allocate_pack_alt ? 2 : 1);
       est_needed += 8192;
       est_needed += per_stream_batch * (sizeof(unsigned long long) * 2 + sizeof(unsigned int));
     }
     if (opt.region_staged())
       est_needed += sizeof(unsigned int) * per_stream_batch;
+    if (allocate_pack_alt && est_needed > free_b * 0.90) {
+      // The search can bottom out at batch=1 where only the original pack fits.
+      // The standby is optional: rejecting this allocation would drop the last
+      // GPU and exit 5 although the synchronous path can finish the job.
+      est_needed -= pack_bytes;
+      allocate_pack_alt = false;
+      if (est_needed <= free_b * 0.90)
+        vlog(V_VERBOSE, opt, "[GDS] write-behind disabled: the standby pack does not fit the VRAM budget\n");
+    }
     if (opt.verbosity >= V_DEBUG) {
       fprintf(stderr, "[VRAM check] batch=%zu gpu_chunk=%zu max_out=%zu temp=%zu MiB est=%zu MiB free=%zu MiB\n",
               per_stream_batch, gpu_chunk/ONE_MIB, max_out_chunk/ONE_MIB,
@@ -35984,10 +36193,17 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   if (cudaMalloc(&C.d_in_sizes,   sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_comp_sizes, sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_stats,      sizeof(nvcompStatus_t) * C.per_stream_batch) != cudaSuccess) return false;
-  if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+  if (g_gds_cout_active.load(std::memory_order_relaxed) && C.pack_owner) {
     // Sized to hold a whole batch's worth of worst-case output plus slack, so a
     // flush is rare relative to frames.  Registered once; registration is what
-    // puts it in BAR1 and is the expensive part.
+    // puts it in BAR1 and is the expensive part.  The owner's only: the
+    // device's other streams pack into it (see StreamCtx::pack).
+    if (!C.pack_stream
+        && cudaStreamCreateWithFlags(&C.pack_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      cudaGetLastError();
+      C.pack_stream = nullptr;
+      return false;
+    }
     C.d_pack_cap = C.per_stream_batch * C.max_out_chunk + (8u << 20);
     C.d_pack_cap = (C.d_pack_cap + 4095) & ~size_t(4095);
     if (cudaMalloc(&C.d_pack_base, C.d_pack_cap) != cudaSuccess) return false;
@@ -36006,6 +36222,19 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
     if (!C.gds_pack_reg.reg(C.d_pack_base, C.d_pack_cap, &pwhy)) {
       std::cerr << "gzstd: --gds-only: cannot register the output pack buffer: " << pwhy << "\n";
       return false;
+    }
+    // Write-behind's standby pack, the same size, registered too.  Best effort:
+    // without it every flush is written on the drain thread, as before v0.18.34.
+    if (allocate_pack_alt) {
+      std::string awhy;
+      if (cudaMalloc(&C.d_pack_alt, C.d_pack_cap) != cudaSuccess) {
+        cudaGetLastError();               // handled: no standby
+        C.d_pack_alt = nullptr;
+      } else if (((uintptr_t)C.d_pack_alt & 4095) != 0
+                 || !C.gds_pack_alt_reg.reg(C.d_pack_alt, C.d_pack_cap, &awhy)) {
+        cudaFree(C.d_pack_alt);
+        C.d_pack_alt = nullptr;
+      }
     }
   }
   if (opt.region_staged()) {
@@ -36188,31 +36417,171 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
 ======================================================================*/
 static std::mutex g_gpu_ctx_init_m;
 
+// THE WRITE-BEHIND THREAD (v0.18.34).  The pack used to be written on the drain
+// thread, synchronously: MEASURED, 64.84 GiB cold to a file on the same NVMe at
+// two streams, 17.2 s of cuFileWrite in a 38.0-38.5 s run, while the ordinary
+// writer -- whose writes overlap the drains -- took 35.2-36.1.  One thread per
+// run (peer-to-peer output takes exactly one device) writes one full pack while
+// the drain fills the other; a flush waits only if the previous write has not
+// landed.  Writes stay strictly in file order: a flush hands over the next
+// extent only after the previous one completed.  A failed write is recorded and
+// raised by the drain at its next flush (or the final one), exit 3.
+// Heap-allocated and never destroyed: a die() elsewhere must not run a
+// joinable std::thread's destructor (std::terminate) on its way out.
+struct GdsCoutWriter {
+  std::mutex m;
+  std::condition_variable cv;
+  std::thread th;
+  bool started = false, stop = false, busy = false;   // busy: a write is pending or running
+  const void * buf = nullptr;
+  size_t n = 0;
+  uint64_t off = 0;
+  int dev = -1;
+  std::string err;
+};
+static GdsCoutWriter & gds_cout_wb()
+{
+  static GdsCoutWriter * w = new GdsCoutWriter;
+  return *w;
+}
+static void gds_cout_wb_loop(GdsCoutWriter * w)
+{
+  // cuFile writes from a device pointer; give this thread the device's context.
+  const cudaError_t ds = (w->dev >= 0) ? cudaSetDevice(w->dev) : cudaSuccess;
+  std::unique_lock<std::mutex> lk(w->m);
+  if (ds != cudaSuccess)
+    w->err = std::string("--gds-only: cudaSetDevice(write-behind): ") + cudaGetErrorString(ds);
+  for (;;) {
+    w->cv.wait(lk, [&] { return w->stop || w->busy; });
+    if (w->busy) {
+      const void * b = w->buf; const size_t n = w->n; const uint64_t off = w->off;
+      const bool failed_before = !w->err.empty();
+      lk.unlock();
+      ssize_t r = -1;
+      const uint64_t t0 = now_ns();
+      if (!failed_before) r = g_gds_cout.write_dev(b, n, (off_t)off, 0);
+      g_gds_cout_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+      lk.lock();
+      if (!failed_before && r != (ssize_t)n)
+        w->err = "--gds-only: cuFileWrite returned " + std::to_string((long long)r)
+               + " for " + std::to_string(n) + " bytes at offset "
+               + std::to_string((unsigned long long)off);
+      else if (!failed_before) {
+        g_gds_cout_writes.fetch_add(1, std::memory_order_relaxed);
+        g_gds_cout_bytes.fetch_add(n, std::memory_order_relaxed);
+        g_gds_cout_wb_writes.fetch_add(1, std::memory_order_relaxed);
+      }
+      w->busy = false;
+      w->cv.notify_all();
+      continue;
+    }
+    if (w->stop) return;
+  }
+}
+// Until no write is in flight; a failed one ends the run (exit 3).
+static void gds_cout_wb_wait()
+{
+  GdsCoutWriter & w = gds_cout_wb();
+  const uint64_t t0 = now_ns();
+  std::unique_lock<std::mutex> lk(w.m);
+  w.cv.wait(lk, [&] { return !w.busy; });
+  g_gds_cout_wb_wait_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+  if (!w.err.empty()) { const std::string e = w.err; lk.unlock(); die(e, EXIT_IO); }
+}
+// Hand one extent to the writer (the caller has waited: none is in flight).
+// False if the thread cannot be started: the caller writes it itself.
+static bool gds_cout_wb_submit(const void * buf, size_t n, uint64_t off, int dev)
+{
+  GdsCoutWriter & w = gds_cout_wb();
+  std::unique_lock<std::mutex> lk(w.m);
+  if (!w.started) {
+    w.stop = false; w.dev = dev; w.err.clear();
+    try { w.th = std::thread(gds_cout_wb_loop, &w); }
+    catch (const std::system_error &) { return false; }
+    w.started = true;
+  }
+  w.buf = buf; w.n = n; w.off = off; w.busy = true;
+  lk.unlock();
+  w.cv.notify_all();
+  return true;
+}
+// Join the writer.  `raise` dies on a failed write; the teardown of a failed run
+// passes false (it is already unwinding and its output is discarded).
+static void gds_cout_wb_stop(bool raise)
+{
+  GdsCoutWriter & w = gds_cout_wb();
+  {
+    std::unique_lock<std::mutex> lk(w.m);
+    if (!w.started) return;
+    w.cv.wait(lk, [&] { return !w.busy; });
+    w.stop = true;
+  }
+  w.cv.notify_all();
+  w.th.join();
+  std::string e;
+  {
+    std::lock_guard<std::mutex> lk(w.m);
+    w.started = false; w.stop = false;
+    e.swap(w.err);
+  }
+  if (raise && !e.empty()) die(e, EXIT_IO);
+}
+
 // Flush whole 4 KiB blocks out of the pack buffer straight to the file.
 // Caller holds g_gds_cout_m.  `final` also commits the sub-block tail, which is
 // the only write in the run that is not a 4 KiB multiple -- it is padded up and
 // the file is ftruncate'd to the true length afterwards, the same trick the
-// decompress side uses.
+// decompress side uses.  C is the pack's OWNER (StreamCtx::pack), and every
+// pack operation runs on its pack_stream; a stream that owns no pack has
+// nothing packed and returns at once.  With a standby pack (d_pack_alt) a
+// non-final flush hands the full pack to the write-behind thread and swaps;
+// the final flush waits for it, writes the tail here and joins it.
 static void gds_cout_flush(StreamCtx & C, bool final_flush)
 {
-  if (C.d_pack_used == 0) return;
+  if (final_flush && C.pack_owner) gds_cout_wb_wait();   // the last handed-off extent lands first
+  if (C.d_pack_used == 0) {
+    if (final_flush && C.pack_owner) gds_cout_wb_stop(true);
+    return;
+  }
   uint64_t phase_t0 = now_ns();
-  checkCuda(cudaStreamSynchronize(C.stream), "sync before peer-to-peer flush");
+  checkCuda(cudaStreamSynchronize(C.pack_stream), "sync before peer-to-peer flush");
   g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
   size_t n = (C.d_pack_used / 4096) * 4096;
   size_t carry = C.d_pack_used - n;
   if (final_flush && carry) {           // pad the tail up; ftruncate trims it
     checkCuda(cudaMemsetAsync(static_cast<char*>(C.d_pack_base) + C.d_pack_used,
-                              0, 4096 - carry, C.stream), "pad the final block");
+                              0, 4096 - carry, C.pack_stream), "pad the final block");
     phase_t0 = now_ns();
-    checkCuda(cudaStreamSynchronize(C.stream), "sync tail pad");
+    checkCuda(cudaStreamSynchronize(C.pack_stream), "sync tail pad");
     g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
     n += 4096; carry = 0;
   }
   if (::getenv("GZSTD_DEBUG_GDS_COUT"))
-    std::fprintf(stderr, "[COUT] flush used=%zu n=%zu carry=%zu file_off=%llu logical=%llu final=%d\n",
+    std::fprintf(stderr, "[COUT] flush used=%zu n=%zu carry=%zu file_off=%llu logical=%llu final=%d%s\n",
                  C.d_pack_used, n, carry, (unsigned long long)g_gds_cout_off,
-                 (unsigned long long)g_gds_cout_logical, (int)final_flush);
+                 (unsigned long long)g_gds_cout_logical, (int)final_flush,
+                 (!final_flush && n && C.d_pack_alt) ? " behind" : "");
+  if (!final_flush && n && C.d_pack_alt) {
+    // WRITE-BEHIND: the standby is free once the previous write has landed.  The
+    // sub-block tail moves to its start (different buffers, so no bounce), and
+    // the full pack goes to the writer at the extent reserved for it now.
+    gds_cout_wb_wait();
+    if (carry) {
+      checkCuda(cudaMemcpyAsync(C.d_pack_alt, static_cast<char*>(C.d_pack_base) + n, carry,
+                                cudaMemcpyDeviceToDevice, C.pack_stream), "carry to the standby pack");
+      phase_t0 = now_ns();
+      checkCuda(cudaStreamSynchronize(C.pack_stream), "sync carry");
+      g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
+    }
+    if (gds_cout_wb_submit(C.d_pack_base, n, g_gds_cout_off, (int)C.stats.dev_index)) {
+      g_gds_cout_off += n;
+      std::swap(C.d_pack_base, C.d_pack_alt);
+      C.d_pack_used = carry;
+      return;
+    }
+    // The thread could not be started: write it here, as before.  The carry was
+    // copied to the standby already; it is copied back below like any carry.
+  }
   if (n) {
     phase_t0 = now_ns();
     const ssize_t w = g_gds_cout.write_dev(C.d_pack_base, n, (off_t)g_gds_cout_off, 0);
@@ -36230,14 +36599,15 @@ static void gds_cout_flush(StreamCtx & C, bool final_flush)
     // through the scratch block.  carry < 4096 by construction.
     checkCuda(cudaMemcpyAsync(C.d_pack_scratch,
                               static_cast<char*>(C.d_pack_base) + n, carry,
-                              cudaMemcpyDeviceToDevice, C.stream), "carry out");
+                              cudaMemcpyDeviceToDevice, C.pack_stream), "carry out");
     checkCuda(cudaMemcpyAsync(C.d_pack_base, C.d_pack_scratch, carry,
-                              cudaMemcpyDeviceToDevice, C.stream), "carry back");
+                              cudaMemcpyDeviceToDevice, C.pack_stream), "carry back");
     phase_t0 = now_ns();
-    checkCuda(cudaStreamSynchronize(C.stream), "sync carry");
+    checkCuda(cudaStreamSynchronize(C.pack_stream), "sync carry");
     g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
   }
   C.d_pack_used = carry;
+  if (final_flush && C.pack_owner) gds_cout_wb_stop(true);
 }
 
 static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
@@ -36247,12 +36617,18 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   C.gds_in_reg.dereg();
   if (C.d_checksums) { cudaFree(C.d_checksums); C.d_checksums = nullptr; }
   if (C.h_ck_pinned) { cudaFreeHost(C.h_ck_pinned); C.h_ck_pinned = nullptr; }
+  // The write-behind thread may still be writing one of these packs (a failed
+  // run's teardown): join it before either registration goes.
+  if (C.pack_owner && (C.d_pack_base || C.d_pack_alt)) gds_cout_wb_stop(false);
   C.gds_pack_reg.dereg();          // before the free: cuFile holds a BAR1 mapping
+  C.gds_pack_alt_reg.dereg();
   if (C.d_pack_base)    { cudaFree(C.d_pack_base);    C.d_pack_base = nullptr; }
+  if (C.d_pack_alt)     { cudaFree(C.d_pack_alt);     C.d_pack_alt = nullptr; }
   if (C.d_pack_scratch) { cudaFree(C.d_pack_scratch); C.d_pack_scratch = nullptr; }
   if (C.d_pack_off)     { cudaFree(C.d_pack_off);     C.d_pack_off = nullptr; }
   if (C.d_pack_csz)     { cudaFree(C.d_pack_csz);     C.d_pack_csz = nullptr; }
   if (C.d_pack_ck)      { cudaFree(C.d_pack_ck);      C.d_pack_ck = nullptr; }
+  if (C.pack_stream)    { cudaStreamDestroy(C.pack_stream); C.pack_stream = nullptr; }
   C.d_pack_cap = C.d_pack_used = 0;
   if (C.d_in_base) { cudaFree(C.d_in_base); }
   if (C.d_out_base) { cudaFree(C.d_out_base); }
@@ -36958,8 +37334,14 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   if (g_gds_cout_active.load(std::memory_order_relaxed)) {
     const uint64_t cout_t0 = now_ns();
     std::lock_guard<std::mutex> lk(g_gds_cout_m);
-    // One device, one stream under --gds-only, so drains arrive in order.
-    // Assert it: an out-of-order batch would corrupt every following offset.
+    // ONE DEVICE, AND ITS ONE PACK (StreamCtx::pack): this device's batches drain
+    // in submit order -- one intake thread pops them in sequence and one drain
+    // thread takes them off a FIFO -- whichever of its streams ran them, so they
+    // arrive in order.  Assert it: an out-of-order batch would corrupt every
+    // following offset.
+    StreamCtx & P = C.pack ? *C.pack : C;
+    if (!P.d_pack_base || !P.pack_stream)
+      die("--gds-only: peer-to-peer output has no device pack buffer on this stream");
     if (C.filled && C.batch[0].seq != g_gds_cout_next_seq)
       die("--gds-only: peer-to-peer output requires in-order drains (got seq "
           + std::to_string(C.batch[0].seq) + ", expected "
@@ -36979,17 +37361,17 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
       const int n = (int)h_off.size();
       // Frame metadata only -- offsets, sizes, checksums.  Payload never touches
       // the host; this is a few KiB.
-      checkCuda(cudaMemcpyAsync(C.d_pack_off, h_off.data(),
+      checkCuda(cudaMemcpyAsync(P.d_pack_off, h_off.data(),
                                 sizeof(unsigned long long) * n,
-                                cudaMemcpyHostToDevice, C.stream), "pack offsets H2D");
-      checkCuda(cudaMemcpyAsync(C.d_pack_csz, h_csz.data(),
+                                cudaMemcpyHostToDevice, P.pack_stream), "pack offsets H2D");
+      checkCuda(cudaMemcpyAsync(P.d_pack_csz, h_csz.data(),
                                 sizeof(unsigned long long) * n,
-                                cudaMemcpyHostToDevice, C.stream), "pack sizes H2D");
-      checkCuda(cudaMemcpyAsync(C.d_pack_ck, h_ck.data(),
+                                cudaMemcpyHostToDevice, P.pack_stream), "pack sizes H2D");
+      checkCuda(cudaMemcpyAsync(P.d_pack_ck, h_ck.data(),
                                 sizeof(unsigned int) * n,
-                                cudaMemcpyHostToDevice, C.stream), "pack checksums H2D");
-      gzp_launch_finalize(C.d_pack_base, C.d_pack_off, C.d_pack_csz,
-                          C.d_pack_ck, n, C.stream);
+                                cudaMemcpyHostToDevice, P.pack_stream), "pack checksums H2D");
+      gzp_launch_finalize(P.d_pack_base, P.d_pack_off, P.d_pack_csz,
+                          P.d_pack_ck, n, P.pack_stream);
       checkCuda(cudaGetLastError(), "gzp_finalize_kernel launch");
       h_off.clear(); h_csz.clear(); h_ck.clear();
     };
@@ -36997,21 +37379,26 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
       const size_t csz  = C.h_comp_sizes[i];
       const size_t need = csz + 4;                    // frame + checksum trailer
       out_sum += need; in_sum += C.h_in_sizes[i];
-      if (C.d_pack_used + need > C.d_pack_cap) {
+      if (P.d_pack_used + need > P.d_pack_cap) {
         finalize_pending();                 // stamp before the bytes go out
-        gds_cout_flush(C, false);
+        gds_cout_flush(P, false);
       }
-      if (C.d_pack_used + need > C.d_pack_cap)
+      if (P.d_pack_used + need > P.d_pack_cap)
         die("--gds-only: frame " + std::to_string(need)
-            + " B exceeds the device pack buffer " + std::to_string(C.d_pack_cap));
-      checkCuda(cudaMemcpyAsync(static_cast<char*>(C.d_pack_base) + C.d_pack_used,
+            + " B exceeds the device pack buffer " + std::to_string(P.d_pack_cap));
+      // C.stream finished this batch (the metadata readback above synchronised
+      // it), so the pack stream may read its output without waiting on it.
+      checkCuda(cudaMemcpyAsync(static_cast<char*>(P.d_pack_base) + P.d_pack_used,
                                 static_cast<char*>(C.d_out_base) + i * C.max_out_chunk,
-                                csz, cudaMemcpyDeviceToDevice, C.stream),
+                                csz, cudaMemcpyDeviceToDevice, P.pack_stream),
                 "cudaMemcpyAsync(frame -> device pack)");
-      h_off.push_back(C.d_pack_used);
+      h_off.push_back(P.d_pack_used);
       h_csz.push_back(csz);
       h_ck.push_back(C.h_ck_pinned ? C.h_ck_pinned[i] : C.h_checksums[i]);
-      C.d_pack_used += need;
+      P.d_pack_used += need;
+      // The owner's per-frame arrays hold its own batch; another stream's batch
+      // can be larger, so stamp in chunks that fit them.
+      if (h_off.size() >= P.per_stream_batch) finalize_pending();
       g_gds_cout_logical += need;
       // SEEK-TABLE GEOMETRY.  writer_thread records every frame's on-disk size
       // so main() can pin the geometry and append the seek trailer; this path
@@ -37022,6 +37409,13 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
       if (opt.tar_index) g_tar_frame_csizes.push_back((uint64_t)need);
     }
     finalize_pending();
+    // C's output slab is reused by its next batch the moment this drain marks
+    // it idle, and the copies out of it ran on the pack stream: let them land.
+    {
+      const uint64_t ps_t0 = now_ns();
+      checkCuda(cudaStreamSynchronize(P.pack_stream), "sync device pack copies");
+      g_gds_cout_sync_ns.fetch_add(now_ns() - ps_t0, std::memory_order_relaxed);
+    }
     if (C.filled) {
       g_gds_cout_next_seq = C.batch[C.filled - 1].seq + 1;
       g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
@@ -37384,6 +37778,7 @@ static void gpu_worker(
     auto & ctxs = *ctxs_ptr;
     for (size_t s=0; s<stream_count; ++s) {
       StreamCtx & C = ctxs[s];
+      C.pack_owner = (s == 0);        // one peer-to-peer pack per device
       checkCuda(cudaStreamCreate(&C.stream), "cudaStreamCreate");
       if (opt.region_staged()) {
         checkCuda(cudaStreamCreate(&C.ck_stream), "cudaStreamCreate(checksum)");
@@ -37430,10 +37825,12 @@ static void gpu_worker(
           // allocated -- the estimator's error in the opposite direction from
           // the verify omission above.  g_gds_cout_active is resolved during
           // output setup, before any worker reaches this search.
-          if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+          if (g_gds_cout_active.load(std::memory_order_relaxed) && C.pack_owner) {
             // The peer-to-peer pack buffer, its carry scratch, and three
-            // per-frame arrays (offset, compressed size, checksum).
-            est += ((mid * max_out_chunk + 8u * ONE_MIB) + 4095u) & ~size_t(4095);
+            // per-frame arrays (offset, compressed size, checksum) -- stream 0's
+            // alone: the device's other streams share it (StreamCtx::pack).
+            est += (((mid * max_out_chunk + 8u * ONE_MIB) + 4095u) & ~size_t(4095))
+                 * (gds_cout_write_behind_on() ? 2 : 1);   // and write-behind's standby
             est += 8192;
             est += mid * (sizeof(unsigned long long) * 2 + sizeof(unsigned int));
           }
@@ -37626,6 +38023,10 @@ static void gpu_worker(
       }
     }
 
+    // Every stream of this device packs into stream 0's buffer.  The vector is
+    // final now (a failed stream shrank it above; nothing grows it), so the
+    // address is stable for the device's life.
+    for (auto & C : ctxs) C.pack = ctxs.empty() ? nullptr : &ctxs[0];
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
     if (opt.verbosity >= V_DEBUG) {
       std::ostringstream os;
@@ -39773,16 +40174,18 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   g_gds_cout_drain_ns.store(0, std::memory_order_relaxed);
   g_gds_cout_sync_ns.store(0, std::memory_order_relaxed);
   g_gds_cout_write_ns.store(0, std::memory_order_relaxed);
+  g_gds_cout_wb_wait_ns.store(0, std::memory_order_relaxed);
+  g_gds_cout_wb_writes.store(0, std::memory_order_relaxed);
   g_gds_cout_meter = m;
-  // The pack buffer belongs to a StreamCtx, while the output offset belongs to
-  // the whole run.  With more than one stream/device, accepting batches in seq
-  // order is not enough: stream 0 can retain frame 0 while stream 1 retains
-  // frame 64, then stream 0's next append/teardown can flush frame 128 before
-  // stream 1 ever emits frame 64.  Each context's final 4 KiB pad would also
-  // become an interior hole that the one end-of-file ftruncate cannot remove.
-  // Keep the GDS input path, but use the ordinary ordered output writer for a
-  // shape the per-context packer cannot represent safely.
-  const bool gds_cout_shape_ok = device_count == 1 && opt.gpu_streams == 1;
+  // The output offset belongs to the whole run, so frames must reach the pack in
+  // file order and leave it from ONE buffer.  Per-stream packs could not: stream
+  // 0 could retain frame 0 while stream 1 flushed frame 64, and each pack's final
+  // 4 KiB pad became an interior hole that the one end-of-file ftruncate cannot
+  // remove -- so this shape used to demand one stream as well as one device.
+  // v0.18.34: a device's streams share stream 0's pack (StreamCtx::pack), and its
+  // batches drain in submit order, so any stream count is safe.  Several DEVICES
+  // drain independently, and still use the ordinary ordered writer.
+  const bool gds_cout_shape_ok = device_count == 1;
   // CPU verification is fed by writer_thread's host FrameBuf taps.  The P2P
   // branch intentionally creates neither, so engaging it with a CPU VerifyPool
   // would report success after verifying zero frames.  GPU verification stays
@@ -39791,7 +40194,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.gds_only && !opt.tar_mode && !gds_cout_shape_ok) {
     vlog(V_ERROR, opt,
          "WARNING: --gds-only peer-to-peer compress output requires exactly one "
-         "GPU and one stream; using device-to-host transfers for writing.\n");
+         "GPU; using device-to-host transfers for writing.\n");
   } else if (opt.gds_only && !opt.tar_mode && !gds_cout_verify_ok) {
     vlog(V_ERROR, opt,
          "WARNING: --gds-only CPU verification requires host frame taps; using "
@@ -40236,6 +40639,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // THE QUEUE MUST KNOW THE DEPTH OR THE RUN DEADLOCKS: a worker waits in
   // wait_for_batch_or_cap(pop_n) for pop_n frames, and the producer can never
   // have more than the pool in flight.  max_depth gives that wait its escape.
+  bool dstage_pool_reused = false;
   auto pin_dstage_host_pool = [&](const char * what, double * pin_ms) -> size_t {
     if (gpu_ids.empty()) {
       stage_setup_exit = EXIT_GPU_FAIL;
@@ -40250,6 +40654,15 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t stage_bufs = std::max<size_t>(16, std::min(compress_tune_start, HARD_BATCH_CAP));
     size_t avail = get_available_ram_bytes();
     if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
+    else if (g_dstage_pool_cache) {
+      // This input will reuse the cached allocation or release it before pinning
+      // its replacement.  Headroom already excludes those pages; charging them
+      // again shrinks each RAM-bound pool and can reject even one frame on the
+      // next input (128 MiB available, then a cached 16 MiB slot: 112 / 8 < 16).
+      // Other budgets still see the cache as occupied memory.
+      const size_t cached = g_dstage_pool_cache->stride() * g_dstage_pool_cache->count();
+      avail += std::min(cached, SIZE_MAX - avail);
+    }
     size_t cap_bytes = avail / 8;
     if (opt.mem_limit_bytes > 0)
       cap_bytes = (size_t)std::min<uint64_t>(cap_bytes, opt.mem_limit_bytes / 2);
@@ -40273,10 +40686,20 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (e) stage_bufs = std::max<size_t>(1, (size_t)std::strtoull(e, nullptr, 10));
     std::string swhy;
     const uint64_t pin_t0 = now_ns();
-    while (!stage_pool->init_host(gpu_chunk, stage_bufs, &swhy)) {
-      if (stage_bufs == 1)
-        throw std::runtime_error(std::string(what) + ": " + swhy);
-      stage_bufs = std::max<size_t>(1, stage_bufs / 2);
+    static const bool no_reuse = ::getenv("GZSTD_DEBUG_DSTAGE_NO_REUSE") != nullptr;
+    if (g_dstage_pool_cache && !no_reuse && g_dstage_pool_cache->stride() == gpu_chunk
+        && g_dstage_pool_cache->count() == stage_bufs) {
+      stage_pool.reset(g_dstage_pool_cache);       // the previous input's, already pinned
+      g_dstage_pool_cache = nullptr;
+      dstage_pool_reused = true;
+    } else {
+      delete g_dstage_pool_cache;                  // another size: pin afresh
+      g_dstage_pool_cache = nullptr;
+      while (!stage_pool->init_host(gpu_chunk, stage_bufs, &swhy)) {
+        if (stage_bufs == 1)
+          throw std::runtime_error(std::string(what) + ": " + swhy);
+        stage_bufs = std::max<size_t>(1, stage_bufs / 2);
+      }
     }
     if (pin_ms) *pin_ms = double(now_ns() - pin_t0) / 1e6;
     g_gds_stage_pool.store(stage_pool.get(), std::memory_order_release);
@@ -40382,9 +40805,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         if (opt.verbosity >= V_VERBOSE) {
           char b[192];
           std::snprintf(b, sizeof(b),
-            "[DSTAGE] staging: %zu x %zu MiB of pinned host memory (%.0f ms), "
+            "[DSTAGE] staging: %zu x %zu MiB of pinned host memory (%.0f ms%s), "
             "%d O_DIRECT reader(s) ahead of the GPU\n",
             stage_bufs, gpu_chunk / ONE_MIB, pin_ms,
+            dstage_pool_reused ? ", the previous input's" : "",
             (int)std::min<uint64_t>((uint64_t)std::max(1, nreaders), std::max<uint64_t>(1, nframes)));
           vlog(V_VERBOSE, opt, b);
         }
@@ -40483,8 +40907,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (opt.verbosity >= V_VERBOSE) {
         char b[192];
         std::snprintf(b, sizeof(b),
-          "[DSTAGE] --tar staging: %zu x %zu MiB of pinned host memory (%.0f ms), "
-          "members read O_DIRECT\n", stage_bufs, gpu_chunk / ONE_MIB, pin_ms);
+          "[DSTAGE] --tar staging: %zu x %zu MiB of pinned host memory (%.0f ms%s), "
+          "members read O_DIRECT\n", stage_bufs, gpu_chunk / ONE_MIB, pin_ms,
+          dstage_pool_reused ? ", the previous input's" : "");
         vlog(V_VERBOSE, opt, b);
       }
     }
@@ -40495,6 +40920,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (!stage_setup_failure)
       tarx::assemble(queue, tar_layout, gpu_chunk, opt, m, &throttle, &results);
     else {
+      // THE DEFAULT'S --tar STAGING REBUILDS LIKE ITS PLAIN-FILE STAGING (v0.18.34).
+      // Aborting the pipeline alone, as an explicit --tar --direct-stage may (it
+      // dies below with exit 3), left an automatic run to commit what the abort
+      // had written.  MEASURED before this (Codex review): a pool that could not
+      // be pinned under the default's --tar staging wrote a 130-byte archive at
+      // exit 0, and --rm deleted the sources.  Ask for the driver's CPU rebuild.
+      if (opt.direct_stage_auto) {
+        g_auto_stage_rebuild.store(true);
+        g_gpu_failed_restart.store(true);
+      }
       g_gpu_aborted.store(true, std::memory_order_relaxed);
       queue.set_done();
       throttle.set_done();
@@ -40639,10 +41074,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (ram_avail > 0)
       pool_n = std::min<size_t>(pool_n, std::max<size_t>(pool_floor, (size_t)(ram_avail / 4 / cap)));
     if (pool_n < pool_floor) pool_n = std::min<size_t>(pool_floor, std::max<size_t>(file_chunks + 1, 1));
-    // Huge pages for O_DIRECT only, and plain unprefaulted pages for the
-    // buffered pool on a 6.4+ kernel (see DirectReadPool::init, v0.18.7).
-    const bool pool_ok = nv_pool.init(cap, pool_n,
-                                      /*want_thp=*/want_direct_read && kernel_has_per_vma_locks(),
+    // Plain pages, unprefaulted on a 6.4+ kernel, for O_DIRECT too since v0.18.34
+    // (see DirectReadPool::init): an explicit --direct-read's huge pages stalled
+    // a third of its runs where memory is mostly page cache.
+    const bool pool_ok = nv_pool.init(cap, pool_n, /*want_thp=*/false,
                                       /*prefault_plain=*/!kernel_has_per_vma_locks());
     if (pool_ok) {
       g_direct_read_pool = &nv_pool;
@@ -40800,6 +41235,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // global before destroying the pool: a releaser that loaded the pointer must
   // never find it dangling.
   g_gds_stage_pool.store(nullptr, std::memory_order_release);
+  // A clean host pool waits for the next input (g_dstage_pool_cache); anything
+  // else -- a device slab, an aborted run, a slot still out -- is freed.
+  if (stage_pool && stage_pool->reusable() && !g_gpu_failed_restart.load()) {
+    delete g_dstage_pool_cache;
+    g_dstage_pool_cache = stage_pool.release();
+  }
   stage_pool.reset();
   // --gds-only: the workers are done reading, so the registered handle can go.
   // Deregister BEFORE closing the fd — cuFile holds a reference to it.
@@ -41018,10 +41459,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, b);
       std::snprintf(b, sizeof(b),
         "[GDS] compress drain: %.2f s total, %.2f s pack/finalize sync, "
-        "%.2f s cuFileWrite\n",
+        "%.2f s cuFileWrite (%llu by the write-behind, %.2f s waited for)\n",
         double(g_gds_cout_drain_ns.load(std::memory_order_relaxed)) / 1e9,
         double(g_gds_cout_sync_ns.load(std::memory_order_relaxed)) / 1e9,
-        double(g_gds_cout_write_ns.load(std::memory_order_relaxed)) / 1e9);
+        double(g_gds_cout_write_ns.load(std::memory_order_relaxed)) / 1e9,
+        (unsigned long long)g_gds_cout_wb_writes.load(std::memory_order_relaxed),
+        double(g_gds_cout_wb_wait_ns.load(std::memory_order_relaxed)) / 1e9);
       vlog(V_VERBOSE, opt, b);
     }
   }
@@ -41561,9 +42004,6 @@ static void gpu_decomp_worker(
     g_decomp_exit_cv.notify_all();
     if (out != gpu_worker_count) return;    // not the last worker out
     if (!opt.gpu_only || !queue) return;    // hybrid: its CPU pool outlasts every GPU stream (v0.18.13)
-    if (opt.direct_stage_auto
-        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire))
-      return;                             // caller reframes the tail, not these index-derived Tasks
     if (queue->drained()) return;           // empty AND producer done: nothing owed
     const int lost = std::min(gpu_worker_count,
         (gpu_failures ? gpu_failures->load(std::memory_order_acquire) : 0)
@@ -41660,12 +42100,15 @@ static void gpu_decomp_worker(
     // exit 0 and `-t --gpu-only` reported OK.  The CPU path gets this free from
     // ZSTD_decompressStream; the GPU path never had an equivalent.
     unsigned int * d_verify_ck = nullptr;
+    // --gds-only: where each staged frame really ends (gzx_launch_extent).
+    unsigned long long * d_extent = nullptr;
     nvcompStatus_t * d_statuses = nullptr;
 
     // Host-side arrays
     std::vector<void*> h_comp_ptrs, h_decomp_ptrs;
     std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
     std::vector<unsigned int> h_verify_ck;    // recomputed, device-side
+    std::vector<unsigned long long> h_extent; // walked, device-side (--gds-only)
     std::vector<unsigned int> h_expect_ck;    // from each frame's trailer
     std::vector<unsigned char> h_has_ck;      // frame carries a content checksum
     std::vector<nvcompStatus_t> h_statuses;
@@ -41734,6 +42177,7 @@ static void gpu_decomp_worker(
       if (d_decomp_sizes){ cudaFree(d_decomp_sizes); d_decomp_sizes = nullptr; }
       if (d_actual_sizes){ cudaFree(d_actual_sizes); d_actual_sizes = nullptr; }
       if (d_verify_ck)   { cudaFree(d_verify_ck);    d_verify_ck = nullptr; }
+      if (d_extent)      { cudaFree(d_extent);       d_extent = nullptr; }
       if (d_statuses)    { cudaFree(d_statuses);     d_statuses = nullptr; }
       alloc_batch = 0; alloc_comp = 0; alloc_decomp = 0; temp_bytes = 0;
     }
@@ -41892,6 +42336,10 @@ static void gpu_decomp_worker(
       if (cudaMalloc(&d_actual_sizes, batch_n * sizeof(size_t))  != cudaSuccess) { cudaGetLastError(); return false; }
       if (cudaMalloc(&d_statuses,     batch_n * sizeof(nvcompStatus_t)) != cudaSuccess) { cudaGetLastError(); return false; }
       if (cudaMalloc(&d_verify_ck,    batch_n * sizeof(unsigned int)) != cudaSuccess) { cudaGetLastError(); return false; }
+      // Only cuFile-staged input uses the device extent walk.  Ordinary decode
+      // and --direct-stage must not pay an extra CUDA allocation per resize.
+      if (gds_read && !dstage
+          && cudaMalloc(&d_extent, batch_n * sizeof(unsigned long long)) != cudaSuccess) { cudaGetLastError(); return false; }
       if (needed_temp > 0) {
         if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) { cudaGetLastError(); return false; }
         temp_bytes = needed_temp;
@@ -41916,6 +42364,7 @@ static void gpu_decomp_worker(
       h_actual.resize(batch_n);
       h_statuses.resize(batch_n);
       h_verify_ck.resize(batch_n);
+      if (gds_read && !dstage) h_extent.resize(batch_n);
       h_expect_ck.resize(batch_n);
       h_has_ck.resize(batch_n);
       return true;
@@ -41982,6 +42431,11 @@ static void gpu_decomp_worker(
       // drained, and a context made now is only torn down again at exit.
       if (queue && queue->drained()) { ctx_lk.unlock(); leave_unstarted(); return; }
       checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+      // The cached-archive cap's no-GPU regression uses the same bringup hook
+      // as compress.  Without it that arm silently ran on a healthy GPU.
+      if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_GPU_BRINGUP"))
+        if (std::strcmp(fb, "all") == 0 || std::atoi(fb) == device_id)
+          throw std::runtime_error("cudaSetDevice: out of memory (GZSTD_DEBUG_FAIL_GPU_BRINGUP)");
       checkCuda(cudaFree(0), "cudaFree(0) [force context]");
     }
     if (nothing_left()) return;
@@ -42493,6 +42947,8 @@ static void gpu_decomp_worker(
       sched->set_gpu_ready(device_id);
       for (size_t s = 0; s < ctxs.size(); ++s)
         sched->register_gpu_stream(device_id);
+      vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id) + "] decode ready: "
+           + std::to_string(ctxs.size()) + " stream(s) registered with the scheduler\n");
     }
 
     // Bringup has settled the cap (fit search, headroom cap, reserve retries).
@@ -43029,10 +43485,6 @@ static void gpu_decomp_worker(
               const std::string why = gz_stage_name(opt)
                   + ": one compressed frame exceeds the host memory share per "
                     "device/stream; use fewer devices/streams or more memory";
-              // The default retains the ordinary decoder's resource needs.
-              // Throw into the last-GPU handoff instead of refusing a stream
-              // the CPU can decode without these page-locked staging lanes.
-              if (opt.direct_stage_auto) throw std::runtime_error(why);
               die_io(why);
             }
             lanes = (size_t)std::min<uint64_t>(lanes, share / slot);
@@ -43108,15 +43560,6 @@ static void gpu_decomp_worker(
         };
         auto check_table_extent = [&] {
           if (tab_err.empty()) return;
-          if (opt.direct_stage_auto && gpu_worker_count == 1 && stream_count == 1) {
-            // No frame in this batch has been decoded or delivered.  Previous
-            // batches proved their extents and completed in file order, so
-            // this offset follows the complete, verified output prefix.
-            g_auto_stage_decode_retry.seq = C.batch.front().seq;
-            g_auto_stage_decode_retry.off = (uint64_t)C.batch.front().src_off;
-            g_auto_stage_decode_retry.pending.store(true, std::memory_order_release);
-            throw std::runtime_error(tab_err);
-          }
           gds_table_defect(opt, tab_err);
           die(tab_err, EXIT_DATA);
         };
@@ -43683,8 +44126,47 @@ static void gpu_decomp_worker(
                                     C.filled * sizeof(unsigned int),
                                     cudaMemcpyDeviceToHost, C.stream), "D2H verify checksums");
         }
+        // EVERY --gds-only EXTENT IS PROVEN ONE WHOLE FRAME, IN VRAM (v0.18.34,
+        // ROADMAP 31).  The producer walks only checksumless frames and trusts a
+        // checksummed frame's trailer, and an entry that swallows an IDENTICAL
+        // next frame reads a trailer that matches (see dstage_one_frame, which
+        // closed this for --direct-stage on its host copy).  --gds-only has no
+        // host copy, but the frame is already in VRAM: walk its block headers
+        // there (gzx_launch_extent), on the pointers and claimed sizes nvCOMP was
+        // given, and read the result back with the other metadata.  The claim is
+        // never read past, so a lying size cannot send the walk out of the slot.
+        const bool walk_extents = staged_batch && !C.dstage;
+        if (walk_extents) {
+          gzx_launch_extent(C.d_comp_ptrs, C.d_comp_sizes, (int)C.filled,
+                            C.d_extent, C.stream);
+          checkCuda(cudaGetLastError(), "gzx_extent launch");
+          checkCuda(cudaMemcpyAsync(C.h_extent.data(), C.d_extent,
+                                    C.filled * sizeof(unsigned long long),
+                                    cudaMemcpyDeviceToHost, C.stream), "D2H frame extents");
+        }
         checkCuda(cudaStreamSynchronize(C.stream), "D2H meta sync");
         rc_bail_if_reclaimed();
+        // Before ANY frame of this batch is delivered or written: a dishonest
+        // table is the archive's defect -- exit 4, as the producer's walk, the
+        // trailer check and --direct-stage's host walk do.
+        if (walk_extents) {
+          for (size_t i = 0; i < C.filled; ++i) {
+            if (C.batch[i].src_off < 0) continue;
+            const unsigned long long fc = C.h_extent[i];
+            if (fc == (unsigned long long)C.h_comp_sizes[i]) continue;
+            const std::string why =
+                "this archive's seek table gives frame " + std::to_string(C.batch[i].seq)
+              + " a compressed extent of " + std::to_string(C.h_comp_sizes[i])
+              + " bytes, but " + (fc == ~0ULL ? std::string("no single frame fits it")
+                                  : "the frame there ends after " + std::to_string(fc))
+              + ", so the table does not account for every frame in the file";
+            gds_table_defect(opt, why);       // exits unless --keep-going
+            die(why, EXIT_DATA);
+          }
+          for (size_t i = 0; i < C.filled; ++i)
+            if (C.batch[i].src_off >= 0)
+              g_gds_extent_frames.fetch_add(1, std::memory_order_relaxed);
+        }
         if (ck_t0)
           g_gdsv_kernel_ns.fetch_add(now_ns() - ck_t0, std::memory_order_relaxed);
         if (C.gds_read || C.gds_only)
@@ -44390,24 +44872,15 @@ static void gpu_decomp_worker(
     // post-sync reclaimed check can run.  If reclaim won, only the process-lifetime
     // registry is still legal to touch.
     if (!gz_decomp_unpublish(device_id)) gz_decomp_park_forever();
-    const bool table_retry = opt.direct_stage_auto
-        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire);
-    if (table_retry) {
-      queue->set_done();                  // release a producer blocked pushing the index tail
-      vlog(V_VERBOSE, opt, "[STAGE] the seek table is wrong; finishing from the last "
-                           "verified batch boundary on the CPU\n");
-    } else {
-      *any_gpu_failed = true;
-      g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);
-      *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
-    }
+    *any_gpu_failed = true;
+    g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);
+    *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
     // SAY WHAT HAPPENED, HERE.  fatal_msg is reported by the caller after the
     // workers join -- but when this is the last worker out under --gpu-only the
     // rescue can die() first, and the user then gets "the GPU path failed" with
     // no cause at all.
-    if (!table_retry)
-      vlog(V_VERBOSE, opt, std::string("[GPU") + std::to_string(device_id)
-           + "] fault: " + e.what() + "\n");
+    vlog(V_VERBOSE, opt, std::string("[GPU") + std::to_string(device_id)
+         + "] fault: " + e.what() + "\n");
 
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
     // The batch was popped from the queue but not (fully) decompressed.
@@ -44437,10 +44910,7 @@ static void gpu_decomp_worker(
           // for sequence numbers that never come ("writer stuck", exit 1, after
           // a long wait).  Out of memory here is fatal; say so (review, v0.17.87).
           try {
-            if (table_retry) {
-              for (auto & t : C.batch) t.release_input();
-              C.batch.clear();
-            } else queue->re_enqueue(C.batch);
+            queue->re_enqueue(C.batch);
           }
           catch (...) {
             die("out of memory handing a failed GPU batch back to the CPU; "
@@ -44471,7 +44941,7 @@ static void gpu_decomp_worker(
 
     // The re-enqueue above happens-before this increment, so whichever worker
     // is last out sees those frames when it decides whether a rescue is owed.
-    if (!table_retry && gpu_failures) gpu_failures->fetch_add(1, std::memory_order_acq_rel);
+    if (gpu_failures) gpu_failures->fetch_add(1, std::memory_order_acq_rel);
     gpu_bringup_signal();       // one fewer GPU that could satisfy the barrier
     note_exit_and_rescue();
   }
@@ -44636,14 +45106,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   const int fd = ::fileno(in);
   if (fd < 0) return GDS_VERIFY_DEMOTE;
 
-  auto table_defect = [&](const std::string & why) {
-    if (!opt.direct_stage_auto) return gds_table_defect(opt, why);
-    // No Task has been published yet.  The default can ignore the index and
-    // let the ordinary producer find authoritative boundaries from the data.
-    g_gds_table_rejected.store(true, std::memory_order_relaxed);
-    vlog(V_VERBOSE, opt, "[STAGE] " + why + "; using the ordinary reader\n");
-    return true;
-  };
+  auto table_defect = [&](const std::string & why) { return gds_table_defect(opt, why); };
 
   auto read_meta = [&](void * dst, size_t n, uint64_t off) -> size_t {
     size_t got = 0;
@@ -44672,17 +45135,9 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   // Geometry is already in st.  Keep only the checksum evidence until every
   // entry is checked, then construct Tasks at the bounded queue hand-off.
   struct FrameCheck { uint32_t checksum = 0; bool has_checksum = false; };
-  if (nframes > tarx::seek_metadata_budget() / sizeof(FrameCheck)) {
-    if (opt.direct_stage_auto) return GDS_VERIFY_DEMOTE;
+  if (nframes > tarx::seek_metadata_budget() / sizeof(FrameCheck))
     die_io(gz_stage_name(opt) + ": frame metadata exceeds an eighth of available memory");
-  }
-  std::vector<FrameCheck> checks;
-  // Still before publication and meter credits: safe for the default to demote.
-  try { checks.resize(nframes); }
-  catch (const std::bad_alloc &) {
-    if (opt.direct_stage_auto) return GDS_VERIFY_DEMOTE;
-    throw;
-  }
+  std::vector<FrameCheck> checks(nframes);
 
   // TRIED AND REVERTED (2026-09-09): batching `posix_fadvise(WILLNEED)` over the
   // header and trailer page of every frame before this loop, to turn its
@@ -44784,8 +45239,17 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     // user has asked to survive a bad archive, find the defect while standing
     // down is still possible.  The walk's cost is then paid only by a run that
     // explicitly asked to tolerate damage, never by an ordinary one.
-    const bool self_checked = (hdr[4] & 0x04) != 0;
-    const bool must_walk    = !self_checked || opt.keep_going_requested;
+    //
+    // v0.18.34: ONLY --keep-going WALKS HERE NOW.  Every staged extent is proven
+    // where the worker already holds the frame -- --direct-stage on its pinned
+    // host copy (dstage_one_frame, v0.18.33), --gds-only in VRAM (gzx_launch_extent)
+    // -- before any of its batch is delivered, checksum or not.  That is stronger
+    // than this walk ever was for a checksummed frame (the trailer match it relied
+    // on is fooled by an identical swallowed frame) and costs no host I/O, so the
+    // ~1.7 million QD1 preads a checksumless archive paid here are gone.  What
+    // stays is --keep-going's reason above: to find the lie while demoting to the
+    // ordinary producer is still possible.
+    const bool must_walk    = opt.keep_going_requested;
     if (must_walk) ++walked_frames;
     int extent_read_error = 0;
     if (must_walk
@@ -44836,8 +45300,6 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   // 106.98 GiB @ 28.14 GiB/s" -- the total exceeded the file, and the rate was
   // meaningless because the numerator arrived before any work happened.
   for (size_t k = 0; k < nframes; ++k) {
-    if (opt.direct_stage_auto
-        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire)) break;
     Task t;
     t.seq         = k;
     t.src_off     = (off_t)st.c_off[k];
@@ -44880,7 +45342,8 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
 
 static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
-  g_auto_stage_decode_retry.pending.store(false, std::memory_order_relaxed);
+  g_hyb_decomp_cpu_cap.store(0, std::memory_order_relaxed);   // this input's producer decides
+  g_hyb_decomp_cap_waits.store(0, std::memory_order_relaxed);
   // Process-global because reclaimed workers survive across input files.  Keep a
   // per-file baseline so v0.17.61's warning counts only devices lost while this
   // input was running, not every device retired earlier in the invocation.
@@ -45167,27 +45630,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       // --direct-stage makes NO cuFile call: its workers pread this descriptor.
       if (dfd >= 0 && opt.gds_only && !g_gds_input.open(dfd, &why)) { ::close(dfd); dfd = -1; }
       int plain_fd = -1;
-      if (dfd >= 0) {
-        plain_fd = gz_reopen_input(cur, O_RDONLY);
-        // The default must retain CPU rescue.  With no buffered descriptor
-        // staged Tasks cannot be materialised after the GPU fails, whereas
-        // the ordinary reader can still read through the original FILE*.
-        if (opt.direct_stage_auto && plain_fd < 0) {
-          why = std::string("cannot keep a buffered input for CPU rescue: ")
-              + std::strerror(errno);
-          ::close(dfd);
-          dfd = -1;
-        }
-      }
+      if (dfd >= 0) plain_fd = gz_reopen_input(cur, O_RDONLY);
       if (dfd < 0) {
         vlog(gz_stage_notice_level(opt), opt, std::string("warning: ") + FLAG + " " + what + ": " + (why.empty()
              ? std::string("cannot register the archive with cuFile") : why)
              + "; using the ordinary read path.\n");
       } else {
         g_gds_verify_fd = dfd;
-        // An explicit staged request may run without the buffered rescue fd;
-        // gpu_only_cpu_fallback refuses if it is later needed.  The default
-        // stood down above instead, before publishing any staged Tasks.
+        // A staged request may run without the buffered rescue fd;
+        // gpu_only_cpu_fallback refuses if it is later needed.
         g_gds_verify_plain_fd = plain_fd;
         // BAR1 baseline for the ROUTING REPORT below.  The output arm captures
         // this too, but -t never reaches that arm -- it writes nothing -- so
@@ -45330,10 +45781,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
           // have left `-d --gds-only` paying the whole cost here -- the two walks
           // are deliberately NOT deduplicated (the descriptor pins the inode, not
           // its contents), so a fix applied to one of them is applied to neither.
-          // A self-checked frame is proven by its own trailer at decode time; a
-          // checksumless one has no other proof and is still walked.
-          const bool self_checked = (fh[4] & 0x04) != 0;
-          if ((!self_checked || opt.keep_going_requested)
+          // v0.18.34: only --keep-going walks here, as in the producer -- every
+          // extent is proven in VRAM before its batch is written
+          // (gzx_launch_extent), and --keep-going still needs the lie found
+          // before the output topology is frozen.
+          if (opt.keep_going_requested
               && !gds_frame_extent_matches(pfd, pst.c_off[k], cz, fh, (size_t)got)) {
             std::snprintf(db, sizeof(db),
               "this archive's seek table gives frame %zu a compressed extent "
@@ -46403,6 +46855,12 @@ gds_out_declined:
         GDS_READ_FANOUT,
         rc ? double(rn) / 1e6 / double(rc) : 0.0);
     std::cerr << b;
+    if (const uint64_t ex = g_gds_extent_frames.load(std::memory_order_relaxed)) {
+      std::snprintf(b, sizeof(b),
+          "[GDS] extents: %llu frame(s) proven whole in VRAM (block-header walk)\n",
+          (unsigned long long)ex);
+      std::cerr << b;
+    }
     const uint64_t post = g_gdsd_post_ns.load(std::memory_order_relaxed);
     const uint64_t hash = g_gdsv_kernel_ns.load(std::memory_order_relaxed);
     const uint64_t wns  = g_gdsd_write_ns.load(std::memory_order_relaxed);
@@ -46453,13 +46911,13 @@ gds_out_declined:
         vlog(V_VERBOSE, opt, "[CPU] pool join took " + std::to_string(int(ms)) + " ms\n");
     }
   }
+  if (const uint64_t w = g_hyb_decomp_cap_waits.load(std::memory_order_relaxed))
+    vlog(V_VERBOSE, opt, "[HYBRID] cached-archive cap: " + std::to_string(w)
+         + " take(s) by decoders past the cap left to the GPU\n");
   throttle.set_done();  // safe now: all workers exited
 
   {
     std::lock_guard<std::mutex> lk(results.m);
-    if (opt.direct_stage_auto
-        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire))
-      results.total_tasks = (size_t)g_auto_stage_decode_retry.seq;
     results.workers_done = true;
   }
   results.cv.notify_all();
@@ -46521,35 +46979,6 @@ gds_out_declined:
         b1 > g_gds_bar1_before ? ": BAR1 mapping activity observed"
                                : " (counter did not move)");
       vlog(V_VERBOSE, opt, b);
-    }
-  }
-
-  if (opt.direct_stage_auto
-      && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire)) {
-    // All readers and workers are joined, and the writer has flushed exactly
-    // the proven prefix.  Reframe the rest from the held input, without using
-    // another seek-table entry or changing the caller's output position.
-    gds_decomp_read_close();
-    // Keep the ordinary decoder's checksum evidence, as a hybrid run would.
-    // Staging's geometry is no longer used, but rejecting an extent must not
-    // disable checks on later frames which lack an in-frame checksum.
-    if (::fseeko(in, (off_t)g_auto_stage_decode_retry.off, SEEK_SET) != 0)
-      die_io("cannot seek the held input for automatic staging's CPU retry");
-    const uint64_t prefix = m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0;
-    if (m) {
-      m->total_out.store(prefix, std::memory_order_relaxed);
-      m->total_out_final.store(false, std::memory_order_release);
-      // The staged producer credited the trailer before handing off Tasks.
-      // The authoritative stream will encounter and account for it again.
-      m->skipped_input_bytes.store(0, std::memory_order_relaxed);
-    }
-    Options cpu_tail = opt;
-    cpu_tail.cpu_only = true; cpu_tail.gpu_only = false; cpu_tail.hybrid = false;
-    cpu_tail.direct_stage = false; cpu_tail.direct_stage_auto = false;
-    decompress_stream_from_file(in, out, cpu_tail, m, nullptr, true, prefix);
-    if (m) {
-      m->total_out.store(m->wrote_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
-      m->total_out_final.store(true, std::memory_order_release);
     }
   }
 
@@ -52576,7 +53005,8 @@ static bool adapt_output_is_regular(const Options & opt)
 
  WHEN, all of: no backend named or implied (--cpu-only, --hybrid,
  --gpu-only, -D, --long, ...), no GPU/hybrid tuning flag,
- compression of ONE named regular file of AUTO_STAGE_MIN_BYTES or more,
+ compression of named regular files each of AUTO_STAGE_MIN_BYTES or more
+ (or a --tar whose sources reach it: gz_auto_stage_tar_reaches; v0.18.34),
  the default level and none of zstd's own compressor knobs (nvCOMP
  compresses at one fixed level), no --verify/--keep-going/--no-check/
  --chunk-size/--mmap=on/--no-direct-read/--calibrate, a GPU in /proc that is
@@ -52652,6 +53082,50 @@ static bool gz_auto_stage_output_rebuildable(const Options & opt)
   return true;   // a derived name next to the input, created as a regular file
 }
 
+// A --tar run's sources, sized without the tar walk (which runs after the
+// backend is chosen): lstat each source where the walk will read it
+// (tar_source_fspath: -C applies) and, for a directory, its tree, summing
+// regular files' sizes -- symlinks count nothing, as tar stores them as links,
+// and what --exclude skips counts nothing (tar_path_excluded).  BOUNDED, because it runs before every small-budget --tar compress:
+// it stops at `floor` bytes (the answer is yes) or after AUTO_STAGE_TAR_ENTRIES
+// entries (the answer is "not known cheaply", and the run keeps the default).
+// A tree of large files reaches the floor in a few entries; one of many small
+// files gives up after a few milliseconds of lstat.  `largest` gets the
+// biggest regular file seen, for the O_DIRECT read probe.
+static constexpr size_t AUTO_STAGE_TAR_ENTRIES = 4096;
+static bool gz_auto_stage_tar_reaches(const Options & opt, uint64_t floor,
+                                      std::string * largest)
+{
+  uint64_t total = 0, big = 0;
+  size_t seen = 0;
+  std::vector<std::string> todo;
+  for (size_t si = opt.tar_sources.size(); si-- > 0; )
+    todo.push_back(tarx::tar_source_fspath(opt, si));
+  while (!todo.empty()) {
+    const std::string p = std::move(todo.back());
+    todo.pop_back();
+    if (++seen > AUTO_STAGE_TAR_ENTRIES) return false;
+    if (tarx::tar_path_excluded(opt, p)) continue;
+    struct stat st{};
+    if (::lstat(p.c_str(), &st) != 0) continue;
+    if (S_ISREG(st.st_mode)) {
+      total += (uint64_t)st.st_size;
+      if ((uint64_t)st.st_size > big) { big = (uint64_t)st.st_size; if (largest) *largest = p; }
+      if (total >= floor) return true;
+    } else if (S_ISDIR(st.st_mode)) {
+      DIR * d = ::opendir(p.c_str());
+      if (!d) continue;
+      while (const struct dirent * e = ::readdir(d)) {
+        if (!std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, "..")) continue;
+        if (todo.size() + seen > AUTO_STAGE_TAR_ENTRIES) { ::closedir(d); return false; }
+        todo.push_back(p + "/" + e->d_name);
+      }
+      ::closedir(d);
+    }
+  }
+  return total >= floor;
+}
+
 // Why the default does NOT stage this run, or nullptr when it may.  Cheap
 // tests first; the GPU inventory and O_DIRECT I/O probes last.
 // *cpus_out gets the allowance when it was read.  cap_override, when
@@ -52669,7 +53143,7 @@ static const char * gz_auto_stage_decline(const Options & opt, unsigned * cpus_o
            "on a small budget (an explicit --direct-stage still stages)";
   if (opt.mode != Mode::COMPRESS) return "only compression stages by default";
   if (opt.calibrate) return "calibration uses its own input and pipelines";
-  if (opt.tar_mode || opt.list_mode) return "--tar and -l do not stage by default";
+  if (opt.list_mode) return "-l does not stage";
   if ((opt.mmap_user_set && opt.use_mmap) || (opt.direct_read_user_set && !opt.direct_read))
     return "an input reader choice was given";
   if ((opt.level_user_set || opt.fast_flag || opt.best_flag || opt.ultra
@@ -52681,19 +53155,44 @@ static const char * gz_auto_stage_decline(const Options & opt, unsigned * cpus_o
     return "--verify and --keep-going keep the default";
   if (opt.no_check) return "--no-check keeps the default";
   if (opt.chunk_user_set) return "a frame size was given";
-  if (opt.inputs.size() != 1 || opt.inputs[0] == "-")
-    return "only a single named input stages by default";
+  // SEVERAL INPUTS AND --tar STAGE TOO (v0.18.34, ROADMAP 33).  MEASURED at 4 CPUs,
+  // 64.84 GiB cold, one H100: two inputs 31.8-32.0 s staged against hybrid's
+  // 39.5-43.2 (29-30 CPU-s against 138-154: the fixed start is paid once per
+  // process, so the second input costs less than the first); --tar of one such
+  // member 17.6-17.8 s against 24.3-25.5.
+  if (opt.tar_mode) {
+    if (opt.tar_sources.empty()) return "--tar was given no sources";
+  } else {
+    if (opt.inputs.empty()) return "standard input does not stage by default";
+    for (const auto & i : opt.inputs)
+      if (i == "-") return "standard input does not stage by default";
+  }
   const unsigned cpus = gz_cpu_allowance().allowed();
   if (cpus_out) *cpus_out = cpus;
   const unsigned cap = cap_override ? cap_override : AUTO_STAGE_MAX_CPUS_COMPRESS;
   if (cpus == 0 || cpus > cap) return "enough CPUs for the default";
   // Reject small/non-file inputs and unsuitable outputs before the GPU
-  // inventory and PCIe probe (whose fallback can start NVML).
-  const std::string & in = opt.inputs[0];
-  struct stat st{};
-  if (::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return "the input is not a regular file";
-  if ((uint64_t)st.st_size < gz_auto_stage_min_bytes())
-    return "the input is too small to repay starting a GPU";
+  // inventory and PCIe probe (whose fallback can start NVML).  EVERY input of
+  // a plain compress must repay the start on its own (the measured case; an
+  // input staged alongside a small one is not), and a --tar's sources must
+  // reach the floor between them.
+  std::vector<std::string> probe_inputs;     // what the O_DIRECT probe reads
+  if (opt.tar_mode) {
+    std::string largest;
+    if (!gz_auto_stage_tar_reaches(opt, gz_auto_stage_min_bytes(), &largest))
+      return "the --tar sources are too small to repay starting a GPU, or too many to "
+             "size before the walk";
+    probe_inputs.push_back(largest);
+  } else {
+    for (const auto & i : opt.inputs) {
+      struct stat st{};
+      if (::stat(i.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return "the input is not a regular file";
+      if ((uint64_t)st.st_size < gz_auto_stage_min_bytes())
+        return opt.inputs.size() == 1 ? "the input is too small to repay starting a GPU"
+                                      : "an input is too small to repay starting a GPU";
+    }
+    probe_inputs = opt.inputs;
+  }
   if (!gz_auto_stage_output_rebuildable(opt))
     return "the output could not be discarded and rebuilt on the CPU if the GPU failed";
   if (const char * cvd = std::getenv("CUDA_VISIBLE_DEVICES"); cvd && (cvd[0] == '\0' || cvd[0] == '-'))
@@ -52740,8 +53239,10 @@ static const char * gz_auto_stage_decline(const Options & opt, unsigned * cpus_o
   if (gz_floor_precuda().all_old) return "every GPU is older than this build supports";
   if (detect_min_pcie_gen() < 4) return "the GPUs' PCIe link is older than Gen4, or unknown";
   // The staged reader opens O_DIRECT and dies when it cannot: find out here.
-  // Some filesystems accept the open and refuse the read, so read one block.
-  {
+  // Some filesystems accept the open and refuse the read, so read one block --
+  // of every input (one 4 KiB read each), or of a --tar's largest file (its
+  // reader takes a member that refuses O_DIRECT at open through the page cache).
+  for (const std::string & in : probe_inputs) {
     // Probe the SAME reopen the staged producer needs.  An O_DIRECT open by
     // name can succeed in a namespace without /proc/self/fd, where the
     // producer cannot reopen its verified input and the ordinary reader can.
@@ -52895,7 +53396,10 @@ static void apply_backend_defaults(Options & opt)
   bool budget_owned = false;
   {
     const unsigned static_cap = AUTO_STAGE_MAX_CPUS_COMPRESS;
-    const bool adapting = opt.adapt && !opt.no_profile && !opt.list_mode;
+    // --adapt's budget prior keys a run by ONE input's residency and files one
+    // rate, so a run of several inputs or a --tar takes the static rule.
+    const bool adapting = opt.adapt && !opt.no_profile && !opt.list_mode
+                       && !opt.tar_mode && opt.inputs.size() == 1;
     unsigned stage_cpus = 0;
     const char * no = gz_auto_stage_decline(opt, &stage_cpus,
                           adapting ? (unsigned)16 : 0u);
@@ -53266,7 +53770,7 @@ static void apply_backend_defaults(Options & opt)
       vlog(V_VERBOSE, opt, "[STAGE] no usable GPU after all; the default backend instead\n");
     } else if (opt.verbosity >= V_VERBOSE) {
       vlog(V_VERBOSE, opt, "[STAGE] " + std::to_string(gz_cpu_allowance().allowed())
-           + " CPUs allowed and a GPU beside them: staging the input through the GPU "
+           + " CPUs allowed and a GPU beside them: staging the reads through the GPU "
              "(the --direct-stage path); --hybrid or --cpu-only keeps the CPUs working\n");
     }
   }
@@ -56229,12 +56733,15 @@ static Options parse_args(int argc, char ** argv)
     // the writer fed and gets slower with every extra stream, while compress and
     // verify (-t) overlap their stages and want more than one.  See the two
     // DEFAULT_GPU_*STREAMS constants for the measurements.
-    // --gds-only takes one stream regardless of direction, for two reasons that
-    // are specific to it: every stream registers its own input slab into BAR1
-    // (MEASURED ~490 ms for 1 GiB), and the pure peer-to-peer OUTPUT packer
-    // demotes to the ordinary ordered writer unless the shape is exactly one
-    // device and one stream (its pack buffer is per StreamCtx while its file
-    // offset is global -- see gds_cout_shape_ok).
+    // --gds-only COMPRESS TAKES TWO STREAMS SINCE v0.18.34 (ROADMAP 31); it took
+    // one regardless of direction, for two reasons that no longer hold: every
+    // stream registers its own input slab into BAR1 (MEASURED ~490 ms for 1 GiB
+    // then; 169 ms on driver 595), and the pure peer-to-peer OUTPUT packer was
+    // per StreamCtx while its file offset is global, so it demoted to the
+    // ordinary writer at two streams.  A device's streams now share one pack (see
+    // gds_cout_shape_ok).  And one stream serialised read and compute exactly as
+    // described below for --direct-stage: 64 GiB cold, 34 s at one stream, 22 at
+    // two.  Its decompress and -t keep one, as --direct-stage's do.
     //
     // --direct-stage USED TO INHERIT THAT and pays neither cost: it makes no
     // cuFile call, so it registers nothing, and it has no peer-to-peer output
@@ -56267,7 +56774,7 @@ static Options parse_args(int argc, char ** argv)
     // streams take turns on one worker (measured for -d: no gain).  Compress keeps
     // its two, for the reasons above.
     const bool staged_decomp = opt.region_staged() && opt.mode != Mode::COMPRESS;
-    opt.gpu_streams = (opt.gds_only || staged_decomp) ? 1
+    opt.gpu_streams = staged_decomp ? 1
                     : (opt.mode == Mode::DECOMPRESS)
                         ? DEFAULT_GPU_DECOMP_STREAMS : DEFAULT_GPU_STREAMS;
   }

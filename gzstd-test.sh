@@ -520,6 +520,17 @@ if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
   export GPU_ALL_DEVICES
 fi
 
+# 1 when PATH's filesystem sits on rotating media (sysfs says so), else 0 --
+# gzstd's own rule (device_is_rotational): unknown counts as not rotating.
+dev_rotational() {
+  local mm f
+  mm=$(stat -c '%Hd:%Ld' "$1" 2>/dev/null) || { echo 0; return; }
+  for f in "/sys/dev/block/$mm/queue/rotational" "/sys/dev/block/$mm/../queue/rotational"; do
+    [[ -r $f ]] && { cat "$f"; return; }
+  done
+  echo 0
+}
+
 has_gpu() {
   # An explicitly empty mask means "no CUDA devices" even though nvidia-smi can
   # still see the physical host.  Treat it as such instead of running every GPU
@@ -622,8 +633,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=554
-$EXTENSIVE && EXPECTED_TESTS=896
+EXPECTED_TESTS=560
+$EXTENSIVE && EXPECTED_TESTS=902
 # v0.18.33: +1 default cell on both builds (a cold archive's decode readers) and
 # +10 default GPU cells (a small CPU budget stages by default: compress,
 # decompress, the CPU rebuild, the declines, an explicit flag's refusal, --adapt's
@@ -956,8 +967,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=151   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=229   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33
+EXPECTED_NOGPU_DELTA=155   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=233   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -975,8 +986,8 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=229   # 207 MEASURED 2026-10-14 (824 - 617); 
 # one of the 607 cells has now been exercised.
 # v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
 # cell that exists only under --extensive.
-EXPECTED_NOGDS_DELTA=15   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7, two seek-table-section cells in v0.18.32
-$EXTENSIVE && EXPECTED_NOGDS_DELTA=19   # + the v0.17.83 --extensive cell
+EXPECTED_NOGDS_DELTA=17   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7, two seek-table-section cells in v0.18.32; + two v0.18.34
+$EXTENSIVE && EXPECTED_NOGDS_DELTA=21   # + the v0.17.83 --extensive cell
 
 # ============================================================
 # Banner & system info
@@ -4145,6 +4156,116 @@ GLPY
   fi
   rm -f "$TMPDIR"/gl_[abc] "$TMPDIR"/gl_[abc].zst "$TMPDIR"/gl_[abc].zst.nc \
         "$TMPDIR/gl.zst" "$TMPDIR/gl.out" "$TMPDIR/gl.want"
+
+  # v0.18.34 (ROADMAP 31): EVERY --gds-only EXTENT IS PROVEN IN VRAM.  An entry
+  # merging two frames with IDENTICAL contents reads the swallowed frame's trailer
+  # as the first's checksum -- and it matches -- so the producer's trailer trust
+  # let `-d --gds-only` write one copy at exit 0 (v0.18.33: 2 of 3 MiB) and `-t`
+  # say OK.  --direct-stage closed it on its host copy in v0.18.33; --gds-only
+  # now walks each frame's block headers on the device, where the read put it.
+  # The same proof makes the producer's own pread walk of checksumless frames
+  # redundant outside --keep-going: an honest checksumless archive reports 0
+  # walked, and every frame proven.
+  gx_a="$TMPDIR/gx_a"; gx_b="$TMPDIR/gx_b"; gx_in="$TMPDIR/gx.bin"
+  head -c 786432 /dev/urandom | base64 -w0 | head -c 1048576 > "$gx_a"
+  head -c 786432 /dev/urandom | base64 -w0 | head -c 1048576 > "$gx_b"
+  cat "$gx_a" "$gx_a" "$gx_b" > "$gx_in"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$gx_in" -o "$TMPDIR/gx.zst" 2>/dev/null
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 --no-check "$gx_in" -o "$TMPDIR/gxnc.zst" 2>/dev/null
+  python3 -I - "$TMPDIR/gx.zst" "$TMPDIR/gxf.zst" "$TMPDIR/gxnc.zst" "$TMPDIR/gxempty.zst" <<'GXPY'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+assert struct.unpack('<I', b[-4:])[0] == 0x8F92EAB1
+desc = b[-5]; n = struct.unpack('<I', b[-9:-5])[0]; es = 12 if desc & 0x80 else 8
+skip = len(b) - (n * es + 9) - 8
+ents = [list(struct.unpack('<II', b[skip+8+i*es:skip+16+i*es])) + [b[skip+16+i*es:skip+8+(i+1)*es]] for i in range(n)]
+m = [[ents[0][0] + ents[1][0], ents[0][1], ents[0][2]]] + ents[2:]
+body = b''.join(struct.pack('<II', c, d) + x for c, d, x in m) + struct.pack('<I', len(m)) + bytes([desc]) + struct.pack('<I', 0x8F92EAB1)
+open(sys.argv[2], 'wb').write(b[:skip] + struct.pack('<II', 0x184D2A5E, len(body)) + body)
+# Capacity alone cannot prove an extent on CPU rescue: appending a valid empty
+# DATA frame changes the extent without increasing the decoded size.  Keep the
+# first checksumless frame and its table checksum, but merge that empty frame
+# into the sole entry.  The GPU will fail before doing its own boundary walk.
+b = open(sys.argv[3], 'rb').read()
+desc = b[-5]; n = struct.unpack('<I', b[-9:-5])[0]; es = 12 if desc & 0x80 else 8
+skip = len(b) - (n * es + 9) - 8
+c, d = struct.unpack('<II', b[skip+8:skip+16])
+empty = bytes.fromhex('28b52ffd2000010000')
+body = (struct.pack('<II', c + len(empty), d) + b[skip+16:skip+8+es]
+        + struct.pack('<I', 1) + bytes([desc]) + struct.pack('<I', 0x8F92EAB1))
+open(sys.argv[4], 'wb').write(b[:c] + empty + struct.pack('<II', 0x184D2A5E, len(body)) + body)
+GXPY
+  gx_why=""
+  rm -f "$TMPDIR/gx.out"
+  run_test "$GZSTD" -q -f -d --gds-only "$TMPDIR/gxf.zst" -o "$TMPDIR/gx.out" 2>/dev/null
+  [[ $LAST_RC -eq 4 ]] || gx_why+=" [-d exit $LAST_RC, want 4]"
+  [[ -e "$TMPDIR/gx.out" ]] && gx_why+=" [-d left $(stat -c %s "$TMPDIR/gx.out") bytes]"
+  run_test "$GZSTD" -q -t --gds-only "$TMPDIR/gxf.zst" 2>/dev/null
+  [[ $LAST_RC -eq 4 ]] || gx_why+=" [-t exit $LAST_RC, want 4]"
+  run_test "$GZSTD" -q -f -d --gds-only --keep-going "$TMPDIR/gxf.zst" -o "$TMPDIR/gx.out" 2>/dev/null
+  { [[ $LAST_RC -eq 0 ]] && files_match "$gx_in" "$TMPDIR/gx.out"; } \
+    || gx_why+=" [--keep-going exit $LAST_RC or bytes]"
+  run_test "$GZSTD" -t -v --gds-only "$TMPDIR/gxnc.zst" 2> "$TMPDIR/gx.err"
+  [[ $LAST_RC -eq 0 ]] || gx_why+=" [honest checksumless -t exit $LAST_RC]"
+  grep -aq 'preads (0 walked)' "$TMPDIR/gx.err" || gx_why+=" [producer still walked: $(grep -ao 'preads ([0-9]* walked)' "$TMPDIR/gx.err" | head -1)]"
+  grep -aq '\[GDS\] extents: 3 frame(s) proven' "$TMPDIR/gx.err" || gx_why+=" [no device extent proof for 3 frames]"
+  for gx_stage in --direct-stage --gds-only; do
+    run_test env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_FAIL_GPU_BRINGUP=all \
+      "$GZSTD" -t -v "$gx_stage" --gpu-devices=1 "$TMPDIR/gxempty.zst" 2> "$TMPDIR/gx.err"
+    [[ $LAST_RC -eq 4 ]] || gx_why+=" [$gx_stage CPU rescue accepted merged empty frame: exit $LAST_RC]"
+    grep -aq 'finishing decompression on CPU' "$TMPDIR/gx.err" || gx_why+=" [$gx_stage did not reach CPU rescue]"
+    grep -aq 'seek table gives frame' "$TMPDIR/gx.err" || gx_why+=" [$gx_stage no extent diagnostic]"
+  done
+  if ! gds_testable; then
+    skip "--gds-only proves each extent in VRAM: identical merged frames exit 4" \
+         "GDS unavailable ($(gds_host_status))"
+  elif [[ -z "$gx_why" ]]; then
+    pass "--gds-only proves each extent in VRAM: identical merged frames exit 4"
+  else
+    fail "--gds-only proves each extent in VRAM: identical merged frames exit 4" "$gx_why"
+  fi
+  rm -f "$gx_a" "$gx_b" "$gx_in" "$TMPDIR/gx.zst" "$TMPDIR/gxnc.zst" "$TMPDIR/gxf.zst" \
+        "$TMPDIR/gxempty.zst" "$TMPDIR/gx.out" "$TMPDIR/gx.err"
+
+  # v0.18.34 (ROADMAP 31): --gds-only COMPRESS RUNS TWO STREAMS AND KEEPS ITS
+  # PEER-TO-PEER OUTPUT.  The pack buffer was per stream while the file offset is
+  # the run's, so two streams demoted the output to the ordinary writer and the
+  # default stayed at one -- which serialises read and compute (64 GiB cold: 34 s
+  # against 22).  A device's streams now share stream 0's pack.  Small batches and
+  # 1 MiB frames make the two streams alternate and the pack flush mid-batch; the
+  # archive must be byte-identical to one stream's and to the ordinary writer's.
+  g2_in="$TMPDIR/g2.bin"
+  head -c 30000000 /dev/urandom | base64 -w0 | head -c 41000000 > "$g2_in"
+  g2_why=""
+  env GZSTD_DEBUG_GPU_MIN_BYTES=0 GZSTD_DEBUG_GDS_COUT=1 "$GZSTD" -f -k -vv --gds-only --chunk-size=1 \
+    --gpu-batch=4 "$g2_in" -o "$TMPDIR/g2s2.zst" 2> "$TMPDIR/g2.err"; g2_rc=$?
+  [[ $g2_rc -eq 0 ]] || g2_why+=" [default exit $g2_rc]"
+  grep -aq '/S1\] subchunk=' "$TMPDIR/g2.err" || g2_why+=" [no second stream]"
+  grep -aq 'frames go VRAM -> NVMe' "$TMPDIR/g2.err" || g2_why+=" [peer-to-peer output not engaged]"
+  grep -aq 'requires exactly one GPU' "$TMPDIR/g2.err" && g2_why+=" [demoted]"
+  g2_fl=$(grep -ac '\[COUT\] flush' "$TMPDIR/g2.err"); [[ $g2_fl -ge 3 ]] || g2_why+=" [$g2_fl flushes]"
+  # v0.18.34: full packs go to the write-behind thread ("behind") while the drain
+  # fills the standby; the bytes must equal the synchronous writes'.
+  grep -aq '\[COUT\] flush .* final=0 behind' "$TMPDIR/g2.err" || g2_why+=" [no write-behind flush]"
+  env GZSTD_DEBUG_GPU_MIN_BYTES=0 GZSTD_DEBUG_GDS_COUT_SYNC=1 "$GZSTD" -q -f -k --gds-only --chunk-size=1 \
+    --gpu-batch=4 "$g2_in" -o "$TMPDIR/g2sync.zst" 2>/dev/null || g2_why+=" [synchronous exit $?]"
+  cmp -s "$TMPDIR/g2s2.zst" "$TMPDIR/g2sync.zst" || g2_why+=" [differs from synchronous writes]"
+  env GZSTD_DEBUG_GPU_MIN_BYTES=0 "$GZSTD" -q -f -k --gds-only --chunk-size=1 --gpu-batch=4 \
+    --gpu-streams=1 "$g2_in" -o "$TMPDIR/g2s1.zst" 2>/dev/null || g2_why+=" [one-stream exit $?]"
+  env GZSTD_DEBUG_GPU_MIN_BYTES=0 GZSTD_DEBUG_GDS_NO_P2P_OUT=1 "$GZSTD" -q -f -k --gds-only \
+    --chunk-size=1 --gpu-batch=4 "$g2_in" -o "$TMPDIR/g2ord.zst" 2>/dev/null || g2_why+=" [ordinary exit $?]"
+  cmp -s "$TMPDIR/g2s2.zst" "$TMPDIR/g2s1.zst" || g2_why+=" [differs from one stream]"
+  cmp -s "$TMPDIR/g2s2.zst" "$TMPDIR/g2ord.zst" || g2_why+=" [differs from the ordinary writer]"
+  "$GZSTD" -q -d -c "$TMPDIR/g2s2.zst" 2>/dev/null | cmp -s - "$g2_in" || g2_why+=" [round trip]"
+  if ! gds_testable; then
+    skip "--gds-only compress: two streams share one peer-to-peer pack" \
+         "GDS unavailable ($(gds_host_status))"
+  elif [[ -z "$g2_why" ]]; then
+    pass "--gds-only compress: two streams share one peer-to-peer pack" "$g2_fl flushes"
+  else
+    fail "--gds-only compress: two streams share one peer-to-peer pack" "$g2_why"
+  fi
+  rm -f "$g2_in" "$TMPDIR/g2s2.zst" "$TMPDIR/g2s1.zst" "$TMPDIR/g2ord.zst" "$TMPDIR/g2sync.zst" "$TMPDIR/g2.err"
 
 
   # v0.17.30: the cuFileBufRegister budget is derived from MemAvailable now, so a
@@ -10021,14 +10142,21 @@ fi
 #    device as 33% busy and filed the run compute-bound.  Run 1 writes a seed of 3
 #    (a buffered --adapt run that qualifies for a save).  Run 2 proves that a
 #    buffered pool actually loads that seed; otherwise a broken prior loader
-#    could make the O_DIRECT assertion pass vacuously.  Run 3 reads O_DIRECT,
-#    one stream, in the same bucket, and the -v [READER] line names its divisor.
+#    could make the O_DIRECT assertion pass vacuously.  Run 3 reads O_DIRECT in
+#    the same bucket, and the -v [READER] line names its divisor: its own count,
+#    3 since v0.18.34 (DIRECT_READ_STREAMS; 1 on spinning media).  A seed equal to
+#    that count would make the assertion vacuous, so it is moved to 6 first.
 head -c 64M /dev/urandom > "$TMPDIR/rsd.bin"
 env XDG_CACHE_HOME="$TMPDIR/rsd_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt --cpu-only \
   --no-mmap -v -T24 -c "$TMPDIR/rsd.bin" > /dev/null 2> "$TMPDIR/rsd1.err"
 rsd_rc1=$?
 rsd_seed=$(grep -o '"read_threads_settled_warm_nofile": *[0-9]*' "$TMPDIR/rsd_x/gzstd/profile.json" \
            2>/dev/null | grep -o '[0-9]*$')
+rsd_want=3; [[ "$(dev_rotational "$TMPDIR")" == 1 ]] && rsd_want=1
+if [[ "${rsd_seed:-0}" -eq $rsd_want ]]; then
+  sed -i -E 's/("read_threads_settled_warm_nofile": *)[0-9]+/\16/' "$TMPDIR/rsd_x/gzstd/profile.json"
+  rsd_seed=6
+fi
 env XDG_CACHE_HOME="$TMPDIR/rsd_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 \
   "$GZSTD" --adapt --cpu-only --no-mmap -v -T24 \
   -c "$TMPDIR/rsd.bin" > /dev/null 2> "$TMPDIR/rsd2.err"
@@ -10038,18 +10166,18 @@ env XDG_CACHE_HOME="$TMPDIR/rsd_x" "$GZSTD" --adapt --cpu-only --direct-read -v 
 rsd_rc3=$?
 rsd_line=$(grep -ao '\[READER\] io.*(per thread, [0-9]* reader' "$TMPDIR/rsd3.err" | head -1)
 if grep -q 'could not engage O_DIRECT' "$TMPDIR/rsd3.err"; then
-  skip_host "an O_DIRECT reader publishes 1 reader, not the profile's seed" "no O_DIRECT on TMPDIR"
+  skip_host "an O_DIRECT reader publishes its own count, not the profile's seed" "no O_DIRECT on TMPDIR"
 elif [[ $rsd_rc1 -ne 0 || "${rsd_seed:-0}" -lt 2 ]]; then
-  fail "an O_DIRECT reader publishes 1 reader, not the profile's seed" \
+  fail "an O_DIRECT reader publishes its own count, not the profile's seed" \
        "run 1 exit $rsd_rc1; seed ${rsd_seed:-none} (want at least 2)"
 elif [[ $rsd_rc2 -ne 0 ]] || ! grep -qF "reader pool: started $rsd_seed (from profile)" "$TMPDIR/rsd2.err"; then
-  fail "an O_DIRECT reader publishes 1 reader, not the profile's seed" \
+  fail "an O_DIRECT reader publishes its own count, not the profile's seed" \
        "run 2 exit $rsd_rc2; buffered reader did not load seed $rsd_seed"
-elif [[ $rsd_rc3 -eq 0 && "$rsd_line" == *"(per thread, 1 reader" ]]; then
-  pass "an O_DIRECT reader publishes 1 reader, not the profile's seed" "seed $rsd_seed"
+elif [[ $rsd_rc3 -eq 0 && "$rsd_line" == *"(per thread, $rsd_want reader" ]]; then
+  pass "an O_DIRECT reader publishes its own count, not the profile's seed" "seed $rsd_seed, $rsd_want readers"
 else
-  fail "an O_DIRECT reader publishes 1 reader, not the profile's seed" \
-       "exit $rsd_rc3, seed $rsd_seed: ${rsd_line:-no [READER] line}"
+  fail "an O_DIRECT reader publishes its own count, not the profile's seed" \
+       "exit $rsd_rc3, seed $rsd_seed, want $rsd_want: ${rsd_line:-no [READER] line}"
 fi
 rm -rf "$TMPDIR/rsd.bin" "$TMPDIR/rsd_x" "$TMPDIR/rsd1.err" "$TMPDIR/rsd2.err" \
        "$TMPDIR/rsd3.err" "$TMPDIR/rpr.err"
@@ -10135,10 +10263,12 @@ fi
 #    time-weighted count and says so when that differs from the last.  Reader time
 #    cannot exceed the reader-seconds the passes had, so io <= 100% (101 for
 #    rounding).  CPU producer only: the line and the accounting are shared code.
+#    -T96, so the buffered pass has 12 readers: since v0.18.34 O_DIRECT has 3, and
+#    at -T24 the buffered pass had 3 too -- every pass the same, nothing to average.
 rf_why=""
 rm -f "$TMPDIR/rfr.bin"; truncate -s 4G "$TMPDIR/rfr.bin"
 env XDG_CACHE_HOME="$TMPDIR/rfr_x" GZSTD_DEBUG_READ_PROBE_PICK=direct \
-  "$GZSTD" --no-profile --cpu-only -v -T24 --chunk-size 2 -c "$TMPDIR/rfr.bin" \
+  "$GZSTD" --no-profile --cpu-only -v -T96 --chunk-size 2 -c "$TMPDIR/rfr.bin" \
   > /dev/null 2> "$TMPDIR/rfr.err"
 rf_rc=$?
 rf_line=$(tr '\r' '\n' < "$TMPDIR/rfr.err" | grep -ao '\[READER\] io [0-9.]*%.*run)' | head -1)
@@ -10154,7 +10284,7 @@ else
   rm -rf "$TMPDIR/rfr.bin" "$TMPDIR/rfr_x" "$TMPDIR/rfr.err"
   if [[ -n "$rf_why" ]]; then
     fail "after a read probe, the [READER] line divides by the readers it had" "$rf_why"
-  elif [[ "$rf_line" == *"1 reader at the end, "*" on average"* ]]; then
+  elif [[ "$rf_line" == *"$(( $(dev_rotational "$TMPDIR") == 1 ? 1 : 3 )) reader"*" at the end, "*" on average"* ]]; then
     pass "after a read probe, the [READER] line divides by the readers it had"
   else
     # The buffered probe occupied under 5% of a very long run; the diagnostic
@@ -10163,6 +10293,78 @@ else
       "the probe changed the run's average reader count by at most 5%"
   fi
 fi
+
+# 7. O_DIRECT COMPRESS READS THROUGH THREE READERS (v0.18.34, ROADMAP 34).  It read
+#    through one since v0.13.46, which left the drive idle between reads: 64.84
+#    GiB cold, 14.1-14.4 s against 13.2-13.3 at three.  The readers pull
+#    interleaved chunks, so the last chunk's short read can land on any of them;
+#    a size that is not a multiple of the 4 KiB block (or of the chunk) is where
+#    that would lose or repeat a tail.  --read-threads sets the count (it was
+#    ignored for O_DIRECT compress).  Both producers: --cpu-only, and the default
+#    hybrid one when there is a GPU.
+odr_why=""; odr_ran=0
+odr_want=3; [[ "$(dev_rotational "$TMPDIR")" == 1 ]] && odr_want=1
+head -c $((24 * 1048576 + 12345)) /dev/urandom > "$TMPDIR/odr.bin"
+for odr_arm in cpu gpu; do
+  [[ $odr_arm == gpu ]] && ! has_gpu 2>/dev/null && continue
+  odr_fl=""; [[ $odr_arm == cpu ]] && odr_fl="--cpu-only"
+  for odr_n in default 2; do
+    odr_rt=""; odr_exp=$odr_want
+    [[ $odr_n == 2 ]] && { odr_rt="--read-threads=2"; odr_exp=2; }
+    env GZSTD_DEBUG_GPU_MIN_BYTES=0 "$GZSTD" $odr_fl --direct-read $odr_rt -v -T8 --chunk-size 1 \
+      -f "$TMPDIR/odr.bin" -o "$TMPDIR/odr.zst" 2> "$TMPDIR/odr.err"
+    odr_rc=$?
+    if grep -q 'could not engage O_DIRECT' "$TMPDIR/odr.err"; then continue; fi
+    odr_ran=$((odr_ran+1))
+    odr_line=$(tr '\r' '\n' < "$TMPDIR/odr.err" | grep -ao '\[READER\] io.*(per thread, [0-9]* reader' | head -1)
+    [[ $odr_rc -eq 0 ]] || odr_why+=" [$odr_arm/$odr_n exit $odr_rc]"
+    [[ "$odr_line" == *"(per thread, $odr_exp reader" ]] \
+      || odr_why+=" [$odr_arm/$odr_n want $odr_exp readers: ${odr_line:-no [READER] line}]"
+    "$GZSTD" -d -q -c "$TMPDIR/odr.zst" 2>/dev/null | cmp -s - "$TMPDIR/odr.bin" \
+      || odr_why+=" [$odr_arm/$odr_n bytes]"
+  done
+done
+if [[ $odr_ran -eq 0 ]]; then
+  skip_host "O_DIRECT compress reads through three readers; --read-threads sets them" "no O_DIRECT on TMPDIR"
+elif [[ -z "$odr_why" ]]; then
+  pass "O_DIRECT compress reads through three readers; --read-threads sets them" "$odr_ran runs"
+else
+  fail "O_DIRECT compress reads through three readers; --read-threads sets them" "$odr_why"
+fi
+rm -f "$TMPDIR/odr.bin" "$TMPDIR/odr.zst" "$TMPDIR/odr.err"
+
+# 8. A READ-PROBE TIE GOES TO O_DIRECT (v0.18.34, ROADMAP 34).  O_DIRECT had to beat
+#    buffered by 5%, so a tie went to the path that costs ~10x the kernel CPU and
+#    fills the page cache with the input; buffered must now be MORE than 10%
+#    faster.  GZSTD_DEBUG_READ_PROBE_RATES puts each side of that margin in front
+#    of the rule, whatever this host's device measures: a tie and an 8% buffered
+#    lead keep O_DIRECT, a 12.5% lead takes buffered.  The sparse 4 GiB file is
+#    cold by construction and costs no disk.
+rm -f "$TMPDIR/rpm.bin"; truncate -s 4G "$TMPDIR/rpm.bin"
+rpm_why=""; rpm_ran=0
+for rpm_case in "4.8:4.9:O_DIRECT" "4.8:5.2:O_DIRECT" "4.0:4.5:buffered"; do
+  IFS=: read -r rpm_d rpm_b rpm_want <<<"$rpm_case"
+  env GZSTD_DEBUG_READ_PROBE_RATES="$rpm_d:$rpm_b" "$GZSTD" --no-profile --cpu-only -v -T24 \
+    --chunk-size 2 -c "$TMPDIR/rpm.bin" > /dev/null 2> "$TMPDIR/rpm.err"
+  rpm_rc=$?
+  rpm_l=$(tr '\r' '\n' < "$TMPDIR/rpm.err" | grep -ao '\[READ-PROBE\] O_DIRECT [0-9.]* GiB/s vs.*' | head -1)
+  [[ -n "$rpm_l" ]] || continue
+  rpm_ran=$((rpm_ran+1))
+  [[ $rpm_rc -eq 0 ]] || rpm_why+=" [$rpm_d:$rpm_b exit $rpm_rc]"
+  [[ "$rpm_l" == *"-> $rpm_want for the remainder (GZSTD_DEBUG_READ_PROBE_RATES)"* ]] \
+    || rpm_why+=" [$rpm_d:$rpm_b want $rpm_want: $rpm_l]"
+done
+if [[ $rpm_ran -eq 0 ]]; then
+  skip_host "a read-probe tie goes to O_DIRECT; buffered must be >10% faster" \
+    "no read probe here (rotational TMPDIR or no O_DIRECT)"
+elif [[ $rpm_ran -ne 3 ]]; then
+  fail "a read-probe tie goes to O_DIRECT; buffered must be >10% faster" "probed $rpm_ran of 3 runs$rpm_why"
+elif [[ -z "$rpm_why" ]]; then
+  pass "a read-probe tie goes to O_DIRECT; buffered must be >10% faster"
+else
+  fail "a read-probe tie goes to O_DIRECT; buffered must be >10% faster" "$rpm_why"
+fi
+rm -f "$TMPDIR/rpm.bin" "$TMPDIR/rpm.err"
 
 # ────────────────────────────────────────────────────────────
 section "--adapt sink budget grow (bursty sink-bound)"
@@ -13457,7 +13659,8 @@ if has_gpu 2>/dev/null && command -v python3 >/dev/null 2>&1 && command -v tasks
              "the default's staging finishes on the CPU when the GPU cannot carry it" \
              "--adapt's budget prior: the default runs, then each backend is tried" \
              "--adapt files a staged run under its CPU budget" \
-             "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3"; do
+             "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
+             "several inputs and --tar stage by default; --tar rebuilds on the CPU"; do
       if grep -qE 'older than Gen4|O_DIRECT|no NVIDIA GPU|no usable GPU|older than this build|hides every GPU|cannot safely be narrowed' <<< "$bs_no"; then
         skip_host "$c" "this host does not stage: ${bs_no#the default does not stage: }"
       else
@@ -13614,6 +13817,110 @@ PYEOF
     rm -f "$bs_g" "$bs_gz"
     [[ -z "$why" ]] && pass "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
       || fail "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" "$why"
+    # 11. SEVERAL INPUTS AND --tar STAGE TOO (v0.18.34, ROADMAP 33).  MEASURED at
+    # 4 CPUs, 64.84 GiB cold: two inputs 31.8-32.0 s staged against hybrid's
+    # 39.5-43.2, a --tar of one such member 17.6-17.8 against 24.3-25.5.  Every
+    # input must reach the floor on its own; a --tar's sources together, sized by
+    # a walk that gives up after 4,096 entries.  The default's promise holds for
+    # --tar too: a GPU that cannot come up rebuilds the archive on the CPU.
+    why=""
+    bs_t="$TMPDIR/bs-t"; rm -rf "$bs_t"; mkdir -p "$bs_t/d" "$bs_t/x" "$bs_t/many"
+    cp "$bs_src" "$bs_t/d/a.bin"; head -c 1000 /dev/urandom > "$bs_t/small.bin"
+    "${bs_env[@]}" timeout --foreground -k 10 120 taskset -c "$bs4" \
+      "$GZSTD" -v -f -c "$bs_src" "$bs_t/d/a.bin" > "$bs_out" 2> "$bs_log"; rc=$?
+    [[ $rc -eq 0 ]] || why+=" [two inputs exit $rc]"
+    bs_lines "$bs_log" | grep -aq '^\[STAGE\] 4 CPUs allowed' || why+=" [two inputs: no STAGE line]"
+    bs_n=$(bs_lines "$bs_log" | grep -ac "^\[DSTAGE\] $bs_frames frames")
+    [[ $bs_n -eq 2 ]] || why+=" [two inputs: $bs_n staged]"
+    # The second input takes the first's pinned pool instead of pinning its own.
+    bs_lines "$bs_log" | grep -aq "^\[DSTAGE\] staging: .*, the previous input's)" \
+      || why+=" [two inputs: the staging pool was pinned twice]"
+    "$GZSTD" -d -q -c "$bs_out" 2>/dev/null | cmp -s - <(cat "$bs_src" "$bs_t/d/a.bin") || why+=" [two inputs bytes]"
+    # A cache is already charged to MemAvailable/cgroup headroom.  With 128 MiB
+    # free the pool is one 16 MiB slot; once cached, the next input sees 112 MiB.
+    # It must reuse the slot, not reject 112/8 < 16 as an impossible frame.
+    # Charge it while the first input is held AFTER its workers joined, so this
+    # tests the next input's real budget read rather than a forced slot count.
+    timeout --foreground -k 10 90 python3 -I - "$GZSTD" "$bs_src" "$bs_t/d/a.bin" "$bs_t" "$bs4" <<'PYEOF'
+import errno, os, pathlib, signal, subprocess, sys, time
+binary, first, second, directory, cpus = sys.argv[1:]
+def timed_out(*_):
+    raise TimeoutError('RAM-bound staging reuse timed out')
+signal.signal(signal.SIGTERM, timed_out)  # the finally below also kills its child
+root = pathlib.Path(directory)
+cg = root / 'pool-cg'
+(cg / 'proc/self').mkdir(parents=True)
+group = cg / 'sys/fs/cgroup/job/step'
+group.mkdir(parents=True)
+(cg / 'proc/self/cgroup').write_text('0::/job/step\n')
+(cg / 'proc/self/mountinfo').write_text('30 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n')
+(group / 'memory.max').write_text(str(128 << 20))
+(group / 'memory.current').write_text('0')
+(group / 'memory.stat').write_text('inactive_file 0\n')
+gate = root / 'pool.fifo'
+os.mkfifo(gate)
+env = dict(os.environ, GZSTD_DEBUG_CGROUP_ROOT=str(cg), GZSTD_DEBUG_DSTAGE_GATE=str(gate))
+with (root / 'pool-bound.zst').open('wb') as out, (root / 'pool-bound.log').open('wb') as err:
+    p = subprocess.Popen(['taskset', '-c', cpus, binary, '--no-profile', '--direct-stage',
+                          '--gpu-devices=1', '--gpu-streams=1', '--gpu-batch=1',
+                          '--chunk-size=16', '-v', '-c', first, second],
+                         env=env, stdout=out, stderr=err)
+    try:
+        for i in range(2):
+            deadline = time.monotonic() + 60
+            while True:
+                if p.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError('staging did not reach its post-join gate')
+                # Do not reconnect to the previous input's still-closing reader.
+                if (root / 'pool-bound.log').read_bytes().count(b'[DSTAGE] staging:') < i + 1:
+                    time.sleep(.01)
+                    continue
+                try:
+                    fd = os.open(gate, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError as e:
+                    if e.errno != errno.ENXIO: raise  # reader has not reached its gate
+                    time.sleep(.01)
+            (group / 'memory.current').write_text(str(16 << 20))
+            os.write(fd, b'x')
+            os.close(fd)
+        if p.wait(timeout=60) != 0:
+            raise RuntimeError('staging failed with its previous pool still pinned')
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+if "the previous input's" not in (root / 'pool-bound.log').read_text():
+    raise RuntimeError('the RAM-bound pool was not reused')
+PYEOF
+    [[ $? -eq 0 ]] || why+=" [cached pool charged twice to the RAM budget]"
+    "$GZSTD" -d -q -c "$bs_t/pool-bound.zst" 2>/dev/null | cmp -s - <(cat "$bs_src" "$bs_t/d/a.bin") \
+      || why+=" [RAM-bound reuse bytes]"
+    "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv -f -c "$bs_src" "$bs_t/small.bin" 2> "$bs_log" > /dev/null
+    grep -aq 'does not stage: an input is too small' "$bs_log" || why+=" [a small input staged]"
+    # Pinning can fail before any GPU faults.  That setup abort must request
+    # the same CPU rebuild, rather than commit an empty archive at exit 0.
+    for hk in none GZSTD_DEBUG_FAIL_GPU_BRINGUP=all GZSTD_DEBUG_DSTAGE_PIN_FAIL=1; do
+      rm -rf "$bs_out" "$bs_t/x"/*
+      "${bs_env[@]}" ${hk/#none/BS_NONE=1} timeout --foreground -k 10 120 taskset -c "$bs4" \
+        "$GZSTD" --tar -v -f -o "$bs_out" -C "$bs_t" d 2> "$bs_log"; rc=$?
+      [[ $rc -eq 0 ]] || why+=" [--tar $hk exit $rc]"
+      if [[ $hk == none ]]; then
+        bs_lines "$bs_log" | grep -aq '^\[STAGE\] 4 CPUs allowed' || why+=" [--tar: no STAGE line]"
+        bs_lines "$bs_log" | grep -aq '^\[DSTAGE\] --tar: [0-9]* frames' || why+=" [--tar: not staged]"
+      else
+        bs_lines "$bs_log" | grep -aqE 'rebuilding CPU-only|CPU-only rebuild' || why+=" [--tar $hk: no rebuild report]"
+      fi
+      "$GZSTD" -d -q --tar "$bs_out" -C "$bs_t/x" 2>/dev/null
+      cmp -s "$bs_t/x/d/a.bin" "$bs_src" || why+=" [--tar $hk bytes]"
+    done
+    for i in $(seq 1 4200); do : > "$bs_t/many/f$i"; done
+    cp "$bs_src" "$bs_t/many/zz.bin"
+    "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" --tar -vv -f -o "$bs_out" -C "$bs_t" many 2> "$bs_log"
+    grep -aq 'does not stage: the --tar sources are too small' "$bs_log" || why+=" [an unsized tree staged]"
+    rm -rf "$bs_t"
+    [[ -z "$why" ]] && pass "several inputs and --tar stage by default; --tar rebuilds on the CPU" \
+      || fail "several inputs and --tar stage by default; --tar rebuilds on the CPU" "$why"
   fi
   # 3. What keeps the default: enough CPUs, a level, a pipe, the off switch.
   why=""
@@ -13714,6 +14021,7 @@ else
            "--adapt's budget prior: the default runs, then each backend is tried" \
            "--adapt files a staged run under its CPU budget" \
            "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
+           "several inputs and --tar stage by default; --tar rebuilds on the CPU" \
            "a level, a pipe, --hybrid, -d or enough CPUs keep the default" \
            "an explicit --direct-stage refuses where the default would rebuild" \
            "--direct-stage: a table entry spanning identical frames exits 4" \
@@ -13851,6 +14159,62 @@ PYEOF
 else
   skip_host "a cold archive: O_DIRECT readers on a small budget, three above, a cached one untouched" \
     "the archive cannot be evicted here (tmpfs?), or no drop_cache, python3 or taskset"
+fi
+# A SMALL BUDGET'S CACHED ARCHIVE DECODES ON ONE CPU WORKER WHILE THE GPU RUNS
+# (v0.18.34, ROADMAP 32).  On 4 CPUs hybrid decode's three CPU decoders took the
+# CPU its buffered readers' page-cache copies need.  The cap holds only while a GPU
+# stream is active, so a GPU that never comes up leaves every decoder working;
+# -T names the decoders and a cold archive (O_DIRECT readers) keeps them all.
+c32="a small budget's cached archive: one CPU decoder while the GPU runs, all without it"
+if [[ $crd_tools -eq 1 ]] && has_gpu 2>/dev/null; then
+  why=""
+  crd4=$(python3 -c "import os;print(','.join(map(str,sorted(os.sched_getaffinity(0))[:4])))")
+  cat "$crd_zst" > /dev/null
+  # The cap bites only once the GPU is up, and on this small archive the CPUs
+  # would finish first: hold the reader at its gate until the GPU reports ready,
+  # then every frame arrives with a GPU stream active and the decoders past the
+  # cap must leave takes to it (counted at -v).
+  c32_gate="$TMPDIR/c32.fifo"; rm -f "$c32_gate"; mkfifo "$c32_gate"
+  env GZSTD_DEBUG_MT_READER_GATE="$c32_gate" timeout --foreground -k 10 120 taskset -c "$crd4" \
+    "$GZSTD" -vv -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" &
+  c32_pid=$!
+  timeout 90 python3 -I - "$c32_gate" "$crd_log" <<'PYEOF'
+import os, sys, time
+fd = os.open(sys.argv[1], os.O_WRONLY)
+ok = False
+try:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 60:
+        if b'decode ready:' in open(sys.argv[2], 'rb').read():
+            ok = True; break
+        time.sleep(0.05)
+finally:
+    os.write(fd, b'x'); os.close(fd)
+sys.exit(0 if ok else 1)
+PYEOF
+  [[ $? -eq 0 ]] || why+=" [the GPU never reported ready]"
+  wait "$c32_pid" || why+=" [exit $?]"
+  rm -f "$c32_gate"
+  crd_lines | grep -aq 'one CPU decoder while the GPU runs' || why+=" [no cap on 4 CPUs]"
+  crd_lines | grep -aqE 'cached-archive cap: [1-9][0-9]* take' || why+=" [the cap never held a decoder back]"
+  cmp -s "$crd_out" "$crd_src" || why+=" [bytes]"
+  env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_FAIL_GPU_BRINGUP=all taskset -c "$crd4" \
+    "$GZSTD" -vv -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [no-GPU exit $?]"
+  crd_lines | grep -aqE '^\[CPU/T[1-9][0-9]*\] take seq=' || why+=" [no GPU: only decoder 0 worked]"
+  crd_lines | grep -aq 'cached-archive cap:' && why+=" [no GPU, and the cap still held decoders back]"
+  cmp -s "$crd_out" "$crd_src" || why+=" [no-GPU bytes]"
+  taskset -c "$crd4" "$GZSTD" -v -T3 -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [-T3 exit $?]"
+  crd_lines | grep -aq 'one CPU decoder while the GPU runs' && why+=" [-T3 capped]"
+  if crd_evict; then
+    taskset -c "$crd4" "$GZSTD" -v -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [cold exit $?]"
+    crd_lines | grep -aq 'one CPU decoder while the GPU runs' && why+=" [cold capped]"
+    cmp -s "$crd_out" "$crd_src" || why+=" [cold bytes]"
+  fi
+  [[ -z "$why" ]] && pass "$c32" || fail "$c32" "$why"
+elif ! has_gpu 2>/dev/null; then
+  skip "$c32" "no GPU"
+else
+  skip_host "$c32" "the archive cannot be evicted here (tmpfs?), or no drop_cache, python3 or taskset"
 fi
 rm -f "$crd_src" "$crd_zst" "$crd_log" "$crd_out"
 unset -f crd_evict crd_lines crd_line crd_allowance crd_check_cold

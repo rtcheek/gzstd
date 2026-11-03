@@ -1,12 +1,220 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.33  
+**Covers:** v0.9.50 → v0.18.34  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.34 — ROADMAP 31-34: a cold compress reads O_DIRECT through three readers and a probe tie goes to O_DIRECT (64.84 GiB at full width 13.2-13.3 s and 160 CPU-seconds, where v0.18.33 took 13.8-14.6 s and up to 268), --gds-only proves every frame's extent in VRAM (an identical-frames seek-table merge decoded one copy at exit 0) and compresses on two streams with its peer-to-peer output written behind the drains (34.4 -> 22.4 s to /dev/null, 45-50 -> 35.8 s to a file), several inputs and --tar stage by default on a small CPU budget and share one pinned pool (two 64 GiB inputs 41 -> 32 s, a 64 GiB --tar 25 -> 17.7 s at 4 CPUs), and hybrid decode of a cached archive on a small budget takes one CPU decoder while the GPU runs (median 15.8 -> 13.85 s)
+
+### ROADMAP 34: the read probe's tie, not the worker count
+
+ROADMAP 34 recorded full-width cold compress as wasteful: 64.84 GiB on 256 CPUs, 13.6 s and 257
+CPU-seconds (118 of them system) against 90 on 16 CPUs, and blamed 96 workers for a drive 14 can
+saturate.  Measured again, the system time was BIMODAL -- 11-13 s or 115-210 s for the same binary and
+flags -- and kernel counters showed why: the slow runs allocated 17.6 million pages (67 GiB) that the
+fast ones did not, i.e. the input was going through the page cache.  A cold input of 4 GiB or more is
+read by whichever of O_DIRECT and buffered reads measures faster over ~0.2 s each (v0.15.41), and a tie
+went to buffered: O_DIRECT had to win by 5%.  Here they measured within 3% (O_DIRECT 4.77-4.80 GiB/s,
+buffered 3.86-4.91), so each run flipped a coin between ~12 s and ~120 s of kernel time.
+
+Forced either way (three interleaved runs, /dev/null, all CPUs):
+
+| read path | --cpu-only | hybrid | CPU-s |
+|---|---|---|---|
+| O_DIRECT, 1 reader (v0.18.33) | 14.14-14.39 s | 14.32-14.69 | 154-162 |
+| O_DIRECT, 2 readers | 13.49-13.62 | 13.71-13.85 | 160-170 |
+| **O_DIRECT, 3 readers (v0.18.34)** | **13.20-13.27** | **13.39-13.45** | 160-166 |
+| buffered, 12 readers | 13.73 / 17.69-17.92 | 13.87-13.95 / 18.09-18.14 | 260-355 |
+
+Buffered input costs ~10x the kernel CPU, leaves the whole input cached in place of other work's pages,
+and in a third to two thirds of runs here was 30% slower outright.  O_DIRECT read through ONE reader since
+v0.13.46, on a measurement of four INDEPENDENT partitioned streams; the pooled readers pull interleaved
+chunk indices from one counter (the buffered pool has since v0.13.63), so the device still sees one
+sequential stream, and one reader left it idle between reads (dd: 4.84-5.03 GiB/s with one stream, the
+same with two).  So:
+- **O_DIRECT reads through three readers** (`DIRECT_READ_STREAMS`, decided in `pooled_read_chunks` for
+  every caller); `--read-threads` sets the count (it was ignored for O_DIRECT compress); spinning media
+  keep one.  The probe's O_DIRECT pass reads through them too: 5.3-5.7 GiB/s against buffered's 3.8.
+- **A tie goes to O_DIRECT**: buffered must measure more than 10% faster
+  (`READ_PROBE_BUFFERED_MARGIN`, above the buffered window's own spread).  New hook
+  `GZSTD_DEBUG_READ_PROBE_RATES=D:B` grades given rates.
+- **An explicit `--direct-read` takes plain pages** on a 6.4+ kernel.  It still asked for huge pages
+  and prefaulted the whole pool on one thread -- the stall DirectReadPool's notes record for the probe --
+  and where memory is mostly page cache it stalled: 14.4, 15.0, 23.5 s (hybrid 16.0, 28.1, 29.4: a 23.5
+  GiB pool), plain pages 14.08-14.56 (14.21-14.61), the reader 64% busy on the slow runs against 98%.
+
+Against v0.18.33, three interleaved runs each, cold, /dev/null:
+
+| cell | v0.18.33 | v0.18.34 |
+|---|---|---|
+| --cpu-only, all CPUs | 13.75-14.58 s (system 13-130 s) | **13.20-13.29** (16-17) |
+| hybrid (the default), all CPUs | 13.92-15.09 (14-126) | **13.39-14.51** (13-20) |
+| hybrid, 16 CPUs | 13.95-14.43 | **13.00-13.01** |
+| hybrid, 8 CPUs | 15.29-16.12 | **13.78-14.31** |
+| --cpu-only, 8 CPUs (compute-bound) | 17.14-17.93 | 17.33-18.36 (within noise) |
+| --direct-read, all CPUs | 16.14, 26.95, 64.90 | **13.29-13.37** |
+
+A warm input never probed and is unchanged; decode's cold-archive readers (v0.18.33) are unchanged.
+
+### ROADMAP 31: --gds-only's two gaps
+
+**(a) Every extent is proven in VRAM.**  A seek-table entry merging two frames whose contents are
+identical reads the swallowed frame's trailer as the first's checksum, and it matches: v0.18.33 wrote 2
+of 3 MiB at exit 0 under `-d --gds-only`, and `-t` said OK (reproduced first).  --direct-stage closed this
+in v0.18.33 on its pinned host copy; --gds-only has none, so `gzx_launch_extent` (gpuverify.cu) walks each
+frame's header and block headers on the device, over the bytes cuFileRead put there, never past the
+claimed size, and the batch is checked with the other metadata before any of it is written: a dishonest
+entry exits 4, `--keep-going` decodes every byte.  48.87 GiB cold `-t`: 13.45-13.58 s before, 13.43-13.45
+after.  With every staged extent proven in the worker, the producer's host walk of checksumless frames
+(one 3-byte pread per zstd block) and the -d peer-to-peer preflight's copy of it run only under
+`--keep-going`, which still needs the lie found before it can demote: an 8 GiB checksumless archive's
+`-t` 8.82-8.84 -> 4.00-4.05 s (66,048 preads in 5.41 s before the first batch -> 512 in 0.05).
+
+**(b) Two streams, peer-to-peer output kept.**  --gds-only compress took one stream because each stream
+had its own pack buffer while the output offset is the run's.  A device's streams now share stream 0's
+pack, driven on its own CUDA stream; a device's batches drain in submit order, so the file stays in order.
+Two streams are the --gds-only compress default (decompress and -t keep one).  64.84 GiB cold, one H100:
+
+| sink | 1 stream (v0.18.33) | 2 streams, peer-to-peer | 2 streams, ordinary writer | --direct-stage |
+|---|---|---|---|---|
+| /dev/null | 34.38-35.05 s | **22.14-22.35** | -- | -- |
+| a file, same NVMe | 45.40-49.93 | **38.00-38.51** (user 5 s) | 35.23-36.05 (user 14 s) | 30.38-30.40 |
+
+Byte-identical to one stream and to the ordinary writer (the peer-to-peer validation tool, all 22
+sections).
+
+**(c) The pack is double-buffered, with a write-behind thread** (the owner asked for it to be tried and
+kept only if faster).  At two streams the pack was written synchronously on the drain thread -- 17.2 s of
+cuFileWrite in the 38 s file run -- while the ordinary writer overlaps its writes.  Stream 0 now owns a
+standby pack, registered too: a flush hands the full pack to one write-behind thread at the extent
+reserved for it, moves the sub-block tail to the standby's start and swaps; the next flush waits only if
+that write has not landed, so writes stay strictly in file order; the final flush writes the tail and
+joins the thread, and every teardown joins it before either registration goes.  Without a standby (it
+could not be allocated) the old synchronous path runs; `GZSTD_DEBUG_GDS_COUT_SYNC=1` forces it.  Same
+64.84 GiB to a file, three runs:
+
+| peer-to-peer output | wall | user CPU |
+|---|---|---|
+| synchronous (two streams) | 39.16-39.25 s | 4-5 s |
+| **write-behind** | **35.80-35.91** | 5 |
+| (the ordinary writer) | 35.81-36.80 | 13 |
+
+### ROADMAP 33: the dormant automatic-decode recovery code removed
+
+### ROADMAP 33: several inputs and --tar stage too; the dormant decode code removed
+
+v0.18.33 staged one named input.  Measured at 4 CPUs, 64.84 GiB cold, one H100: two inputs
+31.8-32.0 s staged against hybrid's 39.5-43.2 (29-30 CPU-s against 138-154 -- the fixed start is paid
+once per process, so the second input costs less than the first), a --tar of one such member 17.6-17.8
+against 24.3-25.5.  So the default stages a compress of several named inputs when EVERY one is a regular
+file of 16 GiB or more that reads O_DIRECT, and a --tar whose sources reach 16 GiB within the first
+4,096 entries of a bounded walk (`gz_auto_stage_tar_reaches`: -C and --exclude applied, symlinks not
+followed, the largest file probed for O_DIRECT; a bigger tree of small files keeps the default after a
+few milliseconds of lstat).  Each pass keeps the default's promise as before -- a GPU, pin or setup
+failure discards that pass's output and rebuilds it on the CPU, a --tar from its sources.  --adapt's
+budget prior keys a run by one input's residency, so several inputs and --tar take the static rule.
+
+**The pinned staging pool outlives its input** (the owner asked for it to be tried and kept only if
+faster).  Each staged input pinned its own ~512 MiB pool (~280 ms before its first read) and unpinned it
+at the end; a finished input's pool, every slot returned and never aborted, now waits for the next input
+of the same frame size and depth (`g_dstage_pool_cache`; `GZSTD_DEBUG_DSTAGE_NO_REUSE=1` pins afresh).
+Four staged 8 GiB inputs in one process at 4 CPUs, three runs: 11.57-12.87 s re-pinned, 10.30-10.95
+reused -- more than the three skipped pins, since each input also skipped an unpin.
+
+The automatic-decode recovery code v0.18.33 left unreachable (`GzAutoStageDecodeRetry`, the worker's
+table retry, `TaskQueue::wait_staged_front`, decompress_nvcomp's CPU tail, the decode-only
+`direct_stage_auto` branches) is removed, and with it the checksum-offset defect its last review
+suspected.  `direct_stage_auto` is only ever set for compression.
+
+### ROADMAP 32: a small budget's cached archive decodes on one CPU worker while the GPU runs
+
+On 4 CPUs hybrid decode runs three CPU decoders beside three buffered readers, the GPU worker and the
+writer, and the decoders took the CPU the readers' page-cache copies need.  MEASURED, 48.87 GiB, one H100,
+4 CPUs, warm, eight interleaved runs each (two identical arms differed by up to 8% at this budget):
+
+| CPU decoders | wall | median | CPU-s |
+|---|---|---|---|
+| 3 (v0.18.33) | 13.10-16.58 s | 15.8 | 50-55 |
+| **1 (v0.18.34)** | 11.96-15.01 | **13.85** | 38-42 |
+| 2 | 12.94-15.23 | 14.0 | 43-49 |
+
+Cold it is the reverse (O_DIRECT readers need little CPU): three 12.95-14.36 s, one 13.77-14.53, so a
+cold archive keeps them all.  The producer sets the cap where it keeps buffered readers for a cached
+archive on 4 CPUs or fewer (`g_hyb_decomp_cpu_cap`; not under -T), and the hybrid decoders' take predicate
+applies it only while a GPU stream is active -- `unregister_gpu_stream` already wakes them, so a GPU that
+fails or never comes up leaves every decoder working.  That is the "pool that grows on GPU loss" ROADMAP 32
+said this needed.
+
+### Reviews
+
+Codex (GPT-6.1-Sol, max effort), three rounds: NOT SAFE (three findings), SAFE TO COMMIT (one), and,
+on the write-behind and the pool reuse, SAFE TO COMMIT (two, both reproduced by it and fixed).  The
+first round found, and the second confirmed fixed:
+- **P1: the default's --tar staging could commit an empty archive and let --rm delete the sources.**
+  Reproduced first: a staging pool that could not be pinned (GZSTD_DEBUG_DSTAGE_PIN_FAIL) under
+  automatic --tar staging wrote a 130-byte archive at exit 0, and --rm removed the source directory;
+  an explicit --tar --direct-stage exits 3 and keeps it.  The tar assembler's setup-failure branch
+  now asks for the driver's CPU rebuild, as the plain-file setup does: the same run rebuilds on the
+  CPU and the archive extracts byte for byte.
+- **P1 (by construction): a lost wakeup under the decoder cap.**  CPU work was signalled with
+  notify_one, which can wake a capped decoder that may not take; the one that may then sleeps through
+  it, and at the tail nothing wakes it again.  A capped input's queue now broadcasts its CPU wakes
+  (at most four decoders).
+- **P2: the CPU rescue of a staged frame accepted a merged extent** that a one-shot decode tolerates (a
+  checksumless frame plus an empty one): it now proves the extent with ZSTD_findFrameCompressedSize on
+  the bytes it already read, exit 4 as the GPU path.
+- Also: the decode bringup now honours GZSTD_DEBUG_FAIL_GPU_BRINGUP (the item-32 cell's no-GPU arm had
+  silently run on a healthy GPU); the device extent buffers are allocated only for --gds-only input.
+
+The second round built both configurations and ran its own targeted checks (pack ordering with unequal
+stream batches, a fault after a committed flush, the decoder cap's wake paths on the real TaskQueue,
+1,837 device extent cases under Compute Sanitizer with no error), and found that
+scripts/check-endian-reads.sh -- which the release workflow runs -- read `gz_direct_read_streams(&opt,
+borrowed_fd)` beside `threads / 8` as a host-order field read: exempted, at the site and in the script.
+The third, on the write-behind and the pool reuse:
+- **A cached pool was charged twice to the RAM budget**: under a 128 MiB limit the first input's
+  one-slot pool, cached, left the second input 112 MiB, 112 / 8 < one 16 MiB frame, exit 3.  The pin
+  now credits the allocation it will reuse or release (a cell holds two inputs at the staging gate under
+  a faked 128 MiB cgroup).
+- **The standby pack was required by the VRAM precheck**: at batch 1 on a card where only one pack fit,
+  write-behind exited 5 where synchronous output finishes; the standby is dropped from the estimate
+  when it does not fit, and the run writes synchronously.
+
+### Tests
+
+Six new cells and two updated (default 554 -> 560, --extensive 896 -> 902; no-GPU deltas 151 -> 155
+and 229 -> 233, no-GDS 15 -> 17 and 19 -> 21):
+- `--gds-only proves each extent in VRAM: identical merged frames exit 4` (-d and -t exit 4, no output
+  left, --keep-going decodes every byte, an honest checksumless archive reports 0 walked and every
+  frame proven, and with the GPU failing a CPU rescue refuses a merged empty frame under both staged
+  backends) and `--gds-only compress: two streams share one peer-to-peer pack` (a second stream, no
+  demotion, mid-batch flushes handed to the write-behind, bytes identical to one stream, to synchronous
+  writes and to the ordinary writer) -- GDS hosts;
+- `O_DIRECT compress reads through three readers; --read-threads sets them` and `a read-probe tie goes
+  to O_DIRECT; buffered must be >10% faster` -- both builds;
+- `several inputs and --tar stage by default; --tar rebuilds on the CPU` (bringup and pin failures, the
+  second input reusing the first's pinned pool, and that reuse under a 128 MiB limit) and
+  `a small budget's cached archive: one CPU decoder while the GPU runs, all without it` (the reader held
+  at its gate until the GPU registers, then the cap must refuse a take; none with the GPU failing) --
+  GPU hosts;
+- updated: an O_DIRECT reader publishes its own count, now 3 (a profile seed equal to it is moved to
+  6 so the cell cannot pass vacuously), and the probe's [READER] average runs at -T96 (at -T24 every
+  pass had three readers).
+Mutation-tested: twenty-two mutants, one reverting each piece (no device walk, the walk ignored, the
+producer walking again, one-stream shape, one-stream default, a pack per stream, one O_DIRECT reader,
+--read-threads ignored, the old tie-break, --tar or several inputs declined, an unbounded tar walk, only
+the first input sized, the cap never set / always held / set cold / set under -T, the --tar setup
+abort without a rebuild, the rescue without its extent proof, write-behind off, its carry dropped, the
+pool never reused, the cached pool charged twice), every one caught.  Two survived the
+item-32 cell as first written -- its CPUs finished the archive before the GPU came up, and it only read
+the -v line -- which is why it now holds the reader at its gate and counts the cap's refusals.  The peer-to-peer validation tool's section 8d now asserts
+the new contract (two streams stay peer-to-peer and byte-identical; two GPUs still demote): all
+sections pass.  Both builds warning-free.  Suites (2026-11-03, the 8-GPU server): default 559 passed, 0 failed, 1 host
+skip of 560 in 14m28s; CPU-only 405 passed, 0 failed (560 - 155 no-GPU) in 2m07s.
 
 ## v0.18.33 — a small CPU budget compresses through the GPU by default (16.7 s against 19.5 at 4 CPUs, a fifth of the host CPU), a cold archive's decode readers fit the budget (hybrid at 4 CPUs 23 -> 13 s; 43% less CPU at full width), --adapt measures cpu-only, hybrid and the staged path at each budget (ROADMAP 21), and --direct-stage leaves EXPERIMENTAL after a production review fixed silent frame loss on a dishonest seek table, a hang with no usable GPU, and a source that grows while staged
 

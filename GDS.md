@@ -26,8 +26,9 @@ Set `--gds-only` up if you want the last 5% and your hardware qualifies. Otherwi
 
 **Since v0.18.33 `--direct-stage` is a production backend, no longer experimental** (`--gds-only`
 still is), and gzstd takes its path **by default for compression** when the process may use few
-CPUs — a container's cpuset or quota, or a `taskset` — and an eligible GPU is available: one named
-file of 16 GiB or more, up to 4 CPUs, PCIe Gen4 or newer. `--help` under `--direct-stage` lists the
+CPUs — a container's cpuset or quota, or a `taskset` — and an eligible GPU is available: named files
+of 16 GiB or more each (since v0.18.34 several of them, or a `--tar` whose sources reach 16 GiB), up
+to 4 CPUs, PCIe Gen4 or newer. `--help` under `--direct-stage` lists the
 conditions; `-v` says when it happens; `--hybrid` or `--cpu-only` keeps the old behaviour.
 Decompression is not staged by default: v0.18.33's readers for a cold archive make hybrid decode as
 fast on a small budget, so `-d --direct-stage` remains the way to ask for it.
@@ -294,10 +295,23 @@ refuses when either fails. A `--gds-only` run that completes has cleared both, b
 - **It raises the default GPU batch to 64 frames.** The per-frame content checksum runs on the
   device, and that kernel's throughput scales with frame count; a smaller batch would make the
   checksum, not the drive, the bottleneck. An explicit `--gpu-batch` still wins.
-- **It uses one GPU and one stream by default.** Each stream registers its own input buffer into
-  BAR1, which is expensive (~490 ms for a 1 GiB buffer), and the peer-to-peer output path requires
-  exactly one device and one stream. `--direct-stage` has neither constraint and defaults to two
-  streams so its reads overlap compute.
+- **It uses one GPU by default, and since v0.18.34 two streams when compressing.** One stream
+  serialised read and compute: 64 GiB cold, 34.4 s against 22.4 s at two. The peer-to-peer output
+  path used to require exactly one stream, because each stream had its own pack buffer while the
+  output offset is the run's; a device's streams now share one pack, so two streams keep
+  peer-to-peer output (byte-identical to one stream's and to the ordinary writer's), and its pack
+  is double-buffered with a write-behind thread, so writes overlap the drains: 64 GiB cold to a
+  file on the same NVMe 39.2 s -> 35.8 s, level with the ordinary writer at a third of its user
+  CPU. Several GPUs still use the ordinary writer. Each stream registers its own input buffer into BAR1 (~169 ms a
+  GiB on driver 595; ~490 ms on older ones). Decompression and `-t` keep one stream, as
+  `--direct-stage`'s do.
+- **Every frame's extent is proven on the device (v0.18.34).** A seek table can merge two frames
+  into one entry; when the two frames' contents are identical, the second's checksum trailer
+  matches the first's, and v0.18.33 and older decoded one copy at exit 0. `--gds-only` now walks
+  each frame's block headers in VRAM, where the read already put them, before any of its batch is
+  written: a dishonest entry exits 4, and `--keep-going` decodes every byte. The host-side walk a
+  checksumless archive used to pay before the first batch (one 3-byte read per zstd block, ~1.7
+  million on a 65 GiB archive) is gone outside `--keep-going`.
 - **Archives are identical either way.** The per-frame XXH64 content checksum is computed on the GPU
   instead of the host, so output is byte-for-byte an ordinary zstd archive and stock `zstd` reads it.
 

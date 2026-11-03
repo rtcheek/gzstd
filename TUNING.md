@@ -237,14 +237,16 @@ Whatever the host does, `--adapt` measures the startup cost as part of each numb
 overhead. The measurement ends before process-exit teardown, so a device-count-dependent teardown
 cost is absent from the prediction. If startup cost changes, a later re-measurement picks that up.
 
-## Few CPUs beside a GPU (containers): the default stages compression (v0.18.33)
+## Few CPUs beside a GPU (containers): the default stages compression (v0.18.33-34)
 
-A process allowed only a few CPUs — a container's cpuset or CPU quota, a `taskset` — compresses one
-large named file through `--direct-stage`'s path by default when a GPU is present (thresholds and
+A process allowed only a few CPUs — a container's cpuset or CPU quota, a `taskset` — compresses
+large named files through `--direct-stage`'s path by default when a GPU is present: since v0.18.34
+several of them (each 16 GiB or more) and a `--tar` whose sources reach 16 GiB (thresholds and
 conditions: `--help`, under `--direct-stage`). Nothing needs tuning for it, and `-v` reports it.
 Decompression is not staged by default: a cold archive's readers (O_DIRECT on 8 CPUs or fewer,
-at most three buffered above) make hybrid decode as fast on a small budget. Two things are worth
-knowing:
+at most three buffered above) make hybrid decode as fast on a small budget, and since v0.18.34 a
+cached archive on 4 CPUs or fewer decodes on one CPU worker while the GPU runs (median 15.8 ->
+13.85 s on 48.87 GiB; every worker returns if the GPU does not run). Two things are worth knowing:
 
 - **The thresholds were measured on one host** (64 GiB on NVMe, one H100): staging wins or ties at
   every cell up to 4 CPUs, at 16 GiB of input or more: below about 14 GiB the staged path's fixed
@@ -266,4 +268,11 @@ knowing:
   profile.
 - **Storage:** see `--help` for `--direct`, `--mmap` and `--direct-stage`. GDS.md covers GPUDirect
   Storage.
+- **A cold input is read O_DIRECT (v0.18.34).** Compressing a file of 4 GiB or more that the page
+  cache does not hold, gzstd times O_DIRECT against buffered reads over the first ~0.2 s of each and
+  keeps O_DIRECT unless buffered measures more than 10% faster. O_DIRECT reads through three
+  interleaved readers (`--read-threads` sets the count; spinning media keep one). Measured on a
+  64.84 GiB file, 256 CPUs: 13.2-13.3 s and 160 CPU-seconds, against buffered reads' 13.7-18.1 s and
+  260-355, which also leave the whole input in the page cache. `--no-direct-read` keeps the page
+  cache if you will re-read the file soon.
 - **Everything `--adapt` stores** is listed under `--adapt` in `gzstd --help`.
