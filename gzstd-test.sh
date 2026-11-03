@@ -4209,6 +4209,12 @@ GXPY
   [[ $LAST_RC -eq 0 ]] || gx_why+=" [honest checksumless -t exit $LAST_RC]"
   grep -aq 'preads (0 walked)' "$TMPDIR/gx.err" || gx_why+=" [producer still walked: $(grep -ao 'preads ([0-9]* walked)' "$TMPDIR/gx.err" | head -1)]"
   grep -aq '\[GDS\] extents: 3 frame(s) proven' "$TMPDIR/gx.err" || gx_why+=" [no device extent proof for 3 frames]"
+  # v0.18.35: a checksummed frame's trailer comes back from that device walk, so
+  # the producer reads headers only -- one metadata pread a frame, not two.
+  run_test "$GZSTD" -t -v --gds-only "$TMPDIR/gx.zst" 2> "$TMPDIR/gx.err"
+  [[ $LAST_RC -eq 0 ]] || gx_why+=" [honest checksummed -t exit $LAST_RC]"
+  grep -aq 'producer: 3 frames, 3 metadata preads' "$TMPDIR/gx.err" \
+    || gx_why+=" [trailers still preaded: $(grep -ao 'producer: [0-9]* frames, [0-9]* metadata preads' "$TMPDIR/gx.err" | head -1)]"
   for gx_stage in --direct-stage --gds-only; do
     run_test env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_FAIL_GPU_BRINGUP=all \
       "$GZSTD" -t -v "$gx_stage" --gpu-devices=1 "$TMPDIR/gxempty.zst" 2> "$TMPDIR/gx.err"

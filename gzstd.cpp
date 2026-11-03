@@ -13221,10 +13221,16 @@ struct Task {
   // --gds-only -t: a staged Task has NO host bytes, so the two things the GPU
   // worker normally reads off the frame header (the Content_Checksum_flag) and
   // trailer (the expected XXH64) cannot be read from ptr().  The producer
-  // preads those 13 bytes -- header[0..8] and the last 4 -- and carries them
-  // here.  That is metadata, not payload: the frame body never touches host.
+  // preads the header and carries the flag here; the trailer the worker reads
+  // where the frame is (stg_ck_in_frame).  A checksumless frame's expected value
+  // is the seek table's, also carried here.  The frame body never touches host.
   unsigned char stg_has_ck    = 0;
   unsigned int  stg_expect_ck = 0;
+  // v0.18.35: the expected checksum is the frame's OWN trailer, and the worker
+  // reads it where the frame is -- the device extent walk (--gds-only) or the
+  // pinned host copy (--direct-stage) -- after proving the extent, so the
+  // producer no longer preads it.  stg_expect_ck is unset until then.
+  unsigned char stg_ck_in_frame = 0;
 
   bool         is_staged() const { return src_off >= 0 || gds_stage >= 0; }
   const char * ptr() const { return view_ptr ? view_ptr : data.data(); }
@@ -35785,7 +35791,8 @@ extern "C" void gzx_launch_xxh64(const void * base, size_t stride,
 // Each frame's real compressed extent, walked over its block headers in VRAM
 // (gpuverify.cu, v0.18.34): ~0ULL where no single frame fits the claimed size.
 extern "C" void gzx_launch_extent(const void * d_ptrs, const size_t * d_sizes,
-                                  int n, unsigned long long * d_out, void * stream);
+                                  int n, unsigned long long * d_out,
+                                  unsigned int * d_ck, void * stream);
 
 // GZSTD_DEBUG_XXH_SELFTEST=1 — prove gzx_xxh64_kernel agrees with xxh::hash BIT
 // FOR BIT before trusting it to stamp a frame.  This is not decoration: the GPU
@@ -42100,8 +42107,10 @@ static void gpu_decomp_worker(
     // exit 0 and `-t --gpu-only` reported OK.  The CPU path gets this free from
     // ZSTD_decompressStream; the GPU path never had an equivalent.
     unsigned int * d_verify_ck = nullptr;
-    // --gds-only: where each staged frame really ends (gzx_launch_extent).
+    // --gds-only: where each staged frame really ends (gzx_launch_extent), and
+    // the checksum trailer it ends with.
     unsigned long long * d_extent = nullptr;
+    unsigned int * d_extent_ck = nullptr;
     nvcompStatus_t * d_statuses = nullptr;
 
     // Host-side arrays
@@ -42109,6 +42118,7 @@ static void gpu_decomp_worker(
     std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
     std::vector<unsigned int> h_verify_ck;    // recomputed, device-side
     std::vector<unsigned long long> h_extent; // walked, device-side (--gds-only)
+    std::vector<unsigned int> h_extent_ck;    // the trailers that walk reached
     std::vector<unsigned int> h_expect_ck;    // from each frame's trailer
     std::vector<unsigned char> h_has_ck;      // frame carries a content checksum
     std::vector<nvcompStatus_t> h_statuses;
@@ -42178,6 +42188,7 @@ static void gpu_decomp_worker(
       if (d_actual_sizes){ cudaFree(d_actual_sizes); d_actual_sizes = nullptr; }
       if (d_verify_ck)   { cudaFree(d_verify_ck);    d_verify_ck = nullptr; }
       if (d_extent)      { cudaFree(d_extent);       d_extent = nullptr; }
+      if (d_extent_ck)   { cudaFree(d_extent_ck);    d_extent_ck = nullptr; }
       if (d_statuses)    { cudaFree(d_statuses);     d_statuses = nullptr; }
       alloc_batch = 0; alloc_comp = 0; alloc_decomp = 0; temp_bytes = 0;
     }
@@ -42340,6 +42351,8 @@ static void gpu_decomp_worker(
       // and --direct-stage must not pay an extra CUDA allocation per resize.
       if (gds_read && !dstage
           && cudaMalloc(&d_extent, batch_n * sizeof(unsigned long long)) != cudaSuccess) { cudaGetLastError(); return false; }
+      if (gds_read && !dstage
+          && cudaMalloc(&d_extent_ck, batch_n * sizeof(unsigned int)) != cudaSuccess) { cudaGetLastError(); return false; }
       if (needed_temp > 0) {
         if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) { cudaGetLastError(); return false; }
         temp_bytes = needed_temp;
@@ -42364,7 +42377,7 @@ static void gpu_decomp_worker(
       h_actual.resize(batch_n);
       h_statuses.resize(batch_n);
       h_verify_ck.resize(batch_n);
-      if (gds_read && !dstage) h_extent.resize(batch_n);
+      if (gds_read && !dstage) { h_extent.resize(batch_n); h_extent_ck.resize(batch_n); }
       h_expect_ck.resize(batch_n);
       h_has_ck.resize(batch_n);
       return true;
@@ -43594,6 +43607,10 @@ static void gpu_decomp_worker(
                   ah->release(C.batch[i].seq);
                   return;
                 }
+                // The extent is proven: its last 4 bytes are the frame's own
+                // checksum (v0.18.35; the producer no longer preads it).
+                if (C.batch[i].stg_ck_in_frame)
+                  C.batch[i].stg_expect_ck = rd_le32(fp + flen - 4);
                 const cudaError_t cs = cudaMemcpy(d_dst, fp, flen, cudaMemcpyHostToDevice);
                 ah->release(C.batch[i].seq);
                 if (cs != cudaSuccess) {
@@ -43641,6 +43658,8 @@ static void gpu_decomp_worker(
               return;
             }
             if (!dstage_one_frame(hp + pad, flen, C.batch[i].seq)) return;
+            if (C.batch[i].stg_ck_in_frame)
+              C.batch[i].stg_expect_ck = rd_le32(hp + pad + flen - 4);
             const cudaError_t cs = cudaMemcpy(d_dst, hp + pad, flen, cudaMemcpyHostToDevice);
             if (cs != cudaSuccess) {
               fail(std::string("cudaMemcpy(--direct-stage lane -> slab): ")
@@ -44138,11 +44157,14 @@ static void gpu_decomp_worker(
         const bool walk_extents = staged_batch && !C.dstage;
         if (walk_extents) {
           gzx_launch_extent(C.d_comp_ptrs, C.d_comp_sizes, (int)C.filled,
-                            C.d_extent, C.stream);
+                            C.d_extent, C.d_extent_ck, C.stream);
           checkCuda(cudaGetLastError(), "gzx_extent launch");
           checkCuda(cudaMemcpyAsync(C.h_extent.data(), C.d_extent,
                                     C.filled * sizeof(unsigned long long),
                                     cudaMemcpyDeviceToHost, C.stream), "D2H frame extents");
+          checkCuda(cudaMemcpyAsync(C.h_extent_ck.data(), C.d_extent_ck,
+                                    C.filled * sizeof(unsigned int),
+                                    cudaMemcpyDeviceToHost, C.stream), "D2H frame trailers");
         }
         checkCuda(cudaStreamSynchronize(C.stream), "D2H meta sync");
         rc_bail_if_reclaimed();
@@ -44164,8 +44186,13 @@ static void gpu_decomp_worker(
             die(why, EXIT_DATA);
           }
           for (size_t i = 0; i < C.filled; ++i)
-            if (C.batch[i].src_off >= 0)
+            if (C.batch[i].src_off >= 0) {
               g_gds_extent_frames.fetch_add(1, std::memory_order_relaxed);
+              // Every extent in the batch is now proven, so the trailer the walk
+              // stopped at IS this frame's checksum (v0.18.35; the producer
+              // no longer preads it).
+              if (C.batch[i].stg_ck_in_frame) C.h_expect_ck[i] = C.h_extent_ck[i];
+            }
         }
         if (ck_t0)
           g_gdsv_kernel_ns.fetch_add(now_ns() - ck_t0, std::memory_order_relaxed);
@@ -45134,7 +45161,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   size_t max_frame_decomp = 0;
   // Geometry is already in st.  Keep only the checksum evidence until every
   // entry is checked, then construct Tasks at the bounded queue hand-off.
-  struct FrameCheck { uint32_t checksum = 0; bool has_checksum = false; };
+  struct FrameCheck { uint32_t checksum = 0; bool has_checksum = false; bool in_frame = false; };
   if (nframes > tarx::seek_metadata_budget() / sizeof(FrameCheck))
     die_io(gz_stage_name(opt) + ": frame metadata exceeds an eighth of available memory");
   std::vector<FrameCheck> checks(nframes);
@@ -45161,13 +45188,13 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
 
     FrameCheck & ck = checks[k];
 
-    // METADATA ONLY: 9 header bytes + the 4-byte trailer.  Byte 4 of a zstd
-    // frame header is the Frame Header Descriptor and bit 0x04 is
-    // Content_Checksum_flag; when set, the frame's last four bytes are
-    // XXH64(content) truncated to 32 bits, little-endian.  The GPU worker
-    // normally reads these off the host copy of the frame, which this path
-    // does not have -- so they travel on the Task instead.
-    unsigned char hdr[18], tr[4];               // 18 = ZSTD_FRAMEHEADERSIZE_MAX
+    // METADATA ONLY: the frame header (v0.18.35: no longer the trailer too).
+    // Byte 4 of a zstd frame header is the Frame Header Descriptor and bit 0x04
+    // is Content_Checksum_flag; when set, the frame's last four bytes are
+    // XXH64(content) truncated to 32 bits, little-endian.  The flag travels on
+    // the Task; the trailer the worker reads where it holds the frame (see
+    // stg_ck_in_frame below).
+    unsigned char hdr[18];                      // 18 = ZSTD_FRAMEHEADERSIZE_MAX
     size_t hwant = sizeof hdr;
     if (csz < (uint64_t)hwant) hwant = (size_t)csz;
     const size_t hgot = read_meta(hdr, hwant, off);
@@ -45266,11 +45293,14 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     if (g_no_check) {
       // --no-check: no expected checksum, so no trailer pread either.
     } else if (hdr[4] & 0x04) {
-      if (read_meta(tr, sizeof tr, off + csz - 4) != sizeof tr)
-        return GDS_VERIFY_DEMOTE;
+      // THE TRAILER IS READ WHERE THE FRAME IS (v0.18.35, ROADMAP 35).  Both
+      // workers of this producer hold every frame whole before decoding it and
+      // prove its extent there -- --gds-only in VRAM (gzx_launch_extent, which
+      // returns the trailer it stops at), --direct-stage in its pinned host copy
+      // -- so this per-frame host pread (half the producer's metadata reads, a
+      // QD1 read each before the first batch) is not needed.
       ck.has_checksum = true;
-      ck.checksum = (unsigned int)tr[0] | ((unsigned int)tr[1] << 8)
-                      | ((unsigned int)tr[2] << 16) | ((unsigned int)tr[3] << 24);
+      ck.in_frame = true;
     } else if (!st.checksums.empty() && k < st.checksums.size()) {
       // The frame carries no checksum, so take the seek table's.  A staged Task
       // has no host bytes for the device verifier to read a trailer from, which
@@ -45308,6 +45338,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     t.out_off     = st.u_off[k];
     t.stg_has_ck    = checks[k].has_checksum;
     t.stg_expect_ck = checks[k].checksum;
+    t.stg_ck_in_frame = checks[k].in_frame;
     queue.push(std::move(t));
   }
   queue.set_done();
@@ -46409,6 +46440,7 @@ gds_out_declined:
                 t.src_len       = src.src_len;
                 t.stg_has_ck    = src.stg_has_ck;
                 t.stg_expect_ck = src.stg_expect_ck;
+                t.stg_ck_in_frame = src.stg_ck_in_frame;
               } else {
                 t.data.assign(src.ptr(), src.ptr() + src.len());
               }

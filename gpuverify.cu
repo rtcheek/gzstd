@@ -383,10 +383,18 @@ extern "C" void gzp_launch_finalize(void * pack,
  One thread per frame.  A 16 MiB frame is ~128 blocks, so a thread makes ~128
  dependent 3-byte loads -- tens of microseconds, with every frame of the batch
  walking at once.
+
+ THE TRAILER TOO (v0.18.35).  A frame with Content_Checksum_flag ends in the
+ 4-byte XXH64-low32 the device verifier compares against, and the walk stops
+ exactly there: it is returned in `ck` (0 when the frame has none or the walk
+ failed), so the producer no longer preads it on the host.  It is only trusted
+ for a frame whose extent the host has just found equal to the claim.
 ======================================================================*/
 __device__ unsigned long long gzx_frame_extent(const unsigned char * p,
-                                               unsigned long long claimed)
+                                               unsigned long long claimed,
+                                               unsigned int * ck)
 {
+  *ck = 0;
   const unsigned long long BAD = ~0ULL;
   if (!p || claimed < 9) return BAD;
   if (p[0] != 0x28 || p[1] != 0xB5 || p[2] != 0x2F || p[3] != 0xFD) return BAD;
@@ -414,6 +422,8 @@ __device__ unsigned long long gzx_frame_extent(const unsigned char * p,
   }
   if (fhd & 0x04u) {                                // Content_Checksum_flag
     if (claimed - pos < 4) return BAD;
+    *ck = (unsigned)p[pos] | ((unsigned)p[pos + 1] << 8)
+        | ((unsigned)p[pos + 2] << 16) | ((unsigned)p[pos + 3] << 24);
     pos += 4;
   }
   return pos;
@@ -421,21 +431,25 @@ __device__ unsigned long long gzx_frame_extent(const unsigned char * p,
 
 __global__ void gzx_extent_kernel(const unsigned char * const * __restrict__ ptrs,
                                   const size_t * __restrict__ sizes,
-                                  int n, unsigned long long * __restrict__ out)
+                                  int n, unsigned long long * __restrict__ out,
+                                  unsigned int * __restrict__ ck)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  out[i] = gzx_frame_extent(ptrs[i], (unsigned long long)sizes[i]);
+  unsigned int c = 0;
+  out[i] = gzx_frame_extent(ptrs[i], (unsigned long long)sizes[i], &c);
+  ck[i] = c;
 }
 
 // Launch on `stream`, after the reads that filled the frames and the upload of
 // their device pointers and claimed sizes (the same arrays nvCOMP is given).
 extern "C" void gzx_launch_extent(const void * d_ptrs, const size_t * d_sizes,
-                                  int n, unsigned long long * d_out, void * stream)
+                                  int n, unsigned long long * d_out,
+                                  unsigned int * d_ck, void * stream)
 {
   if (n <= 0) return;
   const int threads = 64;
   const int blocks  = (n + threads - 1) / threads;
   gzx_extent_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-      (const unsigned char * const *)d_ptrs, d_sizes, n, d_out);
+      (const unsigned char * const *)d_ptrs, d_sizes, n, d_out, d_ck);
 }
