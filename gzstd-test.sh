@@ -12554,6 +12554,11 @@ zv_why=""
 zv_line=$("$GZSTD" --version 2>/dev/null | head -1)
 grep -qE '\[zstd [0-9]+\.[0-9]+\.[0-9]+, (multithreaded|single-threaded)\]$' <<< "$zv_line" \
   || zv_why+=" [--version does not name the zstd library: '$zv_line']"
+# One line under 80 columns (v0.18.35; it was 83), field 2 the version: the
+# admin scripts that gate on it read only `gzstd -V | awk '{print $2}'`.
+(( ${#zv_line} <= 80 )) || zv_why+=" [--version is ${#zv_line} columns: '$zv_line']"
+[[ $("$GZSTD" --version 2>/dev/null | wc -l) -eq 1 ]] || zv_why+=" [--version is not one line]"
+[[ $(awk '{print $2}' <<< "$zv_line") =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || zv_why+=" [field 2 is not the version]"
 zv_line=$(GZSTD_DEBUG_ZSTD_SINGLE_THREAD=1 "$GZSTD" --version 2>/dev/null | head -1)
 grep -q ', single-threaded\]$' <<< "$zv_line" || zv_why+=" [the hook did not report single-threaded: '$zv_line']"
 head -c 3000000 /dev/urandom | base64 > "$TMPDIR/zv.in"

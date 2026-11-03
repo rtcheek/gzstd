@@ -741,11 +741,32 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       count there; its last O_DIRECT measurement predates both (1.42x over buffered, one reader).
       Also seen: --cpu-only at 8 CPUs (compute-bound) 17.33-18.36 s against 17.14-17.93 -- within
       noise, possibly 1% for the extra reader threads.
-    - **--gds-only decode could read each frame's trailer on the device.**  The producer still
-      preads each frame's 4-byte checksum trailer on the host before any batch (the -d note in
-      gds_staged_frames_to_queue: ~1.2 s of a ~21 s -d on a 65 GiB archive).  The device extent walk
-      (gzx_launch_extent) now reaches each frame's real end, so it could return the trailer too,
-      leaving only the header read on the host.
+    - ~~**--gds-only decode could read each frame's trailer on the device.**~~  **Measured in
+      v0.18.35, not kept.**  Built (the extent walk returned the trailer; --direct-stage read it from
+      its pinned copy), and as a ceiling a build that skipped every producer header read as well.
+      48.87 GiB, 4,150 frames, cold, 4 interleaved runs: `-t --gds-only` 13.41-13.59 s, trailer on
+      the device 13.39-13.67, no header reads 13.43-13.52; `-t --direct-stage` 12.11-12.23 /
+      12.09-12.22 / 12.10-12.15; `-d --gds-only` to a file 32.65-35.72 / 32.90-34.00 / 32.73-35.78.
+      A trailer shares its 4 KiB page with the next frame's header, so dropping its pread saved a
+      syscall, never a disk read (8,300 -> 4,150 preads, 0.40 -> 0.39 s); and the producer's reads run
+      while each GPU worker registers VRAM (0.62 s), so no worker waits on them.  The "1.2 s of a
+      -d" note was the loop's own time, not a wait.  **The code is on the branch
+      `roadmap35-device-checks`** (on v0.18.34; it rebases onto v0.18.35 cleanly), worth revisiting
+      only where the metadata loop would outlast the workers' start-up -- QD1 reads in milliseconds,
+      e.g. GDS on a network filesystem.  Moving the header checks too needs more than the branch
+      has: the device would check the declared size and window, and a frame declaring no size, which
+      the producer demotes quietly today, would need the decoded-size check instead.  A wrong table
+      exits 4 either way (`gds_table_defect`), so only where it is caught would change.  A switch or
+      an `--adapt` tunable was considered and not built: nothing measurable to choose between on this
+      host, and the unchosen path would go untested.  Where it ever matters, keeping several header
+      reads in flight is the smaller change.
+    - **-d --gds-only reads every frame header twice, and the first pass is serial.**  The check that
+      arms peer-to-peer output (decompress_nvcomp: 4 KiB alignment, magic, declared size against the
+      table) preads each header on the main thread after the cuFile driver opens (~1.6 s) and before
+      any worker starts (placed there by strace timestamps): 0.34-0.39 s cold on 4,150 frames,
+      replayed without strace.  The producer's second pass then hits the page cache, 0.01 s.  The device cannot take it: it must decide
+      before the workers freeze the output topology.  Running it beside the driver open would hide
+      it -- about 1% of a -d run, below -d's 3 s run-to-run spread on this host, so not yet built.
     - **A pre-6.4 kernel's explicit --direct-read keeps huge pages.**  v0.18.34 moved it to plain
       pages on 6.4+ after measuring the stall here; nothing has measured a pre-6.4 host either way.
 

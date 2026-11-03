@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.34";
+static constexpr const char * GZSTD_VERSION = "0.18.35";
 //
 // Architecture overview:
 //
@@ -4438,11 +4438,13 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
 
 // Short help — shown by -h and -?.  Groups flags by purpose with one-line
 // descriptions.  Point users at --help for details and examples.
+// The -V line (defined with print_version): -h and --help open with it too.
+static std::string gz_version_line();
+
 static void print_help()
 {
   gz_stdout_will_be_written();
-  std::cout <<
-"gzstd " << GZSTD_VERSION << " — hybrid CPU+GPU Zstd compression\n"
+  std::cout << gz_version_line() << "\n" <<
 "\n"
 "Usage: gzstd [options] [file ...]\n"
 "\n"
@@ -4615,8 +4617,7 @@ static void print_help()
 static void print_help_long()
 {
   gz_stdout_will_be_written();
-  std::cout <<
-"gzstd " << GZSTD_VERSION << " — hybrid CPU+GPU Zstd compression\n"
+  std::cout << gz_version_line() << "\n" <<
 "\n"
 "Usage: gzstd [options] [file ...]\n"
 "\n"
@@ -6367,17 +6368,34 @@ static bool gz_zstd_multithreaded()
   return !ZSTD_isError(b.error) && b.upperBound > 0;
 }
 
-static void print_version()
+// THE ONE VERSION LINE: -V/--version print it alone, -h and --help open with it
+// (v0.18.35; the help banners said "hybrid CPU+GPU Zstd compression" in the
+// CPU-only build too).
+static std::string gz_version_line()
 {
-  gz_stdout_will_be_written();
   // The zstd library goes on the SAME line: scripts read the first line.
+  //
+  // ONE LINE, UNDER 80 COLUMNS (v0.18.35; it was 83).  What reads it, and
+  // what each needs kept: field 2 is the version (deleteuser/restoreuser parse
+  // only `gzstd -V | awk '{print $2}'`, so it must stay ONE line); the line ENDS
+  // with "[zstd V, multithreaded]" or "single-threaded]" (the release workflow
+  // and build-portable.sh match it fixed-string, the suite anchors it at $);
+  // the GPU build says "nvCOMP" (gzstd-benchmark.sh, case-sensitive) and the
+  // CPU-only build says "CPU-only" (the suite tells the builds apart by it).
+  // MT-CPU is gzstd's own frame-parallel pool, not the bracket's zstd workers.
   const std::string zl = std::string(" [zstd ") + ZSTD_versionString()
                        + (gz_zstd_multithreaded() ? ", multithreaded]" : ", single-threaded]");
 #ifdef HAVE_NVCOMP
-  std::cout << "gzstd " << GZSTD_VERSION << " (CPU + nvCOMP) MT-CPU + Hybrid scheduling" << zl << "\n";
+  return std::string("gzstd ") + GZSTD_VERSION + " (MT-CPU + nvCOMP + Hybrid)" + zl;
 #else
-  std::cout << "gzstd " << GZSTD_VERSION << " (CPU-only) MT compression" << zl << "\n";
+  return std::string("gzstd ") + GZSTD_VERSION + " (MT-CPU, CPU-only)" + zl;
 #endif
+}
+
+static void print_version()
+{
+  gz_stdout_will_be_written();
+  std::cout << gz_version_line() << "\n";
 }
 
 // Convert a value string to integer/double with friendly errors.  std::sto*
@@ -45147,12 +45165,21 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   // kept -- these reads are already near this drive's QD1 latency and the advice
   // bought no overlap the kernel was not already getting.
   //
-  // The cost is real and still open: 1.23 s of a ~21 s `-d` run reads metadata
-  // the GPU is about to read again, because each frame's 4-byte trailer is
-  // preaded on the HOST and then arrives in VRAM anyway as part of that frame's
-  // cuFileRead.  Removing it means extracting the trailer ON THE DEVICE, where
-  // the bytes already are -- a new kernel on the integrity path, which wants its
-  // own change rather than riding along with six others.
+  // TRIED AND REVERTED (v0.18.35, ROADMAP 35): reading these on the DEVICE.
+  // The trailer was taken from the extent walk (gzx_launch_extent) and, as a
+  // ceiling, a build skipped every header read here too.  MEASURED, 48.87 GiB,
+  // 4,150 frames, cold, 4 interleaved runs each: `-t --gds-only` 13.41-13.59 s,
+  // trailer on the device 13.39-13.67, no header reads 13.43-13.52; the
+  // `--direct-stage` and `-d` cells the same within noise.  Two reasons:
+  //  - a trailer shares its page with the next frame's header, so dropping its
+  //    pread saves a syscall, never a disk read (8,300 -> 4,150 preads, 0.40 ->
+  //    0.39 s);
+  //  - this loop runs while each GPU worker registers its VRAM (0.62 s), so
+  //    the workers never wait for it, and on `-d` it hits the page cache
+  //    anyway: decompress_nvcomp's peer-to-peer output check has already read
+  //    every header (that pass IS serial -- see ROADMAP 35).
+  // The code is on the roadmap35-device-checks branch; the old "1.23 s of a -d
+  // run" note here was this loop's time, not a cost any run waited on.
   for (size_t k = 0; k < nframes; ++k) {
     const uint64_t off  = st.c_off[k];
     const uint64_t csz  = st.c_off[k + 1] - st.c_off[k];

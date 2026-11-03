@@ -1,12 +1,58 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.34  
+**Covers:** v0.9.50 → v0.18.35  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.35 — gzstd -V fits in 80 columns: `gzstd 0.18.35 (MT-CPU + nvCOMP + Hybrid) [zstd 1.5.7, multithreaded]` (68; it was 83) and `(MT-CPU, CPU-only)` for the CPU-only build (60), and -h and --help open with the same line
+
+The GPU build's version line was `gzstd 0.18.34 (CPU + nvCOMP) MT-CPU + Hybrid scheduling [zstd 1.5.7,
+multithreaded]`, 83 columns, and wrapped on an 80-column terminal.  It is now `gzstd 0.18.35 (MT-CPU +
+nvCOMP + Hybrid) [zstd 1.5.7, multithreaded]`, 68, and the CPU-only build's `(CPU-only) MT compression`
+is `(MT-CPU, CPU-only)`, 60 (the owner's wording).  MT-CPU is gzstd's own frame-parallel pool; the
+bracket says whether the linked zstd has worker threads of its own -- different things, as v0.17.92's
+single-threaded portable build showed.
+
+-h and --help opened with their own banner, `gzstd 0.18.34 — hybrid CPU+GPU Zstd compression`, in the
+CPU-only build as well.  All three now print one function's line (`gz_version_line`), so the build a
+help screen describes is named the same way -V names it.
+
+Everything that reads the line was checked against both new binaries first: deleteuser and restoreuser
+gate on field 2 only (`gzstd -V | awk '{print $2}'`, version >= 0.14.77 -- both accept 0.18.35); the
+release workflow and scripts/build-portable.sh match `[zstd V, multithreaded]` as a fixed string; the
+suite anchors that bracket at the end of the line, tells the builds apart by `CPU-only`, and finds the
+GPU build by `nvcomp`/`gpu`/`cuda`; gzstd-benchmark.sh greps `nvCOMP` (case-sensitive), and
+gzstd-gds-check.sh `nvcomp`; the nightly installer only downloads.  All unchanged in meaning.  The
+suite's --version cell now also requires one line of at most 80 columns whose second field is the
+version.  Both builds warning-free.
+
+### Measured, not kept: --gds-only decode's frame metadata on the device (ROADMAP 35)
+
+The staged producer preads each frame's header and checksum trailer before the first batch.  The
+trailer was moved to the device -- the extent walk (`gzx_launch_extent`) already stops at it, and
+--direct-stage read it from its pinned copy -- and a ceiling build skipped every header read as well.
+48.87 GiB, 4,150 frames, cold, four interleaved runs each:
+
+| | v0.18.35 | trailer on the device | no header reads (ceiling) |
+|---|---|---|---|
+| `-t --gds-only` | 13.41-13.59 s | 13.39-13.67 | 13.43-13.52 |
+| `-t --direct-stage` | 12.11-12.23 | 12.09-12.22 | 12.10-12.15 (one 13.96) |
+| `-d --gds-only` to a file | 32.65-35.72 | 32.90-34.00 | 32.73-35.78 |
+| producer metadata | 8,300 preads, 0.40 s | 4,150, 0.39 s | 0, 0.00 s |
+
+Noise throughout.  A trailer shares its 4 KiB page with the next frame's header, so dropping its pread
+removed a syscall and never a disk read; and the loop runs while each GPU worker registers its VRAM
+(0.62 s), so no worker waited on it.  On `-d` the loop took 0.01 s in every build: the check that arms
+peer-to-peer output had already read every header -- serially, between the cuFile driver open and the
+workers' start, 0.34-0.39 s cold.  That pass cannot move to the device (it decides the output topology
+before the workers exist); ROADMAP 35 records overlapping it with the driver open, about 1% of a `-d`
+run.  The comment in `gds_staged_frames_to_queue` that invited this attempt ("1.23 s of a ~21 s -d
+run") was the loop's own time, not a wait, and now says so.  The code is on the
+`roadmap35-device-checks` branch.
 
 ## v0.18.34 — ROADMAP 31-34: a cold compress reads O_DIRECT through three readers and a probe tie goes to O_DIRECT (64.84 GiB at full width 13.2-13.3 s and 160 CPU-seconds, where v0.18.33 took 13.8-14.6 s and up to 268), --gds-only proves every frame's extent in VRAM (an identical-frames seek-table merge decoded one copy at exit 0) and compresses on two streams with its peer-to-peer output written behind the drains (34.4 -> 22.4 s to /dev/null, 45-50 -> 35.8 s to a file), several inputs and --tar stage by default on a small CPU budget and share one pinned pool (two 64 GiB inputs 41 -> 32 s, a 64 GiB --tar 25 -> 17.7 s at 4 CPUs), and hybrid decode of a cached archive on a small budget takes one CPU decoder while the GPU runs (median 15.8 -> 13.85 s)
 
