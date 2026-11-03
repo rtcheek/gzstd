@@ -237,6 +237,29 @@ Whatever the host does, `--adapt` measures the startup cost as part of each numb
 overhead. The measurement ends before process-exit teardown, so a device-count-dependent teardown
 cost is absent from the prediction. If startup cost changes, a later re-measurement picks that up.
 
+## Few CPUs beside a GPU (containers): the default stages compression (v0.18.33)
+
+A process allowed only a few CPUs — a container's cpuset or CPU quota, a `taskset` — compresses one
+large named file through `--direct-stage`'s path by default when a GPU is present (thresholds and
+conditions: `--help`, under `--direct-stage`). Nothing needs tuning for it, and `-v` reports it.
+Decompression is not staged by default: a cold archive's readers (O_DIRECT on 8 CPUs or fewer,
+at most three buffered above) make hybrid decode as fast on a small budget. Two things are worth
+knowing:
+
+- **The thresholds were measured on one host** (64 GiB on NVMe, one H100): staging wins or ties at
+  every cell up to 4 CPUs, at 16 GiB of input or more: below about 14 GiB the staged path's fixed
+  start (about 2 s: CUDA, the pinned pool) outweighs what it saves. A host
+  whose drive or GPU is slower crosses over at fewer CPUs, one with more GPU per CPU at more.
+  `--adapt` measures cpu-only, hybrid and the staged path at your budget and switches when another
+  is more than 5% faster.
+  Rates need at least 4 seconds and the profile save floor. A short or unsuccessful probe saves an
+  attempt stamp, so it does not repeat on every run; an unmeasurable static choice permits measured
+  alternatives. Residency must be known and unaffected by `--cold` or `--direct-read` to use these
+  buckets. The budget prior separates residency below 10% (`uncached`), 10% to below 95%
+  (`cached`), and at least 95% (`warm`), so partial-cache runs cannot borrow uncached rates.
+- **A warm page cache favours hybrid**: the staged path reads the drive even when the file is
+  cached. From cache at 4 CPUs the two tie; on 6-8 CPUs hybrid is faster, and it is what runs.
+
 ## Other tuning notes
 
 - **Benchmarks:** use `--no-profile`, so that results don't depend on what earlier runs taught the

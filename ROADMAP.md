@@ -398,7 +398,22 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    matter either (`numactl` to the card's socket or the other one: same times; item 9.1 below).
    Measurement trap found on the way: polling `nvidia-smi` every 0.5 s during a run made it ~1 s
    slower.  Revisit on a host that mixes GPU generations.
-21. **--adapt does not consider `--gds-only` (owner's note, 2026-10-15).**  The idea: when GPUDirect
+21. ~~**--adapt does not consider `--gds-only`.**~~ SHIPPED v0.18.33, as the STAGED path and by
+   DEFAULT on a small CPU budget (CHANGELOG v0.18.33 has the matrix).  Measured on the quiet 8-GPU
+   server, 64.84 GiB on NVMe, one H100, CPUs by taskset and by cgroup quota, cold and warm, three
+   runs a cell: the staged path (`--direct-stage`'s) is flat in CPUs at a fifth of the host CPU and
+   wins from 2 to 4 CPUs both ways and to 6 decoding a cold archive (16.7 s against hybrid's 19.3-19.8
+   compressing at 4; 13.6-13.8 against 22.7-24.7 decoding, before the reader fix -- decode keeps
+   the ordinary backend, item 33); from 8 CPUs, or from a warm page cache
+   sooner, hybrid ties or wins; on a real output file on the same drive everything is drive-bound
+   from 8.  `--gds-only` as shipped lost every cell (one stream: 34 s, 22 with two) except -d to a
+   file, and was not added as an arm; `--gpu-only` never beat the staged path.  So: the default
+   stages a COMPRESS on a small budget (gz_auto_stage_decline; decode was staged too until the
+   built binary was measured -- item 33), --adapt measures cpu-only, hybrid and staged per budget
+   class and residency (adapt_budget_choose), a cold archive's decode readers were fixed (O_DIRECT
+   on 8 CPUs or fewer, at most three above), and --direct-stage left EXPERIMENTAL after a production
+   review (items 31-34 hold what is left).  The original text:
+   **--adapt does not consider `--gds-only` (owner's note, 2026-10-15).**  The idea: when GPUDirect
    Storage is usable on this host (the same checks `--gds-only` already refuses on: nvidia-fs loaded
    and matching the driver, P2PDMA, a supported filesystem, a card the drive can reach), have --adapt
    try it as a fourth backend beside --cpu-only, --hybrid and --gpu-only, on EACH of the GPUs (GDS is
@@ -648,6 +663,50 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     here 0.015 bytes a byte, so the ceiling).  What remains at each route's floor -- one decoder's
     two frames, the throttle's minimum, a CUDA context, the heap's high-water -- is the working
     set, not a budget: going lower would take smaller frames, which the owner's rule excludes.
+31. **`--gds-only` keeps two gaps `--direct-stage` closed in v0.18.33 (owner's call).**  (a) A seek
+    table entry that merges two frames whose contents are IDENTICAL decodes to one copy at exit 0:
+    the producer walks only checksumless frames, and the swallowed frame's trailer equals the first's.
+    `--direct-stage` now proves every extent with ZSTD_findFrameCompressedSize on the pinned host copy
+    it already makes; `--gds-only` reads drive -> VRAM with no host copy, and the walk that would close
+    it cost 28.6 -> 111.6 s on a cold 65 GiB archive when it existed.  Options: walk only under a
+    flag, prove the extent on the device, or accept it for an EXPERIMENTAL path that needs a forged
+    table.  (b) One GPU stream by design (cuFile registration per stream, the peer-to-peer output
+    packer): 64 GiB cold compress 34 s, 22 with `--gpu-streams=2`, 16.8 for `--direct-stage`.  The
+    registration cost that justified it was 490 ms/GiB; it measures 169 ms on driver 595.
+32. **Hybrid decode on a small budget still runs too many CPU decoders.**  Sweep (v0.18.32 binary,
+    48.87 GiB archive, two runs): at 4 CPUs one worker instead of three, cold 24.2-24.8 -> 15.9 s,
+    warm 15.1-15.3 -> 11.2-11.8; at 6, two or three instead of five; at 8, about the same.  v0.18.33's
+    cold-archive O_DIRECT readers already take hybrid at 4 CPUs to 12.8-13.6 s; what is left is
+    mostly a warm archive.  Deferred: the
+    pool is sized before the deferred GPU detection answers, and nothing grows it if the GPU never
+    comes up, so a GPU-less or failed-GPU host would decode on one worker.  Needs a pool that grows
+    on GPU loss first.  And it may not be worth it: a second sweep with the reader fix in place
+    (two runs) found fewer workers add nothing cold -- 4 CPUs, O_DIRECT readers alone 12.9-13.0 s,
+    with one worker 14.5 -- and little warm (4 CPUs 13.1-13.5 -> 12.6 s; 6 and 8 the same).
+33. **Automatic staging covers compression only, at one host's thresholds.**  4 CPUs, 16 GiB of
+    input, PCIe Gen4+.  Unmeasured: a Gen4 consumer card (the floor admits it), the Gen3 workstation
+    (excluded; its staged compress was last measured at 1.04 GiB/s, before compress had two
+    streams), --tar, several files.  --adapt's budget prior moves the choice per machine once it has
+    measured.  The staged path's fixed start (about 2 s: CUDA, the pinned pool) sets the size floor.
+    DECODE IS NOT STAGED BY DEFAULT, and why: v0.18.33 first staged it too (up to 6 CPUs for a cold
+    archive), then measured the built binary.  The automatic choice confirms a usable device with
+    CUDA before it commits (decode under --gpu-only has no CPU pool to fall back to), and that
+    serialises cuInit ahead of the reads an explicit `-d --direct-stage` overlaps it with: 4 CPUs,
+    cold, automatic 14.72-14.88 s against explicit 13.69-13.70 -- while hybrid with v0.18.33's
+    cold-archive readers took 13.09-14.04.  Re-enabling it needs (a) the confirmation overlapped with
+    the first reads and a CPU restart for the no-device case (nothing has been written then), and (b)
+    a fix to the dormant recovery code: the automatic decode's CPU-tail recovery after a dishonest
+    seek table keeps the table's checksums keyed by the REJECTED table's decompressed offsets, which
+    the CPU decoder looks up by actual offsets (the production review's last finding, unconfirmed by
+    a run: frames P X X Y Z with the X's merged and Y/Z carrying only table checksums would fail Y
+    against Z's hash).  Those paths (`direct_stage_auto` in the decode producer, the table retry, the
+    CPU tail) are unreachable while gz_auto_stage_decline declines every decode; remove them or fix
+    them before relying on them.
+34. **Hybrid at full width wastes CPU on a drive-bound input.**  Cold compress of 64.84 GiB on all
+    256 CPUs: 13.6 s and 257 CPU-seconds (139 user, 118 system) against 13.8 s and 90 on 16 CPUs --
+    96 workers and 12 O_DIRECT readers for a drive that 14 workers saturate.  v0.18.33 fixed the
+    decode side for a cold archive (three readers); compress is untouched.  Not a wall-time defect,
+    but on a shared host it takes ~10 cores of kernel time from the neighbours.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

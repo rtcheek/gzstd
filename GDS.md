@@ -14,7 +14,9 @@ Decomposed on one host, cold, of 3.73 host CPU-seconds saved against the ordinar
 | peer-to-peer DMA itself | 0.19 s (5%) |
 
 `--direct-stage` is that 95%. It needs **none** of the four requirements below — no cuFile, no
-`nvidia-fs`, no resizable BAR, no particular filesystem — and it runs anywhere you have a GPU:
+`nvidia-fs`, no resizable BAR, no particular filesystem — and it runs on any host with a GPU this
+build supports (NVIDIA, CUDA and nvCOMP, compute capability 7.0 or newer) and an input on a
+filesystem that accepts O_DIRECT:
 
 ```bash
 gzstd --direct-stage BIGFILE -o BIGFILE.zst
@@ -22,9 +24,24 @@ gzstd --direct-stage BIGFILE -o BIGFILE.zst
 
 Set `--gds-only` up if you want the last 5% and your hardware qualifies. Otherwise stop here.
 
-Also worth knowing: **what either flag buys is not throughput.** Both paths saturate the same drive.
-The win is host CPU and memory bandwidth handed back to whatever else the machine is doing, so on an
-idle box it measures as very nearly nothing.
+**Since v0.18.33 `--direct-stage` is a production backend, no longer experimental** (`--gds-only`
+still is), and gzstd takes its path **by default for compression** when the process may use few
+CPUs — a container's cpuset or quota, or a `taskset` — and an eligible GPU is available: one named
+file of 16 GiB or more, up to 4 CPUs, PCIe Gen4 or newer. `--help` under `--direct-stage` lists the
+conditions; `-v` says when it happens; `--hybrid` or `--cpu-only` keeps the old behaviour.
+Decompression is not staged by default: v0.18.33's readers for a cold archive make hybrid decode as
+fast on a small budget, so `-d --direct-stage` remains the way to ask for it.
+
+Automatic staging keeps the default's promise to finish: a compress whose GPU fails, whose staging
+memory cannot be pinned, or whose input changes is discarded and rebuilt on the CPU. An explicit
+`--direct-stage` keeps its stricter requirements: a GPU or a refusal.
+
+Also worth knowing: **on a machine with CPUs to spare, what either flag buys is not throughput.**
+Both paths saturate the same drive. The win is host CPU and memory bandwidth handed back to
+whatever else the machine is doing, so on an idle box with all its cores it measures as very nearly
+nothing. With few CPUs it is throughput too: hybrid's CPU workers compete with its own readers, and
+the staged path does not need the CPUs. Measured on a 64 GiB cold file, one H100, 4 CPUs: compress
+16.7 s against hybrid's 19.6, at a fifth of the host CPU.
 
 ## Quick check
 

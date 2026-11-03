@@ -1,12 +1,180 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.32  
+**Covers:** v0.9.50 → v0.18.33  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.33 — a small CPU budget compresses through the GPU by default (16.7 s against 19.5 at 4 CPUs, a fifth of the host CPU), a cold archive's decode readers fit the budget (hybrid at 4 CPUs 23 -> 13 s; 43% less CPU at full width), --adapt measures cpu-only, hybrid and the staged path at each budget (ROADMAP 21), and --direct-stage leaves EXPERIMENTAL after a production review fixed silent frame loss on a dishonest seek table, a hang with no usable GPU, and a source that grows while staged
+
+### Measured first: what a GPU buys when the CPUs are few
+
+ROADMAP 21 asked whether --adapt should consider --gds-only and --direct-stage.  Measured on the
+8-GPU server while it was idle: 64.84 GiB of base64-of-random on its NVMe (the GPU arms need
+entropy-coded data), a 48.87 GiB archive of it, ONE H100 (the card on the drive's root complex),
+the process held to N CPUs by taskset as sibling pairs on that NUMA node, output to /dev/null, the
+input cold (evicted, checked with mincore) or warm, three interleaved runs of each cell (v0.18.32):
+
+| CPUs | compress cold: cpu-only / hybrid / staged | decompress cold: cpu-only / hybrid / --gpu-only / staged |
+|---|---|---|
+| 2 | 94.9-97.5 / 23.4-24.1 / **16.5** | 62.0-64.2 / 27.1-30.7 / 21.6-24.5 / **13.8-14.8** |
+| 4 | 33.2-33.5 / 19.3-19.8 / **16.7** | 27.1-27.3 / 22.7-24.7 / 14.1-14.3 / **13.6-13.8** |
+| 6 | 23.0-23.9 / 16.3-16.8 / 16.7-16.9 | 18.8-19.8 / 16.8-17.0 / 13.7-13.9 / **13.6-14.2** |
+| 8 | 16.8-17.2 / **15.6-16.0** / 16.8 | 14.1-14.3 / 14.5-14.8 / 13.3-13.4 / 13.6 |
+| 16 | **14.1-15.1** / 14.2-15.1 / 16.8 | **11.9-12.1** / 12.1-12.2 / 12.9-13.3 / 13.6-13.7 |
+| all 256 | **13.6-14.2** / 13.7-13.9 / 16.8-17.4 | 13.5-13.9 / 13.3-13.9 / 13.7-17.0 / 13.7-13.9 |
+
+Host CPU-seconds, staged against hybrid: 12-24 against 42-290.  The staged path (--direct-stage's
+O_DIRECT read into pinned memory, hashed and coded on the GPU) is FLAT in CPUs; hybrid's time grows
+as they are taken away, because its CPU workers compete with its own readers and, decoding, starve
+them (at 4 CPUs its three readers were saturated at 1.84 GiB/s of archive while --gpu-only read 3.2).
+From a warm page cache hybrid reads memory where the staged path still reads the drive: compress ties
+at 4 CPUs (hybrid 16.6-19.4, staged 17.0-20.7) and hybrid wins at 6.  A cgroup CPU quota behaves like
+a mask (4-CPU quota: compress 16.7-17.2 staged against hybrid's 18.6).  Eight visible GPUs make hybrid
+WORSE on a small budget (compress at 4 CPUs 23.4-23.6 s: cuInit on every card), while the staged path
+takes one card.  A real output file on the same NVMe makes every arm drive-bound from 8 CPUs;
+--gds-only as shipped lost every cell (one stream by design: 34 s against 22 with --gpu-streams=2)
+except -d to a file, where it used the least CPU; --gpu-only never beat the staged path.
+
+### The default compresses through the GPU on a small CPU budget
+
+Up to 4 CPUs (where staging wins or ties every measured cell) and 16 GiB of input or more: the staged
+path's fixed start (CUDA, the pinned pool) is about 2 s, and at 8 GiB it lost (4 CPUs: 4.07-4.10 s
+against hybrid's 3.74-3.81); fitting both sizes puts the crossover at 14-15 GiB.
+`gz_auto_stage_decline` holds every condition: no backend named or implied, no GPU/hybrid tuning or
+input-reader flag, ONE named regular file, the default level and none of zstd's own compressor knobs
+(nvCOMP compresses at one fixed level), no --verify/--keep-going/--no-check/--chunk-size/--calibrate,
+a GPU in /proc new enough, PCIe Gen4 or newer (on a Gen3 host the staged compress was last measured
+at 1.04 GiB/s), an input that reopens O_DIRECT through the held descriptor and reads, an output a CPU
+rebuild can discard without touching bytes it did not write (a regular file, stdout at its end or
+O_APPEND, the null device), and a CUDA_VISIBLE_DEVICES it can narrow without changing its meaning.
+
+THE CONTRACT IS THE DEFAULT'S.  A user who types --direct-stage gets a GPU or a refusal; a run that
+defaulted to staging must finish wherever hybrid would have.  The choice is made before the device
+mask (one device, hidden from cuInit like an explicit --direct-stage) and committed only after CUDA
+confirms that device -- a staged compress starts CUDA before its first read anyway.  A compress whose
+GPU then fails, whose staging pool cannot be pinned, whose O_DIRECT reopen fails, or whose input
+changes is discarded and done again on the CPU.  Messages name "the staged read (chosen for a small
+CPU budget)", never a flag the user did not type.  `-v`: "[STAGE] 4 CPUs allowed and a GPU beside
+them: staging ..."; `-vv` gives the reason a run did not stage.  --hybrid or --cpu-only keeps the old
+behaviour.  New hooks: GZSTD_DEBUG_AUTO_STAGE=0 (off), GZSTD_DEBUG_AUTO_STAGE_MIN_BYTES (the floor),
+GZSTD_DEBUG_DSTAGE_PIN_FAIL (the pool cannot be pinned).
+
+DECOMPRESSION IS NOT STAGED BY DEFAULT, though this version first did it (up to 6 CPUs for a cold
+archive).  The built binary, against v0.18.32, 3 runs: automatic staged decode at 4 CPUs 14.72-14.88 s,
+an explicit `-d --direct-stage` 13.69-13.70 -- the automatic choice must confirm CUDA before it reads
+(decode under --gpu-only has no CPU pool to fall back to), where an explicit staged decode overlaps
+cuInit with its first reads -- and hybrid with the readers below 13.09-14.04.  ROADMAP 33 records what
+re-enabling it needs, and the dormant recovery code it would use.
+
+### A cold archive's decode readers
+
+Twelve buffered decode readers (the count follows the CPU pool) on a cold archive bought nothing but
+kernel time, and on a small budget the decoders starved them.  O_DIRECT readers need little CPU but
+were slower than buffered read-ahead at 16-32 CPUs.  MEASURED, 48.87 GiB cold, v0.18.32, 3 runs:
+
+| CPUs, backend | buffered (default) | O_DIRECT | 3 buffered |
+|---|---|---|---|
+| 4, hybrid | 24.8-25.3 s, 98 CPU-s | **12.8-13.6, 46** | (3 already) |
+| 8, cpu-only | 14.7-14.9, 111 | **13.1-13.2, 77** | (3 already) |
+| 16, cpu-only | **11.7-12.1**, 99 | 13.3-13.4, 78 | (3 already) |
+| all, cpu-only | 13.1-13.4, 286 | 13.7-13.9, 143 | **12.8-13.8, 169** |
+| all, hybrid | 13.3-13.7, 286 | 13.8, 145 | **12.9-13.0, 163** |
+| all, --gpu-only | 13.9-14.2, 165 | 14.4, 16 | **13.3-13.8, 42** |
+
+So a COLD archive (sampled with mincore on the held descriptor; --cold counts, and now evicts a
+redirected stdin too) is read O_DIRECT on 8 CPUs or fewer (not --gpu-only, whose 8-CPU cell lost 8%),
+and by at most three buffered readers above, which also bounds --adapt's reader controller.  A cached
+archive, or any --direct-read / --no-direct-read / --read-threads, is untouched.  `-v`: "[READER]
+parallel prefetch: 3 reader threads, O_DIRECT ... (the archive is cold)".  Fewer hybrid CPU workers
+on top added nothing cold and little warm (ROADMAP 32).
+
+### Before and after, the built binary
+
+v0.18.32 against v0.18.33, interleaved, 3 runs a cell (64.84 GiB / 48.87 GiB, one H100):
+
+| cell | v0.18.32 | v0.18.33 |
+|---|---|---|
+| decode cold, all CPUs | 13.28-13.77 s, 289 CPU-s | **12.47-13.14 s, 165** |
+| decode cold, 4 CPUs, --hybrid | 22.25-25.49 s, 89 | **12.96-13.93 s, 46** |
+| compress cold, 4 CPUs (stages) | 19.30-19.70 s, 72 | **16.67-16.85 s, 16** |
+| compress cold, all CPUs | 13.80-15.81 s, 230 | 13.84-14.82 s, 230 |
+| compress cold, 8 CPUs | 15.77-16.09 s | 15.92-16.41 s |
+| decode warm, all CPUs (6 runs) | 1.61-2.00 s | 1.69-1.88 s |
+| decode warm, 6 CPUs | 10.06-13.38 s | 11.61-14.10 s |
+
+### --adapt measures the three backends at each budget (ROADMAP 21)
+
+The cpu/hybrid prior scales a cpu-only rate by the CPUs then and now.  That is wrong once the drive is
+the limit (cold compress: 4.75 GiB/s on 256 CPUs, 4.69 on 16 -- scaled, 0.3) and cannot predict
+hybrid's collapse.  On 16 or fewer CPUs, a compress that could stage is now decided among cpu-only,
+hybrid and staged, each measured AT THIS BUDGET: classes of up to 2, 4, 8 and 16 CPUs, split by input
+residency (below 10% cached, 10 to 95%, above), are separate buckets
+(`budget_<arm>_<b2|b4|b8|b16>_<uncached|cached|warm>`).  The default's own arm runs and is measured
+first, each other arm is explored once on runs predicted long enough to record, the stalest is
+re-measured every 20 runs, and an arm measured 5% faster replaces the default's; a probe that cannot
+measure its arm is stamped so it does not repeat.  Hybrid and staged rates are GPU measurements,
+dropped on a driver change.  A container runs at one budget, so its bucket fills in a few runs; above
+16 CPUs, and for decompression, the cpu/hybrid pair is unchanged.
+
+### --direct-stage leaves EXPERIMENTAL: what the production review found
+
+The owner asked for a full review before the status change (Codex, max effort, four turns; verdict
+READY FOR PRODUCTION).  Two P1s reproduced on v0.18.32 exactly as stated:
+
+- **A seek-table entry spanning two identical frames decoded to one copy at exit 0.**  The producer
+  walks only checksumless frames' block headers, trusting a checksummed frame's trailer -- an entry
+  that swallows the next frame reads the wrong frame's hash -- unless the swallowed frame's content
+  equals the first's (zeroed regions, repeated blocks), and then its trailer IS the first's.  Frames
+  X X Y, the table merging the X's: `-d --direct-stage` wrote 2,148,576 of 3,197,152 bytes, exit 0,
+  and `-t` said OK; --cpu-only and hybrid decoded every byte.  The fix is not the walk the review
+  proposed (1.7 M serial preads on a cold 65 GiB archive took `-t` from 28.6 to 111.6 s when it
+  existed): each frame's compressed bytes are already in pinned host memory for the upload, so
+  `ZSTD_findFrameCompressedSize` proves the extent there, at both the read-ahead and the lane read, in
+  microseconds.  A dishonest entry exits 4; --keep-going decodes every byte.  --gds-only reads drive
+  -> VRAM with no host copy, keeps the gap, and stays EXPERIMENTAL (ROADMAP 31).
+- **With no usable GPU a staged -t or -d hung.**  The deferred bringup set "no device" and returned
+  while the staged producer sat in push() on a full bounded queue.  It now closes the queue.  326
+  frames, --gpu-batch=1: exit 2 in 0.7 s where v0.18.32 was killed at 60.
+
+And three more, after rebasing: a source that changes while staged (the staged reader stops at the
+size it saw, while the ordinary readers read to EOF -- MEASURED, a 200 MiB file grown by 10 MiB
+decoded to 220 MiB under --cpu-only; staged it would have lost the tail, and --rm then deletes the
+input): the size/mtime/ctime of the held descriptor is compared at the end of the pass, an automatic
+staging rebuilds through EOF (decoded 139,994,097 bytes, the grown file) and an explicit
+--direct-stage exits 3 with the input kept; memory bounds (the seek metadata budgeted before it is
+allocated -- declining optional geometry rather than refusing an archive the old allocation fit --
+CPU-rescue allocation checks, a lane that cannot fit refuses, compact checksum records); exit codes
+(an O_DIRECT setup failure is exit 3, a staged read failure to a pipe exit 3 naming the read, not the
+GPU).
+
+### Reviews
+
+Codex (GPT-6.1-Sol, max): the --direct-stage production review (four turns) and six rounds on the
+v0.18.33 change -- 6, 6, 3, 3 findings, a clean round, then the decode scope reduction.  Every P1
+reproduced before it was fixed.  The rounds' fixes include the stdout-in-the-middle-of-a-file rebuild
+hazard, setup failures that bypassed the CPU rebuild, --calibrate inheriting the choice, a malformed
+CUDA_VISIBLE_DEVICES being narrowed into a valid one, reader flags overridden, two ways the budget
+prior could explore forever, residency classes that let partly cached runs borrow cold rates, and the
+cold-reader policy's reach into --adapt's reader controller and a redirected stdin under --cold.
+
+### Tests
+
+"Small CPU budget: the default stages through the GPU (v0.18.33)": ten default GPU cells -- staged
+compress with exact [DSTAGE] counts, -d keeping the default, the CPU rebuild (bringup and pin
+failures), the declines (a level, a pipe, --hybrid, -d, enough CPUs, the off switch), an explicit
+flag's refusal, the budget prior's table and filing, an input that grows while staged, the
+identical-frames forgery, and no device -- and one cell both builds run (a cold archive's readers; it
+skips where the archive cannot be evicted).  Mutation-tested: twelve mutants of the new code, every
+one caught by its cell.  Default 543 -> 554, --extensive 885 -> 896, no-GPU deltas +10.
+Suites on the 8-GPU server: default 553 passed, 0 failed, 1 skipped (a cell this host cannot
+exercise) of 554 in 15m00s; CPU-only 403 passed, 0 failed (125 GPU cells skipped) in 2m22s.  The
+default run is slower than v0.18.32's 10m48s, but not because of this change: v0.18.32's own suite
+on the same host the same night took 14m03s, and the 203 cells the two share took 803 s in both;
+the eleven new cells add 59 s.
 
 ## v0.18.32 — ROADMAP 30 closed: -d --tar's frames carry their throttle permit until written, a pooled reader takes its buffer before it claims a chunk (a hang under a limit since v0.18.30), -M caps the frames in flight on compress, and --gds-only's registrations are bounded by what they measurably cost (a 2 GiB decode under 128 MB; -d --tar and --gpu-only under 192)
 

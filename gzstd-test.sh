@@ -622,8 +622,14 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=543
-$EXTENSIVE && EXPECTED_TESTS=885
+EXPECTED_TESTS=554
+$EXTENSIVE && EXPECTED_TESTS=896
+# v0.18.33: +1 default cell on both builds (a cold archive's decode readers) and
+# +10 default GPU cells (a small CPU budget stages by default: compress,
+# decompress, the CPU rebuild, the declines, an explicit flag's refusal, --adapt's
+# budget prior and its filing, an input that grows while staged; and two --direct-stage
+# defects: a table entry spanning identical frames, no device): 543 -> 554, 885 -> 896;
+# the no-GPU deltas +10.  DERIVED.
 # v0.18.32, at the owner's request, as in v0.18.7: stable, slow default cells moved to
 # --extensive (each marked "moved to -e in v0.18.32"): seek-table content checksums,
 # GPU VRAM pressure, --adapt persistent profile, GPU failure handling, single-frame
@@ -950,8 +956,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=141   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=219   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31
+EXPECTED_NOGPU_DELTA=151   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=229   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -13401,6 +13407,453 @@ else
   rm -rf "$swp_cl"
 fi
 rm -f "$TMPDIR"/swp*.err
+
+# ============================================================
+section "Small CPU budget: the default stages through the GPU (v0.18.33)"
+
+# A process allowed few CPUs with a GPU beside it takes --direct-stage's path by
+# default (gz_auto_stage_decline): MEASURED on the 8-GPU server, 64 GiB cold, one
+# H100, 4 CPUs: compress 16.7 s staged against hybrid's 19.6, decode 13.6 against
+# 22.7.  The cells hold the decision, the declines, the default's promise to finish
+# (a CPU rebuild where the GPU cannot carry it) against an explicit flag's refusal,
+# two --direct-stage defects found by the v0.18.33 production review (a seek-table
+# entry spanning identical frames decoded to one copy at exit 0; no device hung a
+# staged -t), and --adapt's budget-keyed prior.  The size floor is lowered by hook;
+# a host on PCIe Gen3 never stages by default, and skips what needs staging.
+if has_gpu 2>/dev/null && command -v python3 >/dev/null 2>&1 && command -v taskset >/dev/null 2>&1; then
+  bs_cpus() { python3 -c "import os;print(','.join(map(str,sorted(os.sched_getaffinity(0))[:$1])))"; }
+  # The progress meter shares lines with the log (a carriage return, the meter,
+  # an erase-line escape), so split on \r and drop the escape before anchoring.
+  bs_lines() { tr '\r' '\n' < "$1" | sed 's/\x1b\[K//g'; }
+  # The CPU banner reflects both affinity and an inherited cgroup quota.  When
+  # the whole machine fits the mask it has no banner, so count that mask.
+  bs_allowance() {
+    local n
+    n=$(bs_lines "$1" | sed -n 's/^\[CPU\] this process may use \([0-9]*\) of .*/\1/p' | head -1)
+    [[ -n "$n" ]] || n=$(awk -F, '{print NF}' <<< "$2")
+    printf '%s\n' "$n"
+  }
+  bs4=$(bs_cpus 4); bs8=$(bs_cpus 8)
+  bs_src="$TMPDIR/bs.bin"; bs_zst="$TMPDIR/bs.zst"; bs_out="$TMPDIR/bs.out"; bs_log="$TMPDIR/bs.log"
+  ( set +o pipefail
+    head -c $((49*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$bs_src" )
+  "$GZSTD" -q -f --cpu-only "$bs_src" -o "$bs_zst" 2>/dev/null
+  bs_env=(env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_AUTO_STAGE_MIN_BYTES=1048576)
+  # Does this host stage at all?  Ask the decision itself at -vv.
+  "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv -f -c "$bs_src" > "$bs_out" 2> "$bs_log"
+  bs_rc=$?
+  bs_ncpu=$(bs_allowance "$bs_log" "$bs4")
+  bs_class=b4; (( bs_ncpu <= 2 )) && bs_class=b2
+  bs_no=$(grep -a -o 'the default does not stage: .*' "$bs_log" | head -1)
+  if [[ -z "$bs_no" ]] && grep -aq '\[STAGE\] no usable GPU after all' "$bs_log"; then
+    bs_no="the default does not stage: no usable GPU under the caller's CUDA mask"
+  fi
+  bs_frames=5    # 64 MiB + 12,345 bytes in 16 MiB frames
+  if [[ -n "$bs_no" ]]; then
+    # Only what the HOST decides is a skip; any other decline is the decision
+    # failing, and a broken decision must not turn these cells into skips.
+    for c in "a small CPU budget compresses through the GPU by default" \
+             "a small CPU budget decompresses by the default (not staged)" \
+             "the default's staging finishes on the CPU when the GPU cannot carry it" \
+             "--adapt's budget prior: the default runs, then each backend is tried" \
+             "--adapt files a staged run under its CPU budget" \
+             "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3"; do
+      if grep -qE 'older than Gen4|O_DIRECT|no NVIDIA GPU|no usable GPU|older than this build|hides every GPU|cannot safely be narrowed' <<< "$bs_no"; then
+        skip_host "$c" "this host does not stage: ${bs_no#the default does not stage: }"
+      else
+        fail "$c" "the default declined: ${bs_no#the default does not stage: }"
+      fi
+    done
+  else
+    # 1. Compress: staged ([STAGE] and the exact [DSTAGE] count), right bytes.
+    why=""
+    [[ $bs_rc -eq 0 ]] || why+=" [exit $bs_rc]"
+    bs_lines "$bs_log" | grep -aq "^\[STAGE\] $bs_ncpu CPUs allowed" || why+=" [no STAGE line]"
+    bs_lines "$bs_log" | grep -aq "^\[DSTAGE\] $bs_frames frames" || why+=" [DSTAGE: $(bs_lines "$bs_log" | grep -a -o '^\[DSTAGE\] [0-9]* frames' | head -1)]"
+    "$GZSTD" -d -q -c "$bs_out" 2>/dev/null | cmp -s - "$bs_src" || why+=" [bytes]"
+    [[ -z "$why" ]] && pass "a small CPU budget compresses through the GPU by default" \
+      || fail "a small CPU budget compresses through the GPU by default" "$why"
+    # 2. Decompress keeps the default on the same budget: with the cold-archive
+    # readers hybrid decodes as fast (4 CPUs: 13.0-14.0 s against staged
+    # 13.6-13.8), and an automatic staged decode would start CUDA before reading.
+    why=""
+    "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv -d -f -c "$bs_zst" > "$bs_out" 2> "$bs_log" || why+=" [exit $?]"
+    grep -aq 'does not stage: decompression keeps the default' "$bs_log" || why+=" [no decline reason]"
+    bs_lines "$bs_log" | grep -aq '^\[STAGE\] [0-9]* CPUs allowed' && why+=" [staged]"
+    cmp -s "$bs_out" "$bs_src" || why+=" [bytes]"
+    [[ -z "$why" ]] && pass "a small CPU budget decompresses by the default (not staged)" \
+      || fail "a small CPU budget decompresses by the default (not staged)" "$why"
+    # 4. The default's promise: a GPU that cannot come up, or a pool that cannot
+    # be pinned, rebuilds on the CPU at exit 0 with the right bytes.
+    why=""
+    for hk in GZSTD_DEBUG_FAIL_GPU_BRINGUP=all GZSTD_DEBUG_DSTAGE_PIN_FAIL=1; do
+      rm -f "$bs_out"
+      "${bs_env[@]}" "$hk" timeout --foreground -k 10 120 taskset -c "$bs4" \
+        "$GZSTD" -v -f -o "$bs_out" "$bs_src" 2> "$bs_log"
+      rc=$?
+      [[ $rc -eq 0 ]] || why+=" [$hk exit $rc]"
+      # The report names the cause: a GPU that could not carry it, or the setup
+      # step that failed (the pool, the O_DIRECT reopen) -- either way a CPU rebuild.
+      bs_lines "$bs_log" | grep -aqE 'rebuilding CPU-only|CPU-only rebuild' || why+=" [$hk: no rebuild report]"
+      "$GZSTD" -d -q -c "$bs_out" 2>/dev/null | cmp -s - "$bs_src" || why+=" [$hk bytes]"
+    done
+    [[ -z "$why" ]] && pass "the default's staging finishes on the CPU when the GPU cannot carry it" \
+      || fail "the default's staging finishes on the CPU when the GPU cannot carry it" "$why"
+    # 8. --adapt's budget prior, from crafted profiles: the default's arm runs and
+    # is measured first, an unmeasured arm is explored, the default holds within
+    # the margin, and a backend measured faster replaces it.
+    why=""
+    bs_x="$TMPDIR/bs-xdg"; rm -rf "$bs_x"; mkdir -p "$bs_x/gzstd"
+    cat "$bs_src" > /dev/null   # hold these crafted-profile choices in the warm slot
+    "${bs_env[@]}" XDG_CACHE_HOME="$bs_x" taskset -c "$bs4" "$GZSTD" --adapt -vv -f -o "$bs_out" "$bs_src" 2> "$bs_log"
+    bs_fp=$(grep -a -o '^\[ADAPT\] fingerprint [0-9a-f]* driver [^ ]*' "$bs_log" | head -1)
+    bs_hash=$(awk '{print $3}' <<< "$bs_fp"); bs_drv=$(awk '{print $5}' <<< "$bs_fp")
+    [[ "$bs_drv" == "(none)" ]] && bs_drv=""
+    bs_slot=$(grep -a -o "budget prior ($bs_ncpu CPUs, ${bs_class}_[a-z]*)" "$bs_log" | head -1 | grep -o "${bs_class}_[a-z]*")
+    grep -aq 'the default runs and is measured: staged' "$bs_log" || why+=" [empty: $(grep -a -o 'budget prior.*' "$bs_log" | head -1)]"
+    bs_seed() {   # cpu hybrid staged rates ("" = unmeasured), for $bs_slot
+      local kv="" a v
+      for a in cpu hybrid staged; do
+        case $a in cpu) v=$1;; hybrid) v=$2;; staged) v=$3;; esac
+        [[ -n "$v" ]] && kv+="\"budget_${a}_${bs_slot}\": $v, \"budget_${a}_${bs_slot}_run\": 3, "
+      done
+      printf '{ "gzstd_profile": %s, "entries": { "%s": { "fingerprint": "crafted", "driver": "%s",\n  "compress": { %s"runs": 3 } } } }\n' \
+        "$PROFILE_SCHEMA" "$bs_hash" "$bs_drv" "$kv" > "$bs_x/gzstd/profile.json"
+    }
+    bs_decide() {   # run once, print the decision line
+      cat "$bs_src" > /dev/null
+      "${bs_env[@]}" XDG_CACHE_HOME="$bs_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 taskset -c "$bs4" \
+        "$GZSTD" --adapt -v -f -o "$bs_out" "$bs_src" 2> "$bs_log"
+      grep -a -o 'budget prior .*' "$bs_log" | head -1
+    }
+    if [[ ${#bs_hash} -ne 16 || -z "$bs_slot" ]]; then
+      why+=" [no fingerprint or slot: '$bs_hash' '$bs_slot']"
+    else
+      bs_seed "" "" 3.0;     d=$(bs_decide); [[ "$d" == *"-> exploring hybrid"* ]] || why+=" [staged only: $d]"
+      # Keep this profile for the next run: the save floor was raised above the
+      # fixture's wall time, so only the attempt stamp can prevent a repeat.
+      d=$(bs_decide); [[ "$d" == *"-> exploring cpu-only"* ]] || why+=" [short hybrid probe repeated: $d]"
+      # A static arm that stood down has a stamp but no rate.  It must not block
+      # an already measured alternative, or re-pay the same failed attempt.
+      bs_seed 1.0 2.0 ""
+      python3 -I - "$bs_x/gzstd/profile.json" "$bs_hash" "$bs_slot" <<'PYEOF'
+import json, sys
+p = json.load(open(sys.argv[1]))
+p['entries'][sys.argv[2]]['compress']['budget_staged_' + sys.argv[3] + '_run'] = 3
+with open(sys.argv[1], 'w') as f:
+    json.dump(p, f)
+PYEOF
+      d=$(bs_decide); [[ "$d" == *"the default was recently unmeasurable; using hybrid"* ]] || why+=" [unmeasurable static arm: $d]"
+      bs_seed 1.0 2.0 3.0;   d=$(bs_decide); [[ "$d" == *"the default holds: staged"* ]] || why+=" [staged best: $d]"
+      bs_lines "$bs_log" | grep -aq "^\[STAGE\] $bs_ncpu CPUs allowed" || why+=" [staged best but not staged]"
+      bs_seed 1.0 3.1 3.0;   d=$(bs_decide); [[ "$d" == *"the default holds: staged"* ]] || why+=" [within 5%: $d]"
+      bs_seed 1.0 4.0 3.0;   d=$(bs_decide); [[ "$d" == *"measured fastest: hybrid"* ]] || why+=" [hybrid best: $d]"
+      bs_lines "$bs_log" | grep -aq '^\[STAGE\] [0-9]* CPUs allowed' && why+=" [hybrid best but staged]"
+    fi
+    [[ -z "$why" ]] && pass "--adapt's budget prior: the default runs, then each backend is tried" \
+      || fail "--adapt's budget prior: the default runs, then each backend is tried" "$why"
+    # 9. A staged run long enough to count (the reader is held 4.5 s on frame 0)
+    # is filed under its budget slot as staged.
+    why=""
+    rm -rf "$bs_x"; mkdir -p "$bs_x"
+    "${bs_env[@]}" XDG_CACHE_HOME="$bs_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:4500 \
+      taskset -c "$bs4" "$GZSTD" --adapt -v -f -o "$bs_out" "$bs_src" 2> "$bs_log" || why+=" [exit $?]"
+    bs_filed_slot=$(grep -a -o "budget prior ($bs_ncpu CPUs, ${bs_class}_[a-z]*)" "$bs_log" | head -1 | grep -o "${bs_class}_[a-z]*")
+    [[ -n "$bs_filed_slot" ]] && grep -q "\"budget_staged_${bs_filed_slot}\"" "$bs_x/gzstd/profile.json" 2>/dev/null \
+      || why+=" [no budget_staged_${bs_filed_slot:-unknown}]"
+    grep -q '"overall_gibs_hybrid"\|"overall_gibs_cpu"' "$bs_x/gzstd/profile.json" 2>/dev/null && why+=" [filed in the cpu/hybrid pair]"
+    [[ -z "$why" ]] && pass "--adapt files a staged run under its CPU budget" \
+      || fail "--adapt files a staged run under its CPU budget" "$why"
+    rm -rf "$bs_x"
+    # 10. Grow the input at the staged pass's existing FIFO gate: all reads have
+    # finished, but the driver's generation check has not run.  Opening the
+    # write end rendezvous with that gate, even if CUDA setup takes seconds.
+    # A sleep from process launch can append before the initial stat instead.
+    # The staged reader stops at the size it saw,
+    # where the ordinary readers read to EOF: the default's staging rebuilds on the
+    # CPU through EOF (every byte kept), and an explicit --direct-stage exits 3 with
+    # the input kept and no output.
+    why=""
+    bs_g="$TMPDIR/bs-grow.bin"; bs_gz="$TMPDIR/bs-grow.zst"
+    for arm in auto explicit; do
+      cp "$bs_src" "$bs_g"; rm -f "$bs_gz"
+      bs_gate="$TMPDIR/bs-grow.$arm.fifo"; rm -f "$bs_gate"; mkfifo "$bs_gate"
+      if [[ $arm == auto ]]; then
+        "${bs_env[@]}" GZSTD_DEBUG_DSTAGE_GATE="$bs_gate" timeout --foreground -k 10 120 \
+          taskset -c "$bs4" "$GZSTD" -v -f -o "$bs_gz" "$bs_g" 2> "$bs_log" &
+      else
+        env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_DSTAGE_GATE="$bs_gate" timeout --foreground -k 10 120 \
+          "$GZSTD" -q --direct-stage -f -o "$bs_gz" "$bs_g" 2> "$bs_log" &
+      fi
+      bs_pid=$!
+      timeout 90 python3 -I - "$bs_gate" "$bs_g" <<'PYEOF'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY)   # returns only when gzstd reaches its gate
+with open(sys.argv[2], 'ab') as f:
+    f.write(os.urandom(1048576))
+os.write(fd, b'x')
+os.close(fd)
+PYEOF
+      bs_gate_rc=$?
+      if [[ $bs_gate_rc -ne 0 ]]; then
+        why+=" [$arm did not reach the staged gate: $bs_gate_rc]"
+        kill "$bs_pid" 2>/dev/null || true
+      fi
+      wait "$bs_pid"; rc=$?
+      rm -f "$bs_gate"
+      if [[ $arm == auto ]]; then
+        [[ $rc -eq 0 ]] || why+=" [auto exit $rc]"
+        bs_lines "$bs_log" | grep -aq 'input changed during staged compression' || why+=" [auto: no report]"
+        "$GZSTD" -d -q -c "$bs_gz" 2>/dev/null | cmp -s - "$bs_g" || why+=" [auto: not every byte]"
+      else
+        [[ $rc -eq 3 ]] || why+=" [explicit exit $rc]"
+        [[ -e "$bs_gz" ]] && why+=" [explicit left an output]"
+        [[ -e "$bs_g" ]] || why+=" [explicit lost the input]"
+      fi
+    done
+    rm -f "$bs_g" "$bs_gz"
+    [[ -z "$why" ]] && pass "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
+      || fail "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" "$why"
+  fi
+  # 3. What keeps the default: enough CPUs, a level, a pipe, the off switch.
+  why=""
+  "${bs_env[@]}" taskset -c "$bs8" "$GZSTD" -vv -f -c "$bs_src" 2> "$bs_log" > /dev/null
+  # An 8-CPU mask cannot grant more than a quota (or more CPUs than the host
+  # has).  The other declines still run when the high-budget case is unavailable.
+  bs_high=$(bs_allowance "$bs_log" "$bs8")
+  if (( bs_high > 4 )); then
+    grep -aq 'does not stage: enough CPUs' "$bs_log" || why+=" [$bs_high CPUs]"
+  fi
+  "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv -19 -f -c "$bs_src" 2> "$bs_log" > /dev/null
+  grep -aq 'does not stage: a compression level' "$bs_log" || why+=" [-19]"
+  "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv -f -c "$bs_src" 2> "$bs_log" | cat > /dev/null
+  grep -aq 'does not stage: the output could not be discarded' "$bs_log" || why+=" [pipe]"
+  "${bs_env[@]}" GZSTD_DEBUG_AUTO_STAGE=0 taskset -c "$bs4" "$GZSTD" -vv -f -c "$bs_src" 2> "$bs_log" > /dev/null
+  grep -aq 'does not stage: switched off' "$bs_log" || why+=" [switch]"
+  "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv --hybrid -f -c "$bs_src" 2> "$bs_log" > /dev/null
+  bs_lines "$bs_log" | grep -aq '^\[STAGE\] [0-9]* CPUs allowed' && why+=" [--hybrid staged]"
+  "${bs_env[@]}" taskset -c "$bs4" "$GZSTD" -vv -d -f -c "$bs_zst" 2> "$bs_log" > /dev/null
+  grep -aq 'does not stage: decompression keeps the default' "$bs_log" || why+=" [-d]"
+  [[ -z "$why" ]] && pass "a level, a pipe, --hybrid, -d or enough CPUs keep the default" \
+    || fail "a level, a pipe, --hybrid, -d or enough CPUs keep the default" "$why"
+  # Gen3 prevents AUTOMATIC staging, but permits the explicit path.  Conversely
+  # a filesystem refusing O_DIRECT or an unusable caller mask prevents both.
+  # Probe the explicit prerequisites only when the automatic run did not prove
+  # them; a missing staging report alone is a failure, never a host skip.
+  bs_explicit_no=""
+  if [[ -n "$bs_no" ]]; then
+    timeout --foreground -k 10 120 "$GZSTD" --direct-stage -v -d -c "$bs_zst" > "$bs_out" 2> "$bs_log"
+    bs_probe_rc=$?
+    if [[ $bs_probe_rc -ne 0 ]] || ! bs_lines "$bs_log" | grep -aq "^\[DSTAGE\] $bs_frames frames"; then
+      bs_explicit_no=$(bs_lines "$bs_log" | grep -aE 'no CUDA devices available|older than this build|cannot reopen.*O_DIRECT|Invalid argument|Operation not supported' | head -1)
+    fi
+  fi
+  bs_x1="$TMPDIR/bs-x1"; bs_ffg="$TMPDIR/bs-ffg.bin"; bs_fz="$TMPDIR/bs-ffg.zst"; bs_ff="$TMPDIR/bs-ffg-forged.zst"
+  if [[ -n "$bs_explicit_no" ]]; then
+    skip_host "an explicit --direct-stage refuses where the default would rebuild" "$bs_explicit_no"
+    skip_host "--direct-stage: a table entry spanning identical frames exits 4" "$bs_explicit_no"
+  else
+  # 5. A user who NAMES --direct-stage keeps its refusal (no CPU rebuild).
+  rm -f "$bs_out"
+  env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_DSTAGE_PIN_FAIL=1 "$GZSTD" -q --direct-stage -f -o "$bs_out" "$bs_src" 2> "$bs_log"
+  rc=$?
+  if [[ $rc -ne 0 && ! -e "$bs_out" ]] && grep -aq 'could not pin' "$bs_log"; then
+    pass "an explicit --direct-stage refuses where the default would rebuild"
+  else
+    fail "an explicit --direct-stage refuses where the default would rebuild" "exit $rc, output $( [[ -e $bs_out ]] && echo left || echo gone)"
+  fi
+  # 6. A seek-table entry spanning two IDENTICAL frames: the swallowed frame's
+  # checksum trailer is the first's, so only the extent proof catches it (v0.18.32
+  # wrote one copy at exit 0).  Explicit -d and -t exit 4; --keep-going, --cpu-only
+  # and the default (which does not stage a decode) decode every byte.  A valid
+  # frame sits before the merge.
+  head -c 1048576 "$bs_src" > "$bs_x1"
+  { tail -c 1048576 "$bs_src"; cat "$bs_x1" "$bs_x1"; tail -c +1048577 "$bs_src" | head -c 1100000; } > "$bs_ffg"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$bs_ffg" -o "$bs_fz" 2>/dev/null
+  python3 -I - "$bs_fz" "$bs_ff" <<'PYEOF'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+assert struct.unpack('<I', b[-4:])[0] == 0x8F92EAB1
+desc = b[-5]; n = struct.unpack('<I', b[-9:-5])[0]; es = 12 if desc & 0x80 else 8
+skip = len(b) - (n * es + 9) - 8
+ents = [list(struct.unpack('<II', b[skip+8+i*es:skip+16+i*es])) + [b[skip+16+i*es:skip+8+(i+1)*es]] for i in range(n)]
+m = ents[:1] + [[ents[1][0] + ents[2][0], ents[1][1], ents[1][2]]] + ents[3:]
+body = b''.join(struct.pack('<II', c, d) + x for c, d, x in m) + struct.pack('<I', len(m)) + bytes([desc]) + struct.pack('<I', 0x8F92EAB1)
+open(sys.argv[2], 'wb').write(b[:skip] + struct.pack('<II', 0x184D2A5E, len(body)) + body)
+PYEOF
+  why=""
+  "$GZSTD" -d -q --direct-stage -c "$bs_ff" > "$bs_out" 2> "$bs_log"; rc=$?
+  [[ $rc -eq 4 ]] || why+=" [-d exit $rc, $(stat -c %s "$bs_out") of $(stat -c %s "$bs_ffg") bytes]"
+  "$GZSTD" -t -q --direct-stage "$bs_ff" 2> "$bs_log"; rc=$?
+  [[ $rc -eq 4 ]] || why+=" [-t exit $rc]"
+  "$GZSTD" -d -q --direct-stage --keep-going -c "$bs_ff" 2>/dev/null | cmp -s - "$bs_ffg" || why+=" [--keep-going bytes]"
+  "$GZSTD" -d -q --cpu-only -c "$bs_ff" 2>/dev/null | cmp -s - "$bs_ffg" || why+=" [--cpu-only bytes]"
+  # The DEFAULT on the same small budget does not stage a decode, so it reads
+  # the stream and decodes every byte.
+  "${bs_env[@]}" timeout --foreground -k 10 120 taskset -c "$bs4" \
+    "$GZSTD" -d -q -c "$bs_ff" > "$bs_out" 2> "$bs_log"; rc=$?
+  [[ $rc -eq 0 ]] && cmp -s "$bs_out" "$bs_ffg" || why+=" [default exit $rc or bytes]"
+  [[ -z "$why" ]] && pass "--direct-stage: a table entry spanning identical frames exits 4" \
+    || fail "--direct-stage: a table entry spanning identical frames exits 4" "$why"
+  fi
+  # 7. No usable device: a staged -t whose bounded queue fills refuses (exit 2)
+  # instead of waiting forever on a GPU that will never start.
+  bs_mz="$TMPDIR/bs-many.zst"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$bs_src" -o "$bs_mz" 2>/dev/null
+  CUDA_VISIBLE_DEVICES= timeout 60 "$GZSTD" -t -q --direct-stage --gpu-batch=1 "$bs_mz" 2> "$bs_log"; rc=$?
+  [[ $rc -eq 2 ]] && pass "--direct-stage with no usable GPU refuses instead of waiting" \
+    || fail "--direct-stage with no usable GPU refuses instead of waiting" "exit $rc (124 = hung)"
+  rm -f "$bs_src" "$bs_zst" "$bs_out" "$bs_log" "$bs_x1" "$bs_ffg" "$bs_fz" "$bs_ff" "$bs_mz"
+  unset -f bs_cpus bs_lines bs_allowance bs_seed bs_decide
+else
+  bs_skip=skip
+  has_gpu 2>/dev/null && bs_skip=skip_host  # missing tools are not in the no-GPU delta
+  for c in "a small CPU budget compresses through the GPU by default" \
+           "a small CPU budget decompresses by the default (not staged)" \
+           "the default's staging finishes on the CPU when the GPU cannot carry it" \
+           "--adapt's budget prior: the default runs, then each backend is tried" \
+           "--adapt files a staged run under its CPU budget" \
+           "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
+           "a level, a pipe, --hybrid, -d or enough CPUs keep the default" \
+           "an explicit --direct-stage refuses where the default would rebuild" \
+           "--direct-stage: a table entry spanning identical frames exits 4" \
+           "--direct-stage with no usable GPU refuses instead of waiting"; do
+    "$bs_skip" "$c" "no GPU, python3 or taskset"
+  done
+fi
+
+# A COLD ARCHIVE'S READERS (v0.18.33, both builds).  Twelve buffered decode readers
+# on a cold archive spent ~125 CPU-seconds of kernel time more than three for the
+# same wall time, and on a small budget the readers starved (hybrid at 4 CPUs
+# decoded 48.87 GiB in 25 s buffered, 13 s O_DIRECT).  So a cold archive is read
+# O_DIRECT on 8 CPUs or fewer and by at most three buffered readers above; a cached
+# archive and an explicit --read-threads are untouched.  The archive must exceed
+# 128 MiB for the parallel reader; where it cannot be evicted (tmpfs) the cell skips.
+crd_dc="$(cd "$(dirname "$0")" && pwd)/scripts/drop_cache"
+crd_src="$TMPDIR/crd.bin"; crd_zst="$TMPDIR/crd.zst"; crd_log="$TMPDIR/crd.log"; crd_out="$TMPDIR/crd.out"
+crd_tools=0
+if [[ -x "$crd_dc" ]] && command -v python3 >/dev/null 2>&1 && command -v taskset >/dev/null 2>&1; then
+  crd_tools=1
+  ( set +o pipefail; head -c $((140*1048576)) /dev/urandom | base64 -w 76 | head -c $((186*1048576 + 777)) > "$crd_src" )
+  "$GZSTD" -q -f --cpu-only "$crd_src" -o "$crd_zst" 2>/dev/null
+fi
+crd_evict() { "$crd_dc" "$crd_zst" >/dev/null 2>&1 && "$crd_dc" -c "$crd_zst" 2>/dev/null | grep -q ', 0.0%)'; }
+crd_lines() { tr '\r' '\n' < "$crd_log" | sed 's/\x1b\[K//g'; }
+crd_line() { crd_lines | grep -a -o 'parallel prefetch: .*' | head -1; }
+crd_allowance() {
+  local n
+  n=$(crd_lines | sed -n 's/^\[CPU\] this process may use \([0-9]*\) of .*/\1/p' | head -1)
+  [[ -n "$n" ]] || n=$(awk -F, '{print NF}' <<< "$1")
+  printf '%s\n' "$n"
+}
+if [[ $crd_tools -eq 1 ]] && crd_evict; then
+  why=""
+  crd4=$(python3 -c "import os;print(','.join(map(str,sorted(os.sched_getaffinity(0))[:4])))")
+  crd_all=$(python3 -c "import os;print(','.join(map(str,sorted(os.sched_getaffinity(0)))))")
+  # An explicit run proves whether THIS filesystem accepts actual direct preads.
+  # A successful open alone is insufficient, and default fallback is legitimate.
+  taskset -c "$crd4" "$GZSTD" -v --cpu-only --direct-read -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [direct probe exit $?]"
+  crd_dio=0
+  crd_lines | grep -aqE 'O_DIRECT preads completed: [1-9][0-9]*' && crd_dio=1
+  cmp -s "$crd_out" "$crd_src" || why+=" [direct probe bytes]"
+  crd_check_cold() {
+    local budget=$1 line
+    line=$(crd_line)
+    [[ "$line" == "parallel prefetch: 3 reader threads"* && "$line" == *"(the archive is cold)"* ]] \
+      || why+=" [cold $budget CPUs: '$line']"
+    if (( budget > 8 )); then
+      [[ "$line" != *O_DIRECT* ]] || why+=" [O_DIRECT above 8 CPUs]"
+    elif [[ $crd_dio -eq 1 ]]; then
+      [[ "$line" == *O_DIRECT* ]] && crd_lines | grep -aqE 'O_DIRECT preads completed: [1-9][0-9]*' \
+        || why+=" [no direct preads on a capable filesystem]"
+    fi
+    cmp -s "$crd_out" "$crd_src" || why+=" [cold bytes]"
+  }
+  crd_evict || why+=" [re-evict]"
+  taskset -c "$crd4" "$GZSTD" -v --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [4 CPUs exit $?]"
+  crd_check_cold "$(crd_allowance "$crd4")"
+  crd_evict || why+=" [re-evict]"
+  "$GZSTD" -v --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [full exit $?]"
+  crd_check_cold "$(crd_allowance "$crd_all")"
+  # Explicitly disabling the automatic input-reader choice is the warm control.
+  cat "$crd_zst" > /dev/null
+  "$GZSTD" -v --cpu-only --no-direct-read -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [warm control exit $?]"
+  crd_warm=$(crd_line)
+  "$GZSTD" -v --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [warm exit $?]"
+  [[ -n "$crd_warm" && "$(crd_line)" == "$crd_warm" ]] || why+=" [warm changed: '$(crd_line)']"
+  cmp -s "$crd_out" "$crd_src" || why+=" [warm bytes]"
+  env GZSTD_DEBUG_MINCORE_FAIL=1 "$GZSTD" -v --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [unknown exit $?]"
+  [[ "$(crd_line)" == "$crd_warm" ]] || why+=" [unknown changed: '$(crd_line)']"
+  cmp -s "$crd_out" "$crd_src" || why+=" [unknown bytes]"
+  crd_evict || why+=" [re-evict]"
+  "$GZSTD" -v --cpu-only --read-threads=6 -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [rt exit $?]"
+  [[ "$(crd_line)" == "parallel prefetch: 6 reader threads" ]] || why+=" [--read-threads=6: '$(crd_line)']"
+  cmp -s "$crd_out" "$crd_src" || why+=" [rt bytes]"
+  # A read-time refusal keeps the same bytes and the small automatic reader count.
+  crd_evict || why+=" [re-evict]"
+  env GZSTD_DEBUG_MT_DIRECT_EINVAL=1 taskset -c "$crd4" "$GZSTD" -v --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [direct refusal exit $?]"
+  cmp -s "$crd_out" "$crd_src" || why+=" [direct refusal bytes]"
+  # --cold must evict redirected stdin too.  Inspect at the reader's FIFO gate,
+  # before its first pread; after decoding the buffered path would re-cache it.
+  cat "$crd_zst" > /dev/null
+  crd_gate="$TMPDIR/crd.fifo"; rm -f "$crd_gate"; mkfifo "$crd_gate"
+  env GZSTD_DEBUG_MT_READER_GATE="$crd_gate" timeout --foreground -k 10 120 taskset -c "$crd4" \
+    "$GZSTD" -v --cpu-only --cold -d -c < "$crd_zst" > "$crd_out" 2> "$crd_log" &
+  crd_pid=$!
+  timeout 90 python3 -I - "$crd_gate" "$crd_dc" "$crd_zst" <<'PYEOF'
+import os, re, subprocess, sys
+fd = os.open(sys.argv[1], os.O_WRONLY)
+try:
+    p = subprocess.run([sys.argv[2], '-c', sys.argv[3]], capture_output=True, text=True)
+    pct = re.search(r', ([0-9.]+)%\)', p.stdout)
+    cold = p.returncode == 0 and pct is not None and float(pct.group(1)) < 10
+finally:
+    os.write(fd, b'x')
+    os.close(fd)
+sys.exit(0 if cold else 1)
+PYEOF
+  crd_gate_rc=$?
+  [[ $crd_gate_rc -eq 0 ]] || { why+=" [--cold stdin did not evict: $crd_gate_rc]"; kill "$crd_pid" 2>/dev/null || true; }
+  wait "$crd_pid" || why+=" [stdin exit $?]"
+  [[ "$(crd_line)" == *"(stdin is a seekable file)" ]] || why+=" [no stdin MT reader]"
+  cmp -s "$crd_out" "$crd_src" || why+=" [stdin bytes]"
+  rm -f "$crd_gate"
+  # Reader caps include seeds and probes; actual O_DIRECT stays fixed-size.
+  crd_x="$TMPDIR/crd-xdg"; rm -rf "$crd_x"; mkdir -p "$crd_x/gzstd"
+  crd_evict || why+=" [re-evict]"
+  env XDG_CACHE_HOME="$crd_x" "$GZSTD" --adapt -vv --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [adapt setup exit $?]"
+  crd_hash=$(crd_lines | sed -n 's/^\[ADAPT\] fingerprint \([0-9a-f]*\) driver .*/\1/p' | head -1)
+  crd_drv=$(crd_lines | sed -n 's/^\[ADAPT\] fingerprint [0-9a-f]* driver \([^ ]*\) .*/\1/p' | head -1)
+  [[ "$crd_drv" == '(none)' ]] && crd_drv=""
+  [[ ${#crd_hash} -eq 16 ]] || why+=" [no adapt fingerprint]"
+  for crd_mask in "$crd4" "$crd_all"; do
+    python3 -I - "$crd_x/gzstd/profile.json" "$PROFILE_SCHEMA" "$crd_hash" "$crd_drv" <<'PYEOF'
+import json, sys
+d = {'runs': 3, 'read_threads_settled_cold_file': 12, 'read_threads_settled_warm_file': 12}
+p = {'gzstd_profile': int(sys.argv[2]), 'entries': {
+    sys.argv[3]: {'fingerprint': 'crafted', 'driver': sys.argv[4], 'decompress': d}}}
+with open(sys.argv[1], 'w') as f:
+    json.dump(p, f)
+PYEOF
+    crd_evict || why+=" [re-evict]"
+    env XDG_CACHE_HOME="$crd_x" taskset -c "$crd_mask" "$GZSTD" --adapt --cold -v --cpu-only -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [adapt exit $?]"
+    crd_cap=$(crd_lines | sed -n 's/.*reader pool: started .* (range [0-9]*-\([0-9]*\)).*/\1/p' | head -1)
+    if crd_lines | grep -aq 'parallel prefetch: .*O_DIRECT'; then
+      [[ -z "$crd_cap" ]] || why+=" [direct pool scales to $crd_cap]"
+    else
+      [[ -n "$crd_cap" ]] && (( crd_cap <= 3 )) || why+=" [cold buffered cap '${crd_cap:-missing}']"
+    fi
+    cmp -s "$crd_out" "$crd_src" || why+=" [adapt bytes]"
+  done
+  rm -rf "$crd_x"
+  [[ -z "$why" ]] && pass "a cold archive: O_DIRECT readers on a small budget, three above, a cached one untouched" \
+    || fail "a cold archive: O_DIRECT readers on a small budget, three above, a cached one untouched" "$why"
+else
+  skip_host "a cold archive: O_DIRECT readers on a small budget, three above, a cached one untouched" \
+    "the archive cannot be evicted here (tmpfs?), or no drop_cache, python3 or taskset"
+fi
+rm -f "$crd_src" "$crd_zst" "$crd_log" "$crd_out"
+unset -f crd_evict crd_lines crd_line crd_allowance crd_check_cold
 
 # ============================================================
 section "Small inputs: zstd's workers in each frame, the pool in one L3 (v0.18.29)"

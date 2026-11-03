@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.32";
+static constexpr const char * GZSTD_VERSION = "0.18.33";
 //
 // Architecture overview:
 //
@@ -1278,7 +1278,8 @@ static int                   g_gds_verify_plain_fd = -1;
 // device-side checksum verdict needs it to tell a lying seek table apart from
 // corrupt data, and that verdict is reached first in file order.
 static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
-                                     const unsigned char * head, size_t head_n);
+                                     const unsigned char * head, size_t head_n,
+                                     int * read_error = nullptr);
 
 // End one decompression's staged-read transaction.  PER FILE, not per process:
 // decompress_nvcomp() runs once per input, and only the demote path used to
@@ -1349,6 +1350,18 @@ static unsigned long long g_gds_bar1_before = 0;
 // whole file.
 static std::atomic<uint64_t> g_dstage_bytes{0};
 static std::atomic<uint64_t> g_dstage_frames{0};
+#ifdef HAVE_NVCOMP
+// Automatic decode may reject an index after earlier batches were written.
+// Its sole GPU/stream publishes the start of the wholly undelivered batch;
+// the ordered writer drains only the proven prefix, then the caller streams
+// the remaining file on CPU.  Nothing already written needs to be discarded,
+// so this also works with a pipe or an append-only output.
+struct GzAutoStageDecodeRetry {
+  uint64_t seq = 0, off = 0;
+  std::atomic<bool> pending{false};
+};
+static GzAutoStageDecodeRetry g_auto_stage_decode_retry;
+#endif
 // --tar --direct-stage: MEMBER bytes by how they were read.  g_dstage_bytes
 // counts whole frames (headers and padding included) moved host -> VRAM; these
 // say whether the member data under them came through O_DIRECT or through the
@@ -2780,6 +2793,13 @@ struct Options {
   // Shares gds_only's Task shape, batch geometry and device checksum; see
   // region_staged() below, which is the predicate every shared site tests.
   bool direct_stage = false;
+  // Set with direct_stage when the DEFAULT chose the staged path (a small CPU
+  // allowance; see gz_auto_stage_decline), never when the user named it.  The
+  // difference is the contract: a user who typed --direct-stage gets a GPU or a
+  // refusal, while an automatic choice must finish on the CPU wherever the
+  // default would have (gpu_only_cpu_fallback), and its messages must not blame
+  // a flag the user never typed.
+  bool direct_stage_auto = false;
   // TRUE FOR BOTH BACKENDS THAT STAGE FILE REGIONS THEMSELVES.  Such a run's
   // Tasks name a region of the input (src_off/src_len) and carry no host bytes,
   // so the GPU worker fetches them, the XXH64 runs on the device, and the batch
@@ -3178,6 +3198,22 @@ static constexpr int V_NORMAL  = 0;  // always shown (no -v needed)
 static constexpr int V_VERBOSE = 3;  // -v:  informational messages
 static constexpr int V_DEBUG   = 4;  // -vv: per-worker/batch detail
 static constexpr int V_TRACE   = 5;  // -vvv: per-chunk debug trace
+
+// What a staged-path message calls the path: the flag the user typed, or, when
+// the default chose it for a small CPU budget (Options::direct_stage_auto),
+// what it is -- no message may blame a flag nobody typed.  And a notice that
+// the run stands down to the ordinary reader is a warning for a user who asked
+// for staging, but -v detail for one who did not.
+static std::string gz_stage_name(const Options & opt)
+{
+  return opt.gds_only ? "--gds-only"
+       : opt.direct_stage_auto ? "the staged read (chosen for a small CPU budget)"
+       : "--direct-stage";
+}
+[[maybe_unused]] static int gz_stage_notice_level(const Options & opt)
+{
+  return opt.direct_stage_auto ? V_VERBOSE : V_NORMAL;
+}
 
 static constexpr int EXIT_OK       = 0;  // success
 static constexpr int EXIT_ERROR    = 1;  // general runtime error (catch-all)
@@ -4499,11 +4535,13 @@ static void print_help()
 "                      O_DIRECT input: single stream on compress; parallel on\n"
 "                      eligible decompress inputs; bypasses the page cache\n"
 "                      (auto-chosen for a COLD compress after measuring both\n"
-"                      read paths on the real data; --no- pins it off)\n"
+"                      read paths on the real data, and for a COLD archive's\n"
+"                      decode on 8 CPUs or fewer; --no- pins it off)\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
 "  --read-threads N    parallel readers for buffered input and O_DIRECT\n"
-"                      decompress (default: auto 3..12 by -T; 1 = single;\n"
-"                      n/a for pipes and O_DIRECT compress)\n"
+"                      decompress (default: auto 3..12 by -T, and at most 3\n"
+"                      for a cold archive, where more only add kernel time;\n"
+"                      1 = single; n/a for pipes and O_DIRECT compress)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -4926,6 +4964,24 @@ static void print_help_long()
 "     win.  Ordinary runs need 2 s or more of GPU work to save a rate; shorter\n"
 "     ones save overhead alone.  An explicit --gpu-devices always wins.  To skip\n"
 "     the exploring runs, measure once with --calibrate FILE.\n"
+"     SMALL CPU BUDGETS (v0.18.33).  With 16 or fewer CPUs allowed, a\n"
+"     compress that could take --direct-stage's path (see there) is decided\n"
+"     among three backends -- cpu-only, hybrid and that staged path --\n"
+"     each measured AT THIS BUDGET: up to 2, 4, 8 and 16 CPUs, split by\n"
+"     input residency: below 10%, 10% to below 95%, and at least 95%\n"
+"     cached, are separate buckets.  A rate measured at\n"
+"     another budget does not predict one: cpu-only stops scaling once\n"
+"     the drive is the limit, hybrid collapses when its CPU workers\n"
+"     starve its readers, and the staged path does not use the CPUs at\n"
+"     all.  The default's own choice is tried first, then each other\n"
+"     backend on runs predicted long enough to measure.  A rate needs\n"
+"     at least 4 s and the profile save floor.  A failed or short probe\n"
+"     saves its attempt stamp; it may be retried after 20 saved runs.\n"
+"     Stale rates are re-measured too.  A backend measured more than\n"
+"     5% faster replaces the default's; if the default cannot be\n"
+"     measured, a measured alternative can run without that comparison.\n"
+"     Unknown residency, --cold and --direct-read leave these buckets\n"
+"     unused.  A stable workload of long runs fills its budget bucket.\n"
 "     PROFILE: a clean --adapt run of 3 s or longer records its measured\n"
 "     calibration to ${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json, keyed\n"
 "     by a hardware fingerprint (CPU model + cores, GPU names, kernel).\n"
@@ -5503,7 +5559,7 @@ static void print_help_long()
 "     explicit CUFILE_LOGFILE_PATH, or logging.dir in cufile.json, is\n"
 "     left alone.\n"
 "\n"
-"  --direct-stage                                        [EXPERIMENTAL]\n"
+"  --direct-stage\n"
 "     THE PORTABLE 95% OF --gds-only, ON ANY HOST WITH A GPU.  Read each\n"
 "     frame with O_DIRECT (a read that bypasses the kernel page cache)\n"
 "     into host staging memory, push it once into the same GPU staging\n"
@@ -5606,6 +5662,47 @@ static void print_help_long()
 "     its wall time on that host ranged from 6.3-7.0 s to 12 s between\n"
 "     sessions, and some runs stalled past 45 s in its buffered reads,\n"
 "     while these O_DIRECT reads stayed within 6.9-7.3 s.\n"
+"\n"
+"     EVERY FRAME'S EXTENT IS PROVEN (v0.18.33).  A seek-table entry that\n"
+"     spans more than one frame is caught before upload: each frame's\n"
+"     compressed bytes, already in host memory for the copy, are walked\n"
+"     to their real end.  With an explicit --direct-stage, a dishonest\n"
+"     table exits 4 (data error); before\n"
+"     this, two identical frames merged into one entry decoded to one\n"
+"     copy at exit 0.  --keep-going ignores the table and decodes all.\n"
+"     With no usable GPU the run refuses (exit 2) instead of waiting.\n"
+"\n"
+"     THE DEFAULT ON A SMALL CPU BUDGET (v0.18.33).  When this process may\n"
+"     use few CPUs (a container's cpuset or quota, a taskset) and a GPU\n"
+"     is available, a plain COMPRESS of one named file takes this path\n"
+"     WITHOUT the flag: up to 4 CPUs, 16 GiB or more of input (below that\n"
+"     the staged path's fixed start, about 2 s, outweighs its gain), PCIe\n"
+"     Gen4 or newer, and no option that names a backend, tunes the GPU or\n"
+"     hybrid, or sets a compression level or zstd parameter (the GPU has\n"
+"     one fixed level).  The input must be regular and accept O_DIRECT.\n"
+"     --verify, --keep-going, --no-check, --chunk-size, --mmap=on,\n"
+"     --no-direct-read, --tar and calibration keep the ordinary path.  Hybrid\n"
+"     cannot use so few CPUs well: its CPU workers compete with its own\n"
+"     readers.  MEASURED on the 8-GPU server, 64 GiB cold on NVMe, one\n"
+"     H100, three runs each, compress hybrid against staged:\n"
+"       2 CPUs  23.4-24.1 s / 16.5      6 CPUs  16.3-16.8 / 16.7-16.9\n"
+"       4 CPUs  19.3-19.8   / 16.7      8 CPUs  15.6-16.0 / 16.8\n"
+"     at a fifth of the host CPU; from a warm page cache hybrid ties at 4\n"
+"     CPUs (this path reads the drive even when the cache holds the file).\n"
+"     DECOMPRESSION is not staged by default: with v0.18.33's readers for\n"
+"     a cold archive (see --read-threads) hybrid decodes as fast on a\n"
+"     small budget (4 CPUs: 13.0-14.0 s against 13.6-13.8), and the\n"
+"     automatic choice would have to start CUDA before reading where an\n"
+"     explicit -d --direct-stage overlaps the two.\n"
+"     The automatic choice keeps the default's promise to finish: it is\n"
+"     made only after CUDA confirms the device, and a compress whose GPU\n"
+"     then fails, whose staging memory cannot be pinned, or whose input\n"
+"     changes is discarded and done again on the CPU (so it also needs\n"
+"     an output that can be discarded: a regular file, stdout at its end,\n"
+"     or the null device).  -v says when it happens; --hybrid or\n"
+"     --cpu-only keeps the old behaviour.  The thresholds are one host's;\n"
+"     --adapt measures each backend at this host's budget and moves them\n"
+"     (see --adapt).\n"
 "\n"
 "     Distinct from --direct-read, which is O_DIRECT input for the CPU\n"
 "     path, and from --direct, which is O_DIRECT OUTPUT.\n"
@@ -6940,6 +7037,57 @@ static std::atomic<int> g_adapt_src_cold{-1};
 // off for ADAPT_BACKEND_RECHECK_RUNS.
 static std::atomic<int> g_adapt_explored{0};
 static const char * adapt_resid_class_name(int c) { return c == 1 ? "warm" : "cold"; }
+
+// THE BUDGET-KEYED BACKEND PRIOR (v0.18.33, ROADMAP 21).  For compression on a
+// small CPU budget the staged path (--direct-stage's) is a third backend, and
+// none can be predicted from a rate measured at another budget: cpu-only
+// scales with CPUs only until the drive is the limit (2 GiB of cold input
+// compresses at 4.75 GiB/s on 256 CPUs and 4.69 on 16 -- scaling the first to
+// 16 CPUs predicts 0.3), hybrid's CPU workers compete with its own readers
+// on a small budget, and staging is flat.
+// So each budget class keeps its own measurement of each arm, split by input
+// residency (staging reads the drive even when the page cache holds the input):
+// a container runs at one budget, so its bucket fills in a few runs, and no
+// model has to be trusted.  Classes: up to 2, 4, 8 and 16 CPUs; above 16 the
+// staged path has not been measured to win, and the cpu/hybrid pair rules.
+// Keep below 10%, partial cache below 95%, and fully cached separate: a
+// partly cached input must not borrow the drive-bound staged rate of an
+// uncached one.  The old "cold" budget keys mixed both regimes, so leave them
+// unused; "warm" still means the same thing and remains reusable.  This is
+// additive, not a profile reset.
+// Slot = class * ADAPT_BUDGET_RESID_CLASSES + residency; -1 = no slot.
+static constexpr int ADAPT_BUDGET_CLASSES = 4;
+static constexpr int ADAPT_BUDGET_RESID_CLASSES = 3;
+static constexpr int ADAPT_BUDGET_SLOTS = ADAPT_BUDGET_CLASSES * ADAPT_BUDGET_RESID_CLASSES;
+static std::atomic<int> g_adapt_budget_slot{-1};
+// The arm a budget probe is exploring (0 none, 1 cpu-only, 2 hybrid, 3 staged),
+// stamped as tried even when the run fails to measure it (g_adapt_explored's
+// reason, for the third arm).
+static std::atomic<int> g_adapt_budget_explored{0};
+#ifdef HAVE_NVCOMP
+static constexpr double ADAPT_BUDGET_CACHED_MIN = 0.10;
+static constexpr double ADAPT_BUDGET_WARM_MIN = 0.95;
+static int adapt_budget_class(unsigned cpus)
+{
+  return cpus == 0 ? -1 : cpus <= 2 ? 0 : cpus <= 4 ? 1 : cpus <= 8 ? 2 : cpus <= 16 ? 3 : -1;
+}
+static int adapt_budget_residency_class(double resid)
+{
+  return resid < 0.0 ? -1 : resid >= ADAPT_BUDGET_WARM_MIN ? 2
+                         : resid >= ADAPT_BUDGET_CACHED_MIN ? 1 : 0;
+}
+#endif
+static std::string adapt_budget_slot_name(int slot)
+{
+  static const char * const cls[ADAPT_BUDGET_CLASSES] = { "b2", "b4", "b8", "b16" };
+  static const char * const resid[ADAPT_BUDGET_RESID_CLASSES] = { "uncached", "cached", "warm" };
+  return std::string(cls[slot / ADAPT_BUDGET_RESID_CLASSES]) + "_"
+       + resid[slot % ADAPT_BUDGET_RESID_CLASSES];
+}
+static const char * adapt_budget_arm_name(int arm)
+{
+  return arm == 1 ? "cpu" : arm == 2 ? "hybrid" : "staged";
+}
 
 /*======================================================================
  THE CPUs THIS PROCESS MAY USE (v0.18.19)
@@ -9228,10 +9376,12 @@ struct AdaptObs {
   bool stamp_only = false;                       // sub-floor probe: record the ATTEMPT, no rates
   int rd_ctx_chunk_mib = 0, rd_ctx_threads = 0;  // config the settled count belongs to
   int explored = 0;                              // backend this run was exploring (0/1/2)
+  int budget_slot = -1;                          // budget-keyed prior slot (g_adapt_budget_slot)
+  int budget_explored = 0;                       // arm a budget probe explored (0/1/2/3)
   // Which backend actually ran, so the end-to-end rate is filed under it.
-  // 0 = do not record (gpu-only, or a run that never chose): the backend prior
-  // only ever picks between cpu-only and hybrid, so only those two are useful.
-  int backend_used = 0;                          // 1 = cpu-only, 2 = hybrid
+  // 0 = do not record (gpu-only, or a run that never chose).  3 = the staged
+  // path (--direct-stage's), which only the budget-keyed prior consumes.
+  int backend_used = 0;                          // 1 = cpu-only, 2 = hybrid, 3 = staged
   bool tar_wt_converged = false;                 // -d --tar: probe found no further gain
   bool fault = false;                            // a GPU fault/rebuild happened this process
   // GPU-count model (--gpu-only compress): per device count, the summed wall
@@ -9264,6 +9414,8 @@ struct AdaptObs {
     rd_ctx_chunk_mib = g_adapt_rd_ctx_chunk.load(std::memory_order_relaxed);
     rd_ctx_threads   = g_adapt_rd_ctx_threads.load(std::memory_order_relaxed);
     explored    = g_adapt_explored.load(std::memory_order_relaxed);
+    budget_slot     = g_adapt_budget_slot.load(std::memory_order_relaxed);
+    budget_explored = g_adapt_budget_explored.load(std::memory_order_relaxed);
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
     if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed)) {
@@ -9319,6 +9471,18 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   };
   dir.put_num("runs",   dir.gnum("runs", 0) + 1);
   dir.put_num("faults", dir.gnum("faults", 0) + (obs.fault ? 1 : 0));
+  // The budget-keyed prior's keys: budget_<arm>_<slot>, and _run when it was
+  // last measured or tried.  A probe of one arm that did not file a rate for
+  // that arm -- it faulted, ran too briefly, or ran another backend -- stamps
+  // the attempt, so the prior holds it off instead of re-trying every run.
+  auto budget_key = [&](int arm) {
+    return std::string("budget_") + adapt_budget_arm_name(arm) + "_"
+         + adapt_budget_slot_name(obs.budget_slot);
+  };
+  auto stamp_budget_probe = [&](int filed_arm) {
+    if (obs.budget_slot >= 0 && obs.budget_explored && obs.budget_explored != filed_arm)
+      dir.put_num(budget_key(obs.budget_explored) + "_run", dir.gnum("runs", 0));
+  };
   dir.put_num("updated", (double)::time(nullptr));
   if (obs.fault) {
     // A FAULTED probe must still record its ATTEMPT, or a machine with a failing
@@ -9334,6 +9498,7 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
                       + adapt_resid_class_name(obs.resid_class) + "_run",
                     dir.gnum("runs", 0));
     }
+    stamp_budget_probe(0);
     return;
   }
 
@@ -9349,6 +9514,7 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
                       + adapt_resid_class_name(obs.resid_class) + "_run",
                     dir.gnum("runs", 0));
     }
+    stamp_budget_probe(0);
     return;
   }
 
@@ -9449,6 +9615,20 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
         dir.put_num(std::string("overall_gibs_") + nm + "_" + rc + "_run",
                     dir.gnum("runs", 0));
     }
+    // THE BUDGET BUCKET (see g_adapt_budget_slot): the same end-to-end rate,
+    // filed under the arm that produced it at this run's budget and residency.
+    // Same duration gate as the pair above.
+    int budget_filed = 0;
+    if (obs.budget_slot >= 0 && long_enough_for_backend
+        && obs.backend_used >= 1 && obs.backend_used <= 3) {
+      const std::string k = budget_key(obs.backend_used);
+      dir.put_num(k, ema(dir.gnum(k, 0), rate));
+      dir.put_num(k + "_run", dir.gnum("runs", 0));
+      budget_filed = obs.backend_used;
+    }
+    stamp_budget_probe(budget_filed);
+  } else {
+    stamp_budget_probe(0);
   }
   if (obs.reader_io_ns > 0)
     dir.put_num("source_gibs", ema(dir.gnum("source_gibs", 0),
@@ -9567,6 +9747,9 @@ struct AdaptPriors {
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
     double tar_wt_class[ADAPT_TAR_WCLASSES] = {0, 0, 0};    // -d --tar settled size per workload class
     double tar_wt_converged = 0;                            // -d --tar probe converged
+    // The budget-keyed prior (g_adapt_budget_slot): [arm 1..3][slot], 0 = never
+    // measured.  Hybrid and staged are GPU numbers, dropped on a driver change.
+    double budget_rate[4][ADAPT_BUDGET_SLOTS] = {}, budget_run[4][ADAPT_BUDGET_SLOTS] = {};
     // GPU-count model, indexed by device count (compress only; see gpuc_choose).
     // 0 = never measured.  Dropped with the other GPU values on a driver change.
     static constexpr int GPUC_MAX = 64;
@@ -9788,6 +9971,17 @@ static AdaptPriors adapt_load_priors()
       D.overall_hybrid_cls_run[c] = P.gpu_valid ? dj->gnum("overall_gibs_hybrid_" + n + "_run", 0) : 0;
       clamp_stamp(D.overall_hybrid_cls_run[c]);
     }
+    for (int arm = 1; arm <= 3; ++arm)
+      for (int sl = 0; sl < ADAPT_BUDGET_SLOTS; ++sl) {
+        const bool valid = arm == 1 || P.gpu_valid;
+        const std::string k = std::string("budget_") + adapt_budget_arm_name(arm) + "_"
+                            + adapt_budget_slot_name(sl);
+        double r = valid ? dj->gnum(k, 0) : 0;
+        if (!(r > 0.0) || !std::isfinite(r)) r = 0;
+        D.budget_rate[arm][sl] = r;
+        D.budget_run[arm][sl]  = valid ? dj->gnum(k + "_run", 0) : 0;
+        clamp_stamp(D.budget_run[arm][sl]);
+      }
     D.regime        = dj->gstr("regime", "");
     if (P.gpu_valid)
       for (int n = 1; n <= AdaptPriors::Dir::GPUC_MAX; ++n) {
@@ -9825,12 +10019,23 @@ static AdaptPriors adapt_load_priors()
 }
 
 // Which backend a completed run actually used, for the end-to-end profile keys.
-// gpu-only returns 0: the backend prior never selects it by default, so recording
-// it would add a number nothing consumes.  Reads the POST-defaults opt, i.e. what
-// really ran, not what the user asked for.
+// gpu-only returns 0 -- no prior selects it, so recording it would add a number
+// nothing consumes -- except the staged path (3), which the budget-keyed prior
+// does (g_adapt_budget_slot).  Reads the POST-defaults opt, i.e. what really
+// ran, not what the user asked for.
 static int adapt_backend_used(const Options & opt)
 {
+  // The staged path counts only when it staged: a -d whose seek table failed the
+  // claim check stood down to the ordinary reader and measured something else.
+#ifdef HAVE_NVCOMP
+  if (opt.gpu_only)
+    return (opt.direct_stage && !opt.gds_only
+            && g_adapt_budget_slot.load(std::memory_order_relaxed) >= 0
+            && g_dstage_frames.load(std::memory_order_relaxed) > 0
+            && !g_auto_stage_decode_retry.pending.load(std::memory_order_acquire)) ? 3 : 0;
+#else
   if (opt.gpu_only) return 0;
+#endif
   // Modes that FORCE cpu-only for reasons unrelated to speed measure something
   // the prior must not learn from: --keep-going is a damaged-archive recovery
   // (single reader, one-shot decode, deliberately slow) and --sliding-window is
@@ -10046,6 +10251,13 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
         gpu_keys.push_back("overall_gibs_hybrid_" + n);
         gpu_keys.push_back("overall_gibs_hybrid_" + n + "_run");
       }
+      for (int arm = 2; arm <= 3; ++arm)
+        for (int sl = 0; sl < ADAPT_BUDGET_SLOTS; ++sl) {
+          const std::string k = std::string("budget_") + adapt_budget_arm_name(arm) + "_"
+                              + adapt_budget_slot_name(sl);
+          gpu_keys.push_back(k);
+          gpu_keys.push_back(k + "_run");
+        }
       for (const char * dn : { "compress", "decompress" }) {
         if (!entry.get(dn)) continue;          // don't materialise absent directions
         AdaptJv & d2 = entry.set(dn);
@@ -10141,15 +10353,16 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
   if (opt.verbosity < V_VERBOSE) return;
   // What the save FILED, in adapt_merge_dir's terms (ROADMAP 22): the backend
   // prior's next decision is made from exactly this, so -v says it.
-  static const char * const bk[] = { "", "cpu-only", "hybrid" };
+  static const char * const bk[] = { "", "cpu-only", "hybrid", "staged" };
+  const int probed = obs.budget_explored ? obs.budget_explored : obs.explored;
   std::string filed;
   if (obs.fault) {
     filed = "fault counted; this run's rates ignored";
-    if (obs.explored)
-      filed += std::string("; the ") + bk[obs.explored == 1 ? 1 : 2]
+    if (probed)
+      filed += std::string("; the ") + bk[probed]
             + " probe stamped as tried";
   } else if (obs.stamp_only) {
-    filed = std::string("the ") + bk[obs.explored == 1 ? 1 : 2]
+    filed = std::string("the ") + bk[probed]
           + " probe stamped as tried; the run was too short for a rate";
   } else {
     filed = "regime " + obs.regime;
@@ -10160,11 +10373,15 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
       if (wall_s < ADAPT_BACKEND_MIN_SEC)
         std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end, under %.0f s: not filed in the "
                       "backend pair", r, ADAPT_BACKEND_MIN_SEC);
-      else if (obs.backend_used == 1 || obs.backend_used == 2)
-        std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end filed as %s%s%s", r,
-                      bk[obs.backend_used], obs.resid_class >= 0 ? ", " : "",
-                      obs.resid_class >= 0
-                        ? (std::string(adapt_resid_class_name(obs.resid_class)) + " input").c_str() : "");
+      else if (obs.backend_used == 1 || obs.backend_used == 2 || obs.backend_used == 3) {
+        const std::string where = obs.budget_slot >= 0
+            ? ", budget " + adapt_budget_slot_name(obs.budget_slot)
+            : obs.resid_class >= 0
+                ? ", " + std::string(adapt_resid_class_name(obs.resid_class)) + " input"
+                : std::string();
+        std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end filed as %s%s", r,
+                      bk[obs.backend_used], where.c_str());
+      }
       else
         std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end, not a backend-pair run", r);
       filed += b;
@@ -10172,6 +10389,10 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
       if (obs.explored && obs.explored != obs.backend_used)
         filed += std::string("; the ") + bk[obs.explored == 1 ? 1 : 2] + " probe did not run as "
                + bk[obs.explored == 1 ? 1 : 2] + ", so it is stamped as tried";
+      if (obs.budget_explored
+          && (obs.budget_explored != obs.backend_used || wall_s < ADAPT_BACKEND_MIN_SEC))
+        filed += std::string("; the budget ") + bk[obs.budget_explored]
+              + " probe did not file a rate and is stamped as tried";
     }
     if (!obs.gpuc.empty()) {
       filed += "; GPU device count";
@@ -13304,6 +13525,10 @@ static void gz_direct_stdout_flush_for_exit() {}
 // the whole output CPU-only from the (still-present) input.  See the compress
 // restart path in the driver.
 static std::atomic<bool> g_gpu_failed_restart{false};
+// Set with it when the default's staging (Options::direct_stage_auto) cannot
+// complete, including a changed input.  The driver's report retains that cause
+// instead of claiming every rebuild means "a GPU faulted".  Cleared per pass.
+static std::atomic<bool> g_auto_stage_rebuild{false};
 
 // Set the instant a GPU faults mid-compress (distinct from g_gpu_failed_restart,
 // which --verify also sets AFTER a pass to request a rebuild).  This one ABORTS
@@ -13995,6 +14220,20 @@ public:
   {
     std::lock_guard<std::mutex> lk(m_);
     return !q_.empty() && q_.front().seq <= s;
+  }
+
+  // Last-GPU handoff for automatic staged decode.  Wait for its first owed
+  // Task without taking it: the caller will close the queue and stream from
+  // this boundary.  A producer that stood down supplies host Tasks instead,
+  // which still belong to the ordinary CPU rescue pool.
+  bool wait_staged_front(uint64_t & seq, uint64_t & off)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] { return done_ || !q_.empty(); });
+    if (q_.empty() || q_.front().src_off < 0) return false;
+    seq = q_.front().seq;
+    off = (uint64_t)q_.front().src_off;
+    return true;
   }
 
   // A worker parked in the throttle with zero permits cannot see that a push
@@ -17630,7 +17869,7 @@ static bool table_checksum_for(uint64_t uoff, uint32_t * ck)
 // Defined further down, next to the code each depends on: the hash lives with
 // namespace xxh, the loader with the seek-table parser.
 static uint32_t gz_content_ck32(const void * p, size_t n);
-static void     table_checksums_load(FILE * in);
+static void     table_checksums_load(FILE * in, const Options * opt = nullptr);
 static void     table_checksums_clear();
 
 // Loads the map for one input and drops it again however the decompress ends,
@@ -17640,7 +17879,7 @@ static void     table_checksums_clear();
 // out from under the outer one and its frames would silently go unverified --
 // so make this refcounted rather than assuming it still holds.
 struct TableCkScope {
-  explicit TableCkScope(FILE * in) { table_checksums_load(in); }
+  explicit TableCkScope(FILE * in, const Options * opt = nullptr) { table_checksums_load(in, opt); }
   ~TableCkScope()                  { table_checksums_clear(); }
   TableCkScope(const TableCkScope &)             = delete;
   TableCkScope & operator=(const TableCkScope &) = delete;
@@ -18333,7 +18572,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   // has the caller's scope: reloading here would rewind its unread FILE* and
   // clear that scope's checksum map when this nested scope ends.
   std::unique_ptr<TableCkScope> tck_scope;
-  if (!table_scope_active) tck_scope = std::make_unique<TableCkScope>(in);
+  if (!table_scope_active) tck_scope = std::make_unique<TableCkScope>(in, &opt);
   StreamFrameCk sck;
   sck.frame_off_ = sck.out_total_ = out_base;
   // WRITE ON ANOTHER THREAD (v0.17.91).  This decoder read, decoded and wrote
@@ -20297,16 +20536,27 @@ static void cpu_decomp_worker(
     // makes nvCOMP fault -- came back as exit 2 "bad usage" instead of exit 4
     // "this archive is damaged", which is the one question -t exists to answer.
     if (t.src_off >= 0 && g_gds_verify_plain_fd >= 0) {
-      std::vector<char> host(t.src_len);
+      // Compressed size is not bounded by decoded size: a foreign frame may
+      // contain arbitrarily many empty blocks.  Rescue must not repeat an
+      // oversized staging allocation on a CPU thread.
+      if (const uint64_t ram = get_available_ram_bytes(); ram && t.src_len > ram / 8)
+        die_io(gz_stage_name(*opt)
+               + ": compressed frame exceeds the host memory budget for CPU rescue");
+      std::vector<char> host;
+      try { host.resize(t.src_len); }
+      catch (const std::bad_alloc &) {
+        die_io(gz_stage_name(*opt) + ": cannot allocate the CPU rescue frame");
+      }
       size_t got = 0;
       while (got < t.src_len) {
         const ssize_t r = ::pread(g_gds_verify_plain_fd, host.data() + got,
                                   t.src_len - got, (off_t)t.src_off + (off_t)got);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
         got += (size_t)r;
       }
       if (got != t.src_len)
-        die(std::string(opt->direct_stage ? "--direct-stage" : "--gds-only")
+        die(gz_stage_name(*opt)
             + ": short read re-reading frame " + std::to_string(t.seq)
             + " on the CPU rescue path", EXIT_IO);
       t.data.swap(host);
@@ -20678,6 +20928,40 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   const bool staged_input_unreadable = decompress
       && g_gds_read_active.load(std::memory_order_relaxed)
       && g_gds_verify_plain_fd < 0;
+  if (decompress && opt.direct_stage_auto
+      && g_gds_read_active.load(std::memory_order_acquire)) {
+    uint64_t seq = 0, off = 0;
+    if (queue->wait_staged_front(seq, off)) {
+      // Index-derived Tasks have not all proved their extents yet.  A CPU
+      // rescue must find real boundaries too, rather than decoding an entry
+      // which could contain two frames into a buffer sized for just one.
+      g_auto_stage_decode_retry.seq = seq;
+      g_auto_stage_decode_retry.off = off;
+      g_auto_stage_decode_retry.pending.store(true, std::memory_order_release);
+      queue->set_done();
+      { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+      vlog(V_NORMAL, opt, "WARNING: the staged GPU could not finish; decoding the "
+                          "remaining stream on the CPU\n");
+      return;
+    }
+  }
+  // THE DEFAULT'S STAGING REBUILDS INSTEAD (v0.18.33).  A compress that staged
+  // only because the CPU budget was small has no CPU rescue either, but it has
+  // the driver's: abort this pass exactly as a GPU fault does, and the driver
+  // discards the output and compresses the whole input again on the CPU.  That
+  // needs an output it can discard, which gz_auto_stage_decline required.  The
+  // wake-ups are the fault path's, in its order: the writer's in-order wait,
+  // the queue's poppers and its pusher, the throttle, a parked reader.
+  if (!decompress && opt.direct_stage_auto) {
+    g_auto_stage_rebuild.store(true);
+    g_gpu_failed_restart.store(true);
+    g_gpu_aborted.store(true);
+    { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+    queue->set_done();
+    if (bp) bp->set_done();
+    gz_direct_read_abort();
+    return;
+  }
   if (opt.region_staged()
       && (!decompress
           || g_gds_out_active.load(std::memory_order_relaxed)
@@ -20943,7 +21227,7 @@ static size_t stream_frames_to_queue_mt(
     TaskQueue & queue, Meter * m, const Options & opt,
     size_t * max_frame_decomp_out, const std::atomic<bool> * abort,
     bool * fallback_out, std::vector<char> * raw_data_out,
-    uint64_t first_frame_decomp)
+    uint64_t first_frame_decomp, int buffered_reader_cap)
 {
   if (fd < 0) return MT_READER_BAIL;
   gz_fifo_gate("GZSTD_DEBUG_MT_READER_GATE");
@@ -21029,7 +21313,9 @@ static size_t stream_frames_to_queue_mt(
   // current size park in ReaderPoolCtl (no polling) until it steps up.  Never
   // scales past a user-pinned --read-threads.  The O_DIRECT decompress pool is
   // now parallel, but remains fixed-size until its scaling policy is measured.
-  const bool can_scale = opt.adapt && opt.read_threads == 0 && !opt.direct_read;
+  // Automatic cold-input O_DIRECT does not set opt.direct_read.  Its actual
+  // descriptor must still keep it out of the unmeasured direct-reader scaler.
+  const bool can_scale = opt.adapt && opt.read_threads == 0 && !opt.direct_read && dfd < 0;
   // Ceiling decoupled from the start (the old cap = min(n*2, 12) was INERT on
   // any box with >=96 threads, where n_readers is already 12), but clamped by
   // RAM: the look-ahead ring is n_slots x BUF (a 64 MiB BLOCK plus OV), so a
@@ -21037,6 +21323,9 @@ static size_t stream_frames_to_queue_mt(
   // eighth of available memory for it; a small box gets a small ceiling rather
   // than a controller that can only make things worse.
   int rd_ceil_d = std::min(n_readers * 3, 32);
+  // A cold buffered input's cap applies to old profile seeds and probes too,
+  // not just the starting count printed by the caller.
+  if (buffered_reader_cap > 0) rd_ceil_d = std::min(rd_ceil_d, buffered_reader_cap);
   if (const uint64_t ram = get_available_ram_bytes())
     rd_ceil_d = (int)std::min<uint64_t>((uint64_t)rd_ceil_d,
                                         std::max<uint64_t>(1, ram / 8 / (2 * BUF)));
@@ -21758,6 +22047,9 @@ static size_t stream_frames_to_queue_mt(
 // bytes read so far in *raw_data, the rest still unread in `in`, and the frame's
 // declared size (0 = none) in *max_frame_decomp_out.  The caller hands both to
 // decompress_stream_from_file.
+#ifndef _WIN32
+static double residency_fraction(const void * addr, size_t len);   // defined below
+#endif
 static size_t stream_frames_to_queue(
     FILE * in,
     TaskQueue & queue,
@@ -21814,41 +22106,92 @@ static size_t stream_frames_to_queue(
     // The probe refuses an O_DIRECT input by default; ask it the counterfactual
     // question ("would this descriptor qualify?") and decide here.
     int pfd = probe_preadable_input(opt, in, &fsz, /*ignore_direct_read=*/true);
-    if (pfd >= 0) {
-      const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
-                          : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
-      int64_t first_decomp = -1;   // the MT reader sizes its block overlap from it
-      if (n_readers > 1 && fsz > (uint64_t)(2 * 64 * ONE_MIB)
-          && (first_decomp = peek_first_frame_decomp_size(in)) >= 0) {
-        int dfd = -1;
-        bool direct_asked = false;
-        if (opt.direct_read) {
-          static const bool mt_direct_off = [] {
-            const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT"); return e && *e == '0'; }();
-          direct_asked = !mt_direct_off;
-          if (direct_asked) dfd = gz_reopen_input(pfd, O_RDONLY | O_DIRECT);
-          if (direct_asked && dfd < 0 && opt.direct_read_user_set)
-            vlog(V_DEFAULT, opt,
-                 "gzstd: warning: --direct-read could not open an O_DIRECT descriptor for the "
-                 "parallel reader (" + std::string(std::strerror(errno))
-                 + "); reading buffered instead.\n");
+    int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
+                  : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
+    int64_t first_decomp = -1;   // the MT reader sizes its block overlap from it
+    // The residency query only chooses HOW this parallel reader runs.  Do not
+    // map or sample a small/sizeless input that cannot use this reader at all.
+    if (pfd >= 0 && n_readers > 1 && fsz > (uint64_t)(2 * 64 * ONE_MIB)
+        && (first_decomp = peek_first_frame_decomp_size(in)) >= 0) {
+      // A COLD ARCHIVE'S READERS (v0.18.33).  Buffered readers scale with the
+      // CPU pool, up to 12, and on a cold archive more than three buy nothing
+      // but kernel time: the drive is the limit, and twelve readers allocating
+      // page cache at once spent ~125 CPU-seconds of system time more than
+      // three.  On a SMALL budget the readers' own CPU is what is short: the
+      // decoders take it, the readers starve, and hybrid decoded at half speed.
+      // O_DIRECT readers need little CPU, but at 16-32 CPUs they were slower
+      // than the buffered readers' read-ahead.  MEASURED, 48.87 GiB archive
+      // cold, two or three runs per cell:
+      //   CPUs  backend    buffered (default)       O_DIRECT          3 buffered
+      //    4    hybrid     24.8-25.3 s,  98 CPU-s   12.8-13.6, 46
+      //    8    cpu-only   14.7-14.9    111         13.1-13.2, 77
+      //    8    hybrid     15.2         112         13.4-13.6, 78
+      //   16    cpu-only   11.7-12.1     99         13.3-13.4, 78     (3 already)
+      //  all    cpu-only   13.1-13.4    286         13.7-13.9, 143    12.8-13.8, 169
+      //  all    hybrid     13.3-13.7    286         13.8,      145    12.9-13.0, 163
+      //  all    --gpu-only 13.9-14.2    165         14.4,       16    13.3-13.8,  42
+      // So a cold archive is read O_DIRECT on 8 CPUs or fewer (not --gpu-only:
+      // its 8-CPU cell lost 8%), and by at most three buffered readers above.
+      // A warm or partly cached archive is untouched (O_DIRECT would bypass the
+      // cache, and the twelve readers' copies are what a warm decode is made
+      // of), and so is any explicit --direct-read / --no-direct-read /
+      // --read-threads.  --cold evicts the archive first, so it counts as cold.
+      int cold = -1;   // 1 cold, 0 cached, -1 unknown or not asked
+      if (!opt.direct_read_user_set && opt.read_threads == 0) {
+        if (opt.cold_read) {
+          // The plain-file driver evicts named inputs, but redirected stdin
+          // and the serial --tar routes reach us without that step.  Apply the
+          // request to this held descriptor before treating it as cold.
+          (void)::posix_fadvise(pfd, 0, 0, POSIX_FADV_DONTNEED);
+          cold = 1;
+        } else if (fsz > 0) {
+          void * m = ::mmap(nullptr, (size_t)fsz, PROT_READ, MAP_SHARED, pfd, 0);
+          if (m != MAP_FAILED) {
+            const double r = residency_fraction(m, (size_t)fsz);
+            ::munmap(m, (size_t)fsz);
+            cold = r < 0.0 ? -1 : r < 0.10 ? 1 : 0;
+          }
         }
-        if (opt.direct_read && !direct_asked) {
-          // The A/B control asked for the old shape: leave the MT path entirely so
-          // this arm measures what v0.17.65 measured.
-        } else {
+      }
+      const bool cold_direct = cold == 1 && !opt.gpu_only
+                            && gz_cpu_allowance().allowed() <= 8;
+      // -T chooses decoders, not an explicit reader count.  Keep the automatic
+      // cold setting at three even with a large -T on a small CPU allowance.
+      // This also bounds a direct pool that later falls back after EINVAL.
+      if (cold == 1) n_readers = std::min(n_readers, 3);
+      int dfd = -1;
+      bool direct_asked = false;
+      if (opt.direct_read || cold_direct) {
+        static const bool mt_direct_off = [] {
+          const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT"); return e && *e == '0'; }();
+        direct_asked = !mt_direct_off;
+        if (direct_asked) dfd = gz_reopen_input(pfd, O_RDONLY | O_DIRECT);
+        if (direct_asked && dfd < 0 && opt.direct_read && opt.direct_read_user_set)
+          vlog(V_DEFAULT, opt,
+               "gzstd: warning: --direct-read could not open an O_DIRECT descriptor for the "
+               "parallel reader (" + std::string(std::strerror(errno))
+               + "); reading buffered instead.\n");
+      }
+      if (opt.direct_read && !direct_asked) {
+        // The A/B control asked for the old shape: leave the MT path entirely so
+        // this arm measures what v0.17.65 measured.
+      } else {
+        // Reopen failure is an ordinary buffered run: retain its three-reader
+        // bound in the adaptive controller as well as the initial count.
+        const int buffered_reader_cap = cold == 1 && dfd < 0 ? 3 : 0;
         if (opt.verbosity >= V_VERBOSE)
           vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
                + " reader threads"
                + (dfd >= 0 ? ", O_DIRECT (page cache bypassed)" : "")
+               + (cold == 1 && !opt.direct_read ? " (the archive is cold)" : "")
                + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
         size_t r = stream_frames_to_queue_mt(pfd, dfd, fsz, n_readers,
                                              queue, m, opt, max_frame_decomp_out, abort,
-                                             fallback, raw_data, (uint64_t)first_decomp);
+                                             fallback, raw_data, (uint64_t)first_decomp,
+                                             buffered_reader_cap);
         if (dfd >= 0) ::close(dfd);
         if (r != MT_READER_BAIL) return r;
         if (m) m->reader_threads.store(1, std::memory_order_relaxed);
-        }
       }
     }
   }
@@ -22400,7 +22743,7 @@ static void gz_pool_place(GzPoolPlacement & p, const Options & opt, unsigned thr
 
 static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
-  TableCkScope tck_scope(in);   // seek-table checksums for THIS input
+  TableCkScope tck_scope(in, &opt);   // seek-table checksums for THIS input
   // A pipe's table comes last: hash what it alone can verify under -t and
   // -d --verify, else warn at the end (GzLateCk).
   gz_late_arm(opt.mode == Mode::TEST || opt.verify_decode);
@@ -28047,8 +28390,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                 char * window = bounce_buf.get(win_n);
                 if (!window) throw std::runtime_error("--tar: cannot allocate an aligned bounce buffer");
                 size_t wgot = 0;
-                while (wgot < win_n) {
+                while (wgot < head + wlen) {
                   ssize_t r = ::pread(sc.fd, window + wgot, win_n - wgot, win_lo + (off_t)wgot);
+                  if (r < 0 && errno == EINTR) continue;
                   if (r <= 0) {
                     if (r < 0 && errno == EINVAL && slot >= 0 && stage->host() && sc.odirect)
                       dio_invalid = true;
@@ -28077,6 +28421,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                   if ((((uintptr_t)dst) & 4095) == 0 && (foff & 4095) == 0) {
                     while (pos < body) {
                       ssize_t r = ::pread(sc.fd, dst + pos, body - pos, foff + (off_t)pos);
+                      if (r < 0 && errno == EINTR) continue;
                       if (r <= 0) {
                         if (r < 0 && errno == EINVAL) dio_invalid = true;
                         break;
@@ -28106,6 +28451,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                       sc.odirect = false;
                       while (done < len) {
                         ssize_t r = ::pread(sc.fd, dst + done, len - done, foff + (off_t)done);
+                        if (r < 0 && errno == EINTR) continue;
                         if (r <= 0) break;
                         done += (size_t)r;
                       }
@@ -28121,6 +28467,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                 } else {
                   while (done < len) {
                     ssize_t r = ::pread(sc.fd, dst + done, len - done, foff + (off_t)done);
+                    if (r < 0 && errno == EINTR) continue;
                     if (r <= 0) break;
                     done += (size_t)r;
                   }
@@ -32756,7 +33103,16 @@ static bool build_seek_plan(FILE * in,
 // decompressing ONLY the frames headers land in, skipping file data by
 // arithmetic.  Big win on large-file archives; on many-small-file archives
 // headers sit in every frame and this degrades toward the full walk.
-static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
+// Include the raw table and its decoded arrays before allocating either.  The
+// old 1 GiB raw-table ceiling alone can exceed a container's entire allowance.
+static uint64_t seek_metadata_budget() {
+  const uint64_t ram = get_available_ram_bytes();
+  return ram ? ram / 8 : (uint64_t(1) << 30);
+}
+
+static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st,
+                                     const Options * opt = nullptr,
+                                     bool preserve_checksums = false) try {
   bool ok = false;
   do {
     if (std::fseek(in, 0, SEEK_END) != 0) break;
@@ -32777,6 +33133,19 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     uint64_t tpay = nf * esz + 9;
     // 1 GiB cap: bounds the allocation a forged frame count can demand.
     if (nf == 0 || tpay > ((uint64_t)1 << 30) || tpay + 8 > end) break;
+    const uint64_t metadata = 8 + tpay + 2 * (nf + 1) * sizeof(uint64_t)
+                            + (has_ck ? nf * sizeof(uint32_t) : 0);
+    if (metadata > seek_metadata_budget()) {
+      // An optional index must not turn an otherwise streamable archive into
+      // a refused default/CPU decode.  An explicit staged backend keeps its
+      // resource refusal; automatic selection simply cannot use this index.
+      if (opt && opt->region_staged() && !opt->direct_stage_auto)
+        die_io(gz_stage_name(*opt) + ": seek-table metadata exceeds an eighth of available memory");
+      // The ordinary checksum loader may need this table as its only integrity
+      // evidence.  Keep its pre-existing allocation/verification behaviour;
+      // the new optional-geometry budget must not silently disable checksums.
+      if (!preserve_checksums || !has_ck) break;
+    }
     uint64_t tstart = end - 8 - tpay;
     std::vector<unsigned char> tb((size_t)(8 + tpay));
     if (std::fseek(in, (long)tstart, SEEK_SET) != 0
@@ -32784,6 +33153,8 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
         || rd_le32(tb.data()) != 0x184D2A5Eu || rd_le32(tb.data() + 4) != tpay) break;
     std::vector<uint64_t> co{0}, uo{0};
     std::vector<uint32_t> cks;
+    co.reserve((size_t)nf + 1); uo.reserve((size_t)nf + 1);
+    if (has_ck) cks.reserve((size_t)nf);
     uint64_t c = 0, u = 0;
     bool bad = false, skips = false;
     const unsigned char * q = tb.data() + 8;
@@ -32858,6 +33229,12 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
   } while (false);
   std::rewind(in);
   return ok;
+} catch (const std::bad_alloc &) {
+  if (preserve_checksums || (opt && opt->region_staged() && !opt->direct_stage_auto))
+    die_io((opt && opt->region_staged() ? gz_stage_name(*opt) + ": " : std::string())
+           + "cannot allocate seek-table metadata");
+  std::rewind(in);
+  return false;
 }
 
 // One member's stream geometry, as recovered by the foreign header-hop scan:
@@ -33436,7 +33813,7 @@ static void table_checksums_clear()
   g_input_geom_known.store(false, std::memory_order_relaxed);
 }
 
-static void table_checksums_load(FILE * in)
+static void table_checksums_load(FILE * in, const Options * opt)
 {
   table_checksums_clear();
   if (!in) return;
@@ -33445,7 +33822,7 @@ static void table_checksums_load(FILE * in)
   // Not under --no-check: nothing would be compared at the end.
   if (std::ftell(in) < 0 && !g_no_check) gz_late_reset(true);
   tarx::TarSeekTable st;
-  if (!tarx::parse_foreign_seek_table(in, st) || !st.valid()) return;
+  if (!tarx::parse_foreign_seek_table(in, st, opt, true) || !st.valid()) return;
   // Publish the real maximum frame size BEFORE the checksum early-outs: a table
   // without checksums still tells the batch sizer how big this archive's frames
   // actually are, which is a different question from whether they can be
@@ -39817,6 +40194,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
   std::exception_ptr stage_setup_failure;
   bool stage_setup_usage = false;
+  int stage_setup_exit = EXIT_IO;
 #ifndef _WIN32
   MmapRegion mmap_region;
   DirectReadPool nv_pool;   // buffered zero-copy pool; must outlive all workers
@@ -39859,11 +40237,15 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // wait_for_batch_or_cap(pop_n) for pop_n frames, and the producer can never
   // have more than the pool in flight.  max_depth gives that wait its escape.
   auto pin_dstage_host_pool = [&](const char * what, double * pin_ms) -> size_t {
-    if (gpu_ids.empty())
+    if (gpu_ids.empty()) {
+      stage_setup_exit = EXIT_GPU_FAIL;
       throw std::runtime_error(std::string(what) + ": no selected GPU for the staging pool");
-    if (const cudaError_t st = cudaSetDevice(gpu_ids.front()); st != cudaSuccess)
+    }
+    if (const cudaError_t st = cudaSetDevice(gpu_ids.front()); st != cudaSuccess) {
+      stage_setup_exit = EXIT_GPU_FAIL;
       throw std::runtime_error(std::string(what) + ": select the staging device failed: "
                                + cudaGetErrorString(st));
+    }
     stage_pool = std::make_unique<GdsStagePool>();
     size_t stage_bufs = std::max<size_t>(16, std::min(compress_tune_start, HARD_BATCH_CAP));
     size_t avail = get_available_ram_bytes();
@@ -39871,9 +40253,20 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t cap_bytes = avail / 8;
     if (opt.mem_limit_bytes > 0)
       cap_bytes = (size_t)std::min<uint64_t>(cap_bytes, opt.mem_limit_bytes / 2);
+    if (gpu_chunk > cap_bytes)
+      throw std::runtime_error(std::string(what)
+                               + ": one staging frame exceeds the host memory budget; "
+                                 "use a smaller --chunk-size or more memory");
     stage_bufs = std::min(stage_bufs, std::max<size_t>(1, cap_bytes / gpu_chunk));
     const uint64_t frames_in = total_in ? (total_in + gpu_chunk - 1) / gpu_chunk : 1;
     stage_bufs = std::min<size_t>(stage_bufs, std::max<uint64_t>(1, frames_in));
+    // GZSTD_DEBUG_DSTAGE_PIN_FAIL: the pool cannot be pinned at all, as on a
+    // host out of page-lockable memory, so the suite can hold both contracts to
+    // it: an explicit --direct-stage refuses, the default's staging rebuilds on
+    // the CPU (v0.18.33).
+    if (::getenv("GZSTD_DEBUG_DSTAGE_PIN_FAIL"))
+      throw std::runtime_error(std::string(what) + ": could not pin the host staging pool "
+                               "(GZSTD_DEBUG_DSTAGE_PIN_FAIL)");
     // Measurement only: pin exactly this many slots.
     const char * e = ::getenv("GZSTD_DEBUG_DSTAGE_SLOTS");
     if (!e) e = ::getenv("GZSTD_DEBUG_DSTAGE_TAR_SLOTS");   // its v0.17.82 name
@@ -39904,12 +40297,22 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // in the staging pool, so this branch must not claim the input first (it did,
   // and reported a pipe that was never involved).
   if (!reader_done && opt.region_staged() && !opt.tar_mode) {
+    // An automatic choice keeps the default's CPU fallback even when setup
+    // fails before any GPU worker can request it.  Explicit staged requests
+    // retain their refusal contract.  Keep setup exceptions inside the live
+    // pipeline and join it before the driver discards the output.
+    auto setup_error = [&](const std::string & why) {
+      if (opt.direct_stage_auto) throw std::runtime_error(why);
+      die_io(why);
+    };
+    try {
     // ONE SETUP, TWO BACKENDS.  Both need the same verified O_DIRECT
     // descriptor, opened here.  Then --gds-only registers it with cuFile and
     // emits region-naming Tasks, and --direct-stage reads every frame into the
     // host pool and emits slot Tasks.  FLAG names the one the user actually typed,
     // so no message ever blames a flag they did not pass.
-    const char * FLAG = opt.gds_only ? "--gds-only" : "--direct-stage";
+    const std::string FLAG_NAME = gz_stage_name(opt);
+    const char * FLAG = FLAG_NAME.c_str();
     if (opt.input == "-")
       die_usage(std::string(FLAG) + " needs a seekable file: it reads by offset "
                 "from a file descriptor, which a pipe cannot provide.  This is "
@@ -39922,17 +40325,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // into the caller's buffered FILE*; unlike opening opt.input, it cannot
     // resolve a substituted name.  The held descriptor selects the inode.
     if (!in || ::fileno(in) < 0)
-      die(std::string(FLAG) + ": the input has no descriptor to read by offset");
+      setup_error(std::string(FLAG) + ": the input has no descriptor to read by offset");
+    struct stat st{};
+    if (::fstat(::fileno(in), &st) != 0)
+      setup_error(std::string(FLAG) + ": fstat failed on " + opt.input
+                  + ": " + std::strerror(errno));
+    if (!S_ISREG(st.st_mode))
+      die_usage(std::string(FLAG) + " needs a regular file; " + opt.input + " is not one");
     const int fd = gz_reopen_input(::fileno(in), O_RDONLY | O_DIRECT);
     if (fd < 0)
-      die(std::string(FLAG) + ": cannot reopen the verified input with O_DIRECT: "
+      setup_error(std::string(FLAG) + ": cannot reopen the verified input with O_DIRECT: "
           + std::strerror(errno));
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) { ::close(fd); die(std::string(FLAG) + ": fstat failed on " + opt.input); }
-    if (!S_ISREG(st.st_mode)) {
-      ::close(fd);
-      die(std::string(FLAG) + " needs a regular file; " + opt.input + " is not one");
-    }
     if (opt.gds_only) {
       std::string why;
       if (!g_gds_input.open(fd, &why)) {
@@ -39964,23 +40367,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     const uint64_t file_size = (uint64_t)st.st_size;
     // --direct-stage: READ AHEAD into the pinned host pool (dstage_read_plain).
-    // A pool that cannot be pinned at all is refused after the joins, as --tar's
-    // is -- never die() with the workers and the writer live.
+    // A pool that cannot be pinned at all reaches the setup handler below --
+    // never die() with the workers and the writer live.
     if (opt.direct_stage) {
       size_t stage_bufs = 0;
       double pin_ms = 0.0;
-      try {
-        stage_bufs = pin_dstage_host_pool("--direct-stage", &pin_ms);
-      } catch (...) {
-        stage_setup_failure = std::current_exception();
-        g_gpu_aborted.store(true, std::memory_order_relaxed);
-        queue.set_done();
-        throttle.set_done();
-        gz_direct_read_abort();
-        std::lock_guard<std::mutex> lk(results.m);
-        results.cv.notify_all();
-      }
-      if (!stage_setup_failure) {
+      stage_bufs = pin_dstage_host_pool(FLAG, &pin_ms);
+      {
         const uint64_t nframes = gpu_chunk ? (file_size + gpu_chunk - 1) / gpu_chunk : 0;
         // Reserve the whole run's sequence numbers up front: readers claim
         // frames in any interleaving, and seq must still be the frame's index.
@@ -40017,6 +40410,19 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // had (v0.17.17), same fix: the GPU worker credits each frame once its
     // cuFileRead has actually delivered the bytes.
     reader_done = true;
+    } catch (...) {
+      stage_setup_failure = std::current_exception();
+      if (opt.direct_stage_auto) {
+        g_auto_stage_rebuild.store(true);
+        g_gpu_failed_restart.store(true);
+      }
+      g_gpu_aborted.store(true, std::memory_order_relaxed);
+      queue.set_done();
+      throttle.set_done();
+      gz_direct_read_abort();
+      { std::lock_guard<std::mutex> lk(results.m); results.cv.notify_all(); }
+      reader_done = true;
+    }
   }
   // --tar: parallel assembler at GPU-chunk granularity (≤16 MiB frames feed the
   // nvCOMP batched path unchanged).  Pushes in sequence order.
@@ -40632,13 +41038,23 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   progress_done = true;
   gz_wake_periodic_loops();
   if (progress_thr.joinable()) progress_thr.join();
+  // Automatic staging has requested the driver's rebuild.  Retain a host/I/O
+  // setup cause for its report instead of blaming a GPU that may be healthy.
+  // Only an explicit staging request gets the setup refusal here.
   if (stage_setup_failure) {
     try { std::rethrow_exception(stage_setup_failure); }
     catch (const std::exception & e) {
-      if (stage_setup_usage) die_usage(e.what());
-      die(e.what());
+      if (!opt.direct_stage_auto) {
+        if (stage_setup_usage) die_usage(e.what());
+        die(e.what(), stage_setup_exit);
+      }
+      if (stage_setup_exit == EXIT_IO) gz_note_stage_read_failure(e.what());
     }
-    catch (...) { die("--tar: staging setup failed"); }
+    catch (...) {
+      const std::string why = gz_stage_name(opt) + ": staging setup failed";
+      if (!opt.direct_stage_auto) die(why, stage_setup_exit);
+      if (stage_setup_exit == EXIT_IO) gz_note_stage_read_failure(why);
+    }
   }
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "compress-hybrid" :
@@ -40819,7 +41235,7 @@ class DStageAhead {
 public:
   DStageAhead(TaskQueue * q, int fd, size_t slot_bytes, size_t cap_frames)
     : q_(q), fd_(fd), slot_(slot_bytes),
-      max_(std::max<size_t>(1, gz_dstage_ahead_bytes() / std::max<size_t>(1, slot_bytes))),
+      max_(gz_dstage_ahead_bytes() / std::max<size_t>(1, slot_bytes)),
       cap_(std::min(cap_frames, max_)) {
     // NEVER REALLOCATED: readers index bufs_ while other readers append to it, so
     // the storage must not move under them.  Reserved to the byte bound, which is
@@ -41007,7 +41423,9 @@ private:
       size_t hgot = 0;
       bool   rerr = false;
       const uint64_t rd_t0 = now_ns();
-      while (hgot < want) {
+      // Padding after the frame is not data.  A partial EOF block may already
+      // contain the whole frame; retrying from it would violate O_DIRECT alignment.
+      while (hgot < pad + len) {
         const ssize_t r = ::pread(fd_, hp + hgot, want - hgot, fo + (off_t)hgot);
         if (r < 0) { if (errno == EINTR) continue; rerr = true; break; }
         if (r == 0) break;                         // EOF: the rounded tail window
@@ -41143,6 +41561,9 @@ static void gpu_decomp_worker(
     g_decomp_exit_cv.notify_all();
     if (out != gpu_worker_count) return;    // not the last worker out
     if (!opt.gpu_only || !queue) return;    // hybrid: its CPU pool outlasts every GPU stream (v0.18.13)
+    if (opt.direct_stage_auto
+        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire))
+      return;                             // caller reframes the tail, not these index-derived Tasks
     if (queue->drained()) return;           // empty AND producer done: nothing owed
     const int lost = std::min(gpu_worker_count,
         (gpu_failures ? gpu_failures->load(std::memory_order_acquire) : 0)
@@ -42601,9 +43022,21 @@ static void gpu_decomp_worker(
           // the whole eighth multiplies it by devices * streams.  Keep one lane
           // per stream as the minimum needed to stage a frame.
           size_t lanes = (size_t)GDS_READ_FANOUT;
-          if (const uint64_t ram = get_available_ram_bytes())
-            lanes = (size_t)std::min<uint64_t>(lanes, std::max<uint64_t>(1,
-                ram / 8 / (size_t)std::max(1, gpu_worker_count) / stream_count / slot));
+          if (const uint64_t ram = get_available_ram_bytes()) {
+            const uint64_t share = ram / 8 / (size_t)std::max(1, gpu_worker_count)
+                                 / stream_count;
+            if (slot > share) {
+              const std::string why = gz_stage_name(opt)
+                  + ": one compressed frame exceeds the host memory share per "
+                    "device/stream; use fewer devices/streams or more memory";
+              // The default retains the ordinary decoder's resource needs.
+              // Throw into the last-GPU handoff instead of refusing a stream
+              // the CPU can decode without these page-locked staging lanes.
+              if (opt.direct_stage_auto) throw std::runtime_error(why);
+              die_io(why);
+            }
+            lanes = (size_t)std::min<uint64_t>(lanes, share / slot);
+          }
           if (lanes < (size_t)GDS_READ_FANOUT)
             vlog(V_VERBOSE, opt, "[DSTAGE] memory: " + std::to_string(lanes) + " of "
                  + std::to_string(GDS_READ_FANOUT) + " staging lanes pinned: they fit an eighth "
@@ -42642,6 +43075,51 @@ static void gpu_decomp_worker(
         bool staged_prefetched = false;   // fan-out already read this batch
         std::mutex rd_err_m;
         std::string rd_err;
+        // A seek-table entry whose extent is not exactly one frame (see
+        // dstage_one_frame below).  Kept apart from rd_err because it is not a
+        // read failure: rd_err is rethrown as a GPU failure and rescued on the
+        // CPU, while a dishonest table is the archive's defect -- exit 4.
+        std::string tab_err;
+        // EVERY STAGED EXTENT IS PROVEN ONE WHOLE FRAME, IN HOST MEMORY (v0.18.33).
+        // The producer walks only checksumless frames, trusting a checksummed
+        // frame's trailer: an entry that swallows the next frame reads the WRONG
+        // frame's hash, and the device XXH64 cannot match.  Unless the swallowed
+        // frame's content equals the first's -- two identical 16 MiB frames are
+        // common (zeroed regions, repeated blocks) -- and then its trailer IS the
+        // first's.  MEASURED (v0.18.32, frames X X Y, table merging the X's): `-d
+        // --direct-stage` wrote 2,148,576 of 3,197,152 bytes at exit 0 and `-t`
+        // said OK, while --cpu-only and hybrid decoded every byte.  The walk the
+        // producer skips costs ~1.7 million serial preads on a 65 GiB archive
+        // (28.6 -> 111.6 s); here the frame is already in pinned host memory,
+        // read for the upload, so zstd's own walk over its block headers costs
+        // a few microseconds and no I/O.  (--gds-only reads drive -> VRAM and
+        // has no host copy to walk; see ROADMAP.)
+        auto dstage_one_frame = [&](const char * fp, size_t n, uint64_t seq) {
+          const size_t fc = ZSTD_findFrameCompressedSize(fp, n);
+          if (!ZSTD_isError(fc) && fc == n) return true;
+          std::lock_guard<std::mutex> lk(rd_err_m);
+          if (tab_err.empty())
+            tab_err = "this archive's seek table gives frame " + std::to_string(seq)
+                    + " a compressed extent of " + std::to_string(n) + " bytes, but "
+                    + (ZSTD_isError(fc) ? std::string("no single frame fits it")
+                                        : "the frame there ends after " + std::to_string(fc))
+                    + ", so the table does not account for every frame in the file";
+          return false;
+        };
+        auto check_table_extent = [&] {
+          if (tab_err.empty()) return;
+          if (opt.direct_stage_auto && gpu_worker_count == 1 && stream_count == 1) {
+            // No frame in this batch has been decoded or delivered.  Previous
+            // batches proved their extents and completed in file order, so
+            // this offset follows the complete, verified output prefix.
+            g_auto_stage_decode_retry.seq = C.batch.front().seq;
+            g_auto_stage_decode_retry.off = (uint64_t)C.batch.front().src_off;
+            g_auto_stage_decode_retry.pending.store(true, std::memory_order_release);
+            throw std::runtime_error(tab_err);
+          }
+          gds_table_defect(opt, tab_err);
+          die(tab_err, EXIT_DATA);
+        };
         // ONE definition of "get frame i's compressed bytes into its slot",
         // because there are TWO callers: this loop, and the re-upload after a
         // temp grow reallocates the slab.  When the staged arm existed only
@@ -42669,6 +43147,10 @@ static void gpu_decomp_worker(
             // Already read ahead?  Then only the upload is left.
             if (DStageAhead * ah = g_dstage_ahead.load(std::memory_order_acquire)) {
               if (const char * fp = ah->claim(C.batch[i].seq, raw, flen)) {
+                if (!dstage_one_frame(fp, flen, C.batch[i].seq)) {
+                  ah->release(C.batch[i].seq);
+                  return;
+                }
                 const cudaError_t cs = cudaMemcpy(d_dst, fp, flen, cudaMemcpyHostToDevice);
                 ah->release(C.batch[i].seq);
                 if (cs != cudaSuccess) {
@@ -42693,7 +43175,7 @@ static void gpu_decomp_worker(
             size_t hgot = 0;
             int    rerrno = 0;
             const uint64_t rd_t0 = now_ns();
-            while (hgot < want) {
+            while (hgot < pad + flen) {
               const ssize_t r = ::pread(g_gds_verify_fd, hp + hgot, want - hgot,
                                         fo + (off_t)hgot);
               if (r < 0) { if (errno == EINTR) continue; rerrno = errno; break; }
@@ -42715,6 +43197,7 @@ static void gpu_decomp_worker(
                    + " at offset " + std::to_string((long long)raw));
               return;
             }
+            if (!dstage_one_frame(hp + pad, flen, C.batch[i].seq)) return;
             const cudaError_t cs = cudaMemcpy(d_dst, hp + pad, flen, cudaMemcpyHostToDevice);
             if (cs != cudaSuccess) {
               fail(std::string("cudaMemcpy(--direct-stage lane -> slab): ")
@@ -42872,6 +43355,7 @@ static void gpu_decomp_worker(
             for (auto & th : pool) th.join();
             if (fanout_exception.load(std::memory_order_relaxed))
               throw std::runtime_error("--direct-stage read fan-out failed");
+            check_table_extent();
             if (!rd_err.empty()) throw std::runtime_error(rd_err);
           }
         }
@@ -42930,6 +43414,9 @@ static void gpu_decomp_worker(
         // all: the failure was recorded and then ignored, and nvCOMP ran on a
         // partial or stale slot.  A frame with no content checksum could then
         // produce wrong bytes of the right declared length and be accepted.
+        // A dishonest table entry (dstage_one_frame) is the archive's defect, not
+        // a read failure: exit 4, as the producer's walk and the trailer check do.
+        check_table_extent();
         if (!rd_err.empty()) throw std::runtime_error(rd_err);
 
         // The pointer table is built once with fixed strides (see
@@ -43049,6 +43536,7 @@ static void gpu_decomp_worker(
           for (size_t i = 0; i < C.filled; ++i) place_frame(i);
           // Same boundary as above: this re-read loop is always sequential, so
           // the fan-out's post-join check cannot report a failure for it.
+          check_table_extent();
           if (!rd_err.empty()) throw std::runtime_error(rd_err);
           checkCuda(cudaMemcpyAsync(C.d_comp_ptrs, C.h_comp_ptrs.data(),
                                     C.filled * sizeof(void*),
@@ -43902,15 +44390,24 @@ static void gpu_decomp_worker(
     // post-sync reclaimed check can run.  If reclaim won, only the process-lifetime
     // registry is still legal to touch.
     if (!gz_decomp_unpublish(device_id)) gz_decomp_park_forever();
-    *any_gpu_failed = true;
-    g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);
-    *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
+    const bool table_retry = opt.direct_stage_auto
+        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire);
+    if (table_retry) {
+      queue->set_done();                  // release a producer blocked pushing the index tail
+      vlog(V_VERBOSE, opt, "[STAGE] the seek table is wrong; finishing from the last "
+                           "verified batch boundary on the CPU\n");
+    } else {
+      *any_gpu_failed = true;
+      g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);
+      *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
+    }
     // SAY WHAT HAPPENED, HERE.  fatal_msg is reported by the caller after the
     // workers join -- but when this is the last worker out under --gpu-only the
     // rescue can die() first, and the user then gets "the GPU path failed" with
     // no cause at all.
-    vlog(V_VERBOSE, opt, std::string("[GPU") + std::to_string(device_id)
-         + "] fault: " + e.what() + "\n");
+    if (!table_retry)
+      vlog(V_VERBOSE, opt, std::string("[GPU") + std::to_string(device_id)
+           + "] fault: " + e.what() + "\n");
 
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
     // The batch was popped from the queue but not (fully) decompressed.
@@ -43939,7 +44436,12 @@ static void gpu_decomp_worker(
           // leave the un-inserted frames owned by nobody: the writer then waits
           // for sequence numbers that never come ("writer stuck", exit 1, after
           // a long wait).  Out of memory here is fatal; say so (review, v0.17.87).
-          try { queue->re_enqueue(C.batch); }
+          try {
+            if (table_retry) {
+              for (auto & t : C.batch) t.release_input();
+              C.batch.clear();
+            } else queue->re_enqueue(C.batch);
+          }
           catch (...) {
             die("out of memory handing a failed GPU batch back to the CPU; "
                 "the output is incomplete");
@@ -43969,8 +44471,7 @@ static void gpu_decomp_worker(
 
     // The re-enqueue above happens-before this increment, so whichever worker
     // is last out sees those frames when it decides whether a rescue is owed.
-    (void)(gpu_failures
-        ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1);
+    if (!table_retry && gpu_failures) gpu_failures->fetch_add(1, std::memory_order_acq_rel);
     gpu_bringup_signal();       // one fewer GPU that could satisfy the barrier
     note_exit_and_rescue();
   }
@@ -44058,8 +44559,10 @@ static bool gds_table_defect(const Options & opt, const std::string & what)
 }
 
 static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
-                                     const unsigned char * head, size_t head_n)
+                                     const unsigned char * head, size_t head_n,
+                                     int * read_error)
 {
+  if (read_error) *read_error = 0;
   if (fd < 0 || !head || head_n < 5 || claimed < 9) return false;
   const unsigned char fhd = head[4];
   if (fhd & 0x08u) return false;                 // reserved descriptor bit
@@ -44084,7 +44587,10 @@ static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
       const ssize_t r = ::pread(fd, bh + have, sizeof bh - have,
                                 (off_t)(off + at + have));
       if (r < 0 && errno == EINTR) continue;
-      if (r <= 0) return false;
+      if (r <= 0) {
+        if (read_error && r < 0) *read_error = errno;
+        return false;
+      }
       have += (size_t)r;
     }
     return true;
@@ -44121,7 +44627,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   // would then run under a label describing a check it is not doing.
   InitPhase phase("reading the archive's seek table");
   tarx::TarSeekTable st;
-  if (!tarx::parse_foreign_seek_table(in, st) || !st.valid())
+  if (!tarx::parse_foreign_seek_table(in, st, &opt) || !st.valid())
     return GDS_VERIFY_DEMOTE;
   const size_t nframes = st.c_off.size() - 1;
   if (nframes == 0) return GDS_VERIFY_DEMOTE;
@@ -44129,6 +44635,30 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
 
   const int fd = ::fileno(in);
   if (fd < 0) return GDS_VERIFY_DEMOTE;
+
+  auto table_defect = [&](const std::string & why) {
+    if (!opt.direct_stage_auto) return gds_table_defect(opt, why);
+    // No Task has been published yet.  The default can ignore the index and
+    // let the ordinary producer find authoritative boundaries from the data.
+    g_gds_table_rejected.store(true, std::memory_order_relaxed);
+    vlog(V_VERBOSE, opt, "[STAGE] " + why + "; using the ordinary reader\n");
+    return true;
+  };
+
+  auto read_meta = [&](void * dst, size_t n, uint64_t off) -> size_t {
+    size_t got = 0;
+    while (got < n) {
+      g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
+      const ssize_t r = ::pread(fd, static_cast<char *>(dst) + got,
+                                n - got, (off_t)(off + got));
+      if (r < 0 && errno == EINTR) continue;
+      if (r < 0)
+        die_io(gz_stage_name(opt) + ": cannot read frame metadata: " + std::strerror(errno));
+      if (r == 0) break;
+      got += (size_t)r;
+    }
+    return got;
+  };
 
   const uint64_t prod_t0 = now_ns();
   g_gds_meta_preads.store(0, std::memory_order_relaxed);
@@ -44139,8 +44669,20 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   // re-reads the archive from the start, so a half-filled queue would deliver
   // every frame twice.
   size_t max_frame_decomp = 0;
-  std::vector<Task> built;
-  built.reserve(nframes);
+  // Geometry is already in st.  Keep only the checksum evidence until every
+  // entry is checked, then construct Tasks at the bounded queue hand-off.
+  struct FrameCheck { uint32_t checksum = 0; bool has_checksum = false; };
+  if (nframes > tarx::seek_metadata_budget() / sizeof(FrameCheck)) {
+    if (opt.direct_stage_auto) return GDS_VERIFY_DEMOTE;
+    die_io(gz_stage_name(opt) + ": frame metadata exceeds an eighth of available memory");
+  }
+  std::vector<FrameCheck> checks;
+  // Still before publication and meter credits: safe for the default to demote.
+  try { checks.resize(nframes); }
+  catch (const std::bad_alloc &) {
+    if (opt.direct_stage_auto) return GDS_VERIFY_DEMOTE;
+    throw;
+  }
 
   // TRIED AND REVERTED (2026-09-09): batching `posix_fadvise(WILLNEED)` over the
   // header and trailer page of every frame before this loop, to turn its
@@ -44162,12 +44704,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     const uint64_t dsz  = st.u_off[k + 1] - st.u_off[k];
     if (csz < 9) return GDS_VERIFY_DEMOTE;          // not a frame we can read
 
-    Task t;
-    t.seq         = k;
-    t.src_off     = (off_t)off;
-    t.src_len     = (size_t)csz;
-    t.decomp_size = (size_t)dsz;
-    t.out_off     = st.u_off[k];
+    FrameCheck & ck = checks[k];
 
     // METADATA ONLY: 9 header bytes + the 4-byte trailer.  Byte 4 of a zstd
     // frame header is the Frame Header Descriptor and bit 0x04 is
@@ -44178,11 +44715,10 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     unsigned char hdr[18], tr[4];               // 18 = ZSTD_FRAMEHEADERSIZE_MAX
     size_t hwant = sizeof hdr;
     if (csz < (uint64_t)hwant) hwant = (size_t)csz;
-    g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
-    const ssize_t hgot = ::pread(fd, hdr, hwant, (off_t)off);
+    const size_t hgot = read_meta(hdr, hwant, off);
     if (hgot < 9) return GDS_VERIFY_DEMOTE;
     if (hdr[0] != 0x28 || hdr[1] != 0xB5 || hdr[2] != 0x2F || hdr[3] != 0xFD) {
-      gds_table_defect(opt,                         // table disagrees with the file
+      table_defect(                               // table disagrees with the file
                "this archive's seek table puts frame " + std::to_string(k)
              + " at offset " + std::to_string(off) + ", where there is no zstd "
                "frame, so the table does not describe this file");
@@ -44207,7 +44743,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
       if (fcs == ZSTD_CONTENTSIZE_ERROR || fcs == ZSTD_CONTENTSIZE_UNKNOWN)
         return GDS_VERIFY_DEMOTE;
       if (fcs != dsz) {
-        gds_table_defect(opt,
+        table_defect(
                  "this archive's seek table claims frame " + std::to_string(k)
                + " decodes to " + std::to_string(dsz) + " bytes but the frame "
                  "itself declares " + std::to_string(fcs)
@@ -44251,9 +44787,13 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     const bool self_checked = (hdr[4] & 0x04) != 0;
     const bool must_walk    = !self_checked || opt.keep_going_requested;
     if (must_walk) ++walked_frames;
+    int extent_read_error = 0;
     if (must_walk
-        && !gds_frame_extent_matches(fd, off, csz, hdr, (size_t)hgot)) {
-      gds_table_defect(opt,
+        && !gds_frame_extent_matches(fd, off, csz, hdr, (size_t)hgot, &extent_read_error)) {
+      if (extent_read_error)
+        die_io(gz_stage_name(opt) + ": cannot read frame block headers: "
+               + std::strerror(extent_read_error));
+      table_defect(
                "this archive's seek table gives frame " + std::to_string(k)
              + " a compressed extent that does not end at that frame's real "
                "boundary, so the table does not account for every frame in the file");
@@ -44262,22 +44802,20 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     if (g_no_check) {
       // --no-check: no expected checksum, so no trailer pread either.
     } else if (hdr[4] & 0x04) {
-      g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
-      if (::pread(fd, tr, sizeof tr, (off_t)(off + csz - 4)) != (ssize_t)sizeof tr)
+      if (read_meta(tr, sizeof tr, off + csz - 4) != sizeof tr)
         return GDS_VERIFY_DEMOTE;
-      t.stg_has_ck    = 1;
-      t.stg_expect_ck = (unsigned int)tr[0] | ((unsigned int)tr[1] << 8)
+      ck.has_checksum = true;
+      ck.checksum = (unsigned int)tr[0] | ((unsigned int)tr[1] << 8)
                       | ((unsigned int)tr[2] << 16) | ((unsigned int)tr[3] << 24);
     } else if (!st.checksums.empty() && k < st.checksums.size()) {
       // The frame carries no checksum, so take the seek table's.  A staged Task
       // has no host bytes for the device verifier to read a trailer from, which
       // is exactly why these travel on the Task itself.
-      t.stg_has_ck    = 1;
-      t.stg_expect_ck = (unsigned int)st.checksums[k];
+      ck.has_checksum = true;
+      ck.checksum = (unsigned int)st.checksums[k];
     }
 
-    if (t.decomp_size > max_frame_decomp) max_frame_decomp = t.decomp_size;
-    built.push_back(std::move(t));
+    if (dsz > max_frame_decomp) max_frame_decomp = (size_t)dsz;
   }
   const uint64_t meta_ns = now_ns() - prod_t0;   // metadata reads + checks only
   // Only now that nothing can demote: publish the totals and claim the path.
@@ -44297,8 +44835,19 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   // double-counted against the worker: a 65.38 GiB archive read "in: 100.0%
   // 106.98 GiB @ 28.14 GiB/s" -- the total exceeded the file, and the rate was
   // meaningless because the numerator arrived before any work happened.
-  for (Task & t : built)
+  for (size_t k = 0; k < nframes; ++k) {
+    if (opt.direct_stage_auto
+        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire)) break;
+    Task t;
+    t.seq         = k;
+    t.src_off     = (off_t)st.c_off[k];
+    t.src_len     = (size_t)(st.c_off[k + 1] - st.c_off[k]);
+    t.decomp_size = (size_t)(st.u_off[k + 1] - st.u_off[k]);
+    t.out_off     = st.u_off[k];
+    t.stg_has_ck    = checks[k].has_checksum;
+    t.stg_expect_ck = checks[k].checksum;
     queue.push(std::move(t));
+  }
   queue.set_done();
   // Handed off: the workers own the run now, and their first batch moves the
   // Meter.  Anything still slow after this point (VRAM registration) sets its
@@ -44331,12 +44880,13 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
 
 static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  g_auto_stage_decode_retry.pending.store(false, std::memory_order_relaxed);
   // Process-global because reclaimed workers survive across input files.  Keep a
   // per-file baseline so v0.17.61's warning counts only devices lost while this
   // input was running, not every device retired earlier in the invocation.
   const uint64_t abandoned_at_start =
       g_decomp_abandoned.load(std::memory_order_relaxed);
-  TableCkScope tck_scope(in);   // seek-table checksums for THIS input
+  TableCkScope tck_scope(in, &opt);   // seek-table checksums for THIS input
   // A pipe's table comes last: hash what it alone can verify under -t and
   // -d --verify, else warn at the end (GzLateCk).
   gz_late_arm(opt.mode == Mode::TEST || opt.verify_decode);
@@ -44586,15 +45136,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       && ::getenv("GZSTD_DEBUG_GDS_NO_STAGED_READ") == nullptr;
   if (gds_read_eligible) {
     const char * what = (opt.mode == Mode::TEST) ? "-t" : "-d";
-    const char * FLAG = opt.gds_only ? "--gds-only" : "--direct-stage";
+    const std::string FLAG_NAME = gz_stage_name(opt);
+    const char * FLAG = FLAG_NAME.c_str();
     // --tar hands decompressed frames to the in-process tar parser, a HOST
     // consumer -- no point pulling bytes into VRAM to copy them straight back.
     if (opt.tar_mode) {
-      vlog(V_NORMAL, opt, std::string("warning: ") + FLAG + " " + what + " --tar works "
+      vlog(gz_stage_notice_level(opt), opt, std::string("warning: ") + FLAG + " " + what + " --tar works "
            "through the tar parser, which reads on the host; using the ordinary "
            "read path.\n");
     } else if (device_count <= 0 || gpu_disabled_by_peek) {
-      vlog(V_NORMAL, opt, std::string("warning: ") + FLAG + " " + what + " needs a GPU; "
+      vlog(gz_stage_notice_level(opt), opt, std::string("warning: ") + FLAG + " " + what + " needs a GPU; "
            "using the ordinary read path.\n");
     } else {
       // O_DIRECT IS REQUIRED, NOT AN OPTIMISATION -- cuFile refuses the
@@ -44615,16 +45166,29 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       }
       // --direct-stage makes NO cuFile call: its workers pread this descriptor.
       if (dfd >= 0 && opt.gds_only && !g_gds_input.open(dfd, &why)) { ::close(dfd); dfd = -1; }
+      int plain_fd = -1;
+      if (dfd >= 0) {
+        plain_fd = gz_reopen_input(cur, O_RDONLY);
+        // The default must retain CPU rescue.  With no buffered descriptor
+        // staged Tasks cannot be materialised after the GPU fails, whereas
+        // the ordinary reader can still read through the original FILE*.
+        if (opt.direct_stage_auto && plain_fd < 0) {
+          why = std::string("cannot keep a buffered input for CPU rescue: ")
+              + std::strerror(errno);
+          ::close(dfd);
+          dfd = -1;
+        }
+      }
       if (dfd < 0) {
-        vlog(V_NORMAL, opt, std::string("warning: ") + FLAG + " " + what + ": " + (why.empty()
+        vlog(gz_stage_notice_level(opt), opt, std::string("warning: ") + FLAG + " " + what + ": " + (why.empty()
              ? std::string("cannot register the archive with cuFile") : why)
              + "; using the ordinary read path.\n");
       } else {
         g_gds_verify_fd = dfd;
-        // A second, BUFFERED descriptor for the CPU rescue.  Failing to get it
-        // is not fatal: it only costs the fallback, and the refusal in
-        // gpu_only_cpu_fallback still catches that case.
-        g_gds_verify_plain_fd = gz_reopen_input(cur, O_RDONLY);
+        // An explicit staged request may run without the buffered rescue fd;
+        // gpu_only_cpu_fallback refuses if it is later needed.  The default
+        // stood down above instead, before publishing any staged Tasks.
+        g_gds_verify_plain_fd = plain_fd;
         // BAR1 baseline for the ROUTING REPORT below.  The output arm captures
         // this too, but -t never reaches that arm -- it writes nothing -- so
         // without this the "before" value stayed 0 and every -t run reported the
@@ -45187,6 +45751,12 @@ gds_out_declined:
           // cleanly (the synchronous path used to die_usage here).  Main checks
           // twice: the reader can finish first -- see the second check.
           gpu_only_no_device.store(true, std::memory_order_release);
+          // The staged producer does not poll this flag while blocked in push(),
+          // and no consumer will ever free its bounded queue: close the queue and
+          // wake it, so main reaches the refusal.  MEASURED (v0.18.32, no visible
+          // GPU, 326 frames of 1 MiB, --gpu-batch=1): -t and -d --direct-stage
+          // hung until killed.  (Codex production review, 2026-11-02.)
+          queue.set_done();
           return;
         }
         // No GPU after all — the CPU pool (already running) does everything.
@@ -45240,7 +45810,15 @@ gds_out_declined:
         if (gpu_ids.size() != before)
           vlog(V_VERBOSE, opt, "[GPU] skipping " + std::to_string(before - gpu_ids.size())
                + " device(s) retired by an earlier reclaim\n");
-        if (gpu_ids.empty()) return;
+        if (gpu_ids.empty()) {
+          // Every device was retired by an earlier input's reclaim: under
+          // --gpu-only that is no device at all, with the same blocked producer.
+          if (opt.gpu_only) {
+            gpu_only_no_device.store(true, std::memory_order_release);
+            queue.set_done();
+          }
+          return;
+        }
       }
     }
     if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
@@ -45520,7 +46098,7 @@ gds_out_declined:
     // a smaller read: a frame the cache does not hold is read by its worker, as
     // before the cache existed.  The cache's own ceiling is the same, so the
     // batch it follows upward (want_frames) cannot take it past either.
-    const size_t fit = (size_t)std::max<uint64_t>(1, gz_dstage_ahead_bytes() / slot);
+    const size_t fit = (size_t)(gz_dstage_ahead_bytes() / slot);
     if (fit < frames) {
       if (fit < std::min<size_t>(frames, std::max<size_t>(1, (4ull << 30) / slot)))
         vlog(V_VERBOSE, opt, "[DSTAGE] memory: read-ahead of at most " + std::to_string(fit)
@@ -45551,7 +46129,13 @@ gds_out_declined:
     }
   }
   if (g_gds_read_active.load(std::memory_order_acquire)) {
-    n_frames = gds_staged_frames_to_queue(in, queue, m, opt, &max_frame_decomp);
+    try {
+      n_frames = gds_staged_frames_to_queue(in, queue, m, opt, &max_frame_decomp);
+    } catch (const std::bad_alloc &) {
+      // Pools are already live: unwinding through their joinable threads
+      // would call terminate instead of removing the partial output.
+      die_io(gz_stage_name(opt) + ": cannot allocate staged frame metadata");
+    }
     if (n_frames == GDS_VERIFY_DEMOTE) {
       // No usable seek table.  Stand down completely -- the workers read
       // g_gds_verify_active to decide whether a Task is a file region, so
@@ -45559,15 +46143,15 @@ gds_out_declined:
       // would have them read from a slab nobody filled.
       stop_dstage_ahead();          // before the descriptor its readers use closes
       gds_decomp_read_close();
-      const std::string SF = opt.gds_only ? "--gds-only" : "--direct-stage";
-      vlog(V_NORMAL, opt,
+      const std::string SF = gz_stage_name(opt);
+      vlog(gz_stage_notice_level(opt), opt,
            g_gds_table_rejected.load(std::memory_order_relaxed)
              ? "warning: " + SF + " located frames from the archive's seek table, "
                "which this archive\n  gets wrong; the ordinary read path is used "
                "instead.\n"
              : "warning: " + SF + " needs the archive's seek table to locate frames "
-               "without reading them;\n  this archive has none, so the ordinary read "
-               "path is used instead.\n");
+               "without reading them;\n  this archive has no usable table for staging, "
+               "so the ordinary read path is used instead.\n");
       if (std::fseek(in, 0, SEEK_SET) != 0)
         die(SF + ": cannot rewind the archive after standing down", EXIT_IO);
     }
@@ -45873,6 +46457,9 @@ gds_out_declined:
 
   {
     std::lock_guard<std::mutex> lk(results.m);
+    if (opt.direct_stage_auto
+        && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire))
+      results.total_tasks = (size_t)g_auto_stage_decode_retry.seq;
     results.workers_done = true;
   }
   results.cv.notify_all();
@@ -45934,6 +46521,35 @@ gds_out_declined:
         b1 > g_gds_bar1_before ? ": BAR1 mapping activity observed"
                                : " (counter did not move)");
       vlog(V_VERBOSE, opt, b);
+    }
+  }
+
+  if (opt.direct_stage_auto
+      && g_auto_stage_decode_retry.pending.load(std::memory_order_acquire)) {
+    // All readers and workers are joined, and the writer has flushed exactly
+    // the proven prefix.  Reframe the rest from the held input, without using
+    // another seek-table entry or changing the caller's output position.
+    gds_decomp_read_close();
+    // Keep the ordinary decoder's checksum evidence, as a hybrid run would.
+    // Staging's geometry is no longer used, but rejecting an extent must not
+    // disable checks on later frames which lack an in-frame checksum.
+    if (::fseeko(in, (off_t)g_auto_stage_decode_retry.off, SEEK_SET) != 0)
+      die_io("cannot seek the held input for automatic staging's CPU retry");
+    const uint64_t prefix = m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0;
+    if (m) {
+      m->total_out.store(prefix, std::memory_order_relaxed);
+      m->total_out_final.store(false, std::memory_order_release);
+      // The staged producer credited the trailer before handing off Tasks.
+      // The authoritative stream will encounter and account for it again.
+      m->skipped_input_bytes.store(0, std::memory_order_relaxed);
+    }
+    Options cpu_tail = opt;
+    cpu_tail.cpu_only = true; cpu_tail.gpu_only = false; cpu_tail.hybrid = false;
+    cpu_tail.direct_stage = false; cpu_tail.direct_stage_auto = false;
+    decompress_stream_from_file(in, out, cpu_tail, m, nullptr, true, prefix);
+    if (m) {
+      m->total_out.store(m->wrote_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      m->total_out_final.store(true, std::memory_order_release);
     }
   }
 
@@ -47159,24 +47775,28 @@ static void hop_frame_blocks(const unsigned char * base, size_t pos, size_t fsiz
 // Sampled page-cache residency of a mapped region: mincore(2) over up to 64
 // evenly spaced 32-page windows — microseconds even on a 65 GiB map, and
 // non-perturbing (querying never faults pages in).  Drives the fallback
-// walk's warm/cold dispatch below.
+// walk's warm/cold dispatch below.  Returns -1 when the query fails.
 static double residency_fraction(const void * addr, size_t len) {
   const size_t page = (size_t)sysconf(_SC_PAGESIZE);
   const size_t npages = (len + page - 1) / page;
   if (!npages) return 1.0;
   const size_t win = 32;
   const size_t nwin = std::min<size_t>(64, (npages + win - 1) / win);
+  const bool debug_fail = std::getenv("GZSTD_DEBUG_MINCORE_FAIL") != nullptr;
   size_t sampled = 0, res = 0;
   unsigned char vec[32];
   for (size_t w = 0; w < nwin; ++w) {
     size_t first = nwin == 1 ? 0 : (npages - 1) * w / (nwin - 1);  // spread incl. tail
     if (first + win > npages) first = npages - std::min(npages, win);
     size_t n = std::min(win, npages - first);
-    if (::mincore((char *)addr + first * page, n * page, vec) != 0) return 0.0;
+    // Unknown is not cold: a sandbox can deny mincore even for cached input.
+    // The hook exercises that error without requiring a particular sandbox.
+    if (debug_fail
+        || ::mincore((char *)addr + first * page, n * page, vec) != 0) return -1.0;
     for (size_t i = 0; i < n; ++i) res += (size_t)(vec[i] & 1);
     sampled += n;
   }
-  return sampled ? double(res) / double(sampled) : 0.0;
+  return sampled ? double(res) / double(sampled) : -1.0;
 }
 
 // Buffered (pread) frame walk for a PAGE-CACHE-RESIDENT file: computes the
@@ -47381,6 +48001,8 @@ static int list_zst(const Options & opt)
             nframes = nskips = uncomp = 0; uncomp_known = true; has_check = false;
             vlog(V_VERBOSE, opt, "[LIST] buffered walk bailed; using the mmap walk\n");
           }
+        } else if (resid < 0.0) {
+          vlog(V_VERBOSE, opt, "[LIST] residency unknown: sequential mmap walk\n");
         } else if (opt.verbosity >= V_VERBOSE) {
           char rb[32]; std::snprintf(rb, sizeof rb, "%.0f%%", resid * 100.0);
           vlog(V_VERBOSE, opt, std::string("[LIST] residency ~") + rb
@@ -50205,7 +50827,17 @@ static int gzstd_main(int argc, char ** argv)
     if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
     if (opt.hybrid) vlog(V_VERBOSE, opt, "[HYBRID] not available in CPU-only build; using MT CPU\n");
 #endif
+    bool stage_input_changed = false;
     auto run_one_pass = [&](const Options & po) {
+      stage_input_changed = false;
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+      // Staging captures a length instead of reading to EOF.  Compare the held
+      // inode across this pass, before the output can be committed or --rm run.
+      const bool check_stage_input = po.direct_stage && !po.cpu_only && !po.tar_mode;
+      struct stat stage_input_before{};
+      if (check_stage_input && (!in || ::fstat(::fileno(in), &stage_input_before) != 0))
+        die_io(gz_stage_name(po) + ": cannot stat the held input before compression");
+#endif
       const uint64_t before = meter.wrote_bytes.load(std::memory_order_relaxed);
 #ifdef HAVE_NVCOMP
       if (po.cpu_only) {
@@ -50217,6 +50849,25 @@ static int gzstd_main(int argc, char ** argv)
 #else
       if (po.sliding_window) compress_cpu_sliding_window(in, out, po, &meter);
       else                   compress_cpu_mt(in, out, po, &meter);
+#endif
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+      if (check_stage_input) {
+        struct stat after{};
+        if (::fstat(::fileno(in), &after) != 0)
+          die_io(gz_stage_name(po) + ": cannot stat the held input after compression");
+        stage_input_changed = after.st_size != stage_input_before.st_size
+            || after.st_mtim.tv_sec  != stage_input_before.st_mtim.tv_sec
+            || after.st_mtim.tv_nsec != stage_input_before.st_mtim.tv_nsec
+            || after.st_ctim.tv_sec  != stage_input_before.st_ctim.tv_sec
+            || after.st_ctim.tv_nsec != stage_input_before.st_ctim.tv_nsec;
+        if (stage_input_changed) {
+          if (!po.direct_stage_auto)
+            die_io(gz_stage_name(po) + ": input changed size, modification time or "
+                   "status-change time during compression; refusing the staged output");
+          g_auto_stage_rebuild.store(true);
+          g_gpu_failed_restart.store(true);
+        }
+      }
 #endif
       // EMPTY INPUT MUST STILL PRODUCE A VALID ARCHIVE.
       //
@@ -50289,6 +50940,7 @@ static int gzstd_main(int argc, char ** argv)
     int rebuild_attempt = 0;
     for (;;) {
       g_gpu_failed_restart.store(false);
+      g_auto_stage_rebuild.store(false);
       g_gpu_aborted.store(false);   // clear the GPU-fault abort before each pass (incl. the CPU rebuild)
       g_gpu_verify_frames.store(0); g_gpu_verify_bytes.store(0); g_gpu_verify_ns.store(0);
       g_verify_failed.store(false, std::memory_order_relaxed);
@@ -50366,16 +51018,21 @@ static int gzstd_main(int argc, char ** argv)
               "  The compressed bytes are CORRUPT; do not use them.  Re-run with\n"
               "  regular files for input and output so --verify can recover.", EXIT_DATA);
         }
-        die(std::string(g_stage_read_failed.load(std::memory_order_relaxed)
-                          ? "the staged input read failed during compression ("
-                            + gz_stage_read_reason() + ") and the "
-                          : "a GPU faulted during compression and the ")
+        const bool stage_io = stage_input_changed
+                           || g_stage_read_failed.load(std::memory_order_relaxed);
+        const std::string cause = stage_input_changed
+            ? "the input changed during staged compression and the "
+            : stage_io ? gz_stage_name(pass_opt) + ": the staged input read failed ("
+                         + gz_stage_read_reason() + ") and the "
+                       : "a GPU faulted during compression and the ";
+        die(cause
             + (!in_rebuildable ? "input is a pipe/stream" : "output is a pipe, stream or device")
             + " — the partial output cannot be discarded and\n"
-            "  rebuilt on the CPU, and a faulted GPU's output is NOT trustworthy.\n"
+            "  rebuilt on the CPU.\n"
             "  Any bytes already sent downstream are INCOMPLETE/CORRUPT; do not use them.\n"
             "  Re-run with --cpu-only, or compress to/from regular files so a GPU\n"
-            "  fault can be recovered automatically.", EXIT_GPU_FAIL);
+            "  fault or staged input failure can be recovered automatically.",
+            stage_io ? EXIT_IO : EXIT_GPU_FAIL);
       }
 
       ++rebuild_attempt;
@@ -50405,6 +51062,9 @@ static int gzstd_main(int argc, char ** argv)
           const int64_t bad = g_verify_failed_seq.load(std::memory_order_relaxed);
           if (bad >= 0) os << " (sequence " << bad << ")";
           os << " — discarding output and rebuilding CPU-only";
+        } else if (stage_input_changed) {
+          os << "WARNING: the input changed during staged compression — discarding "
+                "output and rebuilding CPU-only through EOF";
         } else if (g_stage_read_failed.load(std::memory_order_relaxed)) {
           // The staged path supplies its own cause (read, allocation, or CUDA)
           // so this report does not mislabel every failure as a GPU fault.
@@ -50418,6 +51078,11 @@ static int gzstd_main(int argc, char ** argv)
           os << "WARNING: " << (why.empty() ? std::string("staged input assembly failed") : why)
              << "\n  Staged input or assembly error.  Attempting recovery with a "
                 "CPU-only rebuild";
+        } else if (g_auto_stage_rebuild.load()) {
+          // The default chose the staged path for a small CPU budget, and its GPU
+          // could not carry it (it may never have come up).  No fault is implied.
+          os << "WARNING: the GPU could not carry the staged compress this small CPU "
+                "budget chose — discarding output and rebuilding CPU-only";
         } else {
           os << "WARNING: a GPU faulted — discarding output and rebuilding CPU-only";
         }
@@ -50521,6 +51186,20 @@ static int gzstd_main(int argc, char ** argv)
       // Every rebuild is CPU-only — the trustworthy, deterministic path.
       pass_opt = opt;
       pass_opt.cpu_only = true; pass_opt.gpu_only = false; pass_opt.hybrid = false;
+      pass_opt.direct_stage = false; pass_opt.direct_stage_auto = false;
+      if (stage_input_changed) {
+        // mmap fixes the length, and the probe can choose O_DIRECT again.  A
+        // buffered CPU reader fills chunks until EOF, including an appended tail.
+        pass_opt.use_mmap = false; pass_opt.mmap_user_set = true;
+        pass_opt.direct_read = false; pass_opt.direct_read_user_set = true;
+#ifndef _WIN32
+        // --rm must compare against the generation THIS pass reads.  It still
+        // refuses removal if the source changes again during the CPU rebuild.
+        if (::fstat(::fileno(in), &in_id) != 0)
+          die_io("cannot stat the held input before the CPU rebuild");
+        in_id_ok = true;
+#endif
+      }
       // ...and a CPU-only pass cannot verify on the GPU.  Leaving this set left
       // the rebuild with NO verifier of either kind (see the pool condition
       // above): the run that exists precisely because verification failed was
@@ -51381,7 +52060,8 @@ static int gzstd_main(int argc, char ** argv)
   if (g_adapt_gpu_faulted.load(std::memory_order_relaxed))
     adapt_obs.fault = true;   // a rescued decompress fault (v0.18.13): see the flag
   const bool adapt_stamp_only =
-      adapt_obs.explored != 0 && adapt_obs.wall_ns < adapt_save_min_ns()
+      (adapt_obs.explored != 0 || adapt_obs.budget_explored != 0)
+      && adapt_obs.wall_ns < adapt_save_min_ns()
       && !adapt_obs.fault;
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
       && opt.deferred_exit == EXIT_OK
@@ -51854,6 +52534,334 @@ static bool adapt_output_is_regular(const Options & opt)
 }
 #endif  // !_WIN32
 
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+/*======================================================================
+ A SMALL CPU BUDGET COMPRESSES THROUGH THE GPU BY DEFAULT (v0.18.33,
+ ROADMAP 21).
+
+ A process allowed few CPUs (a container's cpuset or quota, a taskset)
+ with a GPU beside it COMPRESSES by the --direct-stage path by default:
+ the input is read O_DIRECT into pinned memory, hashed and compressed on
+ the GPU, and the host's CPUs do little more than issue reads.  Hybrid
+ cannot do the same with those CPUs: its CPU workers compete with its own
+ readers for them.
+
+ MEASURED on the 8-GPU server (64.84 GiB of base64-of-random on its NVMe,
+ ONE H100 on the drive's root complex, output to /dev/null, CPUs as
+ sibling pairs by taskset, 3 interleaved runs each), compress, cold:
+
+   CPUs      hybrid       staged      host CPU-s, staged vs hybrid
+     2       23.4-24.1    16.5        12 vs 42
+     4       19.3-19.8    16.7        16 vs 71
+     6       16.3-16.8    16.7-16.9   16 vs 78
+     8       15.6-16.0    16.8        16 vs 101
+   all       13.7-13.9    16.8-17.4   16 vs 263
+
+ The staged path is FLAT -- it does not use the CPUs it is not given --
+ while hybrid's time grows as they are taken away.  Warm (page-cache)
+ input ties at 4 CPUs (hybrid 16.6-19.4, staged 17.0-20.7) and favours
+ hybrid at 6.  A 4-CPU cgroup quota behaves like the mask (16.7-17.2
+ against 18.6).  So: up to 4 CPUs, and 16 GiB or more (below).
+
+ NOT DECOMPRESSION.  Decoding stages too and was 1.7x faster at 4 CPUs
+ against v0.18.32's hybrid (13.6-13.8 s against 22.7-24.7), but most of
+ that was hybrid's buffered readers starving: with v0.18.33's cold-archive
+ readers (stream_frames_to_queue) hybrid decodes at 2-4 CPUs as fast as
+ the staged path (4 CPUs: 13.0-14.0 s against 13.6-13.8).  And the
+ automatic choice must confirm a usable device with CUDA before it
+ commits -- decode under --gpu-only has no CPU pool to fall back to --
+ which an explicit staged decode overlaps with its first reads: automatic
+ staged decode MEASURED 14.7-14.9 s.  So -d keeps the default; the
+ explicit flag still stages.  (ROADMAP 33.)
+
+ WHEN, all of: no backend named or implied (--cpu-only, --hybrid,
+ --gpu-only, -D, --long, ...), no GPU/hybrid tuning flag,
+ compression of ONE named regular file of AUTO_STAGE_MIN_BYTES or more,
+ the default level and none of zstd's own compressor knobs (nvCOMP
+ compresses at one fixed level), no --verify/--keep-going/--no-check/
+ --chunk-size/--mmap=on/--no-direct-read/--calibrate, a GPU in /proc that is
+ new enough, PCIe Gen4 or newer (on a Gen3 host the staged path was measured
+ at 1.04 GiB/s, before compress had its second stream: a few CPUs beat that), an input
+ that reopens O_DIRECT, and an output a CPU rebuild can discard without
+ touching bytes this run did not write (a regular file, stdout at its
+ end or O_APPEND, the null device), because...
+
+ ...THE CONTRACT IS THE DEFAULT'S, NOT --direct-stage's.  A user who types
+ the flag gets a GPU or a refusal; a run that merely defaulted to the
+ staged path must finish wherever hybrid would have.  So a usable device is
+ confirmed with CUDA before the choice is committed (a staged compress
+ starts CUDA before its first read anyway), and a compress whose GPU later
+ fails, whose pool cannot be pinned, or whose input changes is discarded
+ and rebuilt on the CPU (gpu_only_cpu_fallback, the driver's rebuild).
+
+ The constants are this host's.  On another host the staged path's rate
+ is set by its drive and its GPU, and the CPU pool's by its cores, so the
+ crossover moves; --adapt measures it per machine (the staged arm of the
+ backend prior).  --hybrid or --cpu-only keeps the old behaviour.
+======================================================================*/
+static constexpr unsigned AUTO_STAGE_MAX_CPUS_COMPRESS   = 4;
+
+// THE SIZE FLOOR, in the input's bytes.  The staged path pays a fixed start the
+// CPU paths do not -- CUDA on its device, the pinned pool, the read-ahead
+// buffers -- MEASURED about 2 s compressing: at 4 CPUs an 8 GiB input compressed
+// in 4.07-4.10 s staged against hybrid's 3.74-3.81, while at 64 GiB staging won
+// 16.7 to 19.3-19.8.  Fitting both sizes puts the crossover near 14-15 GiB.
+static constexpr uint64_t AUTO_STAGE_MIN_BYTES = 16ULL << 30;
+
+// The size floor; GZSTD_DEBUG_AUTO_STAGE_MIN_BYTES lowers it for the suite.
+static uint64_t gz_auto_stage_min_bytes()
+{
+  if (const char * e = std::getenv("GZSTD_DEBUG_AUTO_STAGE_MIN_BYTES")) {
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(e, &end, 10);
+    if (end != e && *end == '\0' && errno == 0) return (uint64_t)v;
+  }
+  return AUTO_STAGE_MIN_BYTES;
+}
+
+// Could the driver's CPU rebuild discard what a failed staged compress wrote?
+// The same question the rebuild itself asks (gz_output_discard), asked before
+// anything is written: a named regular file, stdout at EOF, or the null device,
+// yes; a pipe, a terminal or a device that keeps its bytes, no.
+static bool gz_auto_stage_output_rebuildable(const Options & opt)
+{
+  struct stat st{};
+  if (opt.to_stdout) {
+    if (::fstat(1, &st) != 0) return false;
+    if (S_ISREG(st.st_mode)) {
+      // A rebuild truncates to where this output began.  A caller-owned fd
+      // positioned inside existing data has a suffix the buffered writer
+      // preserves, but that truncate would delete.  Only append at EOF is
+      // discardable without losing bytes this invocation did not write.
+      const int flags = ::fcntl(1, F_GETFL);
+      if (flags < 0) return false;
+      if (flags & O_APPEND) return true;   // the driver records st_size as out_base
+      const off_t pos = ::lseek(1, 0, SEEK_CUR);
+      return pos >= 0 && pos == st.st_size;
+    }
+    return gz_output_discard(1) == OutDiscard::NOTHING_KEPT;
+  }
+  if (!opt.output.empty()) {
+    if (::stat(opt.output.c_str(), &st) != 0) return errno == ENOENT;  // created as a file
+    if (S_ISREG(st.st_mode)) return true;
+    struct stat nd{};
+    return S_ISCHR(st.st_mode) && ::stat("/dev/null", &nd) == 0 && S_ISCHR(nd.st_mode)
+        && st.st_rdev == nd.st_rdev;
+  }
+  return true;   // a derived name next to the input, created as a regular file
+}
+
+// Why the default does NOT stage this run, or nullptr when it may.  Cheap
+// tests first; the GPU inventory and O_DIRECT I/O probes last.
+// *cpus_out gets the allowance when it was read.  cap_override, when
+// nonzero, replaces the static CPU threshold: --adapt asks whether staging is
+// a CANDIDATE up to its budget prior's last class.
+static const char * gz_auto_stage_decline(const Options & opt, unsigned * cpus_out,
+                                          unsigned cap_override = 0)
+{
+  if (const char * e = std::getenv("GZSTD_DEBUG_AUTO_STAGE"); e && e[0] == '0')
+    return "switched off by GZSTD_DEBUG_AUTO_STAGE=0";
+  if (opt.backend_user_set)       return "a backend was named, or implied by another flag";
+  if (opt.gpu_hybrid_tuning_seen) return "a GPU or hybrid tuning flag was given";
+  if (opt.mode == Mode::DECOMPRESS)
+    return "decompression keeps the default: its cold-archive readers decode as fast "
+           "on a small budget (an explicit --direct-stage still stages)";
+  if (opt.mode != Mode::COMPRESS) return "only compression stages by default";
+  if (opt.calibrate) return "calibration uses its own input and pipelines";
+  if (opt.tar_mode || opt.list_mode) return "--tar and -l do not stage by default";
+  if ((opt.mmap_user_set && opt.use_mmap) || (opt.direct_read_user_set && !opt.direct_read))
+    return "an input reader choice was given";
+  if ((opt.level_user_set || opt.fast_flag || opt.best_flag || opt.ultra
+          || opt.zstd_literal_mode != GZ_ZSTD_AUTO || opt.zstd_row_match != GZ_ZSTD_AUTO
+          || opt.zstd_target_cblock_seen || opt.zstd_src_hint_seen))
+    return "a compression level or zstd parameter was given, and the GPU compresses "
+           "at one fixed level";
+  if (opt.verify || opt.verify_decode || opt.keep_going || opt.keep_going_requested)
+    return "--verify and --keep-going keep the default";
+  if (opt.no_check) return "--no-check keeps the default";
+  if (opt.chunk_user_set) return "a frame size was given";
+  if (opt.inputs.size() != 1 || opt.inputs[0] == "-")
+    return "only a single named input stages by default";
+  const unsigned cpus = gz_cpu_allowance().allowed();
+  if (cpus_out) *cpus_out = cpus;
+  const unsigned cap = cap_override ? cap_override : AUTO_STAGE_MAX_CPUS_COMPRESS;
+  if (cpus == 0 || cpus > cap) return "enough CPUs for the default";
+  // Reject small/non-file inputs and unsuitable outputs before the GPU
+  // inventory and PCIe probe (whose fallback can start NVML).
+  const std::string & in = opt.inputs[0];
+  struct stat st{};
+  if (::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return "the input is not a regular file";
+  if ((uint64_t)st.st_size < gz_auto_stage_min_bytes())
+    return "the input is too small to repay starting a GPU";
+  if (!gz_auto_stage_output_rebuildable(opt))
+    return "the output could not be discarded and rebuilt on the CPU if the GPU failed";
+  if (const char * cvd = std::getenv("CUDA_VISIBLE_DEVICES"); cvd && (cvd[0] == '\0' || cvd[0] == '-'))
+    return "CUDA_VISIBLE_DEVICES hides every GPU";
+  if (gz_proc_gpu_uuids().empty()) return "no NVIDIA GPU";
+  if (const char * cvd = std::getenv("CUDA_VISIBLE_DEVICES"); cvd && std::strchr(cvd, ',')) {
+    // Narrowing a caller's list must not change CUDA's interpretation of it:
+    // duplicates reject the whole list (0,0 exposes none, but its first entry
+    // exposes GPU 0).  As in the GPU-count prior below, only narrow lists we
+    // can verify without CUDA; mixed index/UUID lists and MIG stay unchanged
+    // on the ordinary default, since their identities cannot be mapped here.
+    const auto & uuids = gz_proc_gpu_uuids();
+    std::unordered_set<size_t> seen;
+    int name_kind = 0;
+    std::stringstream ss(cvd);
+    std::string tok;
+    if (cvd[std::strlen(cvd) - 1] == ',')
+      return "CUDA_VISIBLE_DEVICES cannot safely be narrowed";
+    while (std::getline(ss, tok, ',')) {
+      if (tok.empty()) return "CUDA_VISIBLE_DEVICES cannot safely be narrowed";
+      const bool index = std::all_of(tok.begin(), tok.end(),
+                                     [](unsigned char c){ return c >= '0' && c <= '9'; });
+      const int kind = index ? 1 : (tok.rfind("GPU-", 0) == 0 ? 2 : 0);
+      if (kind == 0 || (name_kind != 0 && name_kind != kind))
+        return "CUDA_VISIBLE_DEVICES cannot safely be narrowed";
+      name_kind = kind;
+      size_t id = uuids.size();
+      if (index) {
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long v = std::strtoul(tok.c_str(), &end, 10);
+        if (errno == 0 && *end == '\0' && v < uuids.size()) id = (size_t)v;
+      } else {
+        for (size_t i = 0; i < uuids.size(); ++i)
+          if (uuids[i].rfind(tok, 0) == 0) {
+            if (id != uuids.size()) { id = uuids.size(); break; }
+            id = i;
+          }
+      }
+      if (id == uuids.size() || !seen.insert(id).second)
+        return "CUDA_VISIBLE_DEVICES cannot safely be narrowed";
+    }
+  }
+  if (gz_floor_precuda().all_old) return "every GPU is older than this build supports";
+  if (detect_min_pcie_gen() < 4) return "the GPUs' PCIe link is older than Gen4, or unknown";
+  // The staged reader opens O_DIRECT and dies when it cannot: find out here.
+  // Some filesystems accept the open and refuse the read, so read one block.
+  {
+    // Probe the SAME reopen the staged producer needs.  An O_DIRECT open by
+    // name can succeed in a namespace without /proc/self/fd, where the
+    // producer cannot reopen its verified input and the ordinary reader can.
+    const int plain = ::open(in.c_str(), O_RDONLY | O_CLOEXEC);
+    if (plain < 0) return "the input cannot be opened";
+    const int fd = gz_reopen_input(plain, O_RDONLY | O_DIRECT);
+    ::close(plain);
+    if (fd < 0) return "the verified input cannot be reopened with O_DIRECT";
+    void * buf = nullptr;
+    bool ok = ::posix_memalign(&buf, 4096, 4096) == 0;
+    if (ok) {
+      ssize_t r;
+      do { r = ::pread(fd, buf, 4096, 0); } while (r < 0 && errno == EINTR);
+      ok = r > 0;
+    }
+    std::free(buf);
+    ::close(fd);
+    if (!ok) return "the input's filesystem refuses O_DIRECT reads";
+  }
+  return nullptr;
+}
+
+// --adapt's backend choice on a small CPU budget (see g_adapt_budget_slot):
+// returns 0 (the static rule decides), or 1 cpu-only, 2 hybrid, 3 staged.
+// Called only when staging is a candidate (gz_auto_stage_decline passed with
+// the budget prior's cap).  Publishes this run's slot so the run is filed there.
+//
+// STATE TABLE -- the arm the static rule would run ("static": staged at or
+// under the static threshold, hybrid above it) x what the slot holds -> run:
+//   static arm never measured or tried   -> try static, stamping even a decline
+//   static tried but not measured        -> explore other arms, or use the best
+//                                           measured one; retry static after RECHECK
+//   another arm never measured           -> explore it, if this run could be
+//                                           recorded and it was not just tried
+//   all measured, one stale (RECHECK)    -> re-measure the stalest
+//   all measured                         -> the fastest, if it beats the static
+//                                           arm by 5%; else static
+//   residency unknown/overridden, >16    -> no slot: the static rule, unrecorded
+// The actual arm is filed; an attempted arm which cannot be measured (short
+// run, demoted reader, absent/faulted GPU) is stamped without a rate.  In
+// particular, a static arm that cannot run must not block all other learning.
+static int adapt_budget_choose(const Options & opt, unsigned cpus, bool static_stage,
+                               double resid)
+{
+  const int cls = adapt_budget_class(cpus);
+  if (cls < 0) return 0;
+  // These options change residency AFTER this decision, or bypass the cache.
+  // A mincore sample here would label their drive reads as a warm run.
+  if (opt.cold_read || opt.direct_read) return 0;
+  const int rc = adapt_budget_residency_class(resid);
+  if (rc < 0) return 0;
+  const int slot = cls * ADAPT_BUDGET_RESID_CLASSES + rc;
+  g_adapt_budget_slot.store(slot, std::memory_order_relaxed);
+  const AdaptPriors pr = adapt_load_priors();
+  const AdaptPriors::Dir & D = pr.dir[opt.mode == Mode::COMPRESS ? 0 : 1];
+  const int stat_arm = static_stage ? 3 : 2;
+  double r[4] = {}, stamp[4] = {};
+  for (int a = 1; a <= 3; ++a) { r[a] = D.budget_rate[a][slot]; stamp[a] = D.budget_run[a][slot]; }
+  // Could this run be recorded?  The save floor and the backend floor both
+  // apply; with no rate estimate yet, assume it could (as the pair's prior does).
+  bool explorable = true;
+  {
+    struct stat sb{};
+    if (D.input_gibs > 0 && ::stat(opt.inputs[0].c_str(), &sb) == 0) {
+      const double secs = double(sb.st_size) / (D.input_gibs * 1073741824.0);
+      explorable = secs >= double(adapt_save_min_ns()) / 1e9 && secs >= ADAPT_BACKEND_MIN_SEC;
+    }
+  }
+  auto untried_recently = [&](int a) {
+    return stamp[a] <= 0.0 || D.runs - stamp[a] >= ADAPT_BACKEND_RECHECK_RUNS;
+  };
+  const std::string sn = adapt_budget_slot_name(slot);
+  auto say = [&](const char * what, int arm) {
+    if (opt.verbosity < V_VERBOSE) return;
+    char b[320];
+    std::snprintf(b, sizeof b, "[ADAPT] budget prior (%u CPUs, %s): cpu-only %.2f, hybrid %.2f, "
+                  "staged %.2f GiB/s -> %s%s\n", cpus, sn.c_str(), r[1], r[2], r[3], what,
+                  arm == 1 ? "cpu-only" : arm ? adapt_budget_arm_name(arm) : "");
+    vlog(V_VERBOSE, opt, b);
+  };
+  if (r[stat_arm] <= 0.0 && untried_recently(stat_arm)) {
+    g_adapt_budget_explored.store(stat_arm, std::memory_order_relaxed);
+    say("the default runs and is measured: ", stat_arm);
+    return 0;
+  }
+  for (int a : { 3, 2, 1 }) {
+    if (a == stat_arm || r[a] > 0.0) continue;
+    if (explorable && untried_recently(a)) {
+      g_adapt_budget_explored.store(a, std::memory_order_relaxed);
+      say("exploring ", a);
+      return a;
+    }
+  }
+  int stale = 0;
+  for (int a = 1; a <= 3; ++a)
+    if (r[a] > 0.0 && (!stale || stamp[a] < stamp[stale])) stale = a;
+  if (explorable && stale && D.runs - stamp[stale] >= ADAPT_BACKEND_RECHECK_RUNS) {
+    g_adapt_budget_explored.store(stale, std::memory_order_relaxed);
+    say("re-measuring ", stale);
+    return stale == stat_arm ? 0 : stale;
+  }
+  int best = stat_arm;
+  for (int a = 1; a <= 3; ++a)
+    if (r[a] > 0.0 && r[a] > r[best]) best = a;
+  if (r[stat_arm] <= 0.0) {
+    // No static baseline exists to apply the margin to.  A recent unsuccessful
+    // attempt is enough to let a measured alternative run.  With no rates at
+    // all, hold on CPU until the probes are due instead of paying the same
+    // unmeasurable staged/default attempt on every invocation.
+    if (r[best] <= 0.0) best = 1;
+    g_adapt_budget_explored.store(best, std::memory_order_relaxed);
+    say("the default was recently unmeasurable; using ", best);
+    return best;
+  }
+  if (best != stat_arm && r[best] > r[stat_arm] * 1.05) { say("measured fastest: ", best); return best; }
+  say("the default holds: ", stat_arm);
+  return 0;
+}
+#endif  // HAVE_NVCOMP && !_WIN32
+
 /*======================================================================
  Apply asymmetric-mode default backend selection.  Called after
  parse_args.  No-op if the user explicitly chose a backend.
@@ -51875,6 +52883,51 @@ static void apply_backend_defaults(Options & opt)
   // command line still records a rate, and that rate is only interpretable
   // alongside the core count that produced it.
   g_adapt_avail_cores.store(adapt_avail_cores(), std::memory_order_relaxed);
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+  // A SMALL CPU BUDGET STAGES THROUGH THE GPU (see gz_auto_stage_decline).
+  // Decided HERE, before the device mask below: --direct-stage runs on one
+  // device, and the mask is the last point before cuInit at which the others
+  // can be hidden (each visible device costs CUDA start-up time).  Committed
+  // only after CUDA confirms the device, after the mask (see below).
+  const int  stage_saved_devices = opt.gpu_devices;
+  // --adapt on a small budget: the budget-keyed prior owns the backend choice
+  // (see adapt_budget_choose), and the cpu/hybrid pair below stands aside.
+  bool budget_owned = false;
+  {
+    const unsigned static_cap = AUTO_STAGE_MAX_CPUS_COMPRESS;
+    const bool adapting = opt.adapt && !opt.no_profile && !opt.list_mode;
+    unsigned stage_cpus = 0;
+    const char * no = gz_auto_stage_decline(opt, &stage_cpus,
+                          adapting ? (unsigned)16 : 0u);
+    // Compression still needs a residency sample for its budget slot even
+    // though its static CPU cap does not depend on the cache.
+    double budget_resid = -1.0;
+    if (!no && adapting && !opt.cold_read && !opt.direct_read)
+      budget_resid = adapt_input_residency(opt);
+    // Under --adapt the decline was asked with the prior's cap, so the static
+    // rule's own CPU cap is applied here: the prior's "default" arm must be the
+    // default's.
+    bool stage = !no && stage_cpus <= static_cap;
+    if (!no && adapting) {
+      const int choice = adapt_budget_choose(opt, stage_cpus, stage, budget_resid);
+      budget_owned = g_adapt_budget_slot.load(std::memory_order_relaxed) >= 0;
+      if (choice == 3) stage = true;
+      else if (choice == 1) { stage = false; opt.cpu_only = true; opt.hybrid = false; }
+      else if (choice == 2) { stage = false; opt.hybrid = true; opt.cpu_only = false; }
+    }
+    if (stage) {
+      opt.direct_stage = true;
+      opt.direct_stage_auto = true;
+      opt.gpu_only = true;
+      opt.hybrid = false;
+      if (opt.gpu_devices == 0) opt.gpu_devices = 1;   // --direct-stage's default
+    } else if (opt.verbosity >= V_DEBUG && !opt.list_mode) {
+      vlog(V_DEBUG, opt, std::string("[STAGE] the default does not stage: ")
+           + (no ? no : budget_owned ? "the --adapt budget prior chose another backend"
+                                     : "enough CPUs for the default") + "\n");
+    }
+  }
+#endif
 #ifdef HAVE_NVCOMP
   // A proper --gpu-devices=N subset must HIDE the other devices from CUDA,
   // not just decline to use them.  An explicit full count is handled below.
@@ -52197,6 +53250,27 @@ static void apply_backend_defaults(Options & opt)
       vlog(V_VERBOSE, opt, os.str());
     }
   }
+#ifndef _WIN32
+  // COMMIT THE DEFAULT'S STAGING ONLY ON A DEVICE CUDA CAN USE.  Every
+  // --gpu-only route refuses (exit 2) when none is usable -- right for a user
+  // who named the flag, wrong for a default.  Asking now costs nothing the
+  // staged compress would not pay anyway: it starts CUDA before its first
+  // read (its pinned pool needs a context), and the answer is cached for every
+  // later first-CUDA site.  The mask above already names the one device.
+  if (opt.direct_stage_auto) {
+    if (gz_cuda_usable_count(opt, "default staging") <= 0) {
+      opt.direct_stage = false;
+      opt.direct_stage_auto = false;
+      opt.gpu_only = false;
+      opt.gpu_devices = stage_saved_devices;
+      vlog(V_VERBOSE, opt, "[STAGE] no usable GPU after all; the default backend instead\n");
+    } else if (opt.verbosity >= V_VERBOSE) {
+      vlog(V_VERBOSE, opt, "[STAGE] " + std::to_string(gz_cpu_allowance().allowed())
+           + " CPUs allowed and a GPU beside them: staging the input through the GPU "
+             "(the --direct-stage path); --hybrid or --cpu-only keeps the CPUs working\n");
+    }
+  }
+#endif
   // Freeze the batch geometry the size gate reasons about BEFORE --adapt seeds
   // gpu_batch_cap from the profile (see Options::gpu_batch_cap_gate).
   opt.gpu_batch_cap_gate = opt.gpu_batch_cap;
@@ -52686,6 +53760,21 @@ static void apply_backend_defaults(Options & opt)
              "consulted\n");
     return;
   }
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+  // Staged by the default for a small CPU budget, or chosen by --adapt's
+  // budget-keyed prior (above): neither the hybrid default's rules nor the
+  // cpu/hybrid pair below applies.  The pair's rates were measured with other
+  // budgets, and its core scaling cannot predict hybrid's collapse on a few
+  // CPUs (its CPU workers starve its own readers) or a drive-bound run's.
+  if (opt.direct_stage_auto || budget_owned) {
+    if (!opt.direct_stage_auto && !opt.cpu_only) opt.hybrid = true;   // the default
+    if (opt.adapt && !opt.no_profile && !opt.list_mode && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[ADAPT] backend: ")
+           + (opt.direct_stage_auto ? "staged" : opt.cpu_only ? "--cpu-only" : "--hybrid")
+           + " on a small CPU budget; the profile's cpu/hybrid pair is not consulted\n");
+    return;
+  }
+#endif
 
 #ifndef _WIN32
   // TOO SMALL TO PAY FOR A GPU AT ALL.
