@@ -204,11 +204,60 @@ Copy the entire `dist/bin/` directory to the target machine. The `$ORIGIN` RPATH
 ### CPU-Only Build
 
 ```bash
-cmake -B build -DUSE_NVCOMP=OFF
-cmake --build build -j$(nproc)
+cmake -B build-cpu -DUSE_NVCOMP=OFF
+cmake --build build-cpu -j$(nproc)
 ```
 
-No CUDA or GPU dependencies required.
+No CUDA or GPU dependencies required.  Build it in its own directory, `build-cpu`, next to the GPU
+build in `build`: reconfiguring `build` with `-DUSE_NVCOMP=OFF` turns the GPU build into a CPU-only
+one.  Run its tests with `./gzstd-test.sh ./build-cpu/gzstd`.  `USE_NVCOMP=OFF` compiles a few dozen
+conditional regions the other way, so `RELEASING.md` requires BOTH builds before a tag.
+
+### Choosing the zstd and libacl a build uses
+
+A build compiles against whichever zstd and libacl CMake finds first, and that may not be the
+pair you meant -- an older system zstd, or one from a different conda env.  Configure from the
+same environment for every build directory (with conda: activate the env that holds zstd and
+nvCOMP, or set `CONDA_PREFIX` to it on the command line), and check what was picked up:
+
+```bash
+cmake -B build-cpu -DUSE_NVCOMP=OFF 2>&1 | grep -E 'Zstd|ACL'
+#   -- Zstd found (manual): /path/to/env/lib/libzstd.so
+#   -- ACL/xattr support: enabled (/usr/lib/x86_64-linux-gnu/libacl.so)
+grep -E '^(ZSTD|ACL)_(LIBRARY|INCLUDE_DIR)' build-cpu/CMakeCache.txt
+./build-cpu/gzstd --version          # ... [zstd 1.5.7, multithreaded]
+ldd ./build-cpu/gzstd | grep -E 'zstd|acl|stdc'
+```
+
+`--version` names the zstd the binary actually loaded and whether it has worker threads; a
+`single-threaded` zstd runs `--sliding-window` on one thread, and zstd older than 1.4.7 cannot
+decompress with `--no-check`.  If libacl is not found the build still succeeds, but `--acls`
+fails at run time (`apt install libacl1-dev` or `dnf install libacl-devel`).
+
+**To point the build at the right ones:**
+
+- **zstd:** CMake tries, in order, CMake's own zstd package, a `zstd.pc` pkg-config file, then
+  `$CONDA_PREFIX`, `$ZSTD_ROOT` and `$ZSTD_PREFIX`, then `libzstd.pc`.  To name one exactly and
+  skip all of that:
+  ```bash
+  cmake -B build-cpu -DUSE_NVCOMP=OFF -DGZSTD_ZSTD_EXPLICIT=ON \
+        -DZSTD_INCLUDE_DIR=/path/to/zstd/include -DZSTD_LIBRARY=/path/to/zstd/lib/libzstd.so
+  ```
+  (Give both; for a source tree, `zstd-1.5.7/lib` and `zstd-1.5.7/lib/libzstd.a` -- see the
+  RHEL section above for building a multithreaded `libzstd.a-mt`.)
+- **libacl:** it is looked up in the standard system paths and `CMAKE_PREFIX_PATH`, not in
+  `$CONDA_PREFIX`.  Name it with `-DACL_INCLUDE_DIR=/path/include -DACL_LIBRARY=/path/lib/libacl.so`,
+  or add its prefix with `-DCMAKE_PREFIX_PATH=/path`.
+- **Reconfigure from scratch after changing either.**  CMake caches what it found, so a new
+  `CONDA_PREFIX` or an installed package is ignored by an existing build directory.  Use
+  `cmake --fresh -B build-cpu ...` (CMake 3.24+) or delete `build-cpu/CMakeCache.txt` first.
+
+**The configure environment also sets the RPATH.**  When `CONDA_PREFIX` is set, its `lib` is added
+to the binary's run-time search path, ahead of the system libraries.  Configuring from the wrong
+env (e.g. conda's `base`, whose `libstdc++` is older than the compiler's) builds cleanly and then
+fails at start-up with ``version `GLIBCXX_3.4.xx' not found``.  So run the binary after every
+build, and check `readelf -d build-cpu/gzstd | grep RUNPATH` names the env you meant.  Even an
+existing build directory takes the RPATH from the shell that reconfigures it.
 
 ## Conda Environment Example
 
