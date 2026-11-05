@@ -634,12 +634,21 @@ human_size() {
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
 EXPECTED_TESTS=564
-$EXTENSIVE && EXPECTED_TESTS=906
+$EXTENSIVE && EXPECTED_TESTS=908
+# v0.18.37: +2 default GPU cells (a refusal for a missing nvidia-fs opens no cuFile
+# driver and leaves no log; the next --gds-only run keeps the newest four non-empty
+# cuFile logs).  Neither needs GDS, so the GDS delta is unchanged: 562 -> 564,
+# 906 -> 908; the no-GPU deltas +2 (156 -> 158, 236 -> 238).  CONFIRMED 2026-11-05
+# on the single-GPU workstation: default 532 ran (564 - 17 GDS - 15 this host could
+# not exercise), CPU-only 406 (564 - 158).
 # v0.18.36: +1 default cell on both builds (the O_DIRECT writer's buffers fit a
-# sixteenth of the memory left) and +3 default GPU cells (a small budget's cached
-# archive on a drive that keeps up reads O_DIRECT; staged compress takes up to
-# six streams; --adapt measures six GPU streams against two): 560 -> 564,
-# 902 -> 906; the no-GPU deltas +3 (155 -> 158, 233 -> 236).
+# sixteenth of the memory left) and +3 GPU cells (a small budget's cached archive
+# on a drive that keeps up reads O_DIRECT; staged compress takes up to six streams;
+# --adapt measures six GPU streams against two): 902 -> 906 and 233 -> 236 under
+# --extensive.  The DEFAULT figures it gave (560 -> 564, 155 -> 158) were derived
+# and two too high: the two streams cells sit in the --direct-stage compression
+# section, --extensive only since v0.18.7.  Default 560 -> 562, 155 -> 156; the
+# v0.18.37 default run found it (two cells short of 566).
 # The cells a single-GPU host (or one whose second card is busy) cannot reach are
 # skip_host now, so they count in "this host could not exercise" instead of a
 # drift note; a GPU-less host still subtracts them once, in EXPECTED_NOGPU_DELTA.
@@ -975,8 +984,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=158   # + three v0.18.36; 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=236   # + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=158   # + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=238   # + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -4361,6 +4370,25 @@ GXPY
       echo $? > "$cfl/$name/rc" )
   }
   cfl_logs() { find "$cfl/$1/xdg" -name 'cufile-*.log' 2>/dev/null | wc -l; }
+  cfl_dead_pids() {
+    # EPERM means another user's LIVE process; only ESRCH is a dead fixture.
+    python3 - "$1" <<'CFLPY'
+import os, sys
+with open('/proc/sys/kernel/pid_max') as f:
+    pid_max = int(f.read())
+found = 0
+for pid in range(pid_max - 1, 0, -1):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        print(pid)
+        found += 1
+        if found == int(sys.argv[1]):
+            break
+    except PermissionError:
+        pass
+CFLPY
+  }
 
   # 1. A healthy run leaves nothing: not in the working directory, not in the cache.
   #    The -v removal line proves the cache path was used at all (no driver open, no log,
@@ -4449,12 +4477,11 @@ CFLPY
   cfl_died_rc=$(cat "$cfl/sweep/rc"); cfl_died_logs=$(cfl_logs sweep)
   cfl_died_log=$(find "$cfl/sweep/xdg" -name 'cufile-*.log' 2>/dev/null | head -1)
   cfl_host=$(hostname | sed 's/[^A-Za-z0-9._-]/_/g')
-  cfl_dead=$(( $(cat /proc/sys/kernel/pid_max) - 1 ))
-  while kill -0 "$cfl_dead" 2>/dev/null; do cfl_dead=$(( cfl_dead - 1 )); done
+  cfl_dead=$(cfl_dead_pids 1)
   cfl_dir="$cfl/sweep/xdg/gzstd"; mkdir -p "$cfl_dir"
   : > "$cfl_dir/cufile-$cfl_host-$cfl_dead.log"             # empty, gone        -> swept
   : > "$cfl_dir/cufile-$cfl_host-$$.log"                     # empty, alive (us)  -> kept
-  echo x > "$cfl_dir/cufile-$cfl_host-$(( cfl_dead - 1 )).log"   # non-empty      -> kept
+  echo x > "$cfl_dir/cufile-$cfl_host-$(( cfl_dead - 1 )).log"   # non-empty, one of the newest four -> kept
   : > "$cfl_dir/cufile-otherhost-$cfl_dead.log"              # another host       -> kept
   cfl_run sweep -- -t --gds-only "$cfl_z"
   if ! gds_testable; then
@@ -4477,6 +4504,84 @@ CFLPY
     fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "$(cfl_logs sweep) logs remain, want the 3 kept fixtures"
   else
     pass "a failed --gds-only run keeps its empty log; the next run sweeps it"
+  fi
+
+  # 5. v0.18.37: a run that is going to be refused for a missing nvidia-fs must not open
+  #    the driver first.  It did: cuFileDriverOpen succeeds in compat mode and writes the
+  #    log, which on such a host is never empty (cuFile logs the missing module at ERROR),
+  #    so every refused run left a kept log -- 261 in one GeForce host's cache directory.
+  #    GZSTD_DEBUG_GDS_NO_NVFS answers "not loaded" where the module IS loaded, so this
+  #    runs on a GDS host too, where the old order leaves the refused run's empty log
+  #    behind (a refusal is a die, and a die keeps the log for the next sweep).
+  #    Where CUFILE_LOGFILE_PATH or a config's logging.dir places the log, gzstd defers
+  #    (cell 3) and an empty cache would prove nothing, so -v's deferral line skips it.
+  cfl_t="a refusal for a missing nvidia-fs opens no cuFile driver and leaves no log"
+  cfl_elsewhere='\[GDS\] cuFile log: (CUFILE_LOGFILE_PATH is set|.* sets logging\.dir)'
+  cfl_run nonvfs GZSTD_DEBUG_GDS_NO_NVFS=1 -- -t --gds-only -v "$cfl_z"
+  if grep -aq 'libcufile.so is not installed' "$cfl/nonvfs/err"; then
+    skip_host "$cfl_t" "libcufile is not installed"
+  elif grep -aqE "$cfl_elsewhere" "$cfl/nonvfs/err"; then
+    skip_host "$cfl_t" "cuFile's log is placed by CUFILE_LOGFILE_PATH or logging.dir"
+  elif [[ $(cat "$cfl/nonvfs/rc") -ne 2 ]]; then
+    fail "$cfl_t" "exit $(cat "$cfl/nonvfs/rc"), want 2"
+  elif ! grep -aq 'nvidia-fs kernel module is not loaded' "$cfl/nonvfs/err"; then
+    fail "$cfl_t" "refused for another reason: $(grep -am1 'ERROR' "$cfl/nonvfs/err")"
+  elif [[ $(cfl_logs nonvfs) -ne 0 || -e "$cfl/nonvfs/cwd/cufile.log" ]]; then
+    fail "$cfl_t" "a cuFile log was written: the driver opened before the refusal"
+  else
+    pass "$cfl_t"
+  fi
+
+  # 6. v0.18.37: kept is not forever.  The next --gds-only start also removes this host's
+  #    NON-EMPTY logs of finished processes past the newest four (CUFILE_LOGS_KEPT), by
+  #    modification time -- never a live process's, another host's, or a symlink with a
+  #    log's name.  The sweep runs before the preflight, so cell 5's refusal drives it on
+  #    any host.  Six non-empty logs of finished processes, oldest first: 0 and 1 go.
+  cfl_t="the next --gds-only run keeps the newest four non-empty cuFile logs of finished runs"
+  cfl_dir="$cfl/cap/xdg/gzstd"; mkdir -p "$cfl_dir"
+  cfl_now=$(date +%s)
+  mapfile -t cfl_deads < <(cfl_dead_pids 8)
+  for cfl_i in 0 1 2 3 4 5; do
+    cfl_f="$cfl_dir/cufile-$cfl_host-${cfl_deads[$cfl_i]}.log"
+    echo "cuFile ERROR $cfl_i" > "$cfl_f"; touch -d "@$(( cfl_now - 600 + cfl_i * 60 ))" "$cfl_f"
+  done
+  : > "$cfl_dir/cufile-$cfl_host-${cfl_deads[6]}.log"                       # empty, finished -> swept
+  echo live > "$cfl_dir/cufile-$cfl_host-$$.log"                             # the OLDEST, but alive (us) -> kept
+  echo other > "$cfl_dir/cufile-otherhost-${cfl_deads[0]}.log"               # another host -> kept
+  echo target > "$cfl/cap-target"
+  ln -s "$cfl/cap-target" "$cfl_dir/cufile-$cfl_host-${cfl_deads[7]}.log"    # a symlink -> kept
+  # Not a pid gzstd could have written: the old long -> pid_t cast checked
+  # cfl_deads[0] instead, then swept this unrelated file as an old log.
+  cfl_bad_pid=$(( 4294967296 + cfl_deads[0] ))
+  cfl_bad_log="$cfl_dir/cufile-$cfl_host-$cfl_bad_pid.log"
+  echo unrelated > "$cfl_bad_log"
+  touch -d "@$(( cfl_now - 9000 ))" "$cfl_dir/cufile-$cfl_host-$$.log" \
+    "$cfl_dir/cufile-otherhost-${cfl_deads[0]}.log" "$cfl/cap-target" "$cfl_bad_log"
+  cfl_run cap GZSTD_DEBUG_GDS_NO_NVFS=1 -- -t --gds-only -v "$cfl_z"
+  cfl_kept=""
+  for cfl_i in 0 1 2 3 4 5; do
+    [[ -e "$cfl_dir/cufile-$cfl_host-${cfl_deads[$cfl_i]}.log" ]] && cfl_kept+="$cfl_i"
+  done
+  if grep -aq 'libcufile.so is not installed' "$cfl/cap/err"; then
+    skip_host "$cfl_t" "libcufile is not installed"
+  elif grep -aqE "$cfl_elsewhere" "$cfl/cap/err"; then
+    skip_host "$cfl_t" "cuFile's log is placed by CUFILE_LOGFILE_PATH or logging.dir"
+  elif [[ "$cfl_kept" != 2345 ]]; then
+    fail "$cfl_t" "kept non-empty logs '$cfl_kept' of 0-5 (oldest first), want 2345"
+  elif [[ -e "$cfl_dir/cufile-$cfl_host-${cfl_deads[6]}.log" ]]; then
+    fail "$cfl_t" "an empty log of a finished process was not swept"
+  elif [[ ! -e "$cfl_dir/cufile-$cfl_host-$$.log" ]]; then
+    fail "$cfl_t" "removed the log of a LIVE process"
+  elif [[ ! -e "$cfl_dir/cufile-otherhost-${cfl_deads[0]}.log" ]]; then
+    fail "$cfl_t" "removed another host's log"
+  elif [[ ! -L "$cfl_dir/cufile-$cfl_host-${cfl_deads[7]}.log" || ! -e "$cfl/cap-target" ]]; then
+    fail "$cfl_t" "touched a symlink with a log's name, or its target"
+  elif [[ ! -e "$cfl_bad_log" ]]; then
+    fail "$cfl_t" "removed a file whose name has an out-of-range pid"
+  elif ! grep -aq 'removed 2 older non-empty logs' "$cfl/cap/err"; then
+    fail "$cfl_t" "no -v line reporting the 2 removals"
+  else
+    pass "$cfl_t"
   fi
   rm -rf "$cfl"
   # <<< cufile-log cells
@@ -4705,6 +4810,8 @@ else
   skip "GPU decompress survives a handled bringup OOM (real fault)" "no GPU"
   skip "GPU decompress survives a handled pinned-staging OOM (real fault)" "no GPU"
   skip "--gds-only -t verifies on the device" "no GPU"
+  skip "a refusal for a missing nvidia-fs opens no cuFile driver and leaves no log" "no GPU"
+  skip "the next --gds-only run keeps the newest four non-empty cuFile logs of finished runs" "no GPU"
   skip "gpu tar" "no GPU"
   skip "gpu batch sizes" "no GPU"
   skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"

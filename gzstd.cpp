@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.36";
+static constexpr const char * GZSTD_VERSION = "0.18.37";
 //
 // Architecture overview:
 //
@@ -61,6 +61,7 @@ static constexpr const char * GZSTD_VERSION = "0.18.36";
 #include <cstring>
 #include <cstdint>
 #include <climits>    // INT_MAX — used in RAM-frame caps; pulled in transitively only with nvCOMP
+#include <limits>
 #include <string>
 #include <vector>
 #include <deque>
@@ -4226,6 +4227,54 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
   // On a mixed host the preflight's cudaMalloc and cuFile registration must
   // probe a supported card, not CUDA's possibly old default device 0.
   gz_select_usable_gds_preflight_device(opt);
+
+  // One refusal, several reasons.  Every path that concludes "peer-to-peer is
+  // impossible here" must say so the same way, and must keep naming
+  // --direct-stage -- that pointer is the only actionable part for the user.
+  auto refuse_no_p2p = [&](const std::string & why, const std::string & hint) {
+    die_usage("--gds-only cannot do peer-to-peer transfers on this host: " + why
+              + ".\n  Every transfer would bounce through host memory -- the exact"
+                " copy --gds-only\n  exists to remove.\n"
+              + hint
+              + "  Use --direct-stage instead: it needs none of GPUDirect Storage's"
+                " requirements\n  and captures most of the same win.");
+  };
+
+  // BOTH VERDICTS BELOW COME BEFORE THE DRIVER OPENS (v0.18.37).  Neither needs
+  // cuFile to decide, and opening it to refuse anyway cost a log file per run:
+  // cuFileDriverOpen succeeds in compat mode and writes the log it was pointed
+  // at, and on a host without nvidia-fs that log is never empty -- cuFile reports
+  // the missing /proc/driver/nvidia-fs/devcount, and a missing liburcu-bp, at
+  // ERROR on every open.  A non-empty log is kept and only named, so MEASURED on
+  // a GeForce host (nvidia-fs cannot load there): 261 logs in the cache
+  // directory, about 120 from each suite run.  It also cost the driver open
+  // itself, 0.5-2.5 s, for a run that was going to be refused.
+  //
+  // THE FORCED VERDICT MUST FIRE ANYWHERE, so it is tested before the host gate
+  // beside it.  It used to live INSIDE the counter block below, which is skipped
+  // whenever /proc/driver/nvidia-fs/stats cannot be read -- so on a host with no
+  // nvidia-fs the switch that exists to make this gate testable was itself
+  // unreachable, and the suite cell asserting the refusal failed there. A control
+  // that cannot fire on the host it describes is not a control.
+  if (std::getenv("GZSTD_DEBUG_GDS_FORCE_COMPAT"))
+    refuse_no_p2p("a compat-mode verdict was forced (GZSTD_DEBUG_GDS_FORCE_COMPAT)",
+                  "");
+
+  // ABSENT IS NOT UNKNOWN.  "Fail open on anything unknown" (below) is right for
+  // a counter we merely cannot read; it is wrong for a module that is not loaded
+  // at all.  Without nvidia-fs, cuFile runs in compat mode by construction and
+  // every byte bounces -- which is precisely what this flag exists to avoid, and
+  // exactly the silent-success shape the counter gate was added to kill.  The
+  // previous code fell through to a post-hoc WARNING at exit 0.
+  //
+  // Test-only: GZSTD_DEBUG_GDS_NO_NVFS=1 answers "not loaded" on a host where it
+  // is, so the suite can see this refusal leave no cuFile log on a GDS host too.
+  if (!gz_nvfs_module_loaded() || std::getenv("GZSTD_DEBUG_GDS_NO_NVFS"))
+    refuse_no_p2p("the nvidia-fs kernel module is not loaded, so cuFile can only "
+                  "run in\n  compat mode",
+                  "  Install and load nvidia-fs (nvidia-fs-dkms) if you meant to use"
+                  " GPUDirect\n  Storage.\n");
+
   const std::string why = gz_gds_unavailable_reason();
   if (!why.empty()) die_usage("--gds-only is not available on this host: " + why);
   void * probe = nullptr;
@@ -4298,40 +4347,9 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
   // not evidence of compat mode, and refusing to run on either would be a worse
   // failure than the quiet bounce.  Once an exact probe read is attempted on a
   // file large enough to serve it, however, any non-exact result is decisive:
-  // the real staged path requires the same exact-count contract.
-  // One refusal, several reasons.  Every path that concludes "peer-to-peer is
-  // impossible here" must say so the same way, and must keep naming
-  // --direct-stage -- that pointer is the only actionable part for the user.
-  auto refuse_no_p2p = [&](const std::string & why, const std::string & hint) {
-    die_usage("--gds-only cannot do peer-to-peer transfers on this host: " + why
-              + ".\n  Every transfer would bounce through host memory -- the exact"
-                " copy --gds-only\n  exists to remove.\n"
-              + hint
-              + "  Use --direct-stage instead: it needs none of GPUDirect Storage's"
-                " requirements\n  and captures most of the same win.");
-  };
-
-  // THE FORCED VERDICT MUST FIRE ANYWHERE, so it is tested before any host gate.
-  // It used to live INSIDE the counter block below, which is skipped whenever
-  // /proc/driver/nvidia-fs/stats cannot be read -- so on a host with no nvidia-fs
-  // the switch that exists to make this gate testable was itself unreachable, and
-  // the suite cell asserting the refusal failed there. A control that cannot fire
-  // on the host it describes is not a control.
-  if (std::getenv("GZSTD_DEBUG_GDS_FORCE_COMPAT"))
-    refuse_no_p2p("a compat-mode verdict was forced (GZSTD_DEBUG_GDS_FORCE_COMPAT)",
-                  "");
-
-  // ABSENT IS NOT UNKNOWN.  "Fail open on anything unknown" (below) is right for
-  // a counter we merely cannot read; it is wrong for a module that is not loaded
-  // at all.  Without nvidia-fs, cuFile runs in compat mode by construction and
-  // every byte bounces -- which is precisely what this flag exists to avoid, and
-  // exactly the silent-success shape the counter gate was added to kill.  The
-  // previous code fell through to a post-hoc WARNING at exit 0.
-  if (!gz_nvfs_module_loaded())
-    refuse_no_p2p("the nvidia-fs kernel module is not loaded, so cuFile can only "
-                  "run in\n  compat mode",
-                  "  Install and load nvidia-fs (nvidia-fs-dkms) if you meant to use"
-                  " GPUDirect\n  Storage.\n");
+  // the real staged path requires the same exact-count contract.  (The forced
+  // verdict and the absent-module refusal are decided above, before the driver
+  // opens.)
 
   // THE DRIVER'S OWN CAPABILITY REPORT (v0.17.76).  The BAR1-counter probe below
   // is NOT enough, and it was shown to pass falsely: on an 8-GPU host with the
@@ -4417,8 +4435,8 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
           if (pr == (ssize_t)PB) {
             unsigned long long b1_after = 0;
             if (gz_nvfs_bar1_read(&b1_after)) moved = (b1_after != b1_before);
-            // (GZSTD_DEBUG_GDS_FORCE_COMPAT is handled above, before any host
-            // gate, so that it fires on hosts this block never reaches.)
+            // (GZSTD_DEBUG_GDS_FORCE_COMPAT is handled above, before the driver
+            // opens, so that it fires on hosts this block never reaches.)
           } else {
             // A short read is unknown only when the input itself is shorter
             // than the probe.  If the file can serve PB bytes, ANY non-exact
@@ -5618,9 +5636,12 @@ static void print_help_long()
 "     cuFile's LOG goes to ${XDG_CACHE_HOME:-~/.cache}/gzstd/\n"
 "     cufile-<host>-<pid>.log instead of the working directory.  gzstd\n"
 "     deletes it after a successful run when cuFile wrote nothing, and\n"
-"     otherwise keeps it, naming it on stderr if it is not empty.  An\n"
-"     explicit CUFILE_LOGFILE_PATH, or logging.dir in cufile.json, is\n"
-"     left alone.\n"
+"     otherwise keeps it, naming it on stderr if it is not empty.  The\n"
+"     next --gds-only run deletes the empty logs of finished runs, and\n"
+"     their non-empty logs past the newest four.  An explicit\n"
+"     CUFILE_LOGFILE_PATH, or logging.dir in cufile.json, is left alone.\n"
+"     Without the nvidia-fs module --gds-only refuses before cuFile\n"
+"     opens, so it writes no log at all.\n"
 "\n"
 "  --direct-stage\n"
 "     THE PORTABLE 95% OF --gds-only, ON ANY HOST WITH A GPU.  Read each\n"
@@ -8997,6 +9018,16 @@ static std::string adapt_profile_path()
 // is gone.  The name carries the host as well as the pid, because a home
 // directory shared across machines would otherwise let one host sweep another's
 // live log on the strength of a pid it cannot see.
+//
+// AND KEPT IS NOT FOREVER (v0.18.37).  A non-empty log is named on stderr when
+// its run ends; after that it is only a record, and the sweep used to keep every
+// one.  Where cuFile writes something on every open -- a host without nvidia-fs
+// logs the missing module and a missing liburcu-bp at ERROR -- that is one file
+// per run without end: MEASURED 261 in one cache directory.  The sweep now also
+// removes this host's non-empty logs of finished processes past the newest
+// CUFILE_LOGS_KEPT, by modification time.  A policy constant, not a measurement:
+// the last few runs are the ones anyone is still reading.
+static constexpr size_t CUFILE_LOGS_KEPT = 4;
 static char g_cufile_log_path[PATH_MAX] = {0};   // set before any thread; read-only after
 static std::atomic<bool> g_cufile_log_finished{false};
 
@@ -9320,20 +9351,52 @@ static void gz_cufile_log_setup(const Options & opt)
     if (!std::isalnum((unsigned char)*h) && *h != '.' && *h != '_' && *h != '-') *h = '_';
   const std::string mine = std::string("cufile-") + host + "-";
 
-  // Sweep: our host's empty logs whose process is gone.  kill(pid, 0) failing with
-  // ESRCH is "no such process"; EPERM means one exists, so it is left alone.
-  for (const auto & e : fs::directory_iterator(dir, ec)) {
-    const std::string n = e.path().filename().string();
+  // Sweep: our host's logs whose process is gone -- every empty one, and the
+  // non-empty ones past the newest CUFILE_LOGS_KEPT (see the block comment).
+  // kill(pid, 0) failing with ESRCH is "no such process"; EPERM means one
+  // exists, so it is left alone.  Only regular files: a symlink that happens to
+  // carry the name is not a log this code wrote.  The non-throwing iterator,
+  // because an unreadable entry must not turn a log sweep into an abort.
+  struct OldLog { fs::file_time_type t; fs::path p; };
+  std::vector<OldLog> kept;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const fs::path p = it->path();
+    const std::string n = p.filename().string();
     if (n.size() <= mine.size() + 4 || n.compare(0, mine.size(), mine) != 0
         || n.compare(n.size() - 4, 4, ".log") != 0) continue;
     const std::string pid_s = n.substr(mine.size(), n.size() - mine.size() - 4);
-    if (pid_s.empty() || pid_s.find_first_not_of("0123456789") != std::string::npos) continue;
-    const long pid = std::atol(pid_s.c_str());
-    if (pid <= 0 || pid == (long)::getpid()) continue;
+    // Only the canonical, positive decimal pid written below is ours.  Check
+    // both conversion overflow and pid_t's range before kill: narrowing a long
+    // such as 2^32 + pid would otherwise check a different process on Linux.
+    if (pid_s.empty() || pid_s[0] == '0'
+        || pid_s.find_first_not_of("0123456789") != std::string::npos) continue;
+    char * pid_end = nullptr;
+    errno = 0;
+    const long pid = std::strtol(pid_s.c_str(), &pid_end, 10);
+    if (errno != 0 || *pid_end != '\0' || pid <= 0
+        || pid > (long)std::numeric_limits<pid_t>::max()
+        || pid == (long)::getpid()) continue;
     std::error_code sec;
-    if (fs::file_size(e.path(), sec) != 0 || sec) continue;
+    if (!fs::is_regular_file(it->symlink_status(sec)) || sec) continue;
+    const uintmax_t size = fs::file_size(p, sec);
+    if (sec) continue;
     if (::kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;
-    fs::remove(e.path(), sec);
+    if (size == 0) { fs::remove(p, sec); continue; }
+    const fs::file_time_type t = fs::last_write_time(p, sec);
+    if (!sec) kept.push_back({t, p});
+  }
+  if (kept.size() > CUFILE_LOGS_KEPT) {
+    std::sort(kept.begin(), kept.end(), [](const OldLog & a, const OldLog & b) {
+      return a.t != b.t ? a.t > b.t : a.p.native() > b.p.native();   // newest first
+    });
+    size_t removed = 0;
+    for (size_t i = CUFILE_LOGS_KEPT; i < kept.size(); ++i) {
+      std::error_code sec;
+      if (fs::remove(kept[i].p, sec)) ++removed;
+    }
+    vlog(V_VERBOSE, opt, "[GDS] cuFile log: removed " + std::to_string(removed)
+         + " older non-empty logs of finished runs from " + dir.string() + "; kept the newest "
+         + std::to_string(CUFILE_LOGS_KEPT) + "\n");
   }
 
   const std::string path = (dir / (mine + std::to_string((long)::getpid()) + ".log")).string();

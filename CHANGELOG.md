@@ -1,12 +1,59 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.36  
+**Covers:** v0.9.50 → v0.18.37  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.37 — --gds-only refuses a host without nvidia-fs before cuFile opens (0.88 s -> under 10 ms, and no log file), and the next --gds-only run keeps only the newest four non-empty cuFile logs of finished runs (261 had built up in one cache directory)
+
+On a host where nvidia-fs is not loaded -- a GeForce card cannot load it -- `--gds-only` is refused,
+correctly, but it was refused only after `cuFileDriverOpen`.  The driver opens fine in compat mode and
+writes the log gzstd points into its cache directory (v0.17.60), and on such a host that log is never
+empty: cuFile reports `unable to load, liburcu-bp.so.6` and `failed to open
+/proc/driver/nvidia-fs/devcount` at ERROR on every open.  A non-empty log is kept and named on stderr,
+and the start-up sweep removed only empty ones, so workstation 2's `~/.cache/gzstd` held 261 of them,
+about 120 from each suite run (its GDS-status probe and the refusal cells use the real cache).
+
+**The refusal comes first.**  The absent-module refusal and the forced compat verdict
+(`GZSTD_DEBUG_GDS_FORCE_COMPAT`) now run before the driver opens.  Neither needs cuFile to decide.  They
+still come after the stale-module check, the all-old-GPU refusal and the mixed-host device selection,
+which keep their order.  On workstation 2, `-t --gds-only` took 0.88 s and left one log (v0.18.35); it
+now refuses in under 10 ms and leaves none, and so do compress, `-d`, `--tar` creation and the forced
+verdict.  A GDS host is unchanged, except that a forced verdict no longer opens the driver first.
+
+**Kept is not forever.**  Each `--gds-only` start also removes this host's non-empty logs of finished
+processes past the newest four (`CUFILE_LOGS_KEPT`), by modification time.  It never touches a live
+process's log, another host's log, or anything that is not a regular file, and `-v` reports what it
+removed.  A name must carry a pid gzstd could have written.  Planted: 7 non-empty logs of finished runs,
+one empty, one of a live process (the oldest of all), another host's and a symlink -- the three oldest
+finished ones and the empty one went, the rest stayed.  The `--help` paragraph on cuFile's log says both.
+
+**Suite:** two default GPU cells, neither needing GDS (564 / 908; no-GPU deltas 158 / 238).  A refused
+run must leave no log; a test hook, `GZSTD_DEBUG_GDS_NO_NVFS`, answers "not loaded" where the module is
+loaded, so the cell also runs on a GDS host, where the old order leaves the refused run's empty log.
+The sweep cell plants the fixtures above.  Both skip where `CUFILE_LOGFILE_PATH` or a config's
+`logging.dir` places the log, where an empty cache would prove nothing.  Five mutants, each caught by
+the check meant for it: the module check back after the driver opens, five kept, liveness ignored for
+a non-empty log, symlinks followed, and the pid parse below reverted.
+
+Default run on workstation 2: 532 passed, 0 failed, 32 skipped (17 GDS unavailable, 15 this host could
+not exercise), 3m8s; CPU-only 406 ran, as expected.  No cuFile log appeared in the real cache directory
+during either run; the two before them had added about 120 each.  The default run also found v0.18.36's
+default total two too high: it counted its two six-stream cells, which sit in the `--direct-stage`
+compression section, `--extensive` only since v0.18.7.  Its default figures were derived and never run,
+because only `-e` ran that night.  Corrected: 562 + 2 = 564, no-GPU delta 156 + 2 = 158.
+
+**Review:** Codex, two rounds, reading the tree in its own sandbox.  Round 1: SAFE TO COMMIT with two
+fixes, both adopted.  The sweep parsed a log name's pid with `atol` and a cast to `pid_t`, so a name
+carrying 2^32 plus a finished pid narrowed to that pid, and its file could be swept; the parse is now
+checked and range-limited, and the sweep cell plants such a name.  And the cells took any failed
+`kill -0` as a finished process, so another user's live one would have failed them; only "no such
+process" counts now.  Round 2, on those fixes and the deferral skip: SAFE TO COMMIT, no findings.
 
 
 ## v0.18.36 — one GPU compresses on six streams (64.84 GiB at 4 CPUs 15.4 -> 11.2 s, --gpu-only 19.1 -> 11.7 s), a small budget's cached archive reads O_DIRECT where the drive keeps up (2 CPUs 8.4 -> 6.6 s, 4 CPUs 7.4 -> 6.3 s), the O_DIRECT writer's buffers fit the memory (a 2 GiB decode under 192 MB was killed 3 of 3), --adapt measures the streams on each box, and a single-GPU host's suite reads "as expected"
