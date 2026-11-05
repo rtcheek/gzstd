@@ -1,11 +1,169 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.35  
+**Covers:** v0.9.50 → v0.18.36  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+- **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.36 — one GPU compresses on six streams (64.84 GiB at 4 CPUs 15.4 -> 11.2 s, --gpu-only 19.1 -> 11.7 s), a small budget's cached archive reads O_DIRECT where the drive keeps up (2 CPUs 8.4 -> 6.6 s, 4 CPUs 7.4 -> 6.3 s), the O_DIRECT writer's buffers fit the memory (a 2 GiB decode under 192 MB was killed 3 of 3), --adapt measures the streams on each box, and a single-GPU host's suite reads "as expected"
+
+The v0.18.35 workstation check, repeated on a second workstation (one RTX 5090 on PCIe Gen5, a 16-core
+CPU, a Gen4 NVMe that reads 5.9 GiB/s O_DIRECT), found four things the server and the first
+workstation could not show.  All timings below are that box, interleaved arms, each cold run gated on a
+1 GiB `dd iflag=direct` probe of the drive.
+
+**Before and after** (v0.18.35 built from its tag with the same toolchain, final binaries):
+
+| | v0.18.35 | v0.18.36 |
+|---|---|---|
+| compress 64.84 GiB cold, 4 CPUs (the default stages) | 15.07-15.54 s | **11.23-11.38** |
+| `--gpu-only` 64.84 GiB cold, full width | 19.12 | **14.26** (11.7-11.9 in the stream sweep) |
+| compress 32.42 GiB cold, full width | 6.58-7.28 | 6.68-6.69 |
+| decode 24.44 GiB cached, 4 CPUs | 6.17-7.57 (sys ~10.8 s) | **6.22-6.41** (sys ~1.9 s) |
+| decode cached, 2 CPUs | 8.11-8.48 | **6.51-6.83** |
+| decode cached / cold, full width | 3.74-3.77 / 7.92 | 3.76 / 7.90-7.92 |
+
+### One GPU's compress takes up to six streams
+
+At four CPUs the default stages a 16 GiB-or-larger compress through the GPU (v0.18.33).  Here staging
+LOST to hybrid -- 15.2-15.3 s against 13.8-14.3 for 64.84 GiB -- where the server measured it 17-25%
+faster.  More O_DIRECT readers did not move it (2, 3, 4: 15.5, 15.2, 15.0 s), nor a deeper pinned pool
+(64 slots: 15.6-15.7); the stream count did:
+
+| streams | 1 | 2 (old default) | 3 | 4 | 6 | 8 | 12 |
+|---|---|---|---|---|---|---|---|
+| staged, 4 CPUs, s | 17.7 | 15.4-15.7 | 14.2 | 12.7-15.3 | **11.0-11.8** | 12.3-12.8 | 18.8 (25 s user: spinning on batches of one) |
+
+At six the staged run reads at the drive's rate, 22% faster than the hybrid it had lost to, still at a
+fifth of hybrid's CPU (about 9 CPU-seconds against 53).  `--gpu-only` at full width: 19.0-19.2 s at two
+streams, 11.7 at six.  Hybrid at 8 CPUs, already at the drive's rate, did not move (10.6-11.8 either
+way).  So a ONE-GPU compress of 4 GiB or more -- staged by default, `--direct-stage`, or `--gpu-only` on
+one device -- now asks for six (`DEFAULT_GPU_WIDE_STREAMS`), decided in `apply_backend_defaults` where
+the device count is final (`--gpu-devices`, staging's one device, `--adapt`'s choice, a caller's
+`CUDA_VISIBLE_DEVICES` entries, else the cards the driver lists).  Six only where the card holds them:
+each stream fits its batch against `gpu_mem_fraction / streams` of the free VRAM, so the device decides
+BEFORE sizing any stream whether a third stream's share at six could hold 8 frames (input, output,
+nvCOMP's workspace for 8), and otherwise asks for two, sized as two always were (`[GPU0] 2 streams: a
+stream more would not fit a batch of 8`).  The review caught the first version deciding afterwards: six
+trimmed to two left those two a third of their old batch -- at a quarter of this card's VRAM, 6 and 5
+frames where the two-stream layout gives 44 and 36.  A stream past the second that still fits fewer than
+8 once allocated is dropped (the backstop).  This card fitted 33, 28, 23, 19, 15, 11 for six, where
+eight fitted down to 3 and ran slower; an 11 GiB card stays at two.  Under 4 GiB the four extra streams cost more than they buy (1 GiB staged 0.74 s against
+0.66; 4 GiB a tie staged, 1.32 against 1.45 `--gpu-only`).  Not `--gds-only` (each stream registers its
+own BAR1 slab), not `--tar` (not measured), not several devices (each device's streams pin their own
+host buffers; eight devices at six were not measured).  `--gpu-streams N` is used as given.  The
+`--gpu-streams` help said "default: 1" since the compress default became 2; both helps now say what the
+defaults are.
+
+### --adapt measures six streams against two
+
+Six was measured on one card.  `--adapt` now measures it against two on each box
+(`adapt_streams_choose`, state table in the code), keyed by path (staged, `--gpu-only`) and residency
+(cold, warm): the default runs and is measured, the next long-enough run explores two, and after that
+two runs only if it measured 5% faster; the stalest is re-measured every 20 runs.  A run is filed by the
+streams that actually ran (the guard can trim six to two), and only when a device compressed bytes.  A
+two-stream probe is slower on purpose, so it is filed under this lever alone -- not the budget prior,
+not the GPU-count model -- and the lever stands aside on a run the budget prior is exploring (one lever
+explores a run).  A card that fits no third stream is remembered (`_wide_run` stamped without a rate),
+so the lever asks for two until the recheck instead of announcing six.  A probe that faults or runs
+too briefly to record stamps its attempt, so it is not re-tried on the next run.  From a fresh
+profile, 4 CPUs, 64.84 GiB cold: staged (11.8 s, the budget prior
+measuring its default) -> hybrid (14.8) -> cpu-only (22.4) -> staged on two streams (15.6, filed under
+the lever only: `budget_staged` stayed at 5.65 GiB/s) -> staged on six.  `--gpu-only`: six (5.51 GiB/s)
+-> two (3.17) -> six.
+
+### A small budget's cached archive reads O_DIRECT where the drive keeps up
+
+v0.18.34 decodes a cached archive on 4 CPUs or fewer with buffered readers and one CPU decoder while the
+GPU runs, because the readers' page-cache copies need the CPU.  Here a cached 24.44 GiB archive decoded
+24-27% SLOWER than a cold one (7.28-7.43 s against 5.84-5.89).  Sampling each thread's system time
+found the readers: three buffered readers spent ~8 s of kernel time copying 24.4 GiB for a GPU (the
+same copy beside CPU decoders: 2.7 s), against ~1.4 s for O_DIRECT readers.  The view cap and the
+pool's page faults were ruled out (`GZSTD_DEBUG_ZC_MAX_BLOCKS=200` changed nothing).  O_DIRECT alone
+was not enough -- with the cap still on it ran 6.90-8.23 s -- because the cap exists for the copies:
+with no copies the CPUs can decode.
+
+| cached archive | buffered + cap (v0.18.35) | O_DIRECT, no cap |
+|---|---|---|
+| 2 CPUs | 8.30-8.51 s | **6.56-6.58** |
+| 4 CPUs | 7.28-7.43 | **6.29-6.37** |
+| 8 CPUs (no cap there) | **4.70-4.74** | 6.91-6.93 |
+
+On a 2 GB/s drive the same switch would be drive-bound (~12 s against the 8.6-9.2 s the cap measured on
+the first workstation), so it is the drive's call.  A cached archive of 4 GiB or more, on the cap's
+budget (4 CPUs or fewer, hybrid, no `-T`), with 1 GiB of memory to spare, is probed: three threads read
+96 MiB O_DIRECT from across the file, and at 3.5 GiB/s per GPU the driver lists or more it is read
+O_DIRECT with every CPU decoding (`[READER] the archive is cached on a drive that reads X GiB/s ...`).
+The break-even here was 3.3 GiB/s of archive; the probe reads 75-90% of the sustained rate.  Three
+things read a fast drive as slow, so each is taken out: buffers faulted in inside the timed reads
+(2.6-3.1 GiB/s for 48 MiB; faulted first: 4.9-5.1), a drive waking from power saving (the first probe
+after idle: 2.1; a 4 KiB read wakes it first), and this process's own CPU contention -- the GPU bringup
+runs beside the probe on 4 CPUs, and the wall clock read 2.0 and 3.8 in two of three runs.  The kernel's
+count is immune: sectors read over the device's busy milliseconds (`/sys/dev/block/M:m/stat`) read
+4.93-5.86 GiB/s with six spinning threads on the same CPUs.  The larger of the two rates is taken, so a
+filesystem with no block device keeps the wall clock.  After the change: 4 CPUs 5.86-7.10 s, 2 CPUs
+6.65-7.77; probes read 4.26-5.35.  `--adapt`'s measured read-path verdict outranks the probe
+(`g_adapt_rd_verdict`, for `-d` and `-t`); it found the same switch here in four runs.
+
+### The O_DIRECT writer's buffers fit the memory
+
+On a Gen4+ bus a file output defaults to the O_DIRECT writer, whose four 16 MiB buffers (64 MiB) sat
+outside every memory budget -- decode had already given seven eighths of the memory left to its pools.
+A 2 GiB decode to a file under a 192 MB cgroup, cold archive, was killed 3 of 3; `--no-direct` and a
+pipe passed.  The first workstation never defaults to O_DIRECT output (PCIe Gen3), so it could not
+show this.  The writer now takes a sixteenth of the memory left, over its four buffers, 1 to 16 MiB each
+(16 from 1 GiB up): 3 of 3 pass at 127 MB, in 1.03 s (`--no-direct` 2.4).  The CPU-only build first
+failed to compile here -- `get_available_ram_bytes` was declared only inside the nvCOMP block.
+
+### The suite on a single-GPU host
+
+Seventeen cells that need two GPUs (or two with enough free VRAM) skipped with a plain `skip`, so a
+one-GPU host's run printed "expected 878 ... but 861 ran -- please update EXPECTED_TESTS".  The machine
+decides those, which is what `skip_host` is for; they now count as "this host could not exercise".
+The no-GPU branch of `--calibrate`'s device-count cells stays a plain skip (it is already in
+`EXPECTED_NOGPU_DELTA`), and the regime-evidence gate, which a fast box finishes before the ramp ends,
+is a `skip_host` too.
+
+**New cells (default run):** the O_DIRECT writer's buffers fit a sixteenth of the memory left (both
+builds, fake cgroup trees); a small budget's cached archive on a drive that keeps up reads O_DIRECT
+(`GZSTD_DEBUG_CACHED_DIRECT_GIBS` stands in for the probe); `--direct-stage` compress takes up to six
+streams and `--gpu-streams` is kept (`GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES` lowers the 4 GiB floor);
+`--adapt` measures six GPU streams against two (crafted profiles, five rows of the state table).  Each
+was seen to fail against a mutant of the code it covers.  560 -> 564 default, 902 -> 906 `-e`; no-GPU
+deltas 155 -> 158, 233 -> 236.
+
+### Review
+
+Codex (gpt-6.1-sol, text-only: its sandbox cannot start on this host) reviewed the diff in rounds.
+Round 1: the stream layout decided after sizing (above), unstamped stream probes on the fault and
+sub-floor paths, `-t` not publishing the read-path verdict, a one-card CUDA mask keeping two streams,
+and a missing `_WIN32` guard on the probe -- all fixed.  Round 2 (SAFE TO COMMIT): the pre-sizing check
+now counts what the search counts for `--verify` (its decompression workspace) and the per-frame
+metadata, and the no-fit stamp is written on the sub-floor and no-payload paths too.  Declined: zeroing
+a measured six-stream rate when a run finds no room for a third stream -- the shortage can be another
+tenant's, and asking six of a card that has room only for two now costs one VRAM query (the check
+then sizes two as two always were).  The suite's endian check flagged the sysfs parser's fscanf into
+an array (text, so byte-order free); it parses with strtoull now instead of taking an exemption.
+
+### Found here, not changed
+
+- **A warm 2 GiB decode under 128 MB is still killed** (both builds; anon ~127 MB, where the pools were
+  sized for ~80): a pre-existing floor -- v0.18.32's 128 MB figure is `--gds-only`'s -- and not this
+  release's defect.
+- A cold archive decoded ~0.45 s faster than the same archive cached and read with `--direct-read` --
+  identical logs, so the box's state (24 GiB more page cache to reclaim from), not a code path.
+- `--gpu-only` and hybrid on several GPUs keep two streams until measured on a multi-GPU host.
+- Staging leaves the CPUs idle; letting CPU workers compress from the pinned staging pool too would make
+  the staged path the fastest at every small budget (here the drive would bind first).
+
+**Owed on the other hosts:** the server -- `--gpu-only` 2 against 6 streams on one and on all devices,
+staged at 4 CPUs (expected drive-bound either way), the cached-archive probe at 4 CPUs (its drive should
+fall under the bar); the first workstation -- `--direct-stage` on an 11 GiB card keeps two streams, and
+the probe declines on its Gen3 drives.
 
 
 ## v0.18.35 — gzstd -V fits in 80 columns: `gzstd 0.18.35 (MT-CPU + nvCOMP + Hybrid) [zstd 1.5.7, multithreaded]` (68; it was 83) and `(MT-CPU, CPU-only)` for the CPU-only build (60), and -h and --help open with the same line

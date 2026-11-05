@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.35";
+static constexpr const char * GZSTD_VERSION = "0.18.36";
 //
 // Architecture overview:
 //
@@ -2682,6 +2682,28 @@ static const size_t DEFAULT_GPU_STREAMS = 2;
 // can drain frame N while N+1 transfers; extra streams add contention and
 // out-of-order delivery against that, with no phase left to overlap.
 static const size_t DEFAULT_GPU_DECOMP_STREAMS = 1;
+// ONE GPU'S COMPRESS TAKES UP TO SIX STREAMS (v0.18.36): staged, and --gpu-only
+// on one device.  A staged batch is read,
+// launched and drained on its own stream, and at two streams the GPU idles in
+// the gaps.  MEASURED, 64.84 GiB cold, one RTX 5090 (170 SMs, 32 GiB) on a
+// 5.9 GiB/s drive, 4 CPUs: 1 stream 17.7 s, 2 (the old default) 15.4-15.7,
+// 3 14.2, 4 12.7-15.3, 6 11.0-11.8 (the drive's rate), 8 12.3-12.8, 12 18.8
+// with 25 s of user CPU spinning on batches of one.  A deeper pinned pool did
+// nothing (2 streams, 64 slots: 15.6-15.7), so it is the streams.  At six the
+// staged default beat the hybrid it had lost to by 8% (14.2-14.4 s), now by
+// 22%, still at a fifth of hybrid's CPU.  The extra streams split the VRAM, so
+// each one past the second is kept only if it fits a batch of at least
+// WIDE_EXTRA_STREAM_MIN_BATCH: a 32 GiB card fitted 33, 28, 23, 19, 15, 11
+// for six; where eight fitted down to 3 the run was slower, and an 11 GiB card
+// would fit ~11, 9, 7 -- so it keeps its two.  --gpu-only on the same card
+// and file at full width: 19.0-19.2 s at two streams, 11.7 at six.  Hybrid
+// at 8 CPUs, already at the drive's rate, did not move (10.6-11.8 either way).
+// Not --gds-only, whose every stream registers its own BAR1 slab; not --tar,
+// not measured; and not --gpu-only on several devices -- each device's streams
+// pin their own host buffers, and eight devices at six were not measured.
+static const size_t DEFAULT_GPU_WIDE_STREAMS = 6;
+static const size_t WIDE_EXTRA_STREAM_MIN_BATCH = 8;
+static const uint64_t WIDE_STREAMS_MIN_INPUT = (uint64_t)4 << 30;
 static const double GROW_CHECK_SEC = 0.3;  // auto-tune check interval (seconds)
 static const size_t HARD_BATCH_CAP = 1024;        // per stream safety cap
 #endif
@@ -2943,6 +2965,8 @@ struct Options {
   uint64_t input_frames_hint = 0;
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   size_t gpu_streams = 0;            // 0=auto (1 for compress, 2 for test/verify)
+  bool gpu_streams_user_set = false; // --gpu-streams given: never re-defaulted
+  bool gpu_streams_wide = false;     // the default chose DEFAULT_GPU_WIDE_STREAMS (guarded per stream)
   int gpu_devices = 0;            // 0=auto (all GPUs, compress and decompress)
   PinMode pin_mode = PinMode::OFF;  // empirical: pinned cudaMemcpy is slower
                                     // on our typical workloads (see CHANGELOG
@@ -4530,7 +4554,8 @@ static void print_help()
   std::cout <<
 "  --gpu-batch N       GPU subchunks per stream (default: tuned per GPU\n"
 "                      from a start chosen by frame size)\n"
-"  --gpu-streams N     CUDA streams per device (default: 1)\n"
+"  --gpu-streams N     CUDA streams per device (default: 2 to compress,\n"
+"                      up to 6 on one GPU from 4 GiB; 1 to decompress)\n"
 "  --gpu-devices N     number of GPUs (0 = auto)\n"
 "  --gpu-order O       cuda (default) | ranked: rank all GPUs by load first\n"
 "  --gpu-mem-frac X    fraction of free VRAM per device (default: 0.60)\n";
@@ -5989,9 +6014,12 @@ static void print_help_long()
 "     batch=X (requested N, ...)`).\n"
 "\n"
 "  --gpu-streams N\n"
-"     CUDA streams per device (default: 1; 2 for -t verify).\n"
-"     More streams = more kernel overlap at the cost of linearly\n"
-"     more VRAM.\n"
+"     CUDA streams per device.  Default: 2 to compress and 1 to\n"
+"     decompress; a compress on ONE GPU of 4 GiB or more (staged, or\n"
+"     --gpu-only) takes up to 6, each stream past the second only\n"
+"     while it still fits a batch of 8 frames in VRAM.  More streams\n"
+"     = more overlap of reads, kernels and copies, at the cost of\n"
+"     linearly more VRAM.  A given N is used as given.\n"
 "\n"
 "  --gpu-devices N\n"
 "     Number of GPUs to use.  0 = auto (all available GPUs, for both\n"
@@ -7126,6 +7154,20 @@ static std::atomic<int> g_adapt_budget_slot{-1};
 // stamped as tried even when the run fails to measure it (g_adapt_explored's
 // reason, for the third arm).
 static std::atomic<int> g_adapt_budget_explored{0};
+// --adapt's GPU stream lever (v0.18.36, adapt_streams_choose): the slot this
+// run is filed under ({staged, --gpu-only} x {cold, warm}; -1 none), whether
+// it is exploring the narrow count, and the most streams any device created.
+static constexpr int ADAPT_STREAMS_SLOTS = 4;
+static std::atomic<int> g_adapt_streams_slot{-1};
+static std::atomic<bool> g_adapt_streams_explore{false};
+static std::atomic<int> g_gpu_streams_created{0};
+static std::atomic<int> g_adapt_streams_asked{0};   // what adapt_streams_choose returned
+static const char * adapt_streams_slot_name(int slot)
+{
+  static const char * const n[ADAPT_STREAMS_SLOTS] =
+      { "staged_cold", "staged_warm", "gpuonly_cold", "gpuonly_warm" };
+  return slot >= 0 && slot < ADAPT_STREAMS_SLOTS ? n[slot] : "none";
+}
 #ifdef HAVE_NVCOMP
 static constexpr double ADAPT_BUDGET_CACHED_MIN = 0.10;
 static constexpr double ADAPT_BUDGET_WARM_MIN = 0.95;
@@ -9440,6 +9482,10 @@ struct AdaptObs {
   int explored = 0;                              // backend this run was exploring (0/1/2)
   int budget_slot = -1;                          // budget-keyed prior slot (g_adapt_budget_slot)
   int budget_explored = 0;                       // arm a budget probe explored (0/1/2/3)
+  int streams_slot = -1;                         // the stream lever's slot (g_adapt_streams_slot)
+  bool streams_explore = false;                  // this run explored the narrow stream count
+  int streams_created = 0;                       // most streams a GPU device created
+  int streams_asked = 0;                         // the count the lever asked for
   // Which backend actually ran, so the end-to-end rate is filed under it.
   // 0 = do not record (gpu-only, or a run that never chose).  3 = the staged
   // path (--direct-stage's), which only the budget-keyed prior consumes.
@@ -9478,6 +9524,12 @@ struct AdaptObs {
     explored    = g_adapt_explored.load(std::memory_order_relaxed);
     budget_slot     = g_adapt_budget_slot.load(std::memory_order_relaxed);
     budget_explored = g_adapt_budget_explored.load(std::memory_order_relaxed);
+    if (compress_dir) {
+      streams_slot    = g_adapt_streams_slot.load(std::memory_order_relaxed);
+      streams_explore = g_adapt_streams_explore.load(std::memory_order_relaxed);
+      streams_created = g_gpu_streams_created.load(std::memory_order_relaxed);
+      streams_asked   = g_adapt_streams_asked.load(std::memory_order_relaxed);
+    }
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
     if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed)) {
@@ -9545,6 +9597,23 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     if (obs.budget_slot >= 0 && obs.budget_explored && obs.budget_explored != filed_arm)
       dir.put_num(budget_key(obs.budget_explored) + "_run", dir.gnum("runs", 0));
   };
+  // The stream lever's attempt, when this run measured nothing for it (a fault,
+  // a sub-floor run): the narrow probe is held off instead of re-tried at once.
+  auto stamp_stream_probe = [&] {
+    if (obs.streams_slot >= 0 && obs.streams_explore)
+      dir.put_num(std::string("streams_") + adapt_streams_slot_name(obs.streams_slot)
+                  + "_narrow_run", dir.gnum("runs", 0));
+  };
+  // Six asked and two or fewer created: the card fits no third stream, so the
+  // lever asks for two until the recheck (adapt_streams_choose).  A rate six
+  // measured earlier is kept -- the shortage may be another tenant's, and two
+  // asked of a card that fits six only costs the pre-sizing check.
+  auto stamp_stream_nofit = [&] {
+    if (obs.streams_slot >= 0 && obs.streams_asked >= 3
+        && obs.streams_created > 0 && obs.streams_created <= 2)
+      dir.put_num(std::string("streams_") + adapt_streams_slot_name(obs.streams_slot)
+                  + "_wide_run", dir.gnum("runs", 0));
+  };
   dir.put_num("updated", (double)::time(nullptr));
   if (obs.fault) {
     // A FAULTED probe must still record its ATTEMPT, or a machine with a failing
@@ -9561,6 +9630,7 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
                     dir.gnum("runs", 0));
     }
     stamp_budget_probe(0);
+    stamp_stream_probe();
     return;
   }
 
@@ -9577,6 +9647,8 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
                     dir.gnum("runs", 0));
     }
     stamp_budget_probe(0);
+    stamp_stream_probe();
+    stamp_stream_nofit();
     return;
   }
 
@@ -9588,7 +9660,10 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   // run as overhead + size / rate.  The rate needs GPUC_RATE_MIN_S of busy
   // window; the overhead is real at any size.  _run stamps the measurement so a
   // stale one is rechecked (a host change such as a driver setting moves both).
+  // A run exploring the narrow stream count ran slower on purpose: it informs the
+  // stream lever alone, never the device-count model or the budget prior.
   for (const AdaptObs::GpucSample & g : obs.gpuc) {
+    if (obs.streams_explore) break;
     if (g.devices <= 0 || g.active_ns == 0 || g.wall_ns <= g.active_ns) continue;
     const std::string k = "gpu_devices_" + std::to_string(g.devices);
     const double active_s = g.active_ns / 1e9;
@@ -9681,7 +9756,7 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     // filed under the arm that produced it at this run's budget and residency.
     // Same duration gate as the pair above.
     int budget_filed = 0;
-    if (obs.budget_slot >= 0 && long_enough_for_backend
+    if (obs.budget_slot >= 0 && long_enough_for_backend && !obs.streams_explore
         && obs.backend_used >= 1 && obs.backend_used <= 3) {
       const std::string k = budget_key(obs.backend_used);
       dir.put_num(k, ema(dir.gnum(k, 0), rate));
@@ -9689,8 +9764,30 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
       budget_filed = obs.backend_used;
     }
     stamp_budget_probe(budget_filed);
+    // THE STREAM LEVER (adapt_streams_choose): the same end-to-end rate, filed by
+    // the stream count that RAN -- wide when a device created three or more (the
+    // guard can trim six to two, and then two is what was measured) -- and only
+    // when a device compressed bytes (obs.gpuc: a staged run rebuilt on the CPU
+    // measured the CPU).  An exploration that could not be measured stamps the
+    // narrow attempt.  Six asked and two created (the card fits no third
+    // stream) stamps the wide attempt, so the lever asks for two until the
+    // recheck instead of claiming six every run (review, v0.18.36).
+    if (obs.streams_slot >= 0) {
+      const std::string base = std::string("streams_") + adapt_streams_slot_name(obs.streams_slot);
+      const bool measured = obs.streams_created > 0 && !obs.gpuc.empty() && long_enough_for_backend;
+      if (measured) {
+        const std::string k = base + (obs.streams_created >= 3 ? "_wide" : "_narrow");
+        dir.put_num(k, ema(dir.gnum(k, 0), rate));
+        dir.put_num(k + "_run", dir.gnum("runs", 0));
+      } else {
+        stamp_stream_probe();
+      }
+      stamp_stream_nofit();
+    }
   } else {
     stamp_budget_probe(0);
+    stamp_stream_probe();
+    stamp_stream_nofit();
   }
   if (obs.reader_io_ns > 0)
     dir.put_num("source_gibs", ema(dir.gnum("source_gibs", 0),
@@ -9817,6 +9914,10 @@ struct AdaptPriors {
     static constexpr int GPUC_MAX = 64;
     double gpuc_overhead_s[GPUC_MAX + 1] = {}, gpuc_gibs[GPUC_MAX + 1] = {},
            gpuc_run[GPUC_MAX + 1] = {};
+    // The stream lever (adapt_streams_choose): [slot][0 narrow, 1 wide], end-to-
+    // end GiB/s and the run each was last measured or tried at.  GPU numbers,
+    // dropped on a driver change.
+    double streams_rate[ADAPT_STREAMS_SLOTS][2] = {}, streams_run[ADAPT_STREAMS_SLOTS][2] = {};
     std::string regime;
   } dir[2];                 // [0] = compress, [1] = decompress
 };
@@ -10045,6 +10146,17 @@ static AdaptPriors adapt_load_priors()
         clamp_stamp(D.budget_run[arm][sl]);
       }
     D.regime        = dj->gstr("regime", "");
+    if (P.gpu_valid)
+      for (int sl = 0; sl < ADAPT_STREAMS_SLOTS; ++sl)
+        for (int w = 0; w < 2; ++w) {
+          const std::string k = std::string("streams_") + adapt_streams_slot_name(sl)
+                              + (w ? "_wide" : "_narrow");
+          double r = dj->gnum(k, 0);
+          if (!(r > 0.0) || !std::isfinite(r)) r = 0;
+          D.streams_rate[sl][w] = r;
+          D.streams_run[sl][w]  = dj->gnum(k + "_run", 0);
+          clamp_stamp(D.streams_run[sl][w]);
+        }
     if (P.gpu_valid)
       for (int n = 1; n <= AdaptPriors::Dir::GPUC_MAX; ++n) {
         const std::string k = "gpu_devices_" + std::to_string(n);
@@ -11808,6 +11920,7 @@ private:
 #endif
 #endif
 static inline uint64_t now_ns();   // defined below; used by DirectWriter write timing
+static uint64_t get_available_ram_bytes();   // defined below; sizes DirectWriter's buffers
 // -v writer breakdown: time inside the O_DIRECT ::write syscall, kept at file
 // scope so the [WRITER] summary can read it after the DirectWriter is destroyed
 // (g_direct_writer is null by summary time).  Reset per output in open().
@@ -11959,10 +12072,26 @@ public:
   }
 
 private:
+  // THE WRITER'S BUFFERS FIT THE MEMORY (v0.18.36).  They were four 16 MiB
+  // buffers, 64 MiB, always -- outside every pool's share of the memory left,
+  // which decode had already spent seven eighths of (gz_mem_fit_pool).  On a
+  // Gen4+ bus a file output defaults to this writer, so a 2 GiB decode to a
+  // file under a 192 MB container limit was killed by the kernel every time
+  // (3 of 3, cold archive), where --no-direct and a pipe passed.  A sixteenth
+  // of the memory left now, over the four buffers: 16 MiB each from 1 GiB up,
+  // never under 1 MiB.  Unknown memory keeps 16.
+  static size_t buf_cap_for_memory_() {
+    const uint64_t ram = get_available_ram_bytes();
+    if (ram == 0) return BUF_CAP_MAX;
+    const uint64_t each = ram / 16 / NBUF / ONE_MIB * ONE_MIB;
+    return (size_t)std::max<uint64_t>(ONE_MIB, std::min<uint64_t>(BUF_CAP_MAX, each));
+  }
+
   bool init_after_open_() {
     // Allocate the aligned buffer pool.
+    buf_cap_ = buf_cap_for_memory_();
     for (int i = 0; i < NBUF; ++i) {
-      if (posix_memalign(&bufs_[i], ALIGN, BUF_CAP) != 0) {
+      if (posix_memalign(&bufs_[i], ALIGN, buf_cap_) != 0) {
         for (int j = 0; j < i; ++j) { ::free(bufs_[j]); bufs_[j] = nullptr; }
         ::close(fd_); fd_ = -1; return false;
       }
@@ -11989,7 +12118,7 @@ private:
   }
 public:
 
-  // Bounce-copy into the current aligned buffer; when it fills (BUF_CAP, a
+  // Bounce-copy into the current aligned buffer; when it fills (buf_cap_, a
   // multiple of ALIGN), hand it to the write thread and take a free one.  Only
   // full buffers flush mid-stream, so there is no unaligned tail except at
   // finalize.  The copy runs here (caller thread); the ::write runs async.
@@ -11998,13 +12127,13 @@ public:
     if (fd_ < 0 || werr_.load(std::memory_order_relaxed)) return false;
     const char * src = static_cast<const char *>(data);
     while (len > 0) {
-      size_t space = BUF_CAP - buf_used_;
+      size_t space = buf_cap_ - buf_used_;
       size_t copy = std::min(len, space);
       std::memcpy(static_cast<char*>(bufs_[cur_bi_]) + buf_used_, src, copy);
       buf_used_ += copy; src += copy; len -= copy;
-      if (buf_used_ == BUF_CAP) {                 // full → hand off
-        enqueue({OP_WRITE, cur_bi_, BUF_CAP, 0, logical_written_});
-        logical_written_ += BUF_CAP;
+      if (buf_used_ == buf_cap_) {                // full → hand off
+        enqueue({OP_WRITE, cur_bi_, buf_cap_, 0, logical_written_});
+        logical_written_ += buf_cap_;
         cur_bi_ = acquire_free();
         if (cur_bi_ < 0) return false;            // write error surfaced
         buf_used_ = 0;
@@ -12283,7 +12412,10 @@ private:
   }
 
 private:
-  static constexpr size_t BUF_CAP = 16 * 1024 * 1024;  // 16 MiB aligned buffer
+public:
+  static constexpr size_t BUF_CAP_MAX = 16 * 1024 * 1024;  // 16 MiB aligned buffer at most
+  size_t buf_cap() const { return buf_cap_; }               // what this writer allocated each
+private:
 
   // Bare ::write loop, run on the background write thread (each op is timed in
   // writer_loop, so no timing here).
@@ -12322,8 +12454,9 @@ private:
   // a dedicated write thread ::writes them, so that CPU work overlaps the
   // O_DIRECT write instead of serializing on one thread (the win that brought
   // -d --tar extract to the device ceiling; this brings plain -d there too).
-  static constexpr int NBUF = 4;            // 4 × 16 MiB = 64 MiB in flight
+  static constexpr int NBUF = 4;            // 4 × buf_cap_ (64 MiB at most) in flight
   int fd_ = -1;
+  size_t buf_cap_ = BUF_CAP_MAX;  // set by init_after_open_ from the memory left
   void * bufs_[NBUF] = {};
   int    cur_bi_ = -1;             // buffer the caller is currently filling
   size_t buf_used_ = 0;            // bytes in the current buffer
@@ -22152,6 +22285,128 @@ static size_t stream_frames_to_queue_mt(
 #ifndef _WIN32
 static double residency_fraction(const void * addr, size_t len);   // defined below
 #endif
+#ifdef HAVE_NVCOMP
+static int gz_precuda_gpu_count();                                 // defined below
+
+// --adapt's measured read-path verdict for decompression, published by the
+// read-path prior: -1 none (or not --adapt), 0 buffered measured no worse than
+// O_DIRECT, 1 O_DIRECT measured better (and already switched on).  A measured
+// verdict outranks the cached-archive probe below.
+static std::atomic<int> g_adapt_rd_verdict{-1};
+// The probe rate per GPU above which a cached archive is read O_DIRECT.  The
+// break-even, MEASURED with one fast GPU at 4 CPUs: buffered + cap moved 3.3
+// GiB/s of archive and O_DIRECT, no cap, 3.9.  The probe reads 75-90% of a
+// drive's sustained rate (4.26-5.35 for 5.9), so 3.5 on the probe is ~4 or more
+// sustained -- above the break-even with room, and a slower GPU needs less.
+static constexpr double CACHED_DIRECT_GIBS_PER_GPU = 3.5;
+
+// A CACHED ARCHIVE ON A FAST DRIVE (v0.18.36).  How fast this file's device
+// reads with O_DIRECT, in GiB/s: three threads, four 8 MiB preads each at
+// offsets spread over the file (96 MiB); 0 when it cannot be measured.  O_DIRECT
+// reads do not touch the cached pages.  Three things read a fast drive as slow,
+// never a slow one as fast, so each is taken out.  MEASURED on a Gen4 x4 NVMe
+// that sustains 5.9 GiB/s:
+//  - buffers faulted in inside the timed preads: 2.6-3.1 GiB/s for 48 MiB, so
+//    they are touched before the clock (then 4.9-5.1);
+//  - a drive waking from a power-saving state: the first probe after idle read
+//    2.1, so one 4 KiB read wakes it first;
+//  - this process's own CPU contention -- on a 4-CPU budget the GPU bringup
+//    runs beside the probe, and the wall clock read 2.0 and 3.8 in two of three
+//    runs (six spinning threads on the same 4 CPUs: 3.95-5.11).  The kernel's
+//    own count is immune: sectors read over the milliseconds the device was
+//    busy (/sys/dev/block/M:m/stat, io_ticks) read 4.93-5.86 under the same
+//    spinning threads.  The larger of the two rates is taken, so a filesystem
+//    with no block device (NFS) keeps the wall clock.
+#ifndef _WIN32
+static double gz_dev_io_stat(dev_t dev, uint64_t * sectors_read)
+{
+  char p[96];
+  std::snprintf(p, sizeof p, "/sys/dev/block/%u:%u/stat", (unsigned)major(dev), (unsigned)minor(dev));
+  FILE * f = std::fopen(p, "r");
+  if (!f) return -1.0;
+  char line[512];
+  const bool got = std::fgets(line, sizeof line, f) != nullptr;
+  std::fclose(f);
+  if (!got) return -1.0;
+  // Text fields: reads, merges, SECTORS READ, ms, writes, merges, sectors, ms,
+  // in flight, IO_TICKS (ms the device was busy), ...
+  unsigned long long v[10] = {};
+  const char * c = line;
+  for (int i = 0; i < 10; ++i) {
+    char * end = nullptr;
+    v[i] = std::strtoull(c, &end, 10);
+    if (end == c) return -1.0;
+    c = end;
+  }
+  *sectors_read = v[2];
+  return (double)v[9];
+}
+
+static double gz_cached_direct_probe_gibs(int pfd, uint64_t fsz)
+{
+  constexpr int T = 3, R = 4;
+  constexpr size_t SZ = 8 * ONE_MIB;
+  if (fsz < (uint64_t)T * R * SZ * 4) return 0.0;
+  const int dfd = gz_reopen_input(pfd, O_RDONLY | O_DIRECT);
+  if (dfd < 0) return 0.0;
+  struct stat dst{};
+  const bool have_dev = ::fstat(dfd, &dst) == 0 && major(dst.st_dev) != 0;
+  std::vector<char *> bufs;
+  for (int i = 0; i < T; ++i) {
+    void * b = nullptr;
+    if (posix_memalign(&b, 4096, SZ) != 0 || !b) break;
+    std::memset(b, 0, SZ);                      // faulted in before the clock
+    bufs.push_back(static_cast<char *>(b));
+  }
+  double gibs = 0.0;
+  if ((int)bufs.size() == T) {
+    std::atomic<bool> ok{true};
+    {   // wake the drive (untimed); a failure here fails the timed reads too
+      ssize_t r;
+      do { r = ::pread(dfd, bufs[0], 4096, 0); } while (r < 0 && errno == EINTR);
+    }
+    uint64_t sec0 = 0, sec1 = 0;
+    const double tick0 = have_dev ? gz_dev_io_stat(dst.st_dev, &sec0) : -1.0;
+    const uint64_t span = fsz / (uint64_t)(T * R + 1);
+    auto work = [&](int i) {
+      for (int k = 0; k < R && ok.load(std::memory_order_relaxed); ++k) {
+        const uint64_t off = span * (uint64_t)(i * R + k + 1) / 4096 * 4096;
+        size_t got = 0;
+        while (got < SZ) {
+          const ssize_t r = ::pread(dfd, bufs[(size_t)i] + got, SZ - got, (off_t)(off + got));
+          if (r > 0 && (size_t)r % 4096 == 0) { got += (size_t)r; continue; }
+          if (r < 0 && errno == EINTR) continue;
+          ok.store(false, std::memory_order_relaxed);   // short, unaligned or failed
+          break;
+        }
+      }
+    };
+    std::vector<std::thread> th;
+    const uint64_t t0 = now_ns();
+    try {
+      for (int i = 1; i < T; ++i) th.emplace_back(work, i);
+    } catch (...) {
+      ok.store(false, std::memory_order_relaxed);
+    }
+    work(0);
+    for (auto & t : th) t.join();
+    const uint64_t dt = now_ns() - t0;
+    const double tick1 = tick0 >= 0.0 ? gz_dev_io_stat(dst.st_dev, &sec1) : -1.0;
+    if (ok.load() && (int)th.size() == T - 1 && dt > 0) {
+      const double bytes = double(T) * R * SZ;
+      gibs = bytes / (double(dt) / 1e9) / double(1ull << 30);
+      // The device's own rate, only when it read at least what we asked of it
+      // (a stacked or unrelated device reports less) and was busy a whole tick.
+      if (tick1 > tick0 && (double)(sec1 - sec0) * 512.0 >= bytes)
+        gibs = std::max(gibs, bytes / ((tick1 - tick0) / 1e3) / double(1ull << 30));
+    }
+  }
+  for (char * b : bufs) std::free(b);
+  ::close(dfd);
+  return gibs;
+}
+#endif  // !_WIN32
+#endif
 static size_t stream_frames_to_queue(
     FILE * in,
     TaskQueue & queue,
@@ -22260,24 +22515,67 @@ static size_t stream_frames_to_queue(
       // A CACHED archive on 4 CPUs or fewer keeps its buffered readers, and the
       // hybrid pool decodes on one CPU worker while a GPU runs
       // (g_hyb_decomp_cpu_cap).  Not under -T, which names the decoders.
+      //
+      // UNLESS THE DRIVE OUTRUNS THE GPUS (v0.18.36).  The cap exists because the
+      // buffered readers' page-cache copies need the CPUs: with a GPU decoding,
+      // three buffered readers spent ~8 s of system time on a 24.4 GiB archive
+      // (the same copy beside CPU decoders, 2.7 s).  O_DIRECT readers copy
+      // nothing, so on a drive fast enough to feed the GPUs a cached archive
+      // decodes fastest the way a cold one does -- O_DIRECT, every CPU decoding.
+      // MEASURED, 24.44 GiB cached, one GPU, a Gen4 x4 NVMe (5.9 GiB/s), runs
+      // interleaved within each budget:
+      //   CPUs  buffered + cap (v0.18.35)   O_DIRECT, no cap   O_DIRECT + cap
+      //    2    8.30-8.51 s                 6.56-6.58
+      //    4    7.28-7.43                   6.29-6.37          6.90-8.23
+      //    8    4.70-4.74 (no cap there)    6.91-6.93
+      // and on a 2 GB/s drive the same switch would be drive-bound (~12 s against
+      // the 8.6-9.2 s the cap measured on two older GPUs), so it is taken only
+      // when a 96 MiB O_DIRECT probe reads at least CACHED_DIRECT_GIBS_PER_GPU
+      // per GPU the driver lists, on an archive of 4 GiB or more (the probe is
+      // ~20 ms), with 1 GiB of memory to spare.  --adapt's measured verdict
+      // outranks the probe.  GZSTD_DEBUG_CACHED_DIRECT_GIBS=R stands in for the
+      // probe's rate, and lifts the size and memory floors, for the suite.
 #ifdef HAVE_NVCOMP
-      if (cold == 0 && !opt.direct_read && opt.hybrid && opt.cpu_share < 0.0
-          && opt.cpu_threads == 0 && !opt.cpu_only && !opt.gpu_only
-          && gz_cpu_allowance().allowed() <= 4) {
+      bool cached_direct = false;
+      const bool small_hybrid = opt.hybrid && opt.cpu_share < 0.0 && opt.cpu_threads == 0
+                             && !opt.cpu_only && !opt.gpu_only
+                             && gz_cpu_allowance().allowed() <= 4;
+      if (cold == 0 && !opt.direct_read && small_hybrid
+          && g_adapt_rd_verdict.load(std::memory_order_relaxed) != 0) {
+        static const char * dbg_gibs = std::getenv("GZSTD_DEBUG_CACHED_DIRECT_GIBS");
+        const int ngpu = gz_precuda_gpu_count();
+        if (ngpu > 0 && (dbg_gibs || (fsz >= (uint64_t)4 << 30
+                                      && get_available_ram_bytes() >= (uint64_t)1 << 30))) {
+          const double gibs = dbg_gibs ? std::strtod(dbg_gibs, nullptr)
+                                       : gz_cached_direct_probe_gibs(pfd, fsz);
+          const double need = CACHED_DIRECT_GIBS_PER_GPU * ngpu;
+          cached_direct = gibs >= need;
+          char b[256];
+          std::snprintf(b, sizeof b, "[READER] the archive is cached on a drive that reads "
+                        "%.2f GiB/s O_DIRECT, %s %.1f for %d GPU%s: %s\n", gibs,
+                        cached_direct ? "at least" : "under", need, ngpu, ngpu == 1 ? "" : "s",
+                        cached_direct ? "O_DIRECT readers, every CPU decoding"
+                                      : "buffered readers");
+          vlog(V_VERBOSE, opt, b);
+        }
+      }
+      if (cold == 0 && !opt.direct_read && small_hybrid && !cached_direct) {
         queue.set_cpu_wake_all();
         g_hyb_decomp_cpu_cap.store(1, std::memory_order_relaxed);
         vlog(V_VERBOSE, opt, "[HYBRID] the archive is cached and " + std::to_string(
              gz_cpu_allowance().allowed()) + " CPUs are allowed: one CPU decoder while "
              "the GPU runs, the rest when it does not\n");
       }
+#else
+      const bool cached_direct = false;
 #endif
       // -T chooses decoders, not an explicit reader count.  Keep the automatic
       // cold setting at three even with a large -T on a small CPU allowance.
       // This also bounds a direct pool that later falls back after EINVAL.
-      if (cold == 1) n_readers = std::min(n_readers, 3);
+      if (cold == 1 || cached_direct) n_readers = std::min(n_readers, 3);
       int dfd = -1;
       bool direct_asked = false;
-      if (opt.direct_read || cold_direct) {
+      if (opt.direct_read || cold_direct || cached_direct) {
         static const bool mt_direct_off = [] {
           const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT"); return e && *e == '0'; }();
         direct_asked = !mt_direct_off;
@@ -22294,12 +22592,21 @@ static size_t stream_frames_to_queue(
       } else {
         // Reopen failure is an ordinary buffered run: retain its three-reader
         // bound in the adaptive controller as well as the initial count.
-        const int buffered_reader_cap = cold == 1 && dfd < 0 ? 3 : 0;
+        const int buffered_reader_cap = (cold == 1 || cached_direct) && dfd < 0 ? 3 : 0;
+#ifdef HAVE_NVCOMP
+        // The probe opened O_DIRECT moments ago, so this is a debug hook or a
+        // vanished file: read the cached archive buffered, as it was, cap and all.
+        if (cached_direct && dfd < 0) {
+          queue.set_cpu_wake_all();
+          g_hyb_decomp_cpu_cap.store(1, std::memory_order_relaxed);
+        }
+#endif
         if (opt.verbosity >= V_VERBOSE)
           vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
                + " reader threads"
                + (dfd >= 0 ? ", O_DIRECT (page cache bypassed)" : "")
                + (cold == 1 && !opt.direct_read ? " (the archive is cold)" : "")
+               + (cached_direct && dfd >= 0 ? " (the archive is cached; the drive keeps up)" : "")
                + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
         size_t r = stream_frames_to_queue_mt(pfd, dfd, fsz, n_readers,
                                              queue, m, opt, max_frame_decomp_out, abort,
@@ -26614,6 +26921,7 @@ struct GzFloorPre {
   bool some_old = false;
   bool uncertain = false;       // an unreadable ID or a floor with no PCI rule
   bool unnamed_gpu = false;     // /proc lists a card that a UUID mask cannot name
+  int usable = 0;               // cards the driver lists that are not known to be below the floor
   std::vector<std::string> old_uuids;   // cards known to be below the floor
   std::vector<std::string> new_uuids;   // cards known to meet the floor
   std::string note;
@@ -26669,12 +26977,14 @@ static const GzFloorPre & gz_floor_precuda()
             || !read_hex("/sys/bus/pci/devices/" + b + "/device", device)) {
           r.uncertain = true;
           all_old = false;
+          ++r.usable;
           continue;
         }
         old = device < first_ok;
       }
       if (!old) {
         all_old = false;
+        ++r.usable;
         if (!uuid.empty()) r.new_uuids.push_back(uuid);
         continue;
       }
@@ -26700,6 +27010,11 @@ static const GzFloorPre & gz_floor_precuda()
   }();
   return result;
 }
+
+// The GPUs this run could use, from the driver's list alone (gz_floor_precuda):
+// every card not known to be below the floor, before any mask.  0 = none listed
+// or unreadable.  For a decision that must come before CUDA starts.
+static int gz_precuda_gpu_count() { return gz_floor_precuda().usable; }
 
 static int gz_pre_uuid_floor(const std::string & uuid)
 {
@@ -37735,7 +38050,52 @@ static void gpu_worker(
     }
     checkNvcomp(nvcompBatchedZstdCompressGetMaxOutputChunkSize(gpu_chunk, comp_opts, &max_out_chunk), "nvcompBatchedZstdCompressGetMaxOutputChunkSize");
     const uint64_t ctx_done_ns = now_ns();  // cudaSetDevice forced context creation
-    const size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
+    size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
+    // SIX STREAMS ONLY WHERE A THIRD WOULD FIT (v0.18.36, DEFAULT_GPU_WIDE_STREAMS).
+    // Decided before any stream is sized: each stream fits its batch against
+    // gpu_mem_fraction / stream_count of the free VRAM, so a six-stream layout
+    // trimmed to two afterwards would leave those two a third of the batch the
+    // two-stream default gives them (review, v0.18.36).  The third stream sees
+    // what the first two left -- at most two shares -- and must hold
+    // WIDE_EXTRA_STREAM_MIN_BATCH frames: input, output and nvCOMP's workspace,
+    // and --verify's slab.  The guard in the loop below stays as the backstop
+    // for what this does not model (the peer-to-peer pack).
+    if (opt.gpu_streams_wide && !opt.gpu_streams_user_set && !opt.gpu_batch_user_set
+        && stream_count > DEFAULT_GPU_STREAMS) {
+      size_t free_b = 0, total_b = 0;
+      bool fits = false;
+      if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0) {
+        try {
+          const size_t n = WIDE_EXTRA_STREAM_MIN_BATCH;
+          const double frac = std::max(0.05, std::min(0.95, opt.gpu_mem_fraction / double(stream_count)));
+          double need = double(n) * double(gpu_chunk + max_out_chunk)
+                      + double(get_nvcomp_temp_size(n, gpu_chunk, comp_opts, cudaStream_t{}))
+                      + double(n) * (sizeof(void*) * 2 + sizeof(size_t) * 2 + sizeof(nvcompStatus_t));
+          if (opt.region_staged()) need += double(n) * sizeof(unsigned int);
+          if (opt.gpu_verify) {
+            // --verify's slab and its own decompression workspace, as the search counts them.
+            nvcompBatchedZstdDecompressOpts_t vopts{};
+            size_t vtb = 0;
+            if (nvcompBatchedZstdDecompressGetTempSizeAsync(n, gpu_chunk, vopts, &vtb, n * gpu_chunk)
+                != nvcompSuccess)
+              throw std::runtime_error("cannot size the verify workspace");
+            need += double(n) * double(gpu_chunk) + double(vtb)
+                  + double(n) * (sizeof(void*) + sizeof(size_t) + sizeof(unsigned int))
+                  + sizeof(unsigned int);
+          }
+          fits = need <= double(free_b) * (1.0 - 2.0 * frac) * frac;
+        } catch (const std::exception &) {
+          fits = false;                   // nvCOMP would not size it: stay at two
+        }
+      }
+      if (!fits) {
+        stream_count = DEFAULT_GPU_STREAMS;
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id) + "] "
+               + std::to_string(stream_count) + " streams: a stream more would not fit a batch of "
+               + std::to_string(WIDE_EXTRA_STREAM_MIN_BATCH) + "\n");
+      }
+    }
     // --gpu-batch is per-stream (same semantics as decompress).  Each stream
     // targets up to gpu_batch_cap subchunks; VRAM safety comes from splitting
     // the memory budget across streams and clamping via binary search below.
@@ -38030,6 +38390,21 @@ static void gpu_worker(
         ctxs.resize(s);
         break;  // exit the stream-init loop
       }
+      // A staged compress's streams past the second are kept only while each
+      // fits a useful batch (see DEFAULT_GPU_WIDE_STREAMS).
+      if (s >= 2 && opt.gpu_streams_wide && !opt.gpu_streams_user_set
+          && !opt.gpu_batch_user_set && C.per_stream_batch < WIDE_EXTRA_STREAM_MIN_BATCH) {
+        free_stream_buffers_only(C, opt);
+        if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+        if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
+        if (C.stream)    { cudaStreamDestroy(C.stream);    C.stream = nullptr; }
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id) + "] " + std::to_string(s)
+               + " streams: a stream more would fit a batch of only "
+               + std::to_string(C.per_stream_batch) + "\n");
+        ctxs.resize(s);
+        break;
+      }
       C.stats.dev_index = size_t(device_id);
       C.stats.stream_index = s;
       if (opt.verbosity >= V_DEBUG) {
@@ -38045,6 +38420,11 @@ static void gpu_worker(
     // final now (a failed stream shrank it above; nothing grows it), so the
     // address is stable for the device's life.
     for (auto & C : ctxs) C.pack = ctxs.empty() ? nullptr : &ctxs[0];
+    {   // what the stream lever files this run under (the most any device made)
+      const int made = (int)ctxs.size();
+      int cur = g_gpu_streams_created.load(std::memory_order_relaxed);
+      while (made > cur && !g_gpu_streams_created.compare_exchange_weak(cur, made)) {}
+    }
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
     if (opt.verbosity >= V_DEBUG) {
       std::ostringstream os;
@@ -51194,6 +51574,10 @@ static int gzstd_main(int argc, char ** argv)
       // If open failed, fall through to normal fwrite via stdout
     } while (false);
   }
+  if (direct_writer && direct_writer->buf_cap() < DirectWriter::BUF_CAP_MAX)
+    vlog(V_VERBOSE, opt, "[O_DIRECT] memory: 4 write buffers of "
+         + std::to_string(direct_writer->buf_cap() / ONE_MIB) + " MiB, not 16: they fit a "
+         "sixteenth of the memory left\n");
   DirectWriter * dw_ptr = direct_writer.get();
 #else
   DirectWriter * dw_ptr = nullptr;
@@ -53292,6 +53676,87 @@ static const char * gz_auto_stage_decline(const Options & opt, unsigned * cpus_o
   return nullptr;
 }
 
+// --adapt's GPU STREAM LEVER (v0.18.36).  The default gives a one-GPU compress
+// of 4 GiB or more six streams (DEFAULT_GPU_WIDE_STREAMS), measured on one
+// card; this measures it against two on THIS box, keyed by path (staged or
+// --gpu-only) and residency (cold < 10% cached, warm >= 95%; between, no slot).
+// Called only when the default chose six.  Returns the stream count to run.
+//
+// STATE TABLE -- the slot's wide (6) and narrow (2) end-to-end rates -> run:
+//   residency partial or unknown            -> 6, no slot, unrecorded
+//   the budget prior explores this run      -> 6, filed (one lever explores a run)
+//   wide never measured, but tried within
+//     RECHECK and no third stream fitted    -> 2 (six did not fit here)
+//   wide never measured                     -> 6, measured (the default)
+//   narrow never measured or tried recently,
+//     run long enough to record             -> 2, exploring (filed under the
+//                                              lever alone: not the budget
+//                                              prior, not the device model)
+//   narrow untried, run too short           -> 6
+//   both measured, one RECHECK runs stale,
+//     run long enough                       -> re-measure the stalest
+//   both measured                           -> 2 if it beat 6 by 5%, else 6
+// The count that RUNS is filed (adapt_merge_dir): the guard can trim six to two.
+static size_t adapt_streams_choose(const Options & opt, bool staged)
+{
+  const double resid = adapt_input_residency(opt);
+  const int rc = resid < 0.0 ? -1 : resid < ADAPT_BUDGET_CACHED_MIN ? 0
+               : resid >= ADAPT_BUDGET_WARM_MIN ? 1 : -1;
+  if (rc < 0) return DEFAULT_GPU_WIDE_STREAMS;
+  const int slot = (staged ? 0 : 2) + rc;
+  g_adapt_streams_slot.store(slot, std::memory_order_relaxed);
+  const AdaptPriors pr = adapt_load_priors();
+  const AdaptPriors::Dir & D = pr.dir[0];
+  const double rn = D.streams_rate[slot][0], rw = D.streams_rate[slot][1];
+  const double sn = D.streams_run[slot][0],  sw = D.streams_run[slot][1];
+  bool explorable = true;
+  {
+    struct stat sb{};
+    if (D.input_gibs > 0 && !opt.inputs.empty() && ::stat(opt.inputs[0].c_str(), &sb) == 0) {
+      const double secs = double(sb.st_size) / (D.input_gibs * 1073741824.0);
+      explorable = secs >= double(adapt_save_min_ns()) / 1e9 && secs >= ADAPT_BACKEND_MIN_SEC;
+    }
+  }
+  auto say = [&](const char * what, size_t n) {
+    if (opt.verbosity < V_VERBOSE) return;
+    char b[256];
+    std::snprintf(b, sizeof b, "[ADAPT] GPU streams (%s): 6 measured %.2f, 2 measured %.2f "
+                  "GiB/s -> %zu%s\n", adapt_streams_slot_name(slot), rw, rn, n, what);
+    vlog(V_VERBOSE, opt, b);
+  };
+  // A probe of two (never measured, or stale) is an exploration: filed under the
+  // lever alone.  Two chosen as the measured best is this box's configuration.
+  auto probe_narrow = [&](const char * what) {
+    g_adapt_streams_explore.store(true, std::memory_order_relaxed);
+    say(what, DEFAULT_GPU_STREAMS);
+    return DEFAULT_GPU_STREAMS;
+  };
+  if (g_adapt_budget_explored.load(std::memory_order_relaxed) != 0) {
+    say(" (the budget prior explores this run)", DEFAULT_GPU_WIDE_STREAMS);
+    return DEFAULT_GPU_WIDE_STREAMS;
+  }
+  if (rw <= 0.0 && sw > 0.0 && D.runs - sw < ADAPT_BACKEND_RECHECK_RUNS) {
+    say(" (six did not fit here)", DEFAULT_GPU_STREAMS);
+    return DEFAULT_GPU_STREAMS;
+  }
+  if (rw <= 0.0) { say(" (the default, measured this run)", DEFAULT_GPU_WIDE_STREAMS); return DEFAULT_GPU_WIDE_STREAMS; }
+  const bool narrow_recent = sn > 0.0 && D.runs - sn < ADAPT_BACKEND_RECHECK_RUNS;
+  if (rn <= 0.0) {
+    if (explorable && !narrow_recent) return probe_narrow(" (exploring)");
+    say(" (2 untried here)", DEFAULT_GPU_WIDE_STREAMS);
+    return DEFAULT_GPU_WIDE_STREAMS;
+  }
+  if (explorable) {
+    const bool n_stale = D.runs - sn >= ADAPT_BACKEND_RECHECK_RUNS;
+    const bool w_stale = D.runs - sw >= ADAPT_BACKEND_RECHECK_RUNS;
+    if (n_stale && (!w_stale || sn <= sw)) return probe_narrow(" (re-measuring)");
+    if (w_stale) { say(" (re-measuring)", DEFAULT_GPU_WIDE_STREAMS); return DEFAULT_GPU_WIDE_STREAMS; }
+  }
+  if (rn > rw * 1.05) { say(" (measured faster here)", DEFAULT_GPU_STREAMS); return DEFAULT_GPU_STREAMS; }
+  say("", DEFAULT_GPU_WIDE_STREAMS);
+  return DEFAULT_GPU_WIDE_STREAMS;
+}
+
 // --adapt's backend choice on a small CPU budget (see g_adapt_budget_slot):
 // returns 0 (the static rule decides), or 1 cpu-only, 2 hybrid, 3 staged.
 // Called only when staging is a candidate (gz_auto_stage_decline passed with
@@ -53452,6 +53917,7 @@ static void apply_backend_defaults(Options & opt)
       opt.gpu_only = true;
       opt.hybrid = false;
       if (opt.gpu_devices == 0) opt.gpu_devices = 1;   // --direct-stage's default
+
     } else if (opt.verbosity >= V_DEBUG && !opt.list_mode) {
       vlog(V_DEBUG, opt, std::string("[STAGE] the default does not stage: ")
            + (no ? no : budget_owned ? "the --adapt budget prior chose another backend"
@@ -53596,6 +54062,53 @@ static void apply_backend_defaults(Options & opt)
     }
   }
 #endif
+  // A ONE-GPU COMPRESS OF 4 GiB OR MORE takes up to six streams (v0.18.36; see
+  // DEFAULT_GPU_WIDE_STREAMS) -- staged (the default's or --direct-stage's) and
+  // --gpu-only -- decided here, where the device count is final: the user's
+  // --gpu-devices, --adapt's choice above or staging's one, else the cards the
+  // driver lists (a caller's mask can only make it fewer, so it errs to two).
+  // The extra streams cost ~80 ms to set up: MEASURED, 1 GiB staged 0.74 s
+  // against 0.66 at two; 4 GiB staged 1.22-1.30 against 1.30-1.31 and
+  // --gpu-only 1.32-1.33 against 1.45.
+  if (opt.mode == Mode::COMPRESS && opt.gpu_only && !opt.gds_only && !opt.tar_mode
+      && !opt.gpu_streams_user_set && !opt.gpu_streams_wide) {
+    int ndev = opt.gpu_devices > 0 ? opt.gpu_devices
+             : opt.direct_stage ? 1 : gz_precuda_gpu_count();
+    // A caller's CUDA_VISIBLE_DEVICES names at most as many devices as it has
+    // entries (CUDA stops at the first invalid one), so a one-card mask on a
+    // larger host is one GPU.  gzstd's own mask is set further down.
+    if (const char * mask = ::getenv("CUDA_VISIBLE_DEVICES")) {
+      int masked = 0;
+      for (const char * p = mask; ; ) {
+        const char * q = std::strchr(p, ',');
+        if ((q ? (size_t)(q - p) : std::strlen(p)) > 0) ++masked;
+        if (!q) break;
+        p = q + 1;
+      }
+      ndev = ndev > 0 ? std::min(ndev, masked) : masked;
+    }
+    uint64_t total = 0;
+    bool known = !opt.inputs.empty();
+    for (const auto & in : opt.inputs) {
+      struct stat ist{};
+      if (in == "-" || ::stat(in.c_str(), &ist) != 0 || !S_ISREG(ist.st_mode)) { known = false; break; }
+      total += (uint64_t)ist.st_size;
+    }
+    // GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES: the floor, for the suite's small files.
+    static const char * min_e = ::getenv("GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES");
+    const uint64_t min_in = min_e ? std::strtoull(min_e, nullptr, 10) : WIDE_STREAMS_MIN_INPUT;
+    if (ndev == 1 && known && total >= min_in) {
+      opt.gpu_streams = DEFAULT_GPU_WIDE_STREAMS;
+      opt.gpu_streams_wide = true;
+      // --adapt measures six against two on this box (adapt_streams_choose).
+      if (opt.adapt && !opt.no_profile && !opt.list_mode && opt.inputs.size() == 1
+          && !opt.cold_read) {
+        opt.gpu_streams = adapt_streams_choose(opt, opt.direct_stage);
+        opt.gpu_streams_wide = opt.gpu_streams == DEFAULT_GPU_WIDE_STREAMS;
+        g_adapt_streams_asked.store((int)opt.gpu_streams, std::memory_order_relaxed);
+      }
+    }
+  }
   // An explicit count can still name the FULL fleet.  In that case there is
   // nothing to hide or rank by default: leave CUDA_VISIBLE_DEVICES unset so
   // CUDA retains its own order.  Keep the old branch when /proc cannot tell us
@@ -54194,6 +54707,10 @@ static void apply_backend_defaults(Options & opt)
       struct stat pst{};
       if (::stat(opt.inputs[0].c_str(), &pst) == 0 && S_ISREG(pst.st_mode)) {
         const double pd = prior_dir.path_pread, dr = prior_dir.path_direct;
+#ifdef HAVE_NVCOMP
+        if (opt.mode != Mode::COMPRESS && pd > 0 && dr > 0)   // -d and -t
+          g_adapt_rd_verdict.store(dr > pd * 1.05 ? 1 : 0, std::memory_order_relaxed);
+#endif
         if (pd > 0 && dr > pd * 1.05) {
           opt.direct_read = true;
           std::snprintf(pline, sizeof(pline),
@@ -55907,7 +56424,7 @@ static Options parse_args(int argc, char ** argv)
       }
       opt.gpu_hybrid_tuning_seen = true;
     }
-    else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) { opt.gpu_hybrid_tuning_seen = true; opt.gpu_streams_user_set = true; }
     else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) {
       // 0 = auto (all available).  A NEGATIVE count was accepted and then
       // propagated into the deferred device-count arithmetic, where it could
@@ -56801,6 +57318,7 @@ static Options parse_args(int argc, char ** argv)
     // streams take turns on one worker (measured for -d: no gain).  Compress keeps
     // its two, for the reasons above.
     const bool staged_decomp = opt.region_staged() && opt.mode != Mode::COMPRESS;
+    // (A one-GPU compress may widen this in apply_backend_defaults.)
     opt.gpu_streams = staged_decomp ? 1
                     : (opt.mode == Mode::DECOMPRESS)
                         ? DEFAULT_GPU_DECOMP_STREAMS : DEFAULT_GPU_STREAMS;

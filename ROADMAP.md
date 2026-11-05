@@ -769,6 +769,26 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       it -- about 1% of a -d run, below -d's 3 s run-to-run spread on this host, so not yet built.
     - **A pre-6.4 kernel's explicit --direct-read keeps huge pages.**  v0.18.34 moved it to plain
       pages on 6.4+ after measuring the stall here; nothing has measured a pre-6.4 host either way.
+36. **Follow-ups from the second workstation (v0.18.36: one RTX 5090, PCIe Gen5, 16 cores).**
+    - **Several GPUs keep two streams.**  Six streams took one card's `--gpu-only` compress from
+      19.1 s to 11.7 and its staged one from 15.4 to 11.2 (64.84 GiB); hybrid at 8 CPUs was
+      drive-bound and did not move.  On several devices each device's streams pin their own host
+      buffers, and eight devices at six were not measured: measure `--gpu-only` and small-budget
+      hybrid at 2 against 6 on the server before widening them, and the guard (a stream past the
+      second must fit a batch of 8) on an 11 GiB card.
+    - **Staging leaves the CPUs idle.**  The staged path reads every frame into pinned host memory
+      and only the GPU compresses it; at 4 CPUs it uses ~9 CPU-seconds of a 64.84 GiB run.  CPU
+      workers compressing frames from the same pinned slots would add the CPUs' rate (2.9 GiB/s at 4
+      CPUs here) to the GPU's (~5.6), so the staged path would be the fastest at every small budget,
+      not only where the GPU alone outruns hybrid -- here the drive (5.9 GiB/s) would bind first.
+      The slots' lifetime (released before the GPU compresses), the ordered writer and the CPU
+      rebuild contract are what it would have to keep.
+    - **A warm decode under 128 MB is still killed** (2 GiB archive, both builds, ~127 MB anonymous
+      where the pools were sized for ~80).  The pools undercount something; v0.18.32's 128 MB figure
+      is `--gds-only`'s, and plain decode was never claimed to fit it.
+    - **The cached-archive probe was measured on one drive.**  The server's (~4 GiB/s) and the first
+      workstation's (Gen3, ~2 GB/s) should both fall under its 3.5 GiB/s-per-GPU bar; confirm with
+      `-v` (`[READER] the archive is cached on a drive that reads ...`).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

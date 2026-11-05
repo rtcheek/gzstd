@@ -633,8 +633,16 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=560
-$EXTENSIVE && EXPECTED_TESTS=902
+EXPECTED_TESTS=564
+$EXTENSIVE && EXPECTED_TESTS=906
+# v0.18.36: +1 default cell on both builds (the O_DIRECT writer's buffers fit a
+# sixteenth of the memory left) and +3 default GPU cells (a small budget's cached
+# archive on a drive that keeps up reads O_DIRECT; staged compress takes up to
+# six streams; --adapt measures six GPU streams against two): 560 -> 564,
+# 902 -> 906; the no-GPU deltas +3 (155 -> 158, 233 -> 236).
+# The cells a single-GPU host (or one whose second card is busy) cannot reach are
+# skip_host now, so they count in "this host could not exercise" instead of a
+# drift note; a GPU-less host still subtracts them once, in EXPECTED_NOGPU_DELTA.
 # v0.18.33: +1 default cell on both builds (a cold archive's decode readers) and
 # +10 default GPU cells (a small CPU budget stages by default: compress,
 # decompress, the CPU rebuild, the declines, an explicit flag's refusal, --adapt's
@@ -967,8 +975,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=155   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=233   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=158   # + three v0.18.36; 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=236   # + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -3535,10 +3543,10 @@ GTIDLE
     fi
     rm -f "$gw_z" "$gw_r" "$gw_e"
   elif [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
-    skip "GPU decompress fault -> rescue finishes the job" \
+    skip_host "GPU decompress fault -> rescue finishes the job" \
          "fewer than 2 GPUs with ${gw_min_mib} MiB of free VRAM"
   else
-    skip "GPU decompress fault -> rescue finishes the job" "needs 2+ GPUs"
+    skip_host "GPU decompress fault -> rescue finishes the job" "needs 2+ GPUs"
   fi
 
   # --gds-only -t (v0.17.16): frame extents from the seek table, cuFileRead into
@@ -5910,7 +5918,7 @@ if has_gpu 2>/dev/null; then
       fail "GPU fault rescue with zero-copy views in flight" "output mismatch"
     fi
   else
-    skip "GPU fault rescue with zero-copy views in flight" "fewer than 2 GPUs with ${zr_min_mib} MiB of free VRAM"
+    skip_host "GPU fault rescue with zero-copy views in flight" "fewer than 2 GPUs with ${zr_min_mib} MiB of free VRAM"
   fi
 else
   skip "GPU decompress reads zero-copy views" "no GPU"
@@ -7201,10 +7209,10 @@ if has_gpu 2>/dev/null; then
     fi
     rm -f "$TMPDIR/mgpu.zst" "$TMPDIR/mgpu.out"
   elif [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
-    skip "multi-GPU dispatch round-trips across multiple devices" \
+    skip_host "multi-GPU dispatch round-trips across multiple devices" \
          "fewer than 2 GPUs with ${mg_min_mib} MiB of free VRAM"
   else
-    skip "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
+    skip_host "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
   fi
 
   # THE ALL-DEVICE RANKING RUNS AFTER CUDA, AND ONLY AT GPU BRINGUP (v0.17.63),
@@ -7565,31 +7573,31 @@ if has_gpu 2>/dev/null; then
     [[ -z "$cl_why" ]] && pass "simultaneous GPU subset jobs see each other's cards" \
       || fail "simultaneous GPU subset jobs see each other's cards" "$cl_why"
   elif [[ "${GPU_ALL_DEVICES:-}" == *,* ]]; then
-    skip "--gpu-order=ranked ranks every device after CUDA startup" \
+    skip_host "--gpu-order=ranked ranks every device after CUDA startup" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" \
+    skip_host "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "an all-device GPU set keeps CUDA's order by default" \
+    skip_host "an all-device GPU set keeps CUDA's order by default" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" \
+    skip_host "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
+    skip_host "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" \
+    skip_host "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "a GPU subset chosen without any load reading says so" \
+    skip_host "a GPU subset chosen without any load reading says so" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
-    skip "simultaneous GPU subset jobs see each other's cards" \
+    skip_host "simultaneous GPU subset jobs see each other's cards" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
   else
-    skip "--gpu-order=ranked ranks every device after CUDA startup" "single GPU host"
-    skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
-    skip "an all-device GPU set keeps CUDA's order by default" "single GPU host"
-    skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "single GPU host"
-    skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "single GPU host"
-    skip "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" "single GPU host"
-    skip "a GPU subset chosen without any load reading says so" "single GPU host"
-    skip "simultaneous GPU subset jobs see each other's cards" "single GPU host"
+    skip_host "--gpu-order=ranked ranks every device after CUDA startup" "single GPU host"
+    skip_host "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
+    skip_host "an all-device GPU set keeps CUDA's order by default" "single GPU host"
+    skip_host "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "single GPU host"
+    skip_host "a hybrid GPU subset that skips GPU bringup has no ranking wait" "single GPU host"
+    skip_host "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" "single GPU host"
+    skip_host "a GPU subset chosen without any load reading says so" "single GPU host"
+    skip_host "simultaneous GPU subset jobs see each other's cards" "single GPU host"
   fi
 
   # THE COMPUTE-CAPABILITY FLOOR (v0.17.77).  gzstd's GPU code runs on compute
@@ -7696,7 +7704,7 @@ if has_gpu 2>/dev/null; then
       || fail "a card below the floor found after CUDA starts is dropped before any bringup" "$fl_why"
     rm -f "$TMPDIR/fl3.zst" "$TMPDIR/fl3.dec" "$TMPDIR/fl4.zst"
   else
-    skip "a card below the floor found after CUDA starts is dropped before any bringup" \
+    skip_host "a card below the floor found after CUDA starts is dropped before any bringup" \
          "needs a UUID mask and a second GPU"
   fi
 
@@ -7939,9 +7947,9 @@ if has_gpu 2>/dev/null; then
     fi
     rm -f "$TMPDIR/fl-mixed.bin" "$TMPDIR/fl-mixed.zst" "$TMPDIR/fl-mixed.dec" "$TMPDIR/fl-sub.zst"
   else
-    skip "mixed card generations: only the card new enough does GPU work" \
+    skip_host "mixed card generations: only the card new enough does GPU work" \
          "fewer than 2 GPUs with ${dr_min_mib:-4096} MiB free, or an index mask"
-    skip "a GPU subset never guesses or ranks a card below the floor" \
+    skip_host "a GPU subset never guesses or ranks a card below the floor" \
          "fewer than 2 GPUs with ${dr_min_mib:-4096} MiB free, or an index mask"
   fi
   rm -f "$TMPDIR/fl.zst"
@@ -8873,7 +8881,7 @@ elif grep -q 'regime shares:' "$rampe"; then
     fail "sufficient classification persists a regime" "gate accepted the run but recorded nothing"
   fi
 else
-  skip "regime-evidence gate" "run never outlived the ramp on this machine"
+  skip_host "regime-evidence gate" "run never outlived the ramp on this machine"
 fi
 rm -f "$TMPDIR/aprof-ramp.txt" "$TMPDIR/aprof-ramp.zst" "$rampe"
 # This test is the only one in the section that runs a QUALIFYING run, so it is
@@ -9256,6 +9264,11 @@ PYEOF2
            "rc=$rc, recorded [$got], want [2 0]: $(grep 'gpu devices' "$GCC/s.err" | head -3 | tr '\n' ' ')"
     fi
     rm -rf "$GCC"
+  elif has_gpu 2>/dev/null && command -v python3 >/dev/null 2>&1; then
+    # The host has fewer than two such cards (skip_host); no GPU at all is in
+    # EXPECTED_NOGPU_DELTA, and a missing python3 stays a plain skip.
+    skip_host "--calibrate FILE records every device count (overhead and rate)" "needs two GPUs with 4 GiB free"
+    skip_host "--calibrate without FILE records device-count overhead only" "needs two GPUs with 4 GiB free"
   else
     skip "--calibrate FILE records every device count (overhead and rate)" "needs two GPUs with 4 GiB free"
     skip "--calibrate without FILE records device-count overhead only" "needs two GPUs with 4 GiB free"
@@ -12975,6 +12988,95 @@ if has_gpu 2>/dev/null; then
     pass "--direct-stage stages every frame of a file and matches the ordinary archive"
   fi
 
+  # 1b. Staged compress takes up to six streams (v0.18.36): two left one fast GPU
+  # idle between batches (64.84 GiB at 4 CPUs, 15.4 s against 11.0-11.8 at six).
+  # Each stream past the second must fit a batch of 8, so a small card keeps two
+  # and says why; --gpu-streams is the user's count, kept; an input under 4 GiB
+  # keeps two (GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES lowers that floor for this
+  # 64 MiB file).  Streams never change the bytes.
+  dsc_t="--direct-stage compress takes up to six streams; --gpu-streams is kept"
+  dsc_streams() { grep -aoE '\[GPU[0-9]+/S[0-9]+\] subchunk=' "$1" | sort -u | wc -l; }
+  dsc_why=""
+  timeout --foreground -k 10 120 "$GZSTD" --direct-stage --chunk-size=1 -vv -f \
+    "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" || dsc_why+=" [small exit $?]"
+  [[ "$(dsc_streams "$dsc_log")" == 2 ]] || dsc_why+=" [under 4 GiB: $(dsc_streams "$dsc_log") streams]"
+  files_match "$dsc_ord" "$dsc_zst" || dsc_why+=" [small bytes]"
+  env GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES=1 timeout --foreground -k 10 120 "$GZSTD" --direct-stage \
+    --chunk-size=1 -vv -f "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" || dsc_why+=" [default exit $?]"
+  dsc_n=$(dsc_streams "$dsc_log")
+  if grep -aqE 'streams: a stream more would (fit a batch of only|not fit a batch of)' "$dsc_log"; then
+    (( dsc_n >= 2 && dsc_n < 6 )) || dsc_why+=" [guard fired at $dsc_n streams]"
+  else
+    (( dsc_n == 6 )) || dsc_why+=" [default: $dsc_n streams, no guard line]"
+  fi
+  files_match "$dsc_ord" "$dsc_zst" || dsc_why+=" [default bytes]"
+  env GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES=1 timeout --foreground -k 10 120 "$GZSTD" --direct-stage \
+    --chunk-size=1 --gpu-streams=2 -vv -f "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" \
+    || dsc_why+=" [--gpu-streams=2 exit $?]"
+  [[ "$(dsc_streams "$dsc_log")" == 2 ]] || dsc_why+=" [--gpu-streams=2 ran $(dsc_streams "$dsc_log")]"
+  grep -aq 'a stream more would' "$dsc_log" && dsc_why+=" [--gpu-streams=2 guarded]"
+  files_match "$dsc_ord" "$dsc_zst" || dsc_why+=" [--gpu-streams=2 bytes]"
+  [[ -z "$dsc_why" ]] && pass "$dsc_t" || fail "$dsc_t" "$dsc_why"
+
+  # 1c. --adapt measures the six streams against two on this box (v0.18.36,
+  # adapt_streams_choose), from crafted profiles: the state table's rows, each
+  # with the stream count that actually runs.  --gpu-only on one device; the
+  # fixture is warm (slot gpuonly_warm); a tiny input_gibs makes the 64 MiB
+  # file long enough to explore.
+  dsa_t="--adapt measures six GPU streams against two"
+  dsa_why=""
+  dsa_x="$TMPDIR/dsa-xdg"; rm -rf "$dsa_x"; mkdir -p "$dsa_x/gzstd"
+  dsa_run() {   # dsa_run LOG [extra args]: --adapt --gpu-only -vv on the fixture
+    local log=$1; shift
+    env XDG_CACHE_HOME="$dsa_x" GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES=1 timeout --foreground -k 10 120 \
+      "$GZSTD" --adapt --gpu-only --gpu-devices=1 --chunk-size=1 -vv "$@" -c "$dsc_src" > "$dsc_zst" 2> "$log"
+  }
+  dsa_line() { grep -ao '\[ADAPT\] GPU streams (gpuonly_warm): .*' "$1" | head -1 | sed 's/.*GiB\/s -> //'; }
+  cat "$dsc_src" > /dev/null
+  dsa_run "$dsc_log" || dsa_why+=" [setup exit $?]"
+  dsa_hash=$(sed -n 's/^\[ADAPT\] fingerprint \([0-9a-f]*\) driver .*/\1/p' "$dsc_log" | head -1)
+  dsa_drv=$(sed -n 's/^\[ADAPT\] fingerprint [0-9a-f]* driver \([^ ]*\) .*/\1/p' "$dsc_log" | head -1)
+  [[ "$dsa_drv" == '(none)' ]] && dsa_drv=""
+  [[ ${#dsa_hash} -eq 16 ]] || dsa_why+=" [no adapt fingerprint]"
+  dsa_prof() {  # dsa_prof WIDE NARROW (0 = absent, -1 = tried, no rate): only that slot
+    python3 -I - "$dsa_x/gzstd/profile.json" "$PROFILE_SCHEMA" "$dsa_hash" "$dsa_drv" "$1" "$2" <<'PYEOF'
+import json, sys
+c = {'runs': 3, 'input_gibs': 0.0001}
+for name, v in (('wide', float(sys.argv[5])), ('narrow', float(sys.argv[6]))):
+    if v > 0:
+        c['streams_gpuonly_warm_' + name] = v
+    if v != 0:
+        c['streams_gpuonly_warm_' + name + '_run'] = 3
+p = {'gzstd_profile': int(sys.argv[2]), 'entries': {
+    sys.argv[3]: {'fingerprint': 'crafted', 'driver': sys.argv[4], 'compress': c}}}
+with open(sys.argv[1], 'w') as f:
+    json.dump(p, f)
+PYEOF
+  }
+  dsa_case() {  # dsa_case NAME WIDE NARROW WANT_LINE WANT_STREAMS(6|2)
+    local log="$TMPDIR/dsa-$1.log" n
+    dsa_prof "$2" "$3"; cat "$dsc_src" > /dev/null
+    dsa_run "$log" || dsa_why+=" [$1 exit $?]"
+    [[ "$(dsa_line "$log")" == "$4" ]] || dsa_why+=" [$1: '$(dsa_line "$log")']"
+    n=$(dsc_streams "$log")
+    if [[ $5 == 2 ]]; then
+      [[ $n == 2 ]] || dsa_why+=" [$1: $n streams]"
+    elif ! grep -aq 'a stream more would' "$log"; then
+      [[ $n == 6 ]] || dsa_why+=" [$1: $n streams]"
+    fi
+    "$GZSTD" -d -q -c "$dsc_zst" | cmp -s - "$dsc_src" || dsa_why+=" [$1 bytes]"
+  }
+  dsa_case empty     0 0   "6 (the default, measured this run)" 6
+  dsa_case explore   5 0   "2 (exploring)"                       2
+  dsa_case narrower  5 6   "2 (measured faster here)"            2
+  dsa_case tie       5 5.1 "6"                                   6
+  dsa_case nofit    -1 4   "2 (six did not fit here)"            2
+  dsa_prof 5 0; dsa_run "$TMPDIR/dsa-user.log" --gpu-streams=3 || dsa_why+=" [user exit $?]"
+  grep -aq '\[ADAPT\] GPU streams' "$TMPDIR/dsa-user.log" && dsa_why+=" [--gpu-streams=3 still chose]"
+  [[ "$(dsc_streams "$TMPDIR/dsa-user.log")" == 3 ]] || dsa_why+=" [--gpu-streams=3 ran $(dsc_streams "$TMPDIR/dsa-user.log")]"
+  rm -rf "$dsa_x" "$TMPDIR"/dsa-*.log
+  [[ -z "$dsa_why" ]] && pass "$dsa_t" || fail "$dsa_t" "$dsa_why"
+
   # 2. A read that fails is named, and the CPU rebuild still writes a correct
   # archive -- with readers PARKED on the pool when it fails.  One slot, four
   # readers: frame 0 holds the slot through a 2 s stall while three wait for it,
@@ -13077,6 +13179,8 @@ if has_gpu 2>/dev/null; then
   rm -f "$dsc_src" "$dsc_ord" "$dsc_zst" "$dsc_out" "$dsc_log"
 else
   skip "--direct-stage stages every frame of a file and matches the ordinary archive" "no GPU"
+  skip "--direct-stage compress takes up to six streams; --gpu-streams is kept" "no GPU"
+  skip "--adapt measures six GPU streams against two" "no GPU"
   skip "--direct-stage compress read failure is named and recovered" "no GPU"
   skip "--direct-stage survives a stalled read with a small throttle" "no GPU"
   skip "--direct-stage compress never loads libcufile" "no GPU"
@@ -14221,6 +14325,44 @@ elif ! has_gpu 2>/dev/null; then
 else
   skip_host "$c32" "the archive cannot be evicted here (tmpfs?), or no drop_cache, python3 or taskset"
 fi
+# A SMALL BUDGET'S CACHED ARCHIVE ON A DRIVE THAT KEEPS UP (v0.18.36).  The cap
+# above exists for the buffered readers' copies; a drive whose O_DIRECT probe
+# reads at least 3.5 GiB/s per GPU is read the way a cold archive is -- O_DIRECT,
+# every CPU decoding.  The rate comes from GZSTD_DEBUG_CACHED_DIRECT_GIBS (which
+# also lifts the probe's 4 GiB archive floor), so any drive runs both branches;
+# without it this archive is under the floor, no probe runs and the cap holds.
+c36="a small budget's cached archive on a drive that keeps up reads O_DIRECT, every CPU decoding"
+if [[ $crd_tools -eq 1 ]] && has_gpu 2>/dev/null && [[ -s "$crd_zst" ]]; then
+  why=""
+  crd4=$(python3 -c "import os;print(','.join(map(str,sorted(os.sched_getaffinity(0))[:4])))")
+  cat "$crd_zst" > /dev/null
+  env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_CACHED_DIRECT_GIBS=100 taskset -c "$crd4" \
+    "$GZSTD" -v -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [fast exit $?]"
+  crd_lines | grep -aq 'cached on a drive that reads 100.00 GiB/s O_DIRECT, at least 3.5 for [1-9][0-9]* GPU' \
+    || why+=" [fast: no decision line]"
+  crd_lines | grep -aq 'one CPU decoder while the GPU runs' && why+=" [fast: capped]"
+  if [[ ${crd_dio:-0} -eq 1 ]]; then
+    [[ "$(crd_line)" == *"O_DIRECT (page cache bypassed) (the archive is cached; the drive keeps up)" ]] \
+      && crd_lines | grep -aqE 'O_DIRECT preads completed: [1-9][0-9]*' || why+=" [fast: '$(crd_line)']"
+  fi
+  cmp -s "$crd_out" "$crd_src" || why+=" [fast bytes]"
+  cat "$crd_zst" > /dev/null
+  env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_CACHED_DIRECT_GIBS=0.5 taskset -c "$crd4" \
+    "$GZSTD" -v -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [slow exit $?]"
+  crd_lines | grep -aq 'cached on a drive that reads 0.50 GiB/s O_DIRECT, under' || why+=" [slow: no decision line]"
+  crd_lines | grep -aq 'one CPU decoder while the GPU runs' || why+=" [slow: no cap]"
+  [[ "$(crd_line)" == "parallel prefetch: 3 reader threads" ]] || why+=" [slow: '$(crd_line)']"
+  cmp -s "$crd_out" "$crd_src" || why+=" [slow bytes]"
+  taskset -c "$crd4" "$GZSTD" -v -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [floor exit $?]"
+  crd_lines | grep -aq 'cached on a drive that reads' && why+=" [probed under the 4 GiB floor]"
+  crd_lines | grep -aq 'one CPU decoder while the GPU runs' || why+=" [floor: no cap]"
+  cmp -s "$crd_out" "$crd_src" || why+=" [floor bytes]"
+  [[ -z "$why" ]] && pass "$c36" || fail "$c36" "$why"
+elif ! has_gpu 2>/dev/null; then
+  skip "$c36" "no GPU"
+else
+  skip_host "$c36" "the archive cannot be evicted here (tmpfs?), or no drop_cache, python3 or taskset"
+fi
 rm -f "$crd_src" "$crd_zst" "$crd_log" "$crd_out"
 unset -f crd_evict crd_lines crd_line crd_allowance crd_check_cold
 
@@ -14736,6 +14878,38 @@ else
     || fail "memory: the headroom is the tightest group's, memory.high and file cache counted, v1 too" "$pm_why"
   rm -rf "$pm_d"
 fi
+
+# 2b. The O_DIRECT writer's buffers fit the memory (v0.18.36).  They were 4 x 16
+#     MiB whatever the limit, outside every pool's share, and a Gen4+ bus sends a
+#     file output through them by default: a 2 GiB decode to a file under a 192
+#     MB container was killed every time.  A sixteenth of the memory left now,
+#     over the 4 buffers: a fake 192 MiB limit gives 3 MiB each, a 64 GiB one the
+#     full 16 (no line).  --direct forces the writer on any bus; a filesystem
+#     that refuses O_DIRECT (the writer never opens) is the host's doing.
+pw_t="memory: the O_DIRECT writer's buffers fit a sixteenth of the memory left"
+pw_d="$TMPDIR/pw-cg"; pw_g="$pw_d/sys/fs/cgroup/job/step"; pw_why=""
+head -c $((24 << 20)) "$pp_in" > "$TMPDIR/pw.bin" 2>/dev/null
+"$GZSTD" -q -f --cpu-only "$TMPDIR/pw.bin" -o "$TMPDIR/pw.zst" 2>/dev/null || pw_why+=" setup"
+pw_odirect=$(python3 -c 'import os,sys
+try: os.close(os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT|os.O_DIRECT, 0o600)); print(1)
+except Exception: print(0)' "$TMPDIR/pw-probe" 2>/dev/null); rm -f "$TMPDIR/pw-probe"
+if [[ "$pw_odirect" != 1 ]]; then
+  skip_host "$pw_t" "this filesystem refuses O_DIRECT (or no python3 to ask it)"
+else
+  pm_tree "$pw_d"; echo $((192 << 20)) > "$pw_g/memory.max"
+  GZSTD_DEBUG_CGROUP_ROOT="$pw_d" "$GZSTD" -v --cpu-only --direct -f -d "$TMPDIR/pw.zst" -o "$TMPDIR/pw.out" \
+    2>"$TMPDIR/pw1.err" || pw_why+=" 192M:rc=$?"
+  grep -qa '\[O_DIRECT\] memory: 4 write buffers of 3 MiB, not 16' "$TMPDIR/pw1.err" \
+    || pw_why+=" 192M:$(grep -ao '\[O_DIRECT\] memory: [^,]*' "$TMPDIR/pw1.err" | head -1)"
+  cmp -s "$TMPDIR/pw.out" "$TMPDIR/pw.bin" || pw_why+=" 192M:bytes"
+  pm_tree "$pw_d"; echo $((64 << 30)) > "$pw_g/memory.max"
+  GZSTD_DEBUG_CGROUP_ROOT="$pw_d" "$GZSTD" -v --cpu-only --direct -f -d "$TMPDIR/pw.zst" -o "$TMPDIR/pw.out" \
+    2>"$TMPDIR/pw2.err" || pw_why+=" 64G:rc=$?"
+  grep -qa '\[O_DIRECT\] memory: 4 write buffers' "$TMPDIR/pw2.err" && pw_why+=" 64G:shrunk"
+  cmp -s "$TMPDIR/pw.out" "$TMPDIR/pw.bin" || pw_why+=" 64G:bytes"
+  [[ -z "$pw_why" ]] && pass "$pw_t" || fail "$pw_t" "$pw_why"
+fi
+rm -rf "$pw_d" "$TMPDIR/pw.bin" "$TMPDIR/pw.zst" "$TMPDIR/pw.out" "$TMPDIR/pw1.err" "$TMPDIR/pw2.err"
 
 # 3. GPU build: an input of fewer frames than CPU workers is compressed on the
 #    CPU, above one GPU batch too (gz_input_one_cpu_wave).  The bound is shrunk
