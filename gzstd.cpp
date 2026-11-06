@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.37";
+static constexpr const char * GZSTD_VERSION = "0.18.38";
 //
 // Architecture overview:
 //
@@ -1355,6 +1355,11 @@ static unsigned long long g_gds_bar1_before = 0;
 // whole file.
 static std::atomic<uint64_t> g_dstage_bytes{0};
 static std::atomic<uint64_t> g_dstage_frames{0};
+// Of the frames the default's staging read, those its CPU workers compressed from
+// their slots instead of the GPU (Options::stage_cpu, v0.18.38).  Not in the two
+// above, which count what went host -> VRAM.
+static std::atomic<uint64_t> g_dstage_cpu_bytes{0};
+static std::atomic<uint64_t> g_dstage_cpu_frames{0};
 // --tar --direct-stage: MEMBER bytes by how they were read.  g_dstage_bytes
 // counts whole frames (headers and padding included) moved host -> VRAM; these
 // say whether the member data under them came through O_DIRECT or through the
@@ -2842,6 +2847,13 @@ struct Options {
   // default would have (gpu_only_cpu_fallback), and its messages must not blame
   // a flag the user never typed.
   bool direct_stage_auto = false;
+  // Set with direct_stage_auto (v0.18.38): the default's staging keeps a CPU pool
+  // whose workers compress frames straight out of the pinned staging slots, beside
+  // the GPU, under the hybrid scheduler.  The staged path is GPU-bound on one H100
+  // (~4.2 GiB/s from NVMe and from tmpfs alike) and left ~3 of 4 CPUs idle.
+  // Never for an explicit --direct-stage, whose contract is the GPU alone.
+  // GZSTD_DEBUG_DSTAGE_NO_CPU=1 leaves it off (the A/B control).
+  bool stage_cpu = false;
   // TRUE FOR BOTH BACKENDS THAT STAGE FILE REGIONS THEMSELVES.  Such a run's
   // Tasks name a region of the input (src_off/src_len) and carry no host bytes,
   // so the GPU worker fetches them, the XXH64 runs on the device, and the batch
@@ -4587,8 +4599,10 @@ static void print_help()
 "  --[no-]preallocate  fallocate output to expected size up front\n"
 "                      (default: off; slower for O_DIRECT — see --preallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache; auto-on for\n"
-"                      Gen4+ compress & decompress, --no-direct to force\n"
-"                      buffered; a >> redirect only when given)\n"
+"                      Gen4+ compress & decompress, and for a named output\n"
+"                      under a memory limit with less than 1 GiB left;\n"
+"                      --no-direct to force buffered; a >> redirect only\n"
+"                      when given)\n"
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
@@ -5098,6 +5112,15 @@ static void print_help_long()
 "     boxes frame production outruns buffered writeback, so bypassing\n"
 "     the page cache is a large win that scales with output volume\n"
 "     (it regresses on smaller Gen<4 boxes, which stay buffered).\n"
+"     UNDER A MEMORY LIMIT (a container's cgroup) with less than 1 GiB\n"
+"     left, a named output file (-o, or the name gzstd picks) is O_DIRECT\n"
+"     by default on any hardware: a buffered output's page cache is\n"
+"     charged to the same limit, and dirty pages cannot be freed until\n"
+"     written.  A 512 MiB decode under 128 MB was killed 9 times in 12\n"
+"     that way, and passed every time in under a second with O_DIRECT.\n"
+"     --no-direct there needs about 160 MB.  The limit leaves a\n"
+"     redirected stdout (-c > FILE) to the rules above, since others may\n"
+"     share it: name the output with -o under a tight limit.\n"
 "     Test mode writes nothing, so it is unaffected.  --no-direct\n"
 "     forces buffered I/O (e.g. to benchmark the buffered baseline on\n"
 "     Gen4).  O_DIRECT can expose the app to NVMe (NVM Express)\n"
@@ -5777,6 +5800,14 @@ static void print_help_long()
 "       4 CPUs  19.3-19.8   / 16.7      8 CPUs  15.6-16.0 / 16.8\n"
 "     at a fifth of the host CPU; from a warm page cache hybrid ties at 4\n"
 "     CPUs (this path reads the drive even when the cache holds the file).\n"
+"     ITS CPUs COMPRESS TOO (v0.18.38): the default's staging -- never an\n"
+"     explicit --direct-stage -- keeps a CPU pool whose workers compress\n"
+"     frames straight out of the pinned slots while the GPU takes the\n"
+"     rest (-T names the workers).  One H100 compresses ~4.2 GiB/s, so the\n"
+"     CPUs add what a faster source can feed: 4 CPUs, 68 GiB cold on the\n"
+"     server's NVMe 16.0-16.6 s against 16.8-16.9 staged alone (hybrid\n"
+"     18.8-19.4); 64 GiB on tmpfs 12.7-14.7 against 15.7-16.1, for about\n"
+"     three times the host CPU.\n"
 "     DECOMPRESSION is not staged by default: with v0.18.33's readers for\n"
 "     a cold archive (see --read-threads) hybrid decodes as fast on a\n"
 "     small budget (4 CPUs: 13.0-14.0 s against 13.6-13.8), and the\n"
@@ -12793,6 +12824,29 @@ static uint64_t get_available_ram_bytes()
   return cg.file.empty() ? avail : std::max<uint64_t>(1, avail);
 }
 
+// UNDER A CONTAINER'S MEMORY LIMIT A FILE OUTPUT DEFAULTS TO O_DIRECT
+// (v0.18.38).  A buffered output's page cache is charged to the same limit as
+// the frames, and dirty pages cannot be reclaimed until written: below about a
+// gigabyte left, where the reader's blocks and the writer's buffers already
+// shrink, the frames' floors leave the cache a few MiB, and every write waits
+// for reclaim.  MEASURED, 512 MiB decoded to a file under a real 128 MB limit:
+// buffered output was killed 9 of 12 (both builds) and the survivors took
+// 13-35 s; O_DIRECT, whose buffers fit the memory (DirectWriter), passed every
+// time in 0.3-1.1 s.  The GPU build on a Gen4+ bus already wrote O_DIRECT, so
+// it never saw this; a CPU-only build, or an older bus, wrote buffered.  An
+// explicit --direct/--no-direct decides; so does a host with no limit.  A NAMED
+// output only: a redirected stdout keeps --direct's rule (see its adoption).
+static bool gz_direct_for_memory(const Options & opt, uint64_t * limit, uint64_t * left)
+{
+  if (opt.direct_io || opt.direct_io_user_set || opt.mode == Mode::TEST) return false;
+  GzMemHeadroom cg;
+  const uint64_t avail = gz_ram_available(&cg);
+  if (cg.file.empty() || avail >= (uint64_t(1) << 30)) return false;
+  if (limit) *limit = cg.limit;
+  if (left) *left = avail;
+  return true;
+}
+
 #ifdef HAVE_NVCOMP
 /*======================================================================
  Pinned host-memory budget (--pinned auto)
@@ -13408,6 +13462,11 @@ static void gz_input_retire_stop() { g_input_retirer.stop(); }
 struct Task {
   size_t seq = 0;
   std::vector<char> data;
+  // The queue charges `data`'s CAPACITY, not its size (v0.18.38).  Set by the decode
+  // reader under a memory limit, where a copy is reserved in a size class (up to an
+  // eighth more than the frame) and a carry is handed over with up to a sixteenth
+  // more: the byte cap then counts what the queue really holds.
+  bool count_capacity = false;
   size_t decomp_size = 0;
   uint64_t out_off = 0;           // --keep-going: this frame's start offset in the decompressed
                                   //  output (prefix sum of decomp_size; set by the single reader)
@@ -13446,7 +13505,9 @@ struct Task {
   // frame -- exactly what the per-frame copy it replaced counted -- so decompress
   // backpressure is unchanged.  Staged Tasks hold no host bytes, and the older views
   // (mmap, DirectReadPool) keep their historical zero.
-  size_t       queued_host_bytes() const { return block ? view_len : data.size(); }
+  size_t       queued_host_bytes() const {
+    return block ? view_len : count_capacity ? data.capacity() : data.size();
+  }
   size_t       len() const {
     if (src_off >= 0 || gds_stage >= 0) return src_len;
     return view_ptr ? view_len : data.size();
@@ -15627,7 +15688,20 @@ public:
       // makes this a user-visible memory cap.  One is sufficient: the cycle
       // needs exactly the writer's next frame to get through, and once it is
       // written its release repays the overdraft and the pipeline moves again.
-      if (permits_ == 0 && urgent()) {
+      //
+      // AND NONE WHILE THE WRITER HOLDS A FRAME (v0.18.38).  The writer drains
+      // a frame and moves its cursor before the frame is written, so with every
+      // permit held by frames it has taken -- one being written, one waiting
+      // behind it -- the next frame looked like the one it needed and was let
+      // past the cap, although a permit was already on its way back.  A slow
+      // sink lives there: a buffered file output under a 128 MB limit, whose
+      // page cache shares the limit, overdrafted on 26-30 frames of 32 and kept
+      // three decoded frames and three compressed ones alive against a
+      // two-frame budget, 108.6 MiB of heap where O_DIRECT output peaked at
+      // 84.5.  It was killed 6 of 6.  While the writer holds a frame, its
+      // release is guaranteed without any other frame, so there is no cycle to
+      // break.  See writer_took().
+      if (permits_ == 0 && writer_held_ == 0 && urgent()) {
         --permits_;
         overdrafts_.fetch_add(1, std::memory_order_relaxed);
         break;
@@ -15637,7 +15711,7 @@ public:
       cv_.wait(lk, [&] {
         if (woke) wakeups_.fetch_add(1, std::memory_order_relaxed);
         woke = true;
-        return permits_ > 0 || done_ || (permits_ == 0 && urgent());
+        return permits_ > 0 || done_ || (permits_ == 0 && writer_held_ == 0 && urgent());
       });
     }
     int observed = max_ - permits_;
@@ -15690,7 +15764,9 @@ public:
       if (done_) break;                    // shutdown: take nothing, report n
       const int full = std::min(n, max_);
       if (permits_ >= full) { taken = full; permits_ -= full; break; }
-      if (permits_ >= 0 && urgent()) {
+      // The overdraft only while the writer holds no frame, as above; what
+      // is free is still taken.
+      if (permits_ >= 0 && (permits_ > 0 || writer_held_ == 0) && urgent()) {
         if (permits_ > 0) { taken = permits_; permits_ = 0; }
         else { taken = 1; --permits_; overdrafts_.fetch_add(1, std::memory_order_relaxed); }
         break;
@@ -15701,7 +15777,8 @@ public:
       bcv_.wait(lk, [&] {
         if (woke) wakeups_.fetch_add(1, std::memory_order_relaxed);
         woke = true;
-        return done_ || permits_ >= std::min(n, max_) || (permits_ >= 0 && urgent());
+        return done_ || permits_ >= std::min(n, max_)
+            || (permits_ >= 0 && (permits_ > 0 || writer_held_ == 0) && urgent());
       });
       --batch_waiters_;
     }
@@ -15819,13 +15896,35 @@ public:
   // ~28k wasteful context switches and serializes workers on throttle.m_.
   // notify_one per permit released matches the actual capacity change and
   // keeps the pipeline unblocked without the convoy.
-  void release(int n = 1) {
+  void release(int n = 1) { release_(n, false); }
+
+  // THE WRITER'S FRAMES (v0.18.38).  The ordered writer counts the frames it
+  // takes for its write thread BEFORE it moves the cursor the head-of-line
+  // predicates read, under this lock, so a waiter that sees the new cursor sees
+  // the count too; the write thread returns each one's permit with
+  // release_written() once it is written.  While the count is above zero a
+  // permit is on its way back with no other frame needed, so the overdraft is
+  // withheld (acquire_or_overdraft).  Only a writer whose release cannot wait
+  // on a later frame may count: not a --tar sink, whose frames can carry their
+  // permits until the parser has the next one.
+  void writer_took(int n) {
+    if (n <= 0 || disabled_) return;
+    std::lock_guard<std::mutex> lk(m_);
+    writer_held_ += n;
+  }
+  void release_written(int n = 1) { release_(n, true); }
+
+private:
+  void release_(int n, bool written) {
     if (n <= 0 || disabled_) return;
     int grew = 0, new_max = 0, step = 0, ceil = 0;
     bool batch_waiting = false;
     {
       std::lock_guard<std::mutex> lk(m_);
       permits_ += n;
+      // The same lock as the permits: a waiter never sees the count fall to
+      // zero without the permit that came with it.
+      if (written) writer_held_ = std::max(0, writer_held_ - n);
       batch_waiting = batch_waiters_ > 0;
       // Consume a pending governor grow request (one step per request).
       if (grow_ceiling_ > max_
@@ -15854,6 +15953,7 @@ public:
     }
   }
 
+public:
   // Signal shutdown -- wake all blocked workers so they can exit.
   // No-op when disabled (no waiters to wake).
   void set_done() {
@@ -15935,6 +16035,7 @@ private:
   std::atomic<bool> ram_bound_{false};
   std::condition_variable bcv_;   // acquire_batch_or_head: GPU intakes (v0.17.90)
   int batch_waiters_ = 0;         // parked on bcv_; guarded by m_
+  int writer_held_ = 0;           // taken by the writer, not yet written (writer_took); m_
   std::atomic<int>      peak_in_flight_{0};
   std::atomic<uint64_t> block_count_{0};
   std::atomic<uint64_t> block_nanos_{0};
@@ -16442,7 +16543,9 @@ private:
       }
       // wrote_bytes is now updated incrementally within write_sparse()
       // Release one frame permit: writer made progress, blocked workers may unblock.
-      if (bp_) bp_->release(1);
+      // The writer counted it in (writer_took): only writer_run hands this pool
+      // its throttle, and every frame it submits was counted.
+      if (bp_) bp_->release_written(1);
       // Drop our shared_ptr ref now (not at end of loop) so the worker pool
       // can recycle the buffer for its next frame as soon as we're done.
       buf.reset();
@@ -16766,6 +16869,11 @@ static void writer_run(FILE * out, ResultStore & results,
       results.data.erase(it);
       ++results.next_to_write;
     }
+    // Counted BEFORE the cursor moves (FrameThrottle::writer_took): a worker
+    // that sees the next frame become the writer's must also see that the
+    // writer holds these, or it overdrafts past a permit already on its way.
+    // Only the write pool's frames: a sink's can wait on a later frame.
+    if (aio && bp && !batch.empty()) bp->writer_took((int)batch.size());
     results.next_pub.store(results.next_to_write, std::memory_order_relaxed);
 
     if (batch.empty()) continue;
@@ -20448,10 +20556,25 @@ static void cpu_worker(
     // bug and must say so.  t.len() is the frame length but t.ptr() is an empty
     // vector for a GDS Task: reading it is undefined behaviour that only failed
     // visibly last time because ZSTD happened to notice the size mismatch.
+    const char * in_ptr = t.ptr();
+#ifdef HAVE_NVCOMP
+    // THE DEFAULT'S STAGING SLOTS (v0.18.38, Options::stage_cpu).  A frame read into
+    // the pinned HOST pool is compressed from its slot in place; release_input()
+    // below returns the slot once the frame is compressed.  A VRAM pool's slot
+    // (--gds-only --tar) has no host bytes, and never reaches a CPU pool.
+    if (t.gds_stage >= 0) {
+      GdsStagePool * sp = g_gds_stage_pool.load(std::memory_order_acquire);
+      if (!sp || !sp->host())
+        die("internal error: a frame staged in VRAM reached a CPU compress worker");
+      in_ptr = static_cast<const char *>(sp->buf(t.gds_stage));
+      g_dstage_cpu_frames.fetch_add(1, std::memory_order_relaxed);
+      g_dstage_cpu_bytes.fetch_add(t.len(), std::memory_order_relaxed);
+    } else
+#endif
     if (t.is_staged())
       die("internal error: a --gds-only frame reached a CPU compress worker; "
           "these name a file region and carry no host bytes");
-    const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch,
+    const size_t csz = compress_one_cpu_frame(in_ptr, t.len(), opt->level, opt->ultra, scratch,
                                               cpuagg ? cpuagg->frame_workers : 0,
                                               cpuagg ? cpuagg->frame_job : 0);
     const auto t1 = std::chrono::steady_clock::now();
@@ -21746,6 +21869,7 @@ static size_t stream_frames_to_queue_mt(
     zc_cap = (size_t)std::strtoull(e, nullptr, 10);
   size_t zc_views = 0, zc_carried = 0, zc_copied = 0, zc_peak = 0, max_frame_comp = 0;
   size_t zc_carry_kept = 0;       // carried frames copied out of a kept carry (carry_exact)
+  size_t zc_carry_moved = 0;      // carried frames handed over at their size (carry_exact)
   size_t zc_overlap = 0;          // frames that ended in their block's overlap
   uint64_t zc_wait_ns = 0;        // consumer time spent waiting for its next block
   struct Slot { std::shared_ptr<BlockBuf> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
@@ -21992,6 +22116,53 @@ static size_t stream_frames_to_queue_mt(
   uint64_t out_off_acc = 0;
   std::vector<char> carry;            // straddling-frame bytes from prior block(s)
   uint64_t carry_origin = 0;          // absolute file offset of carry[0] (for the fallback offset)
+  // THE CARRY AT ITS FRAME'S SIZE (v0.18.38, carry_exact only).  Once a carried
+  // frame's header is in hand, its compress bound -- the most a frame of that
+  // content size takes -- is reserved once, and appends stop there, so the vector
+  // never doubles: the first 16 MiB frame of a run grew it 4 -> 8 -> 16 -> 32 MiB,
+  // and that 32 MiB stayed for the run.  Only for a frame no larger than the
+  // archive's first (every frame of a uniform archive), within what the file has
+  // left and a quarter of the memory: a header that claims more is not believed,
+  // and its carry grows with the bytes that arrive, as before.
+  size_t carry_res = 0;               // the reservation the appends stop at (0 = none)
+  bool carry_hdr = false;             // this carry's header has been read
+  // `h`/`hn` are the frame's first bytes: the source before a carry starts (so a
+  // carry handed over at capacity 0 is allocated once, not grown and then moved),
+  // or the carry itself while section (A) appends.
+  auto carry_reserve_exact = [&](const char * h, size_t hn) {
+    if (!carry_exact || carry_hdr || hn < 4) return;
+    unsigned long long dz = ZSTD_CONTENTSIZE_UNKNOWN;
+    if (rd_le32(h) == ZSTD_MAGICNUMBER) {
+      dz = ZSTD_getFrameContentSize(h, hn);
+      if (dz == ZSTD_CONTENTSIZE_ERROR && hn < (size_t)ZSTD_FRAMEHEADERSIZE_MAX) return;
+    }
+    carry_hdr = true;
+    if (dz != ZSTD_CONTENTSIZE_ERROR && dz != ZSTD_CONTENTSIZE_UNKNOWN
+        && first_frame_decomp != 0 && dz <= first_frame_decomp) {
+      const size_t bound = ZSTD_compressBound((size_t)dz);
+      const uint64_t left = file_size > carry_origin ? file_size - carry_origin : 0;
+      const size_t res = (size_t)std::min<uint64_t>(bound, left);
+      if (!ZSTD_isError(bound) && res > hn && !(ring_ram && res > ring_ram / 4)) {
+        // Replace a buffer kept from a roomier carry, not only a smaller one: a
+        // straddling skippable frame (a concatenated archive's seek table) is sized
+        // by the rule below, and its 20 MiB, kept by clear(), made every later
+        // carry too roomy to hand over (Codex review).  The bytes so far (a split
+        // header, under 18) move with it; `h` is not used after this.
+        if (carry.capacity() < res || carry.capacity() - res > res / 16) {
+          std::vector<char> fresh;
+          fresh.reserve(res);
+          fresh.assign(carry.begin(), carry.end());
+          carry.swap(fresh);
+        }
+        carry_res = res;
+        return;
+      }
+    }
+    // Not sized by its header (a skippable frame, no content size, or a claim
+    // past the archive's first frame): one largest frame and a step (v0.18.32).
+    const size_t want = std::max(hn, max_frame_comp + STEP);
+    if (carry.capacity() < want) carry.reserve(want);
+  };
   bool aborted = false;
   // Set when a mid-stream frame has no content-size header: parallel decode
   // needs known frame sizes, so we hand the rest of the file (from fallback_off)
@@ -22005,6 +22176,22 @@ static size_t stream_frames_to_queue_mt(
     if (fail_msg.empty()) fail_msg = why;
     failed.store(true, std::memory_order_relaxed);
     stop = true;
+  };
+
+  // A FRAME'S COPY IN A SIZE CLASS (v0.18.38, carry_exact only).  Under a limit
+  // every frame is copied, and each copy is freed by the worker that decoded it.
+  // Copies of slightly different sizes -- 12.05 to 12.07 MiB for a base64 archive's
+  // 16 MiB frames -- cannot reuse each other's freed chunks, so the heap grew past
+  // its holes: the parsing thread's arena reached 112.8 MiB for a ~64 MiB live set,
+  // and a 2 GiB decode of compressible data died under 128 MB.  Rounded up to an
+  // eighth of their power of two (at most 12.5% more), one archive's copies share
+  // one size and reuse each other's chunks exactly.
+  auto copy_frame = [&](std::vector<char> & dst, const char * src, size_t n) {
+    if (carry_exact && n > ONE_MIB) {
+      const size_t step = (size_t{1} << (63 - __builtin_clzll((unsigned long long)n))) / 8;
+      dst.reserve((n + step - 1) / step * step);
+    }
+    dst.assign(src, src + n);
   };
 
   // Exactly one of: view_of (a view into that block), take_from (move the carry
@@ -22025,18 +22212,29 @@ static size_t stream_frames_to_queue_mt(
     if (fc > max_frame_comp) max_frame_comp = fc;
     uint64_t cp = m ? now_ns() : 0;
     if (view_of)        { t.view_ptr = p; t.view_len = fc; t.block = *view_of; ++zc_views; }
+    else if (take_from && carry_exact && take_from->capacity() - fc <= fc / 16) {
+      // Under a limit a carry reserved at its frame's size (carry_reserve_exact) is
+      // handed over (v0.18.38): the queue counts the frame's bytes, and the buffer
+      // holds no more than a sixteenth past them.  Copying it out instead kept a
+      // second frame-sized buffer alive for the whole run -- 32 MiB at 16 MiB frames,
+      // in no budget, the largest single reason a 2 GiB decode died under 128 MB.
+      take_from->resize(fc); t.data = std::move(*take_from); take_from->clear();
+      ++zc_carried; ++zc_carry_moved;
+    }
     else if (take_from && carry_exact) {
-      // Under a limit the carry is not handed over (v0.18.32): it was reserved at
-      // twice the largest frame plus a step, and that capacity went with the frame
-      // into the queue -- five carried 4 MiB frames held 111 MiB, and with the small
-      // blocks below most frames are carried.  Copy the frame out, keep the buffer.
-      t.data.assign(take_from->data(), take_from->data() + fc); take_from->clear();
+      // Under a limit a carry with more room than its frame is not handed over
+      // (v0.18.32): that capacity would go with the frame into the queue, which
+      // counts only the frame -- five carried 4 MiB frames held 111 MiB.  Copy the
+      // frame out, keep the buffer (at most one frame's bound, see
+      // carry_reserve_exact) for the next.
+      copy_frame(t.data, take_from->data(), fc); take_from->clear();
       ++zc_carried; ++zc_carry_kept;
     }
     else if (take_from) { take_from->resize(fc); t.data = std::move(*take_from); take_from->clear(); ++zc_carried; }
-    else                { t.data.assign(p, p + fc); ++zc_copied; }
+    else                { copy_frame(t.data, p, fc); ++zc_copied; }
     if (m) m->reader_copy_ns.fetch_add(now_ns() - cp, std::memory_order_relaxed);
     t.decomp_size = (size_t)dz;
+    t.count_capacity = carry_exact;
     t.out_off = out_off_acc;
     out_off_acc += (uint64_t)dz;
     if ((size_t)dz > max_frame_decomp) max_frame_decomp = (size_t)dz;
@@ -22073,11 +22271,19 @@ static size_t stream_frames_to_queue_mt(
     // appends below never regrow -- a regrowth is a hidden copy of everything so far.
     auto start_carry = [&](const char * src, size_t n) {
       uint64_t c0 = m ? now_ns() : 0;
-      // Kept for reuse under a limit (carry_exact), the buffer needs one largest
-      // frame and a step, not two: it regrows only for a frame larger than any yet.
-      const size_t want = std::max(n, (carry_exact ? 1 : 2) * max_frame_comp + STEP);
-      if (carry.capacity() < want) carry.reserve(want);
-      carry.assign(src, src + n);
+      carry_res = 0; carry_hdr = false;
+      if (carry_exact) {
+        // Under a limit the header decides the reservation (carry_reserve_exact),
+        // and a kept buffer keeps its capacity.  A header not yet whole is read
+        // when section (A) has appended the rest of it.
+        carry.clear();
+        carry_reserve_exact(src, n);
+        carry.assign(src, src + n);
+      } else {
+        const size_t want = std::max(n, 2 * max_frame_comp + STEP);
+        if (carry.capacity() < want) carry.reserve(want);
+        carry.assign(src, src + n);
+      }
       if (m) m->reader_copy_ns.fetch_add(now_ns() - c0, std::memory_order_relaxed);
     };
     auto append_carry = [&](const char * src, size_t n) {
@@ -22135,6 +22341,16 @@ static size_t stream_frames_to_queue_mt(
           }
           if (appended >= own) break;       // exhausted this block; frame spans further
           size_t take = std::min(step, own - appended);
+          if (carry_exact) {
+            // The header first, then up to the reservation (carry_reserve_exact): the
+            // vector then never regrows past its frame.  A frame longer than its
+            // header's bound (only a damaged or hand-made one) grows as before.
+            carry_reserve_exact(carry.data(), carry.size());
+            if (!carry_hdr)
+              take = std::min(take, (size_t)ZSTD_FRAMEHEADERSIZE_MAX - carry.size());
+            else if (carry_res > carry.size())
+              take = std::min(take, carry_res - carry.size());
+          }
           append_carry(data + appended, take); appended += take;
           step = std::min(step * 2, BLOCK); // geometric growth, capped at one block
         }
@@ -22215,9 +22431,10 @@ static size_t stream_frames_to_queue_mt(
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   if (opt.verbosity >= V_VERBOSE) {
     char zb[448];
-    char kept[64] = "";
-    if (zc_carry_kept)
-      std::snprintf(kept, sizeof kept, "; %zu carried copied out of a kept carry", zc_carry_kept);
+    char kept[128] = "";
+    if (zc_carry_kept || zc_carry_moved)
+      std::snprintf(kept, sizeof kept, "; %zu carried copied out of a kept carry, %zu handed over at their size",
+                    zc_carry_kept, zc_carry_moved);
     std::snprintf(zb, sizeof zb,
       "[READER] zero-copy: %zu frames as views, %zu carried across block boundaries, "
       "%zu copied%s; %zu ended in the %zu MiB overlap; peak %zu blocks (%.1f GiB%s) alive, "
@@ -40131,10 +40348,14 @@ static void dstage_read_plain(TaskQueue & queue, GdsStagePool & pool, int fd,
     std::lock_guard<std::mutex> lk(results.m);
     results.cv.notify_all();
   };
-  // Never blocks for long: queue.push() cannot reach the depth cap here, because
-  // every queued Task holds a slot and the frame being pushed still holds one,
-  // so at most (slots - 1) are queued (TaskQueue's byte cap is 0 for staged
-  // Tasks).  After an abort, push() drops the Task and returns its slot.
+  // GPU alone, push() never blocks for long: it cannot reach the depth cap here,
+  // because every queued Task holds a slot and the frame being pushed still holds
+  // one, so at most (slots - 1) are queued (TaskQueue's byte cap is 0 for staged
+  // Tasks).  With the default's CPU pool (stage_cpu, v0.18.38) the depth is the
+  // pool less the workers, so push() CAN block at the cap, holding ord_m and its
+  // slot -- backpressure, not a cycle: every queued frame precedes the one being
+  // pushed, and the GPU's capacity escape and the CPU workers pop them without
+  // ord_m or a slot.  After an abort, push() drops the Task and returns its slot.
   auto deliver = [&](uint64_t c, Task && t) {
     std::lock_guard<std::mutex> lk(ord_m);
     waiting.emplace(c, std::move(t));
@@ -40242,6 +40463,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
   g_dstage_bytes.store(0, std::memory_order_relaxed);
   g_dstage_frames.store(0, std::memory_order_relaxed);
+  g_dstage_cpu_bytes.store(0, std::memory_order_relaxed);
+  g_dstage_cpu_frames.store(0, std::memory_order_relaxed);
   g_dstage_tar_direct_bytes.store(0, std::memory_order_relaxed);
   g_dstage_tar_buffered_bytes.store(0, std::memory_order_relaxed);
   if (opt.gds_only) {
@@ -40504,7 +40727,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                       * std::max<size_t>(1, opt.gpu_streams), opt)});
   if (!defer_detect && opt.throttle_frames < 0) {
     per_stream_budget = gz_mem_fit_gpu_batch(&device_count, opt.gpu_streams, per_stream_budget,
-                                             host_chunk, opt.gpu_only ? 0 : cpu_threads_fit,
+                                             host_chunk,
+                                             opt.gpu_only && !opt.stage_cpu ? 0 : cpu_threads_fit,
                                              opt.gpu_only, opt);
     if (device_count <= 0) {
       // As with no usable GPU above: --cpu-batch's queue floor waits for a GPU.
@@ -40738,7 +40962,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<bool> tick_done{false};
   std::thread tick_thr;
 
-  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
+  // The default's staging runs a CPU pool beside its GPU (Options::stage_cpu), so
+  // it takes the hybrid scheduler too: a CPU worker yields while a GPU stream asks
+  // for frames, and the auto queue floor is released by the staging pool's depth
+  // ceiling (pin_dstage_host_pool), as for any bounded producer.
+  const bool stage_cpu = opt.stage_cpu && opt.direct_stage && !opt.gds_only && !opt.cpu_only;
+  if ((!opt.cpu_only && !opt.gpu_only && opt.hybrid) || stage_cpu) {
     sched_ptr = std::make_unique<HybridSched>(
         opt.cpu_share, resolve_cpu_threads(opt.cpu_threads),
         device_count, opt);
@@ -40792,8 +41021,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "[HYBRID] starting CPU pool: " << cpu_threads
-         << " threads (GPUs initializing in background)";
+      if (stage_cpu)
+        os << "[DSTAGE] " << cpu_threads << " CPU worker" << (cpu_threads == 1 ? "" : "s")
+           << " compress from the staging slots beside the GPU";
+      else
+        os << "[HYBRID] starting CPU pool: " << cpu_threads
+           << " threads (GPUs initializing in background)";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     for (int i = 0; i < cpu_threads; ++i)
@@ -40961,7 +41194,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     g_gpuc_bytes.store(0, std::memory_order_relaxed);
     // Ordinary --gpu-only runs do not save the count model; calibration's
     // children pass --adapt even though they use --no-profile.
-    g_gpuc_devices.store(opt.gpu_only && opt.adapt ? gpu_count : 0,
+    // Nor the default's staging with its CPU pool (stage_cpu, v0.18.38): its CPUs
+    // carry frames too (Codex review).
+    g_gpuc_devices.store(opt.gpu_only && !stage_cpu && opt.adapt ? gpu_count : 0,
                          std::memory_order_relaxed);
 
     // Per-device state, built from the REAL count.  Both types hold a mutex, so
@@ -41164,7 +41399,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     if (pin_ms) *pin_ms = double(now_ns() - pin_t0) / 1e6;
     g_gds_stage_pool.store(stage_pool.get(), std::memory_order_release);
-    queue.set_max_depth(stage_bufs);
+    // WITH A CPU POOL (stage_cpu) THE DEPTH LEAVES EACH WORKER ITS SLOT.  A CPU
+    // worker holds its frame's slot while it compresses, and nothing makes it
+    // yield while a GPU stream waits for a batch (gpus_waiting_ is raised only
+    // around the pop), so with the depth at the pool's size the queue could never
+    // reach it while the workers were busy: the stream's capacity escape in
+    // wait_for_batch_or_cap would wait on the CPU pool, frame after frame.  At
+    // the pool less the workers, the escape fires with every worker holding a slot.
+    const size_t stage_depth = stage_cpu && (size_t)cpu_threads < stage_bufs
+        ? stage_bufs - (size_t)cpu_threads : stage_cpu ? 1 : stage_bufs;
+    queue.set_max_depth(stage_depth);
+    if (sched) sched->set_queue_depth_cap(stage_depth);
     g_adapt_src_path.store("dstage", std::memory_order_relaxed);
     return stage_bufs;
   };
@@ -41237,6 +41482,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     g_adapt_src_path.store(opt.gds_only ? "gds" : "dstage", std::memory_order_relaxed);
     g_dstage_bytes.store(0, std::memory_order_relaxed);
     g_dstage_frames.store(0, std::memory_order_relaxed);
+    g_dstage_cpu_bytes.store(0, std::memory_order_relaxed);
+    g_dstage_cpu_frames.store(0, std::memory_order_relaxed);
     if (opt.verbosity >= V_VERBOSE) {
       char b[256];
       if (opt.gds_only)
@@ -41378,9 +41625,18 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     } catch (...) {
       stage_setup_failure = std::current_exception();
     }
-    if (!stage_setup_failure)
-      tarx::assemble(queue, tar_layout, gpu_chunk, opt, m, &throttle, &results);
-    else {
+    // An exception out of the assembler takes the same abort as a failed setup
+    // (Codex review, v0.18.38).  Escaping, it unwound past every join: the staging
+    // pool, declared after the worker pools, was freed first, while the default's
+    // CPU workers could still be compressing out of it.
+    if (!stage_setup_failure) {
+      try {
+        tarx::assemble(queue, tar_layout, gpu_chunk, opt, m, &throttle, &results);
+      } catch (...) {
+        stage_setup_failure = std::current_exception();
+      }
+    }
+    if (stage_setup_failure) {
       // THE DEFAULT'S --tar STAGING REBUILDS LIKE ITS PLAIN-FILE STAGING (v0.18.34).
       // Aborting the pipeline alone, as an explicit --tar --direct-stage may (it
       // dies below with exit 3), left an automatic run to commit what the abort
@@ -41692,6 +41948,18 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // throttle while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : workers) th.join();
   if (tunes) tune_publish_devices(tunes.get(), gpu_count, opt);
+  // THE DEFAULT'S STAGING JOINS ITS CPU POOL HERE (v0.18.38, stage_cpu): its
+  // workers compress out of the staging slots, so they must be gone before the
+  // pool below is cleared, cached or freed -- joined with the rest of the CPU
+  // pool further down, a worker still compressing its last frame read freed
+  // pinned memory.  Before the [DSTAGE] summary too, which counts their frames.
+  // As there, an abandoned pass first releases a worker waiting for a permit.
+  if (stage_cpu && !cpu_pool.empty()) {
+    if (run_abandoned()) throttle.set_done();
+    queue.notify_cpu_waiters();
+    for (auto & th : cpu_pool) th.join();
+    cpu_pool.clear();
+  }
   // Workers are joined, so no staged slot can still be in flight.  Clear the
   // global before destroying the pool: a releaser that loaded the pointer must
   // never find it dangling.
@@ -41766,13 +42034,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           (unsigned long long)g_dstage_tar_buffered_bytes.load(std::memory_order_relaxed);
       char b[320];
       if (opt.verbosity >= V_VERBOSE) {
+        const unsigned long long cf = g_dstage_cpu_frames.load(std::memory_order_relaxed);
+        const unsigned long long fr = g_dstage_frames.load(std::memory_order_relaxed) + cf;
+        const unsigned long long by = g_dstage_bytes.load(std::memory_order_relaxed)
+                                    + g_dstage_cpu_bytes.load(std::memory_order_relaxed);
+        char cpu_s[96] = "";
+        if (cf) std::snprintf(cpu_s, sizeof cpu_s, " (%llu compressed by the CPU workers from their slots)", cf);
         std::snprintf(b, sizeof(b),
           "[DSTAGE] --tar: %llu frames, %llu bytes (%.1f MiB) assembled in pinned host "
-          "memory -> VRAM (no cuFile); member data %llu bytes O_DIRECT, %llu buffered\n",
-          (unsigned long long)g_dstage_frames.load(std::memory_order_relaxed),
-          (unsigned long long)g_dstage_bytes.load(std::memory_order_relaxed),
-          double(g_dstage_bytes.load(std::memory_order_relaxed)) / 1048576.0,
-          direct, buffered);
+          "memory -> VRAM (no cuFile)%s; member data %llu bytes O_DIRECT, %llu buffered\n",
+          fr, by, double(by) / 1048576.0, cpu_s, direct, buffered);
         vlog(V_VERBOSE, opt, b);
       }
       // A filesystem that refused O_DIRECT is not an error -- those members were
@@ -41794,11 +42065,21 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // Rounded MiB cannot tell 4095 staged bytes from 0; the byte count can,
       // and it is what a caller compares against the input size to know the
       // portable path actually carried the whole file.
-      std::snprintf(b, sizeof(b),
-        "[DSTAGE] %llu frames, %llu bytes (%.1f MiB) staged O_DIRECT host -> VRAM (no cuFile)\n",
-        (unsigned long long)g_dstage_frames.load(std::memory_order_relaxed),
-        (unsigned long long)g_dstage_bytes.load(std::memory_order_relaxed),
-        double(g_dstage_bytes.load(std::memory_order_relaxed)) / 1048576.0);
+      // With a CPU pool (stage_cpu) the totals are every frame the staging read,
+      // and the split says which engine compressed them.
+      const unsigned long long gf = g_dstage_frames.load(std::memory_order_relaxed);
+      const unsigned long long gb = g_dstage_bytes.load(std::memory_order_relaxed);
+      const unsigned long long cf = g_dstage_cpu_frames.load(std::memory_order_relaxed);
+      const unsigned long long cb = g_dstage_cpu_bytes.load(std::memory_order_relaxed);
+      if (cf == 0)
+        std::snprintf(b, sizeof(b),
+          "[DSTAGE] %llu frames, %llu bytes (%.1f MiB) staged O_DIRECT host -> VRAM (no cuFile)\n",
+          gf, gb, double(gb) / 1048576.0);
+      else
+        std::snprintf(b, sizeof(b),
+          "[DSTAGE] %llu frames, %llu bytes (%.1f MiB) staged O_DIRECT: %llu host -> VRAM "
+          "(no cuFile), %llu compressed by the CPU workers from their slots\n",
+          gf + cf, gb + cb, double(gb + cb) / 1048576.0, gf, cf);
       vlog(V_VERBOSE, opt, b);
     }
     // OUTSIDE the verbosity guard on purpose: the test that uses this runs -q.
@@ -41955,7 +42236,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (stage_setup_exit == EXIT_IO) gz_note_stage_read_failure(e.what());
     }
     catch (...) {
-      const std::string why = gz_stage_name(opt) + ": staging setup failed";
+      // An assembler exception reaches here too since v0.18.38, staged or not.
+      const std::string why = opt.region_staged() ? gz_stage_name(opt) + ": staging setup failed"
+                                                  : std::string("--tar: assembly failed");
       if (!opt.direct_stage_auto) die(why, stage_setup_exit);
       if (stage_setup_exit == EXIT_IO) gz_note_stage_read_failure(why);
     }
@@ -51523,15 +51806,20 @@ static int gzstd_main(int argc, char ** argv)
   }
 #endif
 
-  // O_DIRECT output: only when explicitly requested via --direct.
-  // Default is buffered I/O (fwrite) which uses the OS page cache for
+  // O_DIRECT output: --direct, the Gen4+ default (apply_backend_defaults), or a
+  // memory limit under a gigabyte left (gz_direct_for_memory).  Otherwise
+  // buffered I/O (fwrite), which uses the OS page cache for
   // consistent throughput — O_DIRECT bypasses the cache and exposes the
   // application to NVMe GC stalls, journal commits, and writeback
   // contention from prior runs, causing 2-5× wall-time variance on
   // sequential large-file workloads.
 #ifndef _WIN32
   std::unique_ptr<DirectWriter> direct_writer;
-  if (opt.direct_io && !to_stdout && out != stdout && out) {
+  // Or a memory limit chose it (gz_direct_for_memory); said at -v once adopted.
+  uint64_t mem_direct_limit = 0, mem_direct_left = 0;
+  const bool mem_direct = gz_direct_for_memory(opt, &mem_direct_limit, &mem_direct_left);
+  const bool direct_out = opt.direct_io || mem_direct;
+  if (direct_out && !to_stdout && out != stdout && out) {
     // ADOPT the descriptor we already hold; never resolve the path a second time.
     // `out` is the temp created O_EXCL|O_NOFOLLOW (atomic path) or the output we
     // opened and identity-checked, so its inode is already the verified one.
@@ -51547,9 +51835,18 @@ static int gzstd_main(int argc, char ** argv)
       if (dw->adopt_fd(ofd)) {
         std::fclose(out); out = nullptr;   // our dup keeps the file alive
         direct_writer = std::move(dw);
+        // Whatever chose it, and whatever its buffers: the suite tells an
+        // adopted writer from a buffered fallback by this line (review).
+        vlog(V_VERBOSE, opt, "[O_DIRECT] named output using O_DIRECT\n");
       }
     }
   } else if (opt.direct_io && to_stdout && out == stdout && opt.mode != Mode::TEST) {
+    // NOT the memory default (review): adopting a redirected stdout truncates
+    // it and writes positionally, which a caller's `1<>file` (a tail to keep)
+    // or two processes sharing one `>` redirect never asked for.  --direct
+    // says this command is the file's only writer; the Gen4+ default keeps the
+    // adoption it has always made; a memory limit says nothing about who owns
+    // the file, so it does not start doing so on more hosts.
     // NOT IN TEST MODE: -t writes no result, and this setup TRUNCATES a regular
     // file on stdout.  `exec 1<>file; gzstd -t --direct x.zst` emptied the file
     // and reported a passing test at exit 0 (v0.17.69 through v0.17.76).
@@ -51636,6 +51933,14 @@ static int gzstd_main(int argc, char ** argv)
       }
       // If open failed, fall through to normal fwrite via stdout
     } while (false);
+  }
+  if (direct_writer && mem_direct && opt.verbosity >= V_VERBOSE) {
+    char lb[32], fb[32];
+    human_bytes(double(mem_direct_limit), lb, sizeof(lb));
+    human_bytes(double(mem_direct_left), fb, sizeof(fb));
+    vlog(V_VERBOSE, opt, std::string("[O_DIRECT] memory: output defaults to --direct under a ")
+         + lb + " limit (" + fb + " left): a buffered file's page cache would share it "
+         "(override with --no-direct)\n");
   }
   if (direct_writer && direct_writer->buf_cap() < DirectWriter::BUF_CAP_MAX)
     vlog(V_VERBOSE, opt, "[O_DIRECT] memory: 4 write buffers of "
@@ -52089,7 +52394,7 @@ static int gzstd_main(int argc, char ** argv)
       // Every rebuild is CPU-only — the trustworthy, deterministic path.
       pass_opt = opt;
       pass_opt.cpu_only = true; pass_opt.gpu_only = false; pass_opt.hybrid = false;
-      pass_opt.direct_stage = false; pass_opt.direct_stage_auto = false;
+      pass_opt.direct_stage = false; pass_opt.direct_stage_auto = false; pass_opt.stage_cpu = false;
       if (stage_input_changed) {
         // mmap fixes the length, and the probe can choose O_DIRECT again.  A
         // buffered CPU reader fills chunks until EOF, including an appended tail.
@@ -53977,6 +54282,7 @@ static void apply_backend_defaults(Options & opt)
     if (stage) {
       opt.direct_stage = true;
       opt.direct_stage_auto = true;
+      opt.stage_cpu = !::getenv("GZSTD_DEBUG_DSTAGE_NO_CPU");
       opt.gpu_only = true;
       opt.hybrid = false;
       if (opt.gpu_devices == 0) opt.gpu_devices = 1;   // --direct-stage's default
@@ -54368,13 +54674,17 @@ static void apply_backend_defaults(Options & opt)
     if (gz_cuda_usable_count(opt, "default staging") <= 0) {
       opt.direct_stage = false;
       opt.direct_stage_auto = false;
+      opt.stage_cpu = false;
       opt.gpu_only = false;
       opt.gpu_devices = stage_saved_devices;
       vlog(V_VERBOSE, opt, "[STAGE] no usable GPU after all; the default backend instead\n");
     } else if (opt.verbosity >= V_VERBOSE) {
       vlog(V_VERBOSE, opt, "[STAGE] " + std::to_string(gz_cpu_allowance().allowed())
            + " CPUs allowed and a GPU beside them: staging the reads through the GPU "
-             "(the --direct-stage path); --hybrid or --cpu-only keeps the CPUs working\n");
+             "(the --direct-stage path)"
+           + (opt.stage_cpu ? ", the CPUs compressing from the same slots; --hybrid reads "
+                              "through their own readers instead, --cpu-only leaves the GPU out\n"
+                            : "; --hybrid or --cpu-only keeps the CPUs working\n"));
     }
   }
 #endif

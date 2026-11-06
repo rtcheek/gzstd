@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.37  
+**Covers:** v0.9.50 → v0.18.38  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,174 @@
 
 ---
 
+
+## v0.18.38 — a 2 GiB decode fits 128 MB (it was killed, warm or cold: a 32 MiB carry outside every share and heap holes between copies), a named output under a memory limit is O_DIRECT and a slow sink no longer lets a frame past the throttle (a buffered output under 128 MB was still killed 9 times in 12), and the default's staging compresses on its CPUs too, beside the GPU (68 GiB at 4 CPUs 16.0-16.6 s against 16.8-16.9; 64 GiB from tmpfs 12.7-14.7 against 15.7-16.1)
+
+**A decode under 128 MB was killed (ROADMAP 36).**  Workstation 2 found it warm; on the server it died
+cold as well, and the GPU build under 160 MB too.  Every pool sat at its floor -- one decoder, one reader
+of 4 MiB blocks, a 2-frame throttle -- and the process still held 140 MiB of live heap (CPU-only build),
+by an `LD_PRELOAD` tracer of every allocation of 1 MiB or more.  Two things were outside every share:
+
+- **The carry.**  Under a limit the blocks shrink to 4 MiB, so every 16 MiB frame is carried across them.
+  The carry was reserved before any frame had been seen, so the vector doubled 4 -> 8 -> 16 -> 32 MiB on
+  the first frame, and under a limit it was kept for the whole run (each frame copied out of it).  Now a
+  carry is reserved once at its frame's compress bound, read from the header (for a frame no larger than
+  the archive's first, within the bytes the file has left and a quarter of the memory), and the appends
+  stop there.  A stored frame's carry is then its size and is handed over to the queue; any other is
+  copied out and the buffer kept.  A buffer that is roomier than the next frame's bound by more than a
+  sixteenth is replaced, so a straddling skippable frame cannot leave every later carry too roomy to
+  hand over (review).
+- **Holes in the heap.**  gzstd keeps frame buffers on the heap on purpose (v0.13.48: munmap's TLB
+  shootdowns), and copies of slightly different sizes -- a base64 archive's 12.05-12.07 MiB -- could not
+  reuse each other's freed chunks: by glibc's own `malloc_stats` the parsing thread's arena reached
+  112.8 MiB for a ~64 MiB live set.  Under a limit a copy now takes a size class (rounded up to an
+  eighth of its power of two), and the queue's byte cap charges such a Task's capacity, not its size.
+
+2 GiB archives under a real 128 MB systemd scope, warm and cold, three runs each, both builds: random data
+98-109 MiB anonymous, base64 114-121 MiB, every output byte-identical (before: killed every time).  The
+GPU build's runs wrote O_DIRECT, its default on this Gen5 bus; the CPU-only build's wrote buffered and
+passed -- by luck, as the next section shows.
+Not taken, measured: one malloc arena (no help with the holes: 169.6 MiB), and a 1 MiB mmap threshold
+(fits, but every frame then faults its buffers in: +40-60% wall on the GPU build).  Under 96 MB both
+archives are still killed -- the floors themselves are ~100 MiB -- and the unlimited path is unchanged.
+Under a 256 MiB fake limit a random archive decodes 10% faster (0.37 s against 0.41-0.45: no copy).
+
+**A buffered output under the limit was still killed (found the next morning).**  The new 128 MB cell
+took 69 s on the CPU-only build and 7 s on the GPU build, and the reason was that they ran different
+tests: the GPU build defaults output to O_DIRECT on a Gen4+ bus, so its "buffered" arms never wrote
+buffered.  512 MiB decoded to a file under a real 128 MB scope: the GPU build with `--no-direct` was killed
+6 of 6, the CPU-only build (buffered by default) 3 of 6, and the survivors took 13-35 s.  `memory.stat`
+showed 108-125 MiB anonymous, the output's page cache squeezed to 1-18 MiB, and thousands of
+`memory.max` events: every write waited for reclaim.  Two causes:
+
+- **The throttle let a frame past while a permit was coming back.**  A worker that gets no permit may
+  overdraft one when the queue's front is the frame the in-order writer waits for (v0.15.67: out-of-order
+  readers could otherwise hold every permit on later frames).  But the writer moves that cursor when it
+  takes a frame, before writing it, so with both permits held by frames it had taken -- one being written,
+  one waiting behind it -- the next frame looked like the one it needed.  A slow sink lives there: 26-30
+  of 32 frames overdrafted, three decoded and three compressed frames alive against a 2-frame budget,
+  108.6 MiB of heap where O_DIRECT output peaked at 84.5.  The writer now counts the frames it holds,
+  under the throttle's lock and before it moves the cursor, and the overdraft is taken only while it
+  holds none: then a permit is already on its way without any other frame.  The claim-ahead cycle the
+  overdraft exists for, where the writer holds nothing, is untouched; a `--tar` sink, whose frames can
+  wait for a later one, is not counted.  Peak 2 of 2, heap 92.6 MiB.
+- **The output's page cache shares the limit.**  Dirty pages cannot be freed until written, and at
+  128 MB the frames' floors (~100 MiB) leave the cache a few MiB.  Under a container's memory limit with
+  less than 1 GiB left -- where the reader's blocks and the O_DIRECT writer's buffers already shrink -- a
+  named output file now defaults to O_DIRECT on any hardware.  `--direct`/`--no-direct` still decide.  A
+  redirected stdout keeps `--direct`'s rule (review): adopting it truncates the file and writes from a
+  fixed position, which a caller's `1<>file` with a tail to keep, or two processes sharing one `>`,
+  never asked for; the long help says to name the output with `-o` under a tight limit.
+
+After both, the same 512 MiB under 128 MB: the default passed 9 of 9 on both builds, 0.45-0.94 s.
+`--no-direct` is still killed there 3 times in 12 (it was 9), and passes 12 of 12 at 160 MB (5-19 s) and
+at 192 MB (1-8 s); the long help says so.  Not measured: the Gen3 workstation, where O_DIRECT output
+regressed without a limit (owed).
+
+**The default's staging compresses on its CPUs too (ROADMAP 36).**  On a small CPU budget the default
+stages its reads through the GPU (v0.18.33), and only the GPU compressed: at 4 CPUs ~3 of them sat idle.
+Measured first that they had something to add: on the server the staged path is bound by the GPU, not
+the drive -- one H100 compresses ~4.2 GiB/s, and from tmpfs (which takes O_DIRECT) staging ran no faster
+than from the NVMe (64 GiB 15.7-16.1 s).  The default's staging now keeps a CPU pool under the hybrid
+scheduler: a worker compresses a frame straight out of its pinned slot and returns the slot after.  The
+queue's depth is the pool less the workers, so a GPU stream's capacity escape fires with every worker
+holding a slot; the pool is joined before the staging slots are freed or kept for the next input; a GPU
+fault still discards the output and rebuilds it on the CPU.  An explicit `--direct-stage` keeps its
+contract, the GPU alone; `GZSTD_DEBUG_DSTAGE_NO_CPU=1` turns the pool off (the A/B control).
+4 CPUs, one H100, to /dev/null, three runs each:
+
+| input | staged + CPUs | staged alone | `--hybrid` |
+|---|---|---|---|
+| 68 GiB base64, cold, NVMe | 16.0-16.6 s | 16.8-16.9 | 18.8-19.4 |
+| 64 GiB, tmpfs | 12.7-14.7 | 15.7-16.1 | 16.3-16.5 |
+| 16 GiB, tmpfs | 5.14-5.36 | 5.65-5.73 | 5.16-5.20 |
+
+The CPUs took 24-36% of the frames, for about three times the host CPU (wall time wins).  From the NVMe,
+one, two or three workers, 32, 48 or 64 slots, and two or three readers all ran the same: the staged
+reader tops out near 4.3 GiB/s there although three parallel `dd` reach 5.1 (open).  Workstation 2,
+whose 5.9 GiB/s drive outruns its GPU and where hybrid beat staging alone by 7-9%, is the case this was
+written for; it has not been measured there yet.  The `[DSTAGE]` summary counts every staged frame and
+names the CPU workers' share; `-v` names the pool and its depth.
+
+**Measured, nothing built:**
+- **The cached-archive decode at 4 CPUs (ROADMAP 36).**  Workstation 2 decoded a cached archive 24-27%
+  slower than a cold one.  On the server, 24.12 GiB, one H100, six interleaved runs: warm 6.66-7.62 s
+  (median 7.13), warm `--direct-read` 6.75-7.34 (7.21), cold 6.73-8.28 (6.78) -- within noise; the H100
+  carries the work beside v0.18.34's one CPU decoder.  No cheaper cached read was built.
+- **The decode reader's overlap (ROADMAP 25)**, on the corpus that question asked for: 130 GiB of
+  uniform text, 2.35:1, 6.6-7.2 MiB frames, warm, full width, nine runs each: 17 MiB (today) median
+  3.32 s `--cpu-only` and 3.36 hybrid, 8 MiB (table-derived) 3.33 and 3.32.  Only 885 of 8,320 frames
+  reach the overlap; closed.
+- **v0.18.36 on the server:** one H100's `--gpu-only` compress on six streams 17.19-17.43 s against
+  23.10-23.71 on two, at half the memory; six H100s drive-bound at either count, so several devices keep
+  two; the cached-archive probe's bar unchanged; the 192 MB cold decode passes.  A bare
+  `--gpu-streams N` implies `--hybrid`, so it does not stage.
+
+**Suite:** two new default cells on both builds (566 / 910; no-GPU and no-GDS deltas unchanged).  A
+decode under a real 128 MB scope writes the DEFAULT output to a named file, random data once and base64
+twice, and each arm asserts the O_DIRECT writer ran; it skips where no systemd user scope can set a
+limit, where `$TMPDIR` is tmpfs, or where an explicit `--direct` there does not get the O_DIRECT writer
+(review).  And a decode under a fake 128 MB limit into a FIFO read at ~100 MiB/s must take no overdraft;
+if the throttle's budget was never spent there the cell skips as inconclusive (review)
+(a pipe on stdout does not open that window: at `-vv` every log line flushes stdout first, which
+serializes the decoder behind the writes).  CPU-only mutants of the final code: no exact reservation,
+killed on the random arm; no size class, killed on both base64 arms in only 3 of 7 runs (the holes depend on allocation order, and nothing logs them); no memory default, "not
+O_DIRECT" on every arm; no throttle fix, the FIFO cell reads peak 3/2 with 6 overdrafts (and the scope
+cell was killed); no hand-over now fits 128 MB with the rest in place, and the hand-over counter names
+it.  Cell
+pm7 now expects stored frames handed over, and a new arm of it decodes an archive with a 6 MiB skippable
+frame straddling a block between two runs of frames: all twenty handed over (the old reservation rule:
+ten copied).  The default-staging cell checks the CPU pool's line, the queue depth (the slots less the
+workers) and its absence under `GZSTD_DEBUG_DSTAGE_NO_CPU=1`.
+
+Suites on the server: `-e` on the GPU build 907 passed, 1 failed, 1 skipped of 909 in 20m56s ("908 ran,
+as expected on this host").  The failure was v0.18.36's cell for a cached archive on a fast drive: it
+matched "at least 3.5 for N GPU", but the bar is 3.5 GiB/s per GPU the driver lists, so eight GPUs print
+"at least 28.0 for 8 GPUs" -- the cell had only ever run on a one-GPU host.  The match now takes any bar
+and count; checked by hand on both of its arms (the fast line matches, the slow one does not), the suite
+not rerun for it.  CPU-only: 407 passed, 0 failed, 130 skipped of 537 in 3m16s ("407 ran, as expected").
+Both runs were before the buffered-output fix above; there the 128 MB cell took 69 s on the CPU-only
+build, which is how it was found.  The two cells now take ~9 s together on either build.  After the
+fix: `-e` 908 passed, 0 failed, 2 skipped of 910 in 25m39s ("908 ran, as expected on this host");
+CPU-only 408 passed, 0 failed, 130 skipped of 538 in 2m23s ("as expected").  The `-e` run was 4.7 min
+longer because all eight GPUs were idle and every GPU cell brought all of them up (one device 1.6 s, eight
+5.5; v0.18.37 measured the same), and the second skip is the decode tail-yield cell finding no GPU online
+before its input ended.
+
+**Review:** Codex (GPT-6.1-Sol, high), text only -- its sandbox cannot start on the server, so each round
+got the diff and the whole functions it touches on stdin.  The decode memory fix, round 1: NOT SAFE, three
+findings, all adopted.  A straddling skippable frame was sized by the old rule and kept its 20 MiB, so
+every later carry was too roomy to hand over (reproduced: ten frames copied after it; now the buffer is
+replaced, and pm7 has the arm); the size classes' slack was not counted (now the capacity is); and the
+new cell's output file would be charged to the limit where `$TMPDIR` is tmpfs (now skipped there --
+streaming it to `cmp` instead was tried, and the mutants without the hand-over or the exact reservation
+then PASSED: the output's page cache is part of what killed the decode).  Round 2: SAFE TO COMMIT.  The
+staging CPU pool, round 1: NOT SAFE.  An exception out of the `--tar` assembler unwound past every join,
+and the staging pool, declared after the worker pools, was freed first while a CPU worker could still be
+compressing from it: the assembler now runs inside the setup failure's catch and takes its abort.  And the
+`--adapt` GPU-count model sampled the mixed run as if the GPU had done all of it; it no longer does.  No
+deadlock in any wait it walked (GPU and CPU intake, readers, a push blocked at the reduced depth, the tail
+yield).  Round 2: SAFE TO COMMIT, with one wording nit adopted (a non-staged `--tar` assembly failure no
+longer says "staging setup failed").  The buffered-output fix, round 1: NOT SAFE, four findings, all
+adopted -- the memory default adopted a redirected stdout too (truncating a `1<>file` tail, and two
+writers sharing one `>` would overwrite each other): named outputs only now; the 128 MB cell would fail
+rather than skip where `$TMPDIR` refuses O_DIRECT; the FIFO cell's window depended on the decoder
+outrunning the sink (it now skips when it did not) and its timeouts lacked a kill.  Round 2: NOT SAFE,
+one finding, adopted -- the cell's O_DIRECT probe threw away its own exit status, so a failing probe
+read as an unsupported filesystem and skipped; and its marker (the shrunk-buffer line) proved adoption
+only together with buffer sizing.  A named output adopted for O_DIRECT now says so at `-v`
+(`[O_DIRECT] named output using O_DIRECT`), the probe checks its status and bytes and fails the cell
+when they are wrong, and only a byte-correct buffered fallback skips.  Round 3: SAFE TO COMMIT.  No deadlock and no
+lock-order cycle found in the throttle change (the writer now takes the throttle's lock under the
+results lock; nothing takes them the other way).  Also re-run by hand: the two stalled-read cells the
+overdraft exists for (5b GPU, 5c CPU) still overdraft when the writer holds nothing, 1-2 per run, no
+hang, 2.2-3.3 s.  Found by me before review: the staged CPU pool was first joined after
+the staging pool was freed -- it is joined right after the GPU workers.
+
+**Found here, not changed:** a log line at `-v` or `-vv` goes to `std::cerr`, which is tied to
+`std::cout`, so each one first flushes stdout -- and with `-c` into a slow pipe that waits on the stdout
+lock the writer holds while its write blocks.  At `-vv`, where every frame logs, a decoder then runs no
+further ahead than the pipe drains.  Quiet runs are unaffected; untying `std::cerr` would change it.
 
 ## v0.18.37 — --gds-only refuses a host without nvidia-fs before cuFile opens (0.88 s -> under 10 ms, and no log file), and the next --gds-only run keeps only the newest four non-empty cuFile logs of finished runs (261 had built up in one cache directory)
 

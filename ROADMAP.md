@@ -507,6 +507,15 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
      high-ratio archive (2.4:1 text frames are ~7 MiB), where up to 11% of the readers' copying could
      go -- the consumer waited 1.7 s of 2.7 for blocks, so the readers do bind warm.  A fair test
      needs a ~130 GiB corpus; a 2 GiB one ran 0.45 s and was all noise.
+     **MEASURED v0.18.38, CLOSED -- nothing to build.**  130 GiB of uniform text (hex-dump lines
+     interleaved with word lines: 2.35:1, 8,320 frames of 6.64-7.22 MiB, a 55.3 GiB archive), warm,
+     `-d -c > /dev/null` on the server with six H100s visible, a measurement build setting the
+     overlap: 17 MiB (today) against 8 MiB (the table-derived value: the largest frame, rounded up),
+     nine interleaved runs each -- `--cpu-only` 2.85-3.46 s (median 3.32) against 2.62-3.57 (3.33),
+     hybrid 2.99-3.59 (3.36) against 2.90-3.51 (3.32).  No overlap at all was no different either
+     (three runs: 2.83-3.48 / 3.31-3.59): with 7 MiB frames in 64 MiB blocks only 885 of 8,320
+     frames reach the overlap, and the readers sat 21-34% busy, so their copying is not what binds
+     at full width.  A mixed archive (v0.18.26) is where the overlap pays, and there 17 MiB is right.
    - **The O_DIRECT output staging copy** (`--sliding-window` and the frame writer to a file): every
      compressed byte is copied into an aligned 16 MiB buffer.  Handing the aligned buffers to the
      positional writes would remove the copy; it overlaps the NVMe writes, so the gain is unproven.
@@ -770,25 +779,75 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     - **A pre-6.4 kernel's explicit --direct-read keeps huge pages.**  v0.18.34 moved it to plain
       pages on 6.4+ after measuring the stall here; nothing has measured a pre-6.4 host either way.
 36. **Follow-ups from the second workstation (v0.18.36: one RTX 5090, PCIe Gen5, 16 cores).**
-    - **Several GPUs keep two streams.**  Six streams took one card's `--gpu-only` compress from
-      19.1 s to 11.7 and its staged one from 15.4 to 11.2 (64.84 GiB); hybrid at 8 CPUs was
-      drive-bound and did not move.  On several devices each device's streams pin their own host
-      buffers, and eight devices at six were not measured: measure `--gpu-only` and small-budget
-      hybrid at 2 against 6 on the server before widening them, and the guard (a stream past the
-      second must fit a batch of 8) on an 11 GiB card.
-    - **Staging leaves the CPUs idle.**  The staged path reads every frame into pinned host memory
-      and only the GPU compresses it; at 4 CPUs it uses ~9 CPU-seconds of a 64.84 GiB run.  CPU
-      workers compressing frames from the same pinned slots would add the CPUs' rate (2.9 GiB/s at 4
-      CPUs here) to the GPU's (~5.6), so the staged path would be the fastest at every small budget,
-      not only where the GPU alone outruns hybrid -- here the drive (5.9 GiB/s) would bind first.
-      The slots' lifetime (released before the GPU compresses), the ordered writer and the CPU
-      rebuild contract are what it would have to keep.
-    - **A warm decode under 128 MB is still killed** (2 GiB archive, both builds, ~127 MB anonymous
-      where the pools were sized for ~80).  The pools undercount something; v0.18.32's 128 MB figure
-      is `--gds-only`'s, and plain decode was never claimed to fit it.
+    - ~~**Several GPUs keep two streams.**~~  **MEASURED on the server (v0.18.37), kept at two.**
+      68 GiB base64-of-random, cold, every arm gated on a 1 GiB O_DIRECT read, three interleaved
+      rounds.  `--gpu-only` on six idle H100s: two streams 17.37-17.84 s, six 17.79-17.90, with
+      2-5 GiB more resident memory at six -- one NVMe (~4.3 GiB/s) feeds six cards either way, so
+      the extra streams only pin more.  On ONE H100 the six-stream default holds up on this host
+      too: `--gpu-only` 17.19-17.43 s against 23.10-23.71 at two (and half the resident memory,
+      8.4-9.4 GiB against 19.8-20.7); staged at 4 CPUs 16.39-16.94 against
+      `--direct-stage --gpu-streams 2` 17.20-17.27 (drive-bound, ~3%).  Small-budget hybrid from
+      a pipe (16 GiB through `head`, 4 CPUs): 14.46-15.87 at two, 14.00-15.59 at six -- noise, the
+      pipe binds.  A bare `--gpu-streams N` implies `--hybrid`, so it does not stage: pair it with
+      `--direct-stage` to compare staged stream counts.  Still owed: the guard (a stream past the
+      second must fit a batch of 8) on an 11 GiB card, and several devices from a source faster
+      than one NVMe.
+    - ~~**Staging leaves the CPUs idle.**~~  **SHIPPED v0.18.38 (the default's staging only).**  The
+      default's staging keeps a CPU pool under the hybrid scheduler; a worker compresses a frame
+      straight out of its pinned slot and returns the slot after.  The queue's depth is the pool
+      less the workers, so a GPU stream's capacity escape fires with every worker holding a slot;
+      the pool is joined before the staging slots are freed; a GPU fault still rebuilds on the CPU.
+      Measured first that it was worth it: on the server the staged path is GPU-BOUND, not
+      drive-bound -- one H100 compresses ~4.2 GiB/s, and staging from tmpfs (which takes O_DIRECT)
+      ran no faster than from the NVMe (64 GiB 15.7-16.1 s).  4 CPUs, one H100, to /dev/null:
+      68 GiB cold on the NVMe 16.0-16.6 s against 16.8-16.9 staged alone and 18.8-19.4 hybrid;
+      64 GiB on tmpfs 12.7-14.7 against 15.7-16.1 and 16.3-16.5.  One, two or three workers ran
+      the same from the NVMe, as did 32, 48 or 64 slots and two or three readers: the staged
+      reader tops out near 4.3 GiB/s there although three parallel `dd` reach 5.1 (open: why).
+      Still owed: workstation 2 (5.9 GiB/s drive, where hybrid beat staging alone by 7-9%) --
+      this is the case it was written for -- and an explicit `--direct-stage`, which stays the
+      GPU alone by contract.
+    - ~~**A warm decode under 128 MB is still killed**~~ **FIXED v0.18.38.**  Cold too, and on the server
+      the GPU build died under 160 MB as well.  Every pool was at its floor (1 decoder, 1 reader of
+      4 MiB blocks, a 2-frame throttle); two things sat outside every share.  An `LD_PRELOAD`
+      tracer of the live heap found the first: under a limit every 16 MiB frame is carried across the
+      shrunk blocks, and the carry -- reserved before any frame was seen -- doubled 4 -> 8 -> 16 ->
+      32 MiB on the first frame and was kept for the run (live peak 140 MiB, CPU-only).  Now a carry
+      is reserved once at its frame's compress bound and the appends stop there; a stored frame's
+      carry is its size and is handed over, others are copied out of it.  glibc's per-arena
+      `malloc_stats` found the second: copies of slightly different sizes (a base64 archive's
+      12.05-12.07 MiB) left holes nothing reused, the parsing thread's arena 112.8 MiB for a ~64 MiB
+      live set.  A copy now takes a size class (an eighth of its power of two).  2 GiB archives under
+      a real 128 MB scope, warm and cold, x3, both builds: random 109 / 98-104 MiB anonymous, base64
+      121 / 114, all byte-identical (before: killed).  Not taken, measured: one malloc arena (no
+      effect on the holes, 169.6 MiB), a 1 MiB mmap threshold (fits, but each frame faults its
+      buffers in: +40-60% wall on the GPU build).  Under 96 MB both archives are still killed:
+      the floors themselves (two 16 MiB decoded frames, three compressed in flight, the ring) are
+      ~100 MiB, so going lower means smaller frames in flight, not better counting.
+      **A BUFFERED output was still killed** (found the next morning: the GPU build's "buffered"
+      arms were O_DIRECT, its Gen4+ default, and the CPU-only build's passes were luck).  512 MiB
+      to a file under 128 MB, buffered: killed 9 of 12 across both builds.  Fixed in the same
+      release: the throttle no longer overdrafts while the writer holds frames (a slow sink kept
+      3 + 3 frames alive against a 2-frame budget), and under a memory limit with < 1 GiB left a
+      NAMED output defaults to O_DIRECT (default 9/9, 0.45-0.94 s; a redirected stdout keeps
+      --direct's rule: it may be shared).  `--no-direct` still needs
+      ~160 MB there.  **OWED:** the Gen3 workstation, where O_DIRECT output regressed unlimited --
+      check that a limited run is not slower with it.
     - **The cached-archive probe was measured on one drive.**  The server's (~4 GiB/s) and the first
       workstation's (Gen3, ~2 GB/s) should both fall under its 3.5 GiB/s-per-GPU bar; confirm with
-      `-v` (`[READER] the archive is cached on a drive that reads ...`).
+      `-v` (`[READER] the archive is cached on a drive that reads ...`).  **Server CONFIRMED
+      (v0.18.37):** a resident 6 GiB archive at 4 CPUs prints `reads 4.93 GiB/s O_DIRECT, under 28.0
+      for 8 GPUs: buffered readers`, unchanged from before the probe.  The Gen3 workstation is still
+      owed.  The 192 MB cold decode to a file (default `--direct`) passes there too: 3/3, 125-158 MB.
+      **And the warm-decode loss behind the probe does not show on the server (v0.18.38, measured, nothing
+      built).**  24.12 GiB base64 archive, 4 CPUs, one H100, to /dev/null, six interleaved rounds: warm
+      default (buffered) 6.66-7.62 s, median 7.13; warm `--direct-read` 6.75-7.34, 7.21; cold 6.73-8.28,
+      6.78.  Within noise -- warm's best beats cold's.  The H100 carries a cached archive's decode beside
+      the one CPU decoder v0.18.34 leaves it (user 10 CPU-s warm against 20 cold), so the three
+      buffered readers' ~9 s of copying out of the page cache costs no wall here, where workstation 2's
+      24-27% came from its four Zen4 CPUs carrying more of the work.  A cheaper cached read (handing
+      frames out of the page cache without the copy) stays the lever if a host shows the loss
+      beside the probe; this one does not.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

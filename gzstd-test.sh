@@ -633,8 +633,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=564
-$EXTENSIVE && EXPECTED_TESTS=908
+EXPECTED_TESTS=566
+$EXTENSIVE && EXPECTED_TESTS=910
+# v0.18.38: +2 default cells on both builds (a decode fits a real 128 MB limit,
+# stored and compressible frames -- a host without a systemd user scope skips it
+# as host-unexercisable; a slow sink takes no head-of-line overdraft while the
+# writer holds frames), so neither the GPU nor the GDS delta changes: 564 -> 566,
+# -e 908 -> 910.
 # v0.18.37: +2 default GPU cells (a refusal for a missing nvidia-fs opens no cuFile
 # driver and leaves no log; the next --gds-only run keeps the newest four non-empty
 # cuFile logs).  Neither needs GDS, so the GDS delta is unchanged: 562 -> 564,
@@ -13890,6 +13895,23 @@ if has_gpu 2>/dev/null && command -v python3 >/dev/null 2>&1 && command -v tasks
     bs_lines "$bs_log" | grep -aq "^\[STAGE\] $bs_ncpu CPUs allowed" || why+=" [no STAGE line]"
     bs_lines "$bs_log" | grep -aq "^\[DSTAGE\] $bs_frames frames" || why+=" [DSTAGE: $(bs_lines "$bs_log" | grep -a -o '^\[DSTAGE\] [0-9]* frames' | head -1)]"
     "$GZSTD" -d -q -c "$bs_out" 2>/dev/null | cmp -s - "$bs_src" || why+=" [bytes]"
+    # Its CPU pool compresses from the staging slots beside the GPU (v0.18.38), and
+    # the queue's depth leaves each worker its slot, or a GPU stream's capacity
+    # escape waits on the pool (see pin_dstage_host_pool).  Which engine takes
+    # which of five frames is timing, so the count is not asserted; the [DSTAGE]
+    # total above counts both.  GZSTD_DEBUG_DSTAGE_NO_CPU=1 leaves the pool out.
+    bs_w=$(bs_lines "$bs_log" | grep -a -oE '^\[DSTAGE\] [0-9]+ CPU workers? compress from the staging slots' | grep -oE '[0-9]+' | head -1)
+    bs_s=$(bs_lines "$bs_log" | grep -a -oE '^\[DSTAGE\] staging: [0-9]+ x' | grep -oE '[0-9]+' | head -1)
+    bs_dc=$(bs_lines "$bs_log" | grep -a -oE 'producer depth ceiling: [0-9]+ frames' | grep -oE '[0-9]+' | head -1)
+    if [[ -z "$bs_w" || -z "$bs_s" ]]; then
+      why+=" [no staged CPU pool: workers '${bs_w}' slots '${bs_s}']"
+    else
+      bs_de=$(( bs_w < bs_s ? bs_s - bs_w : 1 ))
+      [[ "$bs_dc" == "$bs_de" ]] || why+=" [depth ${bs_dc:-none}, not $bs_s slots less $bs_w workers]"
+    fi
+    "${bs_env[@]}" GZSTD_DEBUG_DSTAGE_NO_CPU=1 taskset -c "$bs4" "$GZSTD" -v -f -c "$bs_src" 2> "$bs_log" \
+      | "$GZSTD" -d -q -c 2>/dev/null | cmp -s - "$bs_src" || why+=" [NO_CPU bytes]"
+    bs_lines "$bs_log" | grep -aq 'CPU workers\? compress from the staging slots' && why+=" [NO_CPU still pooled]"
     [[ -z "$why" ]] && pass "a small CPU budget compresses through the GPU by default" \
       || fail "a small CPU budget compresses through the GPU by default" "$why"
     # 2. Decompress keeps the default on the same budget: with the cold-archive
@@ -14445,8 +14467,10 @@ if [[ $crd_tools -eq 1 ]] && has_gpu 2>/dev/null && [[ -s "$crd_zst" ]]; then
   cat "$crd_zst" > /dev/null
   env GZSTD_DEBUG_HOOKS_ACK=1 GZSTD_DEBUG_CACHED_DIRECT_GIBS=100 taskset -c "$crd4" \
     "$GZSTD" -v -d -c "$crd_zst" > "$crd_out" 2> "$crd_log" || why+=" [fast exit $?]"
-  crd_lines | grep -aq 'cached on a drive that reads 100.00 GiB/s O_DIRECT, at least 3.5 for [1-9][0-9]* GPU' \
-    || why+=" [fast: no decision line]"
+  # The bar is 3.5 GiB/s PER GPU the driver lists: 3.5 for one, 28.0 for eight.
+  # (v0.18.36 matched "3.5" only, written on a one-GPU host; on eight it failed.)
+  crd_lines | grep -aqE 'cached on a drive that reads 100\.00 GiB/s O_DIRECT, at least [0-9]+\.[0-9] for [1-9][0-9]* GPUs?:' \
+    || why+=" [fast: no decision line: $(crd_lines | grep -a -o 'cached on a drive.*' | head -1)]"
   crd_lines | grep -aq 'one CPU decoder while the GPU runs' && why+=" [fast: capped]"
   if [[ ${crd_dio:-0} -eq 1 ]]; then
     [[ "$(crd_line)" == *"O_DIRECT (page cache bypassed) (the archive is cached; the drive keeps up)" ]] \
@@ -15359,12 +15383,13 @@ fi
 #    fit an eighth of the memory -- 8 MiB under 256 MiB, 4 MiB for the two of
 #    --read-threads=2 -- and a frame longer than a small block's overlap is
 #    carried, so the output is still the archive's.  Under such a limit
-#    (v0.18.32) a carried frame is copied out of a carry kept for reuse, not
-#    handed the carry's twice-the-largest-frame capacity, and no frame is a view
-#    (a view pins its whole block, which the queue's byte cap does not count):
-#    a 2 GiB decode then survives 128 MB (0 of 6 with the carry handed over).
-#    160 MiB of random data at -1 is ten stored 16 MiB frames in a 160 MiB
-#    archive, the parallel reader's.
+#    (v0.18.32) no frame is a view (a view pins its whole block, which the
+#    queue's byte cap does not count), and a carry is never handed over with
+#    more room than its frame.  Since v0.18.38 a carry is reserved at its
+#    frame's compress bound, so a stored frame's carry IS its size and is
+#    handed over (cell 7b has why); a carry with room to spare is copied out of
+#    and kept.  160 MiB of random data at -1 is ten stored 16 MiB frames in a
+#    160 MiB archive, the parallel reader's.
 pm_t7="memory: a limit shrinks the readers' blocks and pools, never the frames"
 pm_why=""; pm_d="$TMPDIR/pm-cg"; pm_g="$pm_d/sys/fs/cgroup/job/step"
 head -c $((160 << 20)) /dev/urandom > "$TMPDIR/pm7.bin"
@@ -15382,7 +15407,7 @@ else
       | cmp -s - "$TMPDIR/pm7.bin" || pm_why+=" $pm_mib:bytes"
     grep -qa "\[READER\] memory: $pm_mib MiB blocks, not 64" "$TMPDIR/pm7.err" \
       && grep -qaE 'zero-copy: 0 frames as views, [1-9][0-9]* carried across block boundaries' "$TMPDIR/pm7.err" \
-      && grep -qaE '; [1-9][0-9]* carried copied out of a kept carry' "$TMPDIR/pm7.err" \
+      && grep -qaE '; 0 carried copied out of a kept carry, [1-9][0-9]* handed over at their size' "$TMPDIR/pm7.err" \
       || pm_why+=" $pm_mib:[$(grep -ah 'READER\] memory\|zero-copy' "$TMPDIR/pm7.err" | tr '\n' ' ')]"
   done
   # The archive still holds 16 MiB frames whatever decode's --chunk-size.
@@ -15405,6 +15430,27 @@ else
   grep -qaE 'zero-copy: 0 frames as views, [0-9]+ carried across block boundaries, [1-9][0-9]* copied' "$TMPDIR/pm7.err" \
     || pm_why+=" small:[$(grep -ah 'zero-copy' "$TMPDIR/pm7.err")]"
   rm -f "$TMPDIR/pm7s.zst"
+  # A skippable frame that straddles a block (a concatenated archive's seek table,
+  # here 6 MiB starting 7 MiB into an 8 MiB block) must not leave the carry too
+  # roomy to hand over the frames after it (v0.18.38, Codex review): with the
+  # rule that kept its 20 MiB buffer, the second archive's ten frames were copied.
+  python3 -I - "$TMPDIR/pm7.zst" "$TMPDIR/pm7k.zst" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+n, desc, _ = struct.unpack('<IBI', d[-9:])
+a = d[:len(d) - (8 + n * (12 if desc & 0x80 else 8) + 9)]   # the frames, no seek table
+blk = 8 << 20
+gap = ((len(a) + 8) // blk + 1) * blk + (7 << 20) - len(a) - 8
+pad = struct.pack('<II', 0x184D2A5E, gap) + bytes(gap)
+skp = struct.pack('<II', 0x184D2A5F, 6 << 20) + bytes(6 << 20)
+open(sys.argv[2], 'wb').write(a + pad + skp + a)
+PY
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" "$GZSTD" -d -v -f --cpu-only -c "$TMPDIR/pm7k.zst" 2>"$TMPDIR/pm7.err" \
+    | cmp -s - <(cat "$TMPDIR/pm7.bin" "$TMPDIR/pm7.bin") || pm_why+=" skippable:bytes"
+  grep -qaE '8 MiB blocks, not 64' "$TMPDIR/pm7.err" \
+    && grep -qaE '; 0 carried copied out of a kept carry, 20 handed over at their size' "$TMPDIR/pm7.err" \
+    || pm_why+=" skippable:[$(grep -ah 'READER\] memory\|zero-copy' "$TMPDIR/pm7.err" | tr '\n' ' ')]"
+  rm -f "$TMPDIR/pm7k.zst"
   # The compress side's pooled reader (--mmap=off, or a redirected stdin): its
   # 8-buffer floor yields to a limit -- 3 under 192 MiB (v0.18.32) -- and a
   # reader takes its buffer before it claims a chunk.  Claimed first, a reader
@@ -15423,6 +15469,147 @@ else
   [[ -z "$pm_why" ]] && pass "$pm_t7" || fail "$pm_t7" "$pm_why"
 fi
 rm -f "$TMPDIR/pm7.bin" "$TMPDIR/pm7.zst" "$TMPDIR/pm7.err"
+
+# 7b. A decode fits a REAL 128 MB limit (v0.18.38).  Under a limit every 16 MiB
+#     frame is carried across the shrunk blocks, and two buffers sat outside
+#     every share: the carry, which the vector's doubling took to 32 MiB on the
+#     first frame and which was kept for the run, and the holes that copies of
+#     slightly different sizes leave in the heap (a base64 archive's 12.05-12.07
+#     MiB copies took the parsing thread's arena to 112.8 MiB for a ~64 MiB live
+#     set).  These 512 MiB archives were killed 2 of 2 under 128 MB before,
+#     random and base64 alike.  Now a carry is reserved at its frame's bound and
+#     a stored frame's is handed over, and a copy takes a size class.  Mutants
+#     (no hand-over; no size class; no exact reservation) are each killed on one
+#     arm below.  A real scope, not a fake tree: the kernel counts what the heap
+#     keeps, and what the output's page cache takes, which no estimate in gzstd does.
+pm_t7b="memory: a decode fits a real 128 MB limit, stored and compressible frames"
+pm_fs=$(stat -f -c %T "$TMPDIR" 2>/dev/null)
+if ! command -v systemd-run >/dev/null 2>&1 \
+   || ! systemd-run --user --scope -q -p MemoryMax=128M -p MemorySwapMax=0 true >/dev/null 2>&1; then
+  skip_host "$pm_t7b" "no systemd user session can set a memory limit here"
+elif [[ "$pm_fs" == tmpfs || "$pm_fs" == ramfs ]]; then
+  # The output is a FILE on purpose -- that is the case that died, and its page
+  # cache is charged to the limit -- so it cannot live on a RAM filesystem, where
+  # 512 MiB of output alone exceeds 128 MB (Codex review).
+  skip_host "$pm_t7b" "\$TMPDIR is $pm_fs: the output file itself would be charged to the limit"
+else
+  pm_why=""
+  head -c $((512 << 20)) /dev/urandom > "$TMPDIR/pm7b-r.bin"
+  head -c $((384 << 20)) /dev/urandom | base64 -w 76 | head -c $((512 << 20)) > "$TMPDIR/pm7b-b.bin"
+  for pm_k in r b; do
+    "$GZSTD" -1 -q -f --cpu-only "$TMPDIR/pm7b-$pm_k.bin" -o "$TMPDIR/pm7b-$pm_k.zst"
+  done
+  # The DEFAULT output, as a user runs it.  Under a limit it is O_DIRECT on
+  # both builds (gz_direct_for_memory; the GPU build on a Gen4+ bus already
+  # was): a buffered file's page cache shares the limit, and that run was killed
+  # 9 of 12 (the GPU build only ever showed it with --no-direct, which is why a
+  # cell asserting "buffered" here passed on it at 7 s and crawled through
+  # 69 s on the CPU-only build).  Each arm asserts the writer that ran.  Caught,
+  # CPU-only mutants of v0.18.38: no exact reservation killed on r 2 of 2; no
+  # size class killed on b 4 of 6, so two b arms; no memory default wrote
+  # buffered (no writer line); no hand-over now fits, and the counter below
+  # names it.  A NAMED output: a redirected stdout keeps --direct's rule
+  # (review: adopting it truncates, and a `>` may be shared).
+  # A filesystem that refuses O_DIRECT falls back to buffered output, which a
+  # limit this tight cannot carry: ask with an explicit --direct under a fake
+  # limit (no kill).  Only a byte-correct buffered fallback skips; a probe that
+  # fails, or an adopted writer whose buffers did not shrink, fails (review).
+  pm_tree "$TMPDIR/pm-cg7b"; echo $((128 << 20)) > "$TMPDIR/pm-cg7b/sys/fs/cgroup/job/step/memory.max"
+  head -c $((1 << 20)) "$TMPDIR/pm7b-r.bin" > "$TMPDIR/pm7b-p.bin"
+  pm_probe=""
+  "$GZSTD" -q -f --cpu-only "$TMPDIR/pm7b-p.bin" -o "$TMPDIR/pm7b-p.zst" || pm_probe+=" probe:compress"
+  GZSTD_DEBUG_CGROUP_ROOT="$TMPDIR/pm-cg7b" "$GZSTD" -d -v -f --direct "$TMPDIR/pm7b-p.zst" \
+    -o "$TMPDIR/pm7b.out" 2>"$TMPDIR/pm7b-p.err"
+  pm_rc=$?
+  { (( pm_rc == 0 )) && cmp -s "$TMPDIR/pm7b.out" "$TMPDIR/pm7b-p.bin"; } || pm_probe+=" probe:rc=$pm_rc"
+  pm_odirect=$(grep -caE '^\[O_DIRECT\] named output using O_DIRECT' "$TMPDIR/pm7b-p.err")
+  (( pm_odirect > 0 )) && ! grep -qaE '^\[O_DIRECT\] memory: 4 write buffers' "$TMPDIR/pm7b-p.err" \
+    && pm_probe+=" probe:buffers-not-shrunk"
+  pm_why+="$pm_probe"
+  if [[ -z "$pm_probe" ]] && (( pm_odirect > 0 )); then
+    for pm_arm in r:file b:file b:again; do
+      pm_k=${pm_arm%%:*}; pm_e="$TMPDIR/pm7b-${pm_arm/:/-}.err"
+      rm -f "$TMPDIR/pm7b.out"
+      systemd-run --user --scope -q -p MemoryMax=128M -p MemorySwapMax=0 \
+        "$GZSTD" -d -v -f "$TMPDIR/pm7b-$pm_k.zst" -o "$TMPDIR/pm7b.out" 2>"$pm_e"
+      pm_rc=$?
+      { (( pm_rc == 0 )) && cmp -s "$TMPDIR/pm7b.out" "$TMPDIR/pm7b-$pm_k.bin"; } \
+        || pm_why+=" $pm_arm:rc=$pm_rc"
+      grep -qaE '^\[O_DIRECT\] named output using O_DIRECT' "$pm_e" \
+        || pm_why+=" $pm_arm:not-O_DIRECT[$(grep -ah 'O_DIRECT\]' "$pm_e" | tr '\n' ' ')]"
+    done
+    # Stored frames are handed over; the base64 ones have room to spare and are
+    # copied (all but the last, whose reservation is the bytes left in the file).
+    grep -qaE '; 0 carried copied out of a kept carry, [1-9][0-9]* handed over at their size' "$TMPDIR/pm7b-r-file.err" \
+      || pm_why+=" r:[$(grep -ah 'zero-copy' "$TMPDIR/pm7b-r-file.err")]"
+    grep -qaE '; [1-9][0-9]* carried copied out of a kept carry, [01] handed over at their size' "$TMPDIR/pm7b-b-file.err" \
+      || pm_why+=" b:[$(grep -ah 'zero-copy' "$TMPDIR/pm7b-b-file.err")]"
+  fi
+  rm -rf "$TMPDIR"/pm7b-* "$TMPDIR/pm7b.out" "$TMPDIR/pm-cg7b"
+  if [[ -z "$pm_probe" ]] && (( pm_odirect == 0 )); then
+    skip_host "$pm_t7b" "\$TMPDIR does not take O_DIRECT output, and buffered output cannot fit 128 MB"
+  else
+    [[ -z "$pm_why" ]] && pass "$pm_t7b" || fail "$pm_t7b" "$pm_why"
+  fi
+fi
+
+# 7c. A slow sink takes no head-of-line overdraft while the writer holds frames
+#     (v0.18.38).  The writer moves its cursor when it takes a frame, before the
+#     frame is written, so with both permits held by frames it had taken the
+#     next one looked like the frame it was waiting for and was let past the
+#     cap: three decoded frames and three compressed ones alive against a
+#     two-frame budget under 128 MB, a third of the kills there.  A FIFO read at
+#     ~100 MiB/s is the slow sink (a pipe on stdout is not: at -vv every log line
+#     flushes stdout first, which serializes the decoder behind the writes).
+#     Without the fix: peak 3/2 and 6 overdrafts, 2 of 2; block_count proves the
+#     budget was spent, so the window was open.
+pm_t7c="memory: a slow sink takes no overdraft while the writer holds frames"
+if ! command -v python3 >/dev/null 2>&1 || ! command -v mkfifo >/dev/null 2>&1; then
+  skip_host "$pm_t7c" "needs python3 and mkfifo"
+else
+  pm_why=""; pm_d="$TMPDIR/pm-cg"
+  head -c $((128 << 20)) /dev/urandom > "$TMPDIR/pm7c.bin"
+  "$GZSTD" -1 -q -f --cpu-only "$TMPDIR/pm7c.bin" -o "$TMPDIR/pm7c.zst"
+  pm_tree "$pm_d"; echo $((128 << 20)) > "$pm_d/sys/fs/cgroup/job/step/memory.max"
+  rm -f "$TMPDIR/pm7c.fifo"; mkfifo "$TMPDIR/pm7c.fifo"
+  # Both ends bounded: a decoder that never opens the FIFO would leave the
+  # reader blocked in open(), and a reader that never opens it the decoder.
+  timeout -k 10s 90s python3 - "$TMPDIR/pm7c.fifo" "$TMPDIR/pm7c.bin" > "$TMPDIR/pm7c.cmp" <<'EOF' &
+import sys, time
+f = open(sys.argv[1], 'rb', buffering=0); ref = open(sys.argv[2], 'rb')
+ok = True
+while True:
+    b = b''
+    while len(b) < (4 << 20):
+        c = f.read((4 << 20) - len(b))
+        if not c: break
+        b += c
+    if not b: break
+    ok = ok and b == ref.read(len(b))
+    time.sleep(0.04)
+print('OK' if ok and not ref.read(1) else 'BAD')
+EOF
+  pm_py=$!
+  GZSTD_DEBUG_CGROUP_ROOT="$pm_d" timeout -k 10s 60s "$GZSTD" -d -vv -f "$TMPDIR/pm7c.zst" \
+    -o "$TMPDIR/pm7c.fifo" 2>"$TMPDIR/pm7c.err"
+  pm_rc=$?
+  wait "$pm_py"
+  (( pm_rc == 0 )) && [[ "$(cat "$TMPDIR/pm7c.cmp")" == OK ]] \
+    || pm_why+=" rc=$pm_rc bytes=$(cat "$TMPDIR/pm7c.cmp")"
+  pm_st=$(tr '\r' '\n' < "$TMPDIR/pm7c.err" | grep -am1 '^\[THROTTLE\] stats \[decompress')
+  pm_pk=$(grep -oE 'peak=[0-9]+/[0-9]+' <<< "$pm_st" | cut -d= -f2)
+  [[ -n "$pm_pk" ]] && (( ${pm_pk%/*} <= ${pm_pk#*/} )) \
+    && grep -qE 'block_count=[0-9]+, .*head_of_line_overdrafts=0,' <<< "$pm_st" \
+    || pm_why+=" [$pm_st]"
+  rm -f "$TMPDIR"/pm7c.*
+  # A decoder no faster than the sink never spends the budget, and then the
+  # cell has asked nothing (review): say so rather than pass.
+  if [[ -z "$pm_why" ]] && grep -qE 'block_count=0,' <<< "$pm_st"; then
+    skip_host "$pm_t7c" "the decoder never outran the sink here: [$pm_st]"
+  else
+    [[ -z "$pm_why" ]] && pass "$pm_t7c" || fail "$pm_t7c" "$pm_why"
+  fi
+fi
 
 # 8. GPU build: the GPU batches fit the memory before a GPU is declined
 #    (v0.18.31).  The throttle counted every stream's batch at the tuner's
