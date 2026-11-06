@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.38  
+**Covers:** v0.9.50 → v0.18.39  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,123 @@
 
 ---
 
+
+## v0.18.39 — a buffered output fits a memory limit (512 MiB under 128 MB in ~1 s, where v0.18.38 was killed 3 times in 12 or crawled 10-44 s), a decode fits 88 MB (96 MB was killed), `--gpu-only` starts one GPU per 4 GiB of input (a 64 MiB compress 5.5 -> 1.5 s on the 8-GPU server), and `-vv` no longer paces a decoder behind a slow pipe
+
+The six open issues left by v0.18.38, in order.
+
+**A buffered output under a memory limit (1).**  v0.18.38 made a named output O_DIRECT under a limit, but
+left a redirected stdout buffered (it may be shared), and `--no-direct` or a filesystem refusing O_DIRECT
+are buffered too.  Under 128 MB those were killed or crawled: the output's page cache is charged to the
+limit, and dirty pages cannot be freed until written.  Two changes:
+
+- **Drop-behind.**  Under a limit with less than 512 MiB left, a buffered regular file is written a few MiB
+  at a time (a 32nd of what is left, 1-8 MiB).  Each piece's writeback is started at once, and the piece
+  before it is waited for and dropped from the page cache (`sync_file_range` + `POSIX_FADV_DONTNEED`), so
+  the output holds about two pieces of cache and the device keeps writing while the next is copied in.  The
+  same writes at the same positions, so it is as safe for a shared or appended stdout as before.  A waited
+  `sync_file_range` consumes a writeback error for the file description, so its failure is the write's.
+  Decoding to a buffered file, the CPU-only build, dropped against plain:
+
+  | input | 128 MB | 160 MB | 192 MB | 256 MB | 512 MB | 1 GB |
+  |---|---|---|---|---|---|---|
+  | 512 MiB | ~1 s (24/24) / killed or 10-44 s | 0.66-0.81 / 2.2-5.2 | 0.71-0.76 / 1.3-4.0 | | 0.70-0.81 / 0.67-0.84 | |
+  | 2 GiB | 3.3-8.5 / 158-258 | | | 2.8-3.3 / 2.7-2.9 | | 2.6-2.8 / 2.5 |
+
+  So it pays below about 256 MB, ties up to 512 MB and costs 8% at 1 GB: hence 512 MiB, not the 1 GiB
+  where the O_DIRECT default starts (O_DIRECT was about three times faster than either at every limit
+  here).  Waiting for each piece in turn, the first version, left the device idle between pieces and ran
+  3.2-3.6 s at 256 MB-1 GB.  `-v` counts the pieces dropped.
+- **Base64-like frames are handed over.**  A carry is reserved at the compress bound of its frame's
+  content, so a 12 MiB base64 frame arrived in 16.06 MiB, which v0.18.38's rule (within a sixteenth) did
+  not hand over: it was copied to a 13 MiB size class and the carry kept -- four copies and the carry alive
+  at the peak, 68 MiB of compressed frames where stored ones held 48, because the queue's byte cap admits two
+  smaller frames.  A carry is now handed over while its frame fills two thirds of it (three in flight cost
+  three bounds handed over, three frames plus a bound copied), and the queue charges its capacity.  Base64
+  under 128 MB: 117 -> 101 MiB anonymous (O_DIRECT output).
+
+Not the cause, measured: the decoder's buffer pool never missed (`ovf=0`).  What buffered output still
+holds beyond its live heap (about 16 MiB, the same 34 large allocations and 80.2 MiB live either way) is
+fragmentation in the main arena.
+
+**Checks owed on other hosts (2).**  Written down with commands and expectations: the Gen3 workstation,
+where O_DIRECT output regressed without a limit, must show the memory O_DIRECT default is not slower under
+one; workstation 2 must show the staging CPU pool now beats `--hybrid` on its fast drive.
+
+**The staged reader's "cap" (3) was a misreading.**  68 GiB cold at 4 CPUs on one H100: the progress
+line's steady rate is 4.82 GiB/s from a quarter of the way in to the end, against `dd` with two 16 MiB
+O_DIRECT streams over the same file at 5.10 (94%).  The 4.3 GiB/s was the file divided by the wall
+time, which includes ~1.6 s of startup -- the GPU coming up while only the CPU workers consume, 265 ms
+pinning the pool -- and the tail.  Nothing built.
+
+**`-v`/`-vv` no longer paces a decoder behind a slow pipe (4).**  A log line went to `std::cerr`, which is
+tied to `std::cout`, so each one flushed stdout first -- and with `-c` the writer holds stdout's lock
+through each write.  At `-vv`, where every frame logs, the decoder then got no further ahead than the pipe
+drained: decoding into a pipe read at ~200 MiB/s spent the throttle's budget 0 times (v0.18.37) and 6 times
+now.  Log lines are written with `fwrite` to stderr, as zstd's are; the streams stay synchronized with
+stdio, so their order with the remaining `std::cerr` writes holds.
+
+**`--gpu-only` starts no more GPUs than the input can use (5).**  Every visible device is paid for at
+`cuInit` and again for its context and pools, frames or not: `cuInit` alone took 0.9 s with one device
+visible and 2.85 s with eight, and a 64 MiB `--gpu-only` compress ran 5.5 s on eight GPUs with seven idle.
+Measured, warm, compress on 1 / 2 / 4 / 8 devices:
+
+| input | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 1 GiB | 1.98 s | 2.19 | 3.12 | 5.07 |
+| 4 GiB | 2.82 | 3.14 | 4.07 | 5.66 |
+| 16 GiB | 5.78 | 5.17 | 5.88 | 7.10 |
+| 32 GiB | 8.79 | 8.49 | 7.18 | 8.16 |
+
+and decode 4 GiB 3.22 / 3.09 / - / 5.27, 16 GiB 4.92 / 3.91 / - / 6.15.  The best there is about one device
+per 8 GiB; without `--adapt` (whose profile already picks the count), `--gpu-devices` or a caller's
+`CUDA_VISIBLE_DEVICES`, `--gpu-only` on regular files now starts one per 4 GiB, so a slower card still gets
+seconds of work for the startup it costs.  64 MiB 1.4-1.6 s, 1 GiB 1.7-1.9, 4 GiB 2.8-2.9, 16 GiB 5.5 (4
+devices); decoding a 12 GiB archive 3.8-4.1 s (6.15).  The default hybrid run never cared: its CPUs finish
+first (16 GiB in 1.0-1.15 s on any device count).  A GPU fault with one device rebuilds on the CPU.
+`--gpu-order=ranked` keeps every device (it asks for the whole set in an order; review).
+
+**Smaller items (6).**
+- **The size class is counted.**  A test that relied on a kill under a real limit caught a missing size
+  class in only 3 runs of 7; the reader's `-v` line now counts copies at a size class.
+- **The thresholds were measured** across 256 MB-2 GB (the table above): O_DIRECT stays the default for a
+  named output below 1 GiB left; drop-behind moved to 512 MiB.
+- **A decode fits 88 MB.**  Under 96 MB every decode was killed within 0.1 s: the throttle's floor kept two
+  decoded frames in flight ("every consumer one, plus one more"), while a decode's fixed floors -- three
+  compressed frames, the reader's ring, the writer's buffers, the process -- come to ~4.5 frames.  Below
+  seven frames of memory the floor drops the extra one: 88, 96 and 112 MB pass in 0.34-0.65 s, both builds
+  (2 GiB at 96 MB: 1.2 s random, 2.4 s base64).  128 MB keeps two, where one costs 25-35%.  80 MB is still
+  too small.  A buffered output at 96 MB survives but crawls (21-60 s for 512 MiB).
+
+**Suite:** one new default GPU cell (567 / 911; no-GPU deltas 159 / 239): the suite masks every other cell
+to one card, so it clears the mask -- only where the mask is the suite's own -- and asserts that
+`--gpu-only` on 32 MiB starts one device and `--gpu-devices=2` two.  The 128 MB cell now runs the default
+output (random and base64), a `--no-direct` file and a `-c > file`, each asserting the writer that ran and,
+when buffered, the pieces dropped; and a 96 MB arm.  The slow-sink cell adds a stdout-pipe arm (the decoder
+must spend the budget there too, where the FIFO arm shows it can), and opens its window with a test hook,
+`GZSTD_DEBUG_ACQUIRE_DELAY_US`: left to timing, a build without the writer gate overdrafted in about half
+the runs.  Cell pm7 adds a hex archive whose copies must take a size class.  Mutants of every mechanism,
+CPU-only builds of this code, each caught: no writer gate (peak 3/2, 6 overdrafts), no memory O_DIRECT
+default, no drop-behind, drop-behind planned but not done, the old hand-over rule, no hand-over, no exact
+reservation, no size class, the old `std::cerr` logging, no device rule (8 devices online), the old floor
+(killed at 96 MB).
+
+**Review:** Codex (GPT-6.1-Sol, high), text only.  Round 1: NOT SAFE, four findings, all adopted.  A
+waited `sync_file_range` that failed with EINVAL or EOPNOTSUPP was taken for an unsupported call and
+dropping simply stopped -- but that errno can be the description's pending writeback error, which the
+call has just consumed, so a failed write could vanish: every failure of the waited call now fails the
+write, and only the non-waiting call (which reports no writeback error) may fall back.  The device rule
+would have made the suite's all-device ranking cell start one card: `--gpu-order=ranked` is now exempt
+(checked by hand: that cell's five arms behave as it asserts).  The slow-sink cell read the FIFO and the
+pipe through different Python readers: one reader now.  The pieces counter counted advice the kernel
+refused: it counts accepted advice only.  Also adopted: the counter is zeroed per writer, and the
+dropping code is Linux-only.  Round 2: SAFE TO COMMIT, noting that the ranking cell's `--verify` arm now
+ran on one card; it takes `--adapt --no-profile`, which keeps the full set (8 devices online, checked).
+
+Suites on the server: default on the GPU build 566 passed, 0 failed, 1 skipped of 567 in 16m00s ("566
+ran, as expected on this host"; the one skip, as before, a trivial batch that reached no GPU); CPU-only
+408 passed, 0 failed of 538 in 2m34s ("408 ran, as expected").  The new cells: the device count 4.3 s,
+pm7 5.3 s, the 128 MB cell 10.4 s, the slow-sink cell 4.2 s; the ranking cell ranked all 8 devices.
 
 ## v0.18.38 — a 2 GiB decode fits 128 MB (it was killed, warm or cold: a 32 MiB carry outside every share and heap holes between copies), a named output under a memory limit is O_DIRECT and a slow sink no longer lets a frame past the throttle (a buffered output under 128 MB was still killed 9 times in 12), and the default's staging compresses on its CPUs too, beside the GPU (68 GiB at 4 CPUs 16.0-16.6 s against 16.8-16.9; 64 GiB from tmpfs 12.7-14.7 against 15.7-16.1)
 

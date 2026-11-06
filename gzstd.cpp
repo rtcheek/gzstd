@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.38";
+static constexpr const char * GZSTD_VERSION = "0.18.39";
 //
 // Architecture overview:
 //
@@ -3661,14 +3661,24 @@ static void vlog_emit(const std::string & msg)
   if (g_progress_active.load(std::memory_order_relaxed))
     std::fprintf(stderr, "\r\033[K");  // clear progress line
 
+  // stdio's stderr, NOT std::cerr (v0.18.39).  std::cerr is tied to std::cout,
+  // so every line flushed stdout first -- and with -c the data writer holds
+  // stdout's lock through each write, so a log line from a worker waited for
+  // the pipe to drain: at -vv, where every frame logs, a decoder ran no further
+  // ahead than a slow consumer (a FIFO at 200 MiB/s took no head-of-line
+  // overdraft at all through stdout, six through a named output).  zstd's
+  // messages never flush stdout either.  Order with the remaining std::cerr
+  // writes holds: the streams are synchronized with stdio (no
+  // sync_with_stdio(false) anywhere), so both reach the same unbuffered stderr.
   if (!g_color_stderr) {
-    std::cerr << msg;
+    std::fwrite(msg.data(), 1, msg.size(), stderr);
     return;
   }
   // Strip trailing newline so reset lands before it (avoids stray color on blank lines).
   const bool has_nl = !msg.empty() && msg.back() == '\n';
-  std::cerr << vlog_paint(has_nl ? msg.substr(0, msg.size() - 1) : msg);
-  if (has_nl) std::cerr << '\n';
+  const std::string painted = vlog_paint(has_nl ? msg.substr(0, msg.size() - 1) : msg);
+  std::fwrite(painted.data(), 1, painted.size(), stderr);
+  if (has_nl) std::fputc('\n', stderr);
 }
 
 static void vlog(int min_level, const Options & opt, const std::string & msg)
@@ -5118,9 +5128,13 @@ static void print_help_long()
 "     charged to the same limit, and dirty pages cannot be freed until\n"
 "     written.  A 512 MiB decode under 128 MB was killed 9 times in 12\n"
 "     that way, and passed every time in under a second with O_DIRECT.\n"
-"     --no-direct there needs about 160 MB.  The limit leaves a\n"
-"     redirected stdout (-c > FILE) to the rules above, since others may\n"
-"     share it: name the output with -o under a tight limit.\n"
+"     The limit leaves a redirected stdout (-c > FILE) to the rules\n"
+"     above, since others may share it.  A buffered output there\n"
+"     (--no-direct, -c > FILE, a filesystem refusing O_DIRECT) with less\n"
+"     than 512 MiB left is written a few MiB at a time, each piece\n"
+"     dropped from the page cache once on the device: about 1 s for\n"
+"     512 MiB under 128 MB.  Below that it crawls (96 MB: 20-60 s),\n"
+"     while O_DIRECT runs down to about 88 MB: name the output with -o.\n"
 "     Test mode writes nothing, so it is unaffected.  --no-direct\n"
 "     forces buffered I/O (e.g. to benchmark the buffered baseline on\n"
 "     Gen4).  O_DIRECT can expose the app to NVMe (NVM Express)\n"
@@ -6074,10 +6088,13 @@ static void print_help_long()
 "     linearly more VRAM.  A given N is used as given.\n"
 "\n"
 "  --gpu-devices N\n"
-"     Number of GPUs to use.  0 = auto (all available GPUs, for both\n"
-"     compress and decompress; with --adapt, a single-file --gpu-only\n"
-"     compress uses the count its profile predicts is fastest -- see\n"
-"     --adapt).\n"
+"     Number of GPUs to use.  0 = auto: all available GPUs, except that\n"
+"     --gpu-only on regular files starts one per 4 GiB of input: each\n"
+"     costs ~0.5 s to start, frames or not (a 64 MiB --gpu-only compress\n"
+"     took 5.5 s on eight GPUs and 1.6 s on one).  --gpu-order=ranked\n"
+"     keeps them all, a caller's CUDA_VISIBLE_DEVICES is used as given,\n"
+"     and with --adapt a single-file --gpu-only compress uses the count\n"
+"     its profile predicts is fastest -- see --adapt.\n"
 "\n"
 "  --gpu-order {cuda|ranked}    (default: cuda)\n"
 "     The order an all-device set is handed to the workers in.  cuda\n"
@@ -13078,8 +13095,16 @@ static int compute_throttle_budget(size_t frame_bytes,
     // cap's floor below).
     // Never above the old 32-frame floor: a pool pinned by -T 96 under a small
     // limit would otherwise take 97 frames.
+    // BELOW SEVEN FRAMES OF MEMORY, NOT EVEN ONE MORE (v0.18.39).  A decode's
+    // fixed floors -- three compressed frames in flight, the reader's ring, the
+    // writer's buffers, the process -- come to ~4.5 frames, so the floor's
+    // second decoded frame needs ~7 left: under 96 MB (5.8 frames of 16 MiB)
+    // every decode was killed in 0.1 s, and with one frame in flight it ran
+    // 0.34-0.65 s, at 88 MB too (80 MB is still too small).  Where two fit the
+    // extra frame is worth keeping: one frame cost 25-35% at 128 MB.
+    const bool tiny_ram = small_ram && avail < (uint64_t)frame_bytes * 7;
     const int floor_frames = small_ram
-        ? std::min(THROTTLE_MIN_FRAMES, std::max(ram_frames, pipeline_parallelism + 1))
+        ? std::min(THROTTLE_MIN_FRAMES, std::max(ram_frames, pipeline_parallelism + (tiny_ram ? 0 : 1)))
         : THROTTLE_MIN_FRAMES;
     frames = std::max(frames, floor_frames);
     if (gpu_batch_floor > 0 && frames < gpu_batch_floor) {
@@ -15677,6 +15702,16 @@ public:
   template <class Pred>
   void acquire_or_overdraft(Pred urgent) {
     if (disabled_) return;
+    // GZSTD_DEBUG_ACQUIRE_DELAY_US (test-only, v0.18.39): arrive this much
+    // later, so the writer has always taken its frames and moved its cursor
+    // first -- the window where the next frame looked like the writer's.
+    // Without it, which of the two arrived first was set by timing at startup,
+    // and a build without the writer gate overdrafted in about half the runs.
+    static const long delay_us = [] {
+      const char * e = ::getenv("GZSTD_DEBUG_ACQUIRE_DELAY_US");
+      return e ? std::atol(e) : 0L;
+    }();
+    if (delay_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
     std::unique_lock<std::mutex> lk(m_);
     bool waited = false;
     std::chrono::steady_clock::time_point t0;
@@ -16238,17 +16273,26 @@ static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
  Two slots alternate: while slot A is being written to disk by the
  background thread, slot B is being filled by the writer thread.
 ======================================================================*/
+// Pieces AsyncWritePool::out_write synced and dropped behind a buffered output
+// (v0.18.39), for writer_run's -v line: the suite asserts the work, not the plan.
+static std::atomic<uint64_t> g_drop_behind_pieces{0};
+
 class AsyncWritePool {
 public:
   // `inline_writes` (v0.18.24): no write thread; submit() writes the batch
   // itself, through the same code.  For a writer that is the only stage still
   // running (decompress_cpu_mt's one-frame input), where a thread would only
   // be started, handed one batch and joined.
+  // `drop_behind` (v0.18.39): bytes per piece of a buffered output written,
+  // waited for and dropped from the page cache under a memory limit; 0 = off.
+  // See out_write and gz_write_policy.
   explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true,
                           Meter * meter = nullptr, FrameThrottle * bp = nullptr,
-                          bool progressive_sync = false, bool inline_writes = false)
+                          bool progressive_sync = false, bool inline_writes = false,
+                          size_t drop_behind = 0)
     : out_(out_file), dw_(dw), sparse_(sparse), done_(false),
-      progressive_sync_(progressive_sync), meter_(meter), bp_(bp)
+      progressive_sync_(progressive_sync), meter_(meter), bp_(bp),
+      drop_behind_(dw ? 0 : drop_behind)
   {
     if (!inline_writes) worker_ = std::thread(&AsyncWritePool::worker_fn, this);
   }
@@ -16340,6 +16384,86 @@ private:
     return true;   // remainder (< 4096) is always written, never skipped
   }
 
+  // THE BUFFERED WRITE (v0.18.39).  Under a memory limit a buffered output's
+  // page cache is charged to the limit, and its dirty pages cannot be freed
+  // until written: at 128 MB the frames' floors left the cache a few MiB, every
+  // charge went to reclaim, and the reclaim waited on writeback -- a 512 MiB
+  // decode crawled through 13-35 s or was killed (--no-direct 3 of 12 even
+  // after v0.18.38; a redirected stdout, which stays buffered there, the same).
+  // DROP-BEHIND: write a piece, wait for it to reach the device, and tell the
+  // kernel to drop it (sync_file_range + POSIX_FADV_DONTNEED), so the output
+  // never holds more than a piece of cache.  Nothing about the file changes --
+  // the same writes at the same positions -- so it is as safe for a shared or
+  // appended stdout as the plain write.  Under 512 MiB left (gz_write_policy).  A WAITED sync_file_range CONSUMES a
+  // writeback error for this description (the kernel's errseq: a later fsync
+  // or close no longer sees it), so its failure is this write's failure.
+  bool out_write(const char * data, size_t len) {
+#ifndef __linux__
+    drop_behind_ = 0;   // gz_write_policy never asks for it off Linux
+#endif
+    if (!drop_behind_) return robust_fwrite(data, len, out_) == len;
+#ifdef __linux__
+    while (len > 0) {
+      if (db_from_ < 0) {   // where this output's unsynced range begins
+        if (std::fflush(out_) != 0) { gz_note_write_errno(errno); return false; }
+        db_from_ = db_mid_ = ::ftello(out_);
+        if (db_from_ < 0) { drop_behind_ = 0; return robust_fwrite(data, len, out_) == len; }
+      }
+      const size_t n = std::min(len, drop_behind_);
+      if (robust_fwrite(data, n, out_) != n) return false;
+      if (!drop_written_()) return false;
+      data += n; len -= n;
+      if (!drop_behind_) return len == 0 || robust_fwrite(data, len, out_) == len;
+    }
+#endif
+    return true;
+  }
+
+  // ONE PIECE BEHIND (v0.18.39): start this piece's writeback, then wait for
+  // the PREVIOUS piece and drop it, so the device writes one piece while the
+  // next is copied in.  Waiting for each piece in turn left the device idle
+  // between them: a 2 GiB decode under 256 MB-1 GB took 3.2-3.6 s against
+  // 2.6-3.0 for plain buffered output.  At most about two pieces are cached.
+  bool drop_written_() {
+#ifdef __linux__
+    if (std::fflush(out_) != 0) { gz_note_write_errno(errno); return false; }
+    const int fd = ::fileno(out_);
+    const off_t cur = ::ftello(out_);
+    if (fd < 0 || cur < 0) { drop_behind_ = 0; return true; }
+    if (cur < db_mid_) { db_from_ = db_mid_ = cur; return true; }   // the position moved back: restart
+    // Starting writeback waits for nothing and reports no writeback error, so a
+    // failure there can only be the call itself not supported (a filesystem
+    // without it, an odd descriptor): stop dropping, keep writing.  The first
+    // call is made before any wait, so an unsupported one ends dropping before
+    // a single piece was waited for.
+    if (cur > db_mid_ && ::sync_file_range(fd, db_mid_, cur - db_mid_, SYNC_FILE_RANGE_WRITE) != 0) {
+      const int e = errno;
+      if (e == EINVAL || e == ESPIPE || e == ENOSYS || e == EOPNOTSUPP) { drop_behind_ = 0; return true; }
+      gz_note_write_errno(e);
+      return false;
+    }
+    if (db_mid_ > db_from_) {
+      // EVERY failure of the WAITED call is the write's (review): its errno can be
+      // the description's pending writeback error, which this call has just
+      // consumed, and EINVAL or EOPNOTSUPP from a filesystem's writeback reads
+      // the same as an unsupported call.  Swallowing it would lose the error.
+      if (::sync_file_range(fd, db_from_, db_mid_ - db_from_, SYNC_FILE_RANGE_WAIT_BEFORE
+                            | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER) != 0) {
+        gz_note_write_errno(errno);
+        return false;
+      }
+      // Counted only when the advice was accepted (review); advice all the same.
+      if (::posix_fadvise(fd, db_from_, db_mid_ - db_from_, POSIX_FADV_DONTNEED) == 0)
+        g_drop_behind_pieces.fetch_add(1, std::memory_order_relaxed);
+      db_from_ = db_mid_;
+    }
+    db_mid_ = cur;
+#else
+    drop_behind_ = 0;
+#endif
+    return true;
+  }
+
   // Write a whole buffer with no zero-scan (dense frames, and the --no-sparse
   // fast path share this).  Records the I/O time like write_sparse's writes.
   bool write_whole(const char * data, size_t len) {
@@ -16349,7 +16473,7 @@ private:
     if (dw_) ok = dw_->write(data, len);
     else
 #endif
-    if (out_) ok = (robust_fwrite(data, len, out_) == len);
+    if (out_) ok = out_write(data, len);
     if (meter_) {
       meter_->writer_iowrite_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
       if (ok) meter_->wrote_bytes.fetch_add(len, std::memory_order_relaxed);
@@ -16387,7 +16511,7 @@ private:
       if (dw_) { if (!timed_io([&]{ return dw_->write(data, len); })) return false; }
       else
 #endif
-      if (out_) { if (!timed_io([&]{ return robust_fwrite(data, len, out_) == len; })) return false; }
+      if (out_) { if (!timed_io([&]{ return out_write(data, len); })) return false; }
       if (meter_) meter_->wrote_bytes.fetch_add(len, std::memory_order_relaxed);
       return true;
     }
@@ -16453,7 +16577,7 @@ private:
         if (dw_) {
           if (!timed_io([&]{ return dw_->write(data + pos, to_write); })) return false;
         } else if (out_) {
-          if (!timed_io([&]{ return robust_fwrite(data + pos, to_write, out_) == to_write; })) return false;
+          if (!timed_io([&]{ return out_write(data + pos, to_write); })) return false;
         }
         bytes_since_progress += to_write;
         pos = write_end;
@@ -16568,7 +16692,7 @@ private:
     // stubbed out (sync inside the timing; zstd 0.092-0.100).  Past the frame the
     // first hint covers the whole output so far, as every later one did.
     static constexpr off_t PUSH_MIN = 16 * 1024 * 1024;
-    if (progressive_sync_ && !dw_ && out_) {
+    if (progressive_sync_ && !dw_ && out_ && !drop_behind_) {   // drop-behind already waited
       int fd = fileno(out_);
       off_t cur = ftello(out_);
       if (cur >= PUSH_MIN && cur > sync_offset_) {
@@ -16597,6 +16721,9 @@ private:
   off_t sync_offset_ = 0;       // progressive writeback high-water mark
   Meter * meter_ = nullptr;     // for tracking physically-written bytes
   FrameThrottle * bp_ = nullptr;  // frame throttle (releases permits after writes)
+  size_t drop_behind_ = 0;        // piece size under a memory limit; 0 = off (out_write)
+  off_t db_from_ = -1;            // start of the range not yet synced and dropped
+  off_t db_mid_ = -1;             // end of the piece whose writeback was started last
 };
 
 // --tar create: the member-index BODY (uncompressed entry records), built by
@@ -16619,7 +16746,7 @@ static uint64_t g_tar_stream_size = 0;   // total uncompressed tar bytes
 // alone; the single-frame decoder and --sliding-window wrote zeros densely and
 // never pushed writeback, so the same archive made a sparse file by one route
 // and a dense one by the other.  Now the three ask the same question here.
-struct GzWritePolicy { bool sparse; bool psync; };
+struct GzWritePolicy { bool sparse; bool psync; size_t drop_behind = 0; };
 static GzWritePolicy gz_write_policy(FILE * out, const Options & opt)
 {
   // Sparse file support: skip zero-filled 4K blocks via seek.
@@ -16675,7 +16802,36 @@ static GzWritePolicy gz_write_policy(FILE * out, const Options & opt)
   // from fwrite.  Also skip for stdout (no rename).
   bool psync = (opt.mode == Mode::DECOMPRESS) && !opt.unsafe_overwrite
                && (out != stdout);
-  return GzWritePolicy{enable_sparse, psync};
+  // DROP-BEHIND UNDER A MEMORY LIMIT (v0.18.39; AsyncWritePool::out_write): a
+  // buffered regular file -- --no-direct, a redirected stdout (which the memory
+  // default leaves buffered: v0.18.38's review), a filesystem refusing O_DIRECT
+  // -- under a container's limit with less than 512 MiB left.  MEASURED, decode
+  // to a buffered file, the CPU-only build, dropped / plain:
+  //   512 MiB  160 MB 0.66-0.81 / 2.2-5.2 s   192 MB 0.71-0.76 / 1.3-4.0   512 MB 0.70-0.81 / 0.67-0.84
+  //   2 GiB    128 MB 3.3-8.5 / 158-258 s     256 MB 2.8-3.3 / 2.7-2.9    1 GB 2.6-2.8 / 2.5
+  // so it pays below ~256 MB, ties to 512, and costs ~8% at 1 GB.  A piece is a
+  // 32nd of what is left, 1-8 MiB.
+  // GZSTD_DEBUG_DROP_BEHIND: 0 never, N MiB pieces always (test-only).
+  size_t drop_behind = 0;
+#ifdef __linux__
+  if (opt.mode != Mode::TEST && !g_direct_writer && out) {
+    struct stat dst{};
+    const int dfd = ::fileno(out);
+    if (dfd >= 0 && ::fstat(dfd, &dst) == 0 && S_ISREG(dst.st_mode)) {
+      GzMemHeadroom cg;
+      const uint64_t avail = gz_ram_available(&cg);
+      if (!cg.file.empty() && avail < (uint64_t(512) << 20))
+        drop_behind = (size_t)std::min<uint64_t>(8, std::max<uint64_t>(1, avail / 32 / ONE_MIB)) * ONE_MIB;
+      if (const char * e = ::getenv("GZSTD_DEBUG_DROP_BEHIND"))
+        drop_behind = (size_t)std::min<long>(std::max<long>(std::atol(e), 0), 64) * ONE_MIB;
+      if (drop_behind && opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[WRITER] memory: buffered output written " + std::to_string(drop_behind / ONE_MIB)
+             + " MiB at a time and dropped from the page cache once on the device (a memory limit "
+               "charges the cache)\n");
+    }
+  }
+#endif
+  return GzWritePolicy{enable_sparse, psync, drop_behind};
 }
 
 // `inline_writes`: run on the caller's thread with no write thread of its own,
@@ -16745,6 +16901,9 @@ static void writer_run(FILE * out, ResultStore & results,
   };
   update_sink_permits();
 
+  // This writer's dropped pieces only: another pool (the single-frame decoder,
+  // --sliding-window) may have counted before it (review).
+  g_drop_behind_pieces.store(0, std::memory_order_relaxed);
   // Create async write pool for double-buffered I/O
   AsyncWritePool * aio = nullptr;
   std::unique_ptr<AsyncWritePool> aio_ptr;
@@ -16754,11 +16913,11 @@ static void writer_run(FILE * out, ResultStore & results,
     const bool psync = wp.psync;
 #ifndef _WIN32
     aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp, psync,
-                                               inline_writes);
+                                               inline_writes, wp.drop_behind);
     aio = aio_ptr.get();
 #else
     aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse, m, bp, psync,
-                                               inline_writes);
+                                               inline_writes, wp.drop_behind);
     aio = aio_ptr.get();
 #endif
   }
@@ -17007,6 +17166,10 @@ static void writer_run(FILE * out, ResultStore & results,
       vlog(V_VERBOSE, opt, "[WRITER] draining write queue...\n");
     aio->flush();
     if (aio->had_error()) die_io(gz_write_fail("async write failed"));
+    if (const uint64_t pc = g_drop_behind_pieces.exchange(0, std::memory_order_relaxed);
+        pc && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[WRITER] memory: " + std::to_string(pc)
+           + " pieces synced and dropped behind the output\n");
   }
   // NB: the sink is NOT closed here.  writer_thread is not always the last
   // producer — the fallback/streaming decompress tail runs after wthr.join()
@@ -18972,9 +19135,11 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   if (to_out) {
     const GzWritePolicy wp = gz_write_policy(out, opt);   // holes as the frame writer makes them
 #ifndef _WIN32
-    aio = std::make_unique<AsyncWritePool>(out, g_direct_writer, wp.sparse, m, nullptr, wp.psync);
+    aio = std::make_unique<AsyncWritePool>(out, g_direct_writer, wp.sparse, m, nullptr, wp.psync,
+                                           false, wp.drop_behind);
 #else
-    aio = std::make_unique<AsyncWritePool>(out, nullptr, wp.sparse, m, nullptr, wp.psync);
+    aio = std::make_unique<AsyncWritePool>(out, nullptr, wp.sparse, m, nullptr, wp.psync,
+                                           false, wp.drop_behind);
 #endif
   }
   FrameBuf batch;
@@ -21870,6 +22035,7 @@ static size_t stream_frames_to_queue_mt(
   size_t zc_views = 0, zc_carried = 0, zc_copied = 0, zc_peak = 0, max_frame_comp = 0;
   size_t zc_carry_kept = 0;       // carried frames copied out of a kept carry (carry_exact)
   size_t zc_carry_moved = 0;      // carried frames handed over at their size (carry_exact)
+  size_t zc_size_class = 0;       // copies reserved at a size class (copy_frame, carry_exact)
   size_t zc_overlap = 0;          // frames that ended in their block's overlap
   uint64_t zc_wait_ns = 0;        // consumer time spent waiting for its next block
   struct Slot { std::shared_ptr<BlockBuf> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
@@ -22190,6 +22356,7 @@ static size_t stream_frames_to_queue_mt(
     if (carry_exact && n > ONE_MIB) {
       const size_t step = (size_t{1} << (63 - __builtin_clzll((unsigned long long)n))) / 8;
       dst.reserve((n + step - 1) / step * step);
+      ++zc_size_class;   // -v, so the suite sees the class taken, not only a kill (v0.18.39)
     }
     dst.assign(src, src + n);
   };
@@ -22212,12 +22379,20 @@ static size_t stream_frames_to_queue_mt(
     if (fc > max_frame_comp) max_frame_comp = fc;
     uint64_t cp = m ? now_ns() : 0;
     if (view_of)        { t.view_ptr = p; t.view_len = fc; t.block = *view_of; ++zc_views; }
-    else if (take_from && carry_exact && take_from->capacity() - fc <= fc / 16) {
+    else if (take_from && carry_exact && take_from->capacity() - fc <= fc / 2) {
       // Under a limit a carry reserved at its frame's size (carry_reserve_exact) is
-      // handed over (v0.18.38): the queue counts the frame's bytes, and the buffer
-      // holds no more than a sixteenth past them.  Copying it out instead kept a
-      // second frame-sized buffer alive for the whole run -- 32 MiB at 16 MiB frames,
-      // in no budget, the largest single reason a 2 GiB decode died under 128 MB.
+      // handed over (v0.18.38): copying it out instead kept a second frame-sized
+      // buffer alive for the whole run -- 32 MiB at 16 MiB frames, in no budget, the
+      // largest single reason a 2 GiB decode died under 128 MB.
+      // UP TO HALF AGAIN ITS FRAME (v0.18.39; it was a sixteenth).  The carry is
+      // reserved at the compress bound of the frame's CONTENT, so a 12 MiB base64
+      // frame arrives in 16.06 MiB and was copied out, to a 13 MiB size class, with
+      // the carry kept: four copies and the carry alive at the peak, 68 MiB of
+      // compressed frames where stored ones held 48 (the queue's byte cap admits
+      // two smaller frames).  The queue charges the capacity (Task::count_capacity),
+      // so a handed-over carry is counted whole.  Three in flight (decoding,
+      // queued, being pushed) cost 3 x bound handed over, 3 x frame + bound copied:
+      // handing over wins while the frame fills two thirds of its bound.
       take_from->resize(fc); t.data = std::move(*take_from); take_from->clear();
       ++zc_carried; ++zc_carry_moved;
     }
@@ -22430,11 +22605,11 @@ static size_t stream_frames_to_queue_mt(
 
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   if (opt.verbosity >= V_VERBOSE) {
-    char zb[448];
-    char kept[128] = "";
-    if (zc_carry_kept || zc_carry_moved)
-      std::snprintf(kept, sizeof kept, "; %zu carried copied out of a kept carry, %zu handed over at their size",
-                    zc_carry_kept, zc_carry_moved);
+    char zb[640];
+    char kept[192] = "";
+    if (zc_carry_kept || zc_carry_moved || zc_size_class)
+      std::snprintf(kept, sizeof kept, "; %zu carried copied out of a kept carry, %zu handed over at their size, "
+                    "%zu copies at a size class", zc_carry_kept, zc_carry_moved, zc_size_class);
     std::snprintf(zb, sizeof zb,
       "[READER] zero-copy: %zu frames as views, %zu carried across block boundaries, "
       "%zu copied%s; %zu ended in the %zu MiB overlap; peak %zu blocks (%.1f GiB%s) alive, "
@@ -25127,9 +25302,9 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
 
   const GzWritePolicy wp = gz_write_policy(out, opt);   // the frame writer's rules
 #ifndef _WIN32
-  AsyncWritePool aio(out, g_direct_writer, wp.sparse, m, nullptr, wp.psync);
+  AsyncWritePool aio(out, g_direct_writer, wp.sparse, m, nullptr, wp.psync, false, wp.drop_behind);
 #else
-  AsyncWritePool aio(out, nullptr, wp.sparse, m, nullptr, wp.psync);
+  AsyncWritePool aio(out, nullptr, wp.sparse, m, nullptr, wp.psync, false, wp.drop_behind);
 #endif
   FrameBuf batch;
   size_t batch_used = 0;
@@ -54431,6 +54606,46 @@ static void apply_backend_defaults(Options & opt)
     }
   }
 #endif
+  // --gpu-only STARTS NO MORE DEVICES THAN THE INPUT CAN USE (v0.18.39): one per
+  // 4 GiB of input, without --adapt (whose profile picks the count above) or an
+  // explicit --gpu-devices.  Every visible device is paid for at cuInit and again
+  // for its context and pools, ~0.5 s each on the 8-H100 server (cuInit alone
+  // 0.9 s for one, 2.85 for eight), whether or not it gets a frame: a 64 MiB
+  // --gpu-only compress ran 5.5 s on eight with seven idle, 1.6 on one.
+  // MEASURED, warm, the H100 server, compress 1 / 2 / 4 / 8 devices:
+  //   1 GiB   1.98 / 2.19 / 3.12 / 5.07 s     16 GiB  5.78 / 5.17 / 5.88 / 7.10
+  //   4 GiB   2.82 / 3.14 / 4.07 / 5.66       32 GiB  8.79 / 8.49 / 7.18 / 8.16
+  // and decode 4 GiB 3.22 / 3.09 / - / 5.27, 16 GiB 4.92 / 3.91 / - / 6.15.  The
+  // best there is one device per ~8 GiB; 4 is the general choice, so a slower
+  // card still gets seconds of work per startup it costs.  The total of regular
+  // input files; a pipe, a tree, a caller's CUDA_VISIBLE_DEVICES, --gpu-order=
+  // ranked or a staged run (one device already) is left alone.
+  // --gpu-order=ranked asks for the whole set in an order, so it keeps it (review).
+  if (opt.gpu_only && !opt.adapt && opt.gpu_devices == 0 && !opt.gds_only && !opt.direct_stage
+      && !opt.gpu_order_ranked
+      && !opt.tar_mode && !opt.inputs.empty() && !::getenv("CUDA_VISIBLE_DEVICES")
+      && (opt.mode == Mode::COMPRESS || opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST)) {
+    uint64_t total = 0;
+    bool known = true;
+    for (const std::string & in : opt.inputs) {
+      struct stat st {};
+      if (in == "-" || ::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) { known = false; break; }
+      total += (uint64_t)st.st_size;
+    }
+    const int devices = known ? gz_precuda_gpu_count() : 0;
+    if (devices > 1) {
+      constexpr uint64_t PER_DEVICE = uint64_t(4) << 30;
+      const int n = (int)std::min<uint64_t>((uint64_t)devices,
+                                            std::max<uint64_t>(1, (total + PER_DEVICE - 1) / PER_DEVICE));
+      if (n < devices) {
+        opt.gpu_devices = n;
+        char tb[32]; human_bytes(double(total), tb, sizeof(tb));
+        vlog(V_VERBOSE, opt, "[GPU] devices: " + std::to_string(n) + " of " + std::to_string(devices)
+             + " for " + tb + " of input (one per 4 GiB: each costs ~0.5 s to start; --gpu-devices "
+               "sets the count)\n");
+      }
+    }
+  }
   // A ONE-GPU COMPRESS OF 4 GiB OR MORE takes up to six streams (v0.18.36; see
   // DEFAULT_GPU_WIDE_STREAMS) -- staged (the default's or --direct-stage's) and
   // --gpu-only -- decided here, where the device count is final: the user's

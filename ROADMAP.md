@@ -377,7 +377,11 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    `--adapt`'s pipe gate (item 17) already chooses it: 8 runs from a fresh profile, no GPU started,
    compress 5.76-6.21 s, decompress 2.71-3.48.  A count model matters only where GPUs carry real
    work (few cores, slow levels), which this host never reaches at the default level.  Revisit on
-   such a host.
+   such a host.  **v0.18.39: `--gpu-only` without --adapt starts one device per 4 GiB of regular-file
+   input** (compress, decompress and `-t`): every visible device costs ~0.5 s at cuInit and bringup
+   whether it gets a frame or not, and on the server all eight lost to one or two at every size up to
+   16 GiB (64 MiB 5.5 -> 1.5 s; 16 GiB 7.10 -> 5.5).  A per-host model would place the count better
+   (the best there was about one per 8 GiB; a slower card wants more); --adapt's is still compress-only.
 20. **Nothing ranks the cards by measured speed.**  Which GPUs a run uses is CUDA's order (a static
    fastest-first heuristic from device properties), or with `--gpu-order=ranked` the current load
    (utilization, then free memory, from the driver probe); a `--gpu-devices N` subset takes the N
@@ -803,7 +807,10 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       68 GiB cold on the NVMe 16.0-16.6 s against 16.8-16.9 staged alone and 18.8-19.4 hybrid;
       64 GiB on tmpfs 12.7-14.7 against 15.7-16.1 and 16.3-16.5.  One, two or three workers ran
       the same from the NVMe, as did 32, 48 or 64 slots and two or three readers: the staged
-      reader tops out near 4.3 GiB/s there although three parallel `dd` reach 5.1 (open: why).
+      reader tops out near 4.3 GiB/s there although three parallel `dd` reach 5.1.  **CLOSED
+      v0.18.39, a misreading:** that was 68 GiB / wall time; the steady rate is 4.82 GiB/s against
+      `dd` with two 16 MiB O_DIRECT streams over the same file at 5.10 (94%) -- the gap is ~1.6 s of
+      startup (the GPU coming up while only the CPU workers consume, 265 ms pinning) and the tail.
       Still owed: workstation 2 (5.9 GiB/s drive, where hybrid beat staging alone by 7-9%) --
       this is the case it was written for -- and an explicit `--direct-stage`, which stays the
       GPU alone by contract.
@@ -823,16 +830,21 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       effect on the holes, 169.6 MiB), a 1 MiB mmap threshold (fits, but each frame faults its
       buffers in: +40-60% wall on the GPU build).  Under 96 MB both archives are still killed:
       the floors themselves (two 16 MiB decoded frames, three compressed in flight, the ring) are
-      ~100 MiB, so going lower means smaller frames in flight, not better counting.
+      ~100 MiB, so going lower means smaller frames in flight, not better counting.  **v0.18.39:**
+      below seven frames of memory the throttle keeps one decoded frame, not two: 88-112 MB decode
+      in 0.34-0.65 s (128 MB keeps two; 80 MB still dies).
       **A BUFFERED output was still killed** (found the next morning: the GPU build's "buffered"
       arms were O_DIRECT, its Gen4+ default, and the CPU-only build's passes were luck).  512 MiB
       to a file under 128 MB, buffered: killed 9 of 12 across both builds.  Fixed in the same
       release: the throttle no longer overdrafts while the writer holds frames (a slow sink kept
       3 + 3 frames alive against a 2-frame budget), and under a memory limit with < 1 GiB left a
       NAMED output defaults to O_DIRECT (default 9/9, 0.45-0.94 s; a redirected stdout keeps
-      --direct's rule: it may be shared).  `--no-direct` still needs
-      ~160 MB there.  **OWED:** the Gen3 workstation, where O_DIRECT output regressed unlimited --
-      check that a limited run is not slower with it.
+      --direct's rule: it may be shared).  **v0.18.39:** a buffered output (`--no-direct`, `-c >
+      file`) under < 512 MiB left drops its pages behind it (~1 s for 512 MiB at 128 MB, 2 GiB
+      3.3-8.5 s against 158-258 plain), and base64-like carries are handed over (68 -> 48 MiB of
+      compressed frames).  **OWED:** the Gen3 workstation, where O_DIRECT output regressed unlimited --
+      check that a limited run is not slower with it (2 GiB decodes under 256 MB-1 GB, default
+      against `--no-direct`).
     - **The cached-archive probe was measured on one drive.**  The server's (~4 GiB/s) and the first
       workstation's (Gen3, ~2 GB/s) should both fall under its 3.5 GiB/s-per-GPU bar; confirm with
       `-v` (`[READER] the archive is cached on a drive that reads ...`).  **Server CONFIRMED
