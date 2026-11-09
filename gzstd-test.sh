@@ -633,8 +633,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=567
-$EXTENSIVE && EXPECTED_TESTS=911
+EXPECTED_TESTS=570
+$EXTENSIVE && EXPECTED_TESTS=914
+# v0.18.40: +2 default cells on both builds (a piped decode hands its frames on as
+# views of recycled blocks; a named pipe decodes) and +1 default GPU cell (a pipe
+# starts two GPUs, and a cold --gpu-only input two; a host with fewer than three
+# GPUs or a caller's mask skips it as host-unexercisable), so the no-GPU deltas +1
+# (159 -> 160, 239 -> 240) and the GDS delta is unchanged: 567 -> 570, -e 911 -> 914.
 # v0.18.39: +1 default GPU cell (--gpu-only starts one device per 4 GiB of input;
 # a single-GPU host or a caller's mask skips it as host-unexercisable), so the
 # no-GPU deltas +1 (158 -> 159, 238 -> 239) and the GDS delta is unchanged:
@@ -993,8 +998,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=159   # + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=239   # + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=160   # + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=240   # + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1462,6 +1467,96 @@ LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "a pipe fills recycled blocks through a bounce buffer, byte-exact" \
   || fail "a pipe fills recycled blocks through a bounce buffer, byte-exact" "$why"
 rm -f "$TMPDIR/pb.bin" "$TMPDIR/pb.zst" "$TMPDIR/pb.err"
+
+# A PIPED DECODE HANDS ITS FRAMES ON AS VIEWS OF RECYCLED BLOCKS (v0.18.40).  The
+# pipe reader copied every frame into its own buffer (40% of its time; a 12 GiB
+# archive through `cat` 7.3-8.5 s, now 4.0-4.4).  It now parses in 64 MiB blocks
+# and moves only the unparsed tail of one when it fills, so the bytes must survive
+# every boundary: 160 MiB of random data in 3 MiB frames (stored, so a frame
+# straddles each block end), the same in 96 MiB frames (longer than a block: a
+# block of its own), every frame copied past a memory cap of no blocks, and the
+# copying reader (GZSTD_DEBUG_READER_COPY, the A/B control).  A host with under
+# 2 GiB of memory left runs the copying reader by design: skipped there.
+t0=$(now_ms); why=""; pv_t="a piped decode hands its frames on as views of recycled blocks, byte-exact"
+head -c $((160 * 1024 * 1024)) /dev/urandom > "$TMPDIR/pv.bin"
+"$GZSTD" -q -f --cpu-only --chunk-size=3 -c "$TMPDIR/pv.bin" > "$TMPDIR/pv.zst" 2>/dev/null
+"$GZSTD" -q -f --cpu-only --chunk-size=96 -c "$TMPDIR/pv.bin" > "$TMPDIR/pv96.zst" 2>/dev/null
+pv_frames=$(( (160 + 2) / 3 ))
+pv_arm() {   # name, archive, extra env, extra flags; leaves stderr in pv.err
+  cat "$2" | env $3 "$GZSTD" -d -v $4 -c 2> "$TMPDIR/pv.err" > "$TMPDIR/pv.out"
+  local rc=${PIPESTATUS[1]}
+  [[ $rc -eq 0 ]] || why+=" $1:exit-$rc"
+  cmp -s "$TMPDIR/pv.out" "$TMPDIR/pv.bin" || why+=" $1:bytes"
+}
+pv_line() { tr '\r' '\n' < "$TMPDIR/pv.err" | grep -aoE '\[READER\] pipe zero-copy: .*' | head -1; }
+pv_arm views "$TMPDIR/pv.zst" "" --cpu-only
+if tr '\r' '\n' < "$TMPDIR/pv.err" | grep -qa 'frames copied out of the read buffer (under 2 GiB'; then
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  skip_host "$pv_t" "under 2 GiB of memory left: the copying reader runs by design"
+else
+  pv_l=$(pv_line)
+  [[ "$pv_l" =~ ^\[READER\]\ pipe\ zero-copy:\ ${pv_frames}\ frames\ as\ views,\ 0\ copied ]] \
+    || why+=" views:[${pv_l:-no line}]"
+  pv_c=$(sed -nE 's/.*; ([0-9]+) blocks .*/\1/p' <<< "$pv_l")
+  [[ "${pv_c:-0}" -ge 3 ]] || why+=" views:blocks-${pv_c:-none}"
+  [[ "$pv_l" =~ \ 0\.0\ MiB\ of\ partial ]] && why+=" views:no-tail-carried"
+  pv_arm own "$TMPDIR/pv96.zst" "" --cpu-only
+  [[ "$(pv_line)" =~ \(([1-9][0-9]*)\ of\ their\ own\) ]] || why+=" own:[$(pv_line)]"
+  pv_arm cap0 "$TMPDIR/pv.zst" "GZSTD_DEBUG_ZC_MAX_BLOCKS=0" --cpu-only
+  [[ "$(pv_line)" =~ zero-copy:\ 0\ frames\ as\ views,\ ${pv_frames}\ copied ]] || why+=" cap0:[$(pv_line)]"
+  pv_arm copy "$TMPDIR/pv.zst" "GZSTD_DEBUG_READER_COPY=1" --cpu-only
+  { grep -qa 'frames copied out of the read buffer (GZSTD_DEBUG_READER_COPY)' "$TMPDIR/pv.err" \
+      && [[ -z "$(pv_line)" ]]; } || why+=" copy:[$(pv_line)]"
+  if has_gpu 2>/dev/null; then
+    pv_arm gpu "$TMPDIR/pv.zst" "" --gpu-only
+    [[ "$(pv_line)" =~ zero-copy:\ ${pv_frames}\ frames\ as\ views ]] || why+=" gpu:[$(pv_line)]"
+  fi
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "$pv_t" || fail "$pv_t" "$why"
+fi
+rm -f "$TMPDIR/pv.bin" "$TMPDIR/pv.zst" "$TMPDIR/pv96.zst" "$TMPDIR/pv.out" "$TMPDIR/pv.err"
+
+# A NAMED PIPE DECODES (v0.18.40).  The decode drivers checked a named input's
+# magic with fread() and rewind(): stdio had read 4 KiB, and a pipe cannot give
+# them back, so `gzstd -d <(cat x.zst)`, `gzstd -d /dev/stdin`, a named FIFO, -t
+# and --tar on any of them exited 4 ("Unknown frame descriptor") where zstd
+# decodes them.  Each must round-trip, a named pipe must take the pipe reader (not
+# the single-thread sizeless-frame decoder the failed peek chose), and bad bytes
+# through one must still fail.
+t0=$(now_ms); why=""; np_t="a named pipe decodes: <(...), /dev/stdin, a FIFO, -t and --tar"
+"$GZSTD" -q -f --cpu-only --chunk-size=1 -c "$TMPDIR/large.bin" > "$TMPDIR/np.zst" 2>/dev/null
+np_to() { timeout --foreground -k 5 120 "$@"; }
+np_to "$GZSTD" -d -v -c <(cat "$TMPDIR/np.zst") 2>"$TMPDIR/np.err" | cmp -s - "$TMPDIR/large.bin" || why+=" procsub"
+tr '\r' '\n' < "$TMPDIR/np.err" | grep -qaE '\[READER\] pipe( zero-copy:|: frames copied)' || why+=" procsub:not-the-pipe-reader"
+grep -qa 'sizeless' "$TMPDIR/np.err" && why+=" procsub:sizeless-route"
+cat "$TMPDIR/np.zst" | np_to "$GZSTD" -d -c /dev/stdin 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || why+=" dev-stdin"
+rm -f "$TMPDIR/np.fifo"; mkfifo "$TMPDIR/np.fifo"
+{ cat "$TMPDIR/np.zst" > "$TMPDIR/np.fifo" & } 2>/dev/null
+np_to "$GZSTD" -d -c "$TMPDIR/np.fifo" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || why+=" fifo"
+wait 2>/dev/null
+np_to "$GZSTD" -t <(cat "$TMPDIR/np.zst") 2>/dev/null || why+=" test:exit-$?"
+mkdir -p "$TMPDIR/np.src"; head -c 300000 "$TMPDIR/large.bin" > "$TMPDIR/np.src/m"
+"$GZSTD" -q -f --cpu-only --tar -C "$TMPDIR" -o "$TMPDIR/np.tzst" np.src 2>/dev/null || why+=" tar-create:$?"
+np_to "$GZSTD" -t --tar <(cat "$TMPDIR/np.tzst") >/dev/null 2>&1 || why+=" tar-test:exit-$?"
+# Bad bytes are refused from their first four, not at the end of the input: a
+# writer that holds the pipe open must not keep the run waiting (review).
+# Four bytes and the pipe held open, through both readers (views and the copying
+# one), and 0xFD2FB520, next to the pre-1.0 magics the streaming decoder may read.
+np_bad() {   # name, the four bytes (printf), extra env
+  rm -f "$TMPDIR/np.fifo"; mkfifo "$TMPDIR/np.fifo"
+  { printf "$2"; exec sleep 30; } > "$TMPDIR/np.fifo" 2>/dev/null &
+  local wp=$! rc=0
+  env $3 timeout --foreground -k 5 20 "$GZSTD" -d -c "$TMPDIR/np.fifo" >/dev/null 2>"$TMPDIR/np.err" || rc=$?
+  kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
+  [[ $rc -eq 4 ]] || why+=" $1:exit-$rc(want-4;124=waited)"
+  grep -qa 'not a Zstd file (bad magic' "$TMPDIR/np.err" || why+=" $1:message"
+}
+np_bad bad-views '\0\0\0\0' ""
+np_bad bad-copy '\0\0\0\0' "GZSTD_DEBUG_READER_COPY=1"
+np_bad bad-fd2fb520 '\x20\xb5\x2f\xfd' ""
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "$np_t" || fail "$np_t" "$why"
+rm -rf "$TMPDIR/np.zst" "$TMPDIR/np.err" "$TMPDIR/np.fifo" "$TMPDIR/np.src" "$TMPDIR/np.tzst"
 rm -f "$TMPDIR/pipe.zst" "$TMPDIR/pipe.recovered" "$TMPDIR/pipeline.recovered" \
       "$TMPDIR/pg-in.err" "$TMPDIR/pg-out.err" "$TMPDIR/pc.json"
 
@@ -7360,6 +7455,62 @@ if has_gpu 2>/dev/null; then
     skip_host "$gd_t" "single GPU host"
   else
     skip_host "$gd_t" "a caller's CUDA_VISIBLE_DEVICES, or fewer than 2 GPUs with ${mg_min_mib} MiB free"
+  fi
+
+  # A PIPE STARTS TWO GPUs, AND A COLD --gpu-only INPUT TWO (v0.18.40).  A pipe is
+  # one stream; on the 8-H100 server eight cards were never the fastest of 29
+  # piped cells and two beat them by 0.7-1.9 s.  A cold input is read at the
+  # drive's rate, which two H100s outrun (cold 32 GiB: 11.7-12.0 s on the rule's
+  # eight, 8.6-8.8 on two).  Like the cell above it clears the suite's mask, and
+  # it needs three cards (two of two is no cap).  GZSTD_DEBUG_GPU_BYTES_PER_DEVICE
+  # plans a quarter of the 32 MiB fixture per device, so the rule asks for four
+  # (every card on a three-GPU host): --cold, and an input evicted from the page
+  # cache, must take two; the same input cached keeps the plan.
+  gp_t="a pipe starts two GPUs, and a cold --gpu-only input two, not every card"
+  gp_dc="$(cd "$(dirname "$0")" && pwd)/scripts/drop_cache"
+  if [[ "${GPU_ALL_DEVICES:-}" == *,*,* && "${GPU_ALL_DEVICES:-}" == "${GPU_HOST_UUIDS:-}" ]] \
+     && (( ${#mg_cards[@]} >= 3 )); then
+    gp_why=""
+    gp_n=$(tr ',' '\n' <<< "$GPU_ALL_DEVICES" | wc -l)
+    gp_err() { tr '\r' '\n' < "$TMPDIR/gpd.err" | grep -ah 'GPU\] devices\|online' | tr '\n' ' '; }
+    cat "$TMPDIR/large.bin" | env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 "$GZSTD" \
+      --gpu-only -v -c 2>"$TMPDIR/gpd.err" > "$TMPDIR/gpd.zst" || gp_why+=" pipe:rc=$?"
+    "$GZSTD" -d -q -c "$TMPDIR/gpd.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || gp_why+=" pipe:bytes"
+    { grep -qaE "\[GPU\] devices: 2 of $gp_n for a pipe" "$TMPDIR/gpd.err" \
+        && grep -qa '2 device workers online' "$TMPDIR/gpd.err"; } || gp_why+=" pipe:[$(gp_err)]"
+    cat "$TMPDIR/gpd.zst" | env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 "$GZSTD" \
+      -d --gpu-only -v -c 2>"$TMPDIR/gpd.err" | cmp -s - "$TMPDIR/large.bin" || gp_why+=" pipe-d:bytes"
+    grep -qaE "\[GPU\] devices: 2 of $gp_n for a pipe" "$TMPDIR/gpd.err" || gp_why+=" pipe-d:[$(gp_err)]"
+    gp_pd=$(( $(stat -c %s "$TMPDIR/large.bin") / 4 ))
+    gp_want=$(( gp_n < 4 ? gp_n : 4 ))
+    gp_run() {   # name, extra flag
+      env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_BYTES_PER_DEVICE=$gp_pd timeout --foreground -k 10 120 \
+        "$GZSTD" --gpu-only $2 -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gpd.zst" 2>"$TMPDIR/gpd.err" \
+        || gp_why+=" $1:rc=$?"
+      "$GZSTD" -d -q -c "$TMPDIR/gpd.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || gp_why+=" $1:bytes"
+    }
+    gp_cold() {
+      { grep -qaE "\[GPU\] devices: 2 of $gp_n for .*two at most from a cold input" "$TMPDIR/gpd.err" \
+          && grep -qa '2 device workers online' "$TMPDIR/gpd.err"; } || gp_why+=" $1:[$(gp_err)]"
+    }
+    gp_run coldflag --cold; gp_cold coldflag
+    cat "$TMPDIR/large.bin" > /dev/null
+    gp_run cached ""
+    { grep -qa "$gp_want device workers online" "$TMPDIR/gpd.err" \
+        && ! grep -qa 'from a cold input' "$TMPDIR/gpd.err"; } || gp_why+=" cached:[$(gp_err)]"
+    gp_evicted=""
+    if [[ -x "$gp_dc" ]] && command -v python3 >/dev/null 2>&1 \
+       && "$gp_dc" "$TMPDIR/large.bin" >/dev/null 2>&1 \
+       && "$gp_dc" -c "$TMPDIR/large.bin" 2>/dev/null | grep -q ', 0.0%)'; then
+      gp_evicted=1
+      gp_run evicted ""; gp_cold evicted
+    fi
+    rm -f "$TMPDIR/gpd.zst" "$TMPDIR/gpd.err"
+    [[ -z "$gp_why" ]] && pass "$gp_t" "${gp_evicted:+(evicted arm ran)}" || fail "$gp_t" "$gp_why"
+  elif [[ "${GPU_ALL_DEVICES:-}" != *,*,* ]]; then
+    skip_host "$gp_t" "fewer than three GPUs"
+  else
+    skip_host "$gp_t" "a caller's CUDA_VISIBLE_DEVICES, or fewer than 3 GPUs with ${mg_min_mib} MiB free"
   fi
 
   # THE ALL-DEVICE RANKING RUNS AFTER CUDA, AND ONLY AT GPU BRINGUP (v0.17.63),

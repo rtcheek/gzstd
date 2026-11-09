@@ -1,12 +1,143 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.39  
+**Covers:** v0.9.50 → v0.18.40  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.40 — a named pipe decodes (`gzstd -d <(...)`, `/dev/stdin` and FIFOs exited 4), a piped decode no longer copies every frame (a 12 GiB archive through `cat` 7.4-11.5 -> 4.0-4.4 s), a pipe starts two GPUs rather than every card (hybrid compress 16 GiB 7.2 -> 5.7 s on the 8-GPU server), and a cold `--gpu-only` input two (32 GiB 11.7-12.0 -> 8.6-8.8 s)
+
+Measured on the 8-H100 server while it was quiet, against a base64-of-random corpus (1.33:1): 1, 4, 16
+and 32 GiB files, their `--cpu-only` archives (16 MiB frames), warm through `cat` pinned to two CPUs, or
+cold (page cache dropped per run), to `/dev/null`, arms shuffled within each round.
+
+**The pipe decode reader copied every frame.**  Looking at the device counts below, a piped `-d` ran
+slower than the pipe: `cat x.zst | gzstd -d -c --cpu-only` moved a 12.06 GiB archive in 7.3-8.5 s where
+`cat | cat` takes 4.8-5.2 and compress reads the same pipe at ~3.1 GiB/s.  `-vv` said why: `[READER] io
+58.5% | task-copy 39.7%`.  A pipe is read by the single sequential reader, which copied each frame out of
+its read buffer into its Task and moved the unparsed tail to the front before every read; the named-file
+reader dropped that copy in v0.17.47, the pipe reader never did.  Now, with memory to spare, it parses in
+recycled 64 MiB blocks filled through the compress readers' 256 KiB bounce buffer and streaming stores
+(v0.18.12's `GzPipeBlocks` and `gz_pipe_fill`), and hands each frame on as a view that holds its block
+until the frame is released.  A block is never compacted -- the frames handed on point into it -- so when
+it cannot take another 4 MiB read, the unparsed tail (part of one frame) moves to a fresh block; a frame
+longer than a block gets a block of its own, twice what it needs.  12.06 GiB archive, ABBA:
+
+| route | before | after |
+|---|---|---|
+| `--cpu-only` | 7.41-11.46 s | 4.02-4.44 |
+| default (hybrid) | 9.15-10.39 | 5.00-5.26 |
+| `-t` | 10.50-12.34 | 5.24-5.31 |
+| 4 CPUs | 7.17-7.30 | 7.07-7.09 (the decoders bind) |
+
+`zstd -d` takes 14.9 s for the same archive.  A view pins its whole block, which the queue's byte cap does
+not count, so as for the named-file reader the blocks may hold an eighth of the memory left; past that
+frames are copied again (`-v`: `[READER] pipe zero-copy: N frames as views, M copied past the memory cap;
+...`, with the blocks taken and the tail bytes carried).  Below 2 GiB left the copying reader runs exactly
+as before, so the 88 MB-1 GB limits v0.18.38-39 fitted are untouched; so does a regular file, which reaches
+this reader only when small, sizeless or odd.  `GZSTD_DEBUG_READER_COPY=1` forces the copy (the A/B
+control, as for the named-file reader) and `GZSTD_DEBUG_ZC_MAX_BLOCKS=N` caps the blocks.  The CPU and GPU
+decoders already took views from the named-file reader; checked byte-exact on both builds through a
+sizeless zstd stream, a gzstd archive followed by one (the streaming hand-off), 128 MiB frames alone and
+after 16 MiB ones, truncation and trailing bytes (exit 4), `--keep-going` (exit 7), `-t`, and every frame
+copied past a cap of nothing.
+
+**A pipe starts two GPUs.**  With no size to plan by, every backend that starts GPUs started all of them
+for a pipe: the default's hybrid, `--hybrid` and `--gpu-only`; compress, `-d` and `-t`.  A pipe is one
+stream through one reader, and one H100 compresses ~4.2 GiB/s, so the cards past the second only start
+and exit (~0.5 s each).  Eight were never the fastest of the 29 cells measured with them:
+
+| warm through `cat`, to /dev/null | `--cpu-only` | 1 GPU | 2 | 4 | 8 (was the default) |
+|---|---|---|---|---|---|
+| hybrid compress 4 GiB, all CPUs | 1.46-1.79 | 1.84-2.11 | 2.77-3.17 | 2.23-2.66 | 3.80-3.90 |
+| hybrid compress 16 GiB, all CPUs | 5.12-5.57 | 5.63-6.33 | 5.61-5.75 | 6.17-6.32 | 7.17-7.23 |
+| hybrid compress 16 GiB, 4 CPUs | 6.78-8.19 | 7.90-8.81 | 7.49-7.53 | 7.75-8.13 | 8.75-8.79 |
+| hybrid compress 32 GiB, 4 CPUs | 16.67-17.11 | 14.85-15.45 | 14.45-14.72 | 15.47-15.68 | 15.52-15.76 |
+| hybrid compress 32 GiB, 16 CPUs | 14.25-16.16 | 17.01-17.59 | 14.69-15.93 | 14.09-15.65 | 16.44-18.09 |
+| hybrid `-d`, 12 GiB archive, all CPUs (new reader) | 4.44-5.10 | 4.54-4.63 | 4.55-4.81 | | 5.56-6.01 |
+| hybrid `-d`, 12 GiB archive, 4 CPUs (new reader) | 5.98-6.04 | 5.51-5.63 | 5.72-5.96 | | 7.14-7.17 |
+| `--gpu-only` compress 16 GiB | | 6.07-7.91 | 6.52-6.80 | 7.49-7.62 | 9.00-9.30 |
+| `--gpu-only -d`, 24 GiB archive (old reader, one round) | | 10.17 | 10.51 | 12.07 | 12.89 |
+
+Two, not one: one card left a small-budget compress 0.4-2.5 s behind two.  The count only: a pipe the CPUs
+keep up with still starts CUDA on the default's hybrid, as decided in v0.18.13 (`--adapt` is the route
+that starts none).  `--adapt`, `--gpu-devices`, a caller's `CUDA_VISIBLE_DEVICES`, `--gpu-order=ranked`,
+`--tar` and `--calibrate` are left alone.  A device count makes the mask code place a guess and, on a
+driver it cannot ask directly (before R515), start the NVML sampler at once (~370 ms); a pipe that never
+starts CUDA would pay that, so there the rule applies only to `--gpu-only`.
+
+**A cold `--gpu-only` input takes two GPUs.**  v0.18.39's one per 4 GiB was measured warm.  Cold, the
+drive sets the rate (~5 GiB/s here), which two H100s outrun:
+
+| `--gpu-only`, cold | v0.18.39's count | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| compress 16 GiB | 4: 6.09-6.12 | 5.93-6.00 | 5.24-5.47 | 6.39-6.45 | 8.57-8.70 |
+| compress 32 GiB | 8: 11.73-11.96 | 8.25-8.31 | 8.62-8.78 | 9.67-9.81 | 11.88-12.05 |
+| decode, 24 GiB archive | 6: 7.99-8.33 | 7.66-8.51 | 6.45-6.62 | 7.05-7.48 | 8.86-12.78 |
+
+and cached the 32 GiB input still wants four (compress 7.05-7.63 on two or four against 8.01-8.90 on the
+rule's eight; decode 4.71-4.92 on four, 5.12-5.43 on two, 6.09-6.24 on the rule's six).  So a `--gpu-only`
+regular-file input with half its bytes or more outside the page cache (the non-perturbing `mincore`
+sample `--adapt` already takes), or under `--cold`, starts two at most: cold 24 GiB decode 6.89-7.09 s
+against 7.77-8.00 on six, re-measured with the rule.  Cached inputs keep one per 4 GiB, though the best
+here was nearer one per 8 GiB (left as v0.18.39 chose it, for slower cards).  `-v`: `[GPU] devices: 2 of 8
+for 32.00 GiB of input (one per 4 GiB: ...; two at most from a cold input, whose drive sets the rate; ...)`.
+`GZSTD_DEBUG_GPU_BYTES_PER_DEVICE=N` plans N bytes per device, for the suite.
+
+**A named pipe decodes** (found on the way; broken since the magic check was written).  The plain, `-t`
+and `--tar` (extract, test, list) drivers checked a named input's magic with `fread` and `rewind`, keyed on
+the name: anything but `-` was taken for a file.  stdio had already read 4 KiB, and on a pipe the rewind's
+`lseek` fails and drops them, so `gzstd -d <(cat x.zst)`, `gzstd -d /dev/stdin`, a named FIFO, and `-t`
+or `--tar` on any of them exited 4 with "Unknown frame descriptor" -- zstd decodes all of them.  The plain
+decode had also sent such an input to the single-thread sizeless-frame decoder, because its size peek
+cannot seek a pipe.  The check is now taken only where the stream can rewind (`lseek` on the fresh
+descriptor), and a named pipe is read like stdin: through the pipe reader above, with its views.
+Compression from a named pipe was not affected.  And a pipe -- stdin included -- that does not start
+with zstd is now refused from its first four bytes, with the named file's message and hint (`not a Zstd
+file (bad magic: 0x08088B1F): (stdin)` / `hint: this looks like gzip data ...`; `--keep-going` exit 7):
+the pipe reader took an unparsable prefix for an incomplete frame and read to the end of the input
+first, so a writer that held the pipe open kept the run waiting and one that kept writing grew the
+buffer without bound (found in review once named pipes took that route).  The four bytes are read on
+their own, before any 4 MiB read (which would wait for the writer), and the read after them takes 4 MiB
+less those four, so a pipe's reads still end on 4 MiB boundaries: the prefix a sizeless frame hands the
+streaming decoder is unchanged, and its own reads line up as before (off by four, the `-e` cell that
+holds a live pipe open after 12 MiB waited on four bytes never sent).  A pre-1.0 zstd magic still goes
+to the streaming decoder, as on stdin before.  Same exit code (4).
+
+**A piped input under 128 MB is still killed** (v0.18.39 the same; found here).  v0.18.38-39 fitted a 2 GiB
+decode under 128 MB (88 MB since v0.18.39) from a named file; through a pipe the copying reader runs (less
+than 2 GiB left), and it was killed in 0.15 s at 128 MB.  One cause, fixed: its parse buffer grew by
+doubling, 16 -> 32 MiB the first time a 12 MiB frame's tail plus a read passed 16, both alive while it
+copied -- the live heap peaked at 128.4 MiB, where the named-file route peaks at 120.4.  It now grows once,
+to the compress bound of the frame at its front plus a read (doubling only without a usable bound, so a
+long frame stays linear): live peak 116.5 MiB, and 132 MB passes 3 of 3 where v0.18.39 failed 3 of 3 (136
+MB and up both pass).  128 MB still fails: five 12 MiB compressed copies are alive against a 2-frame
+throttle, and ~13 MiB of fragmentation (129 MiB anonymous at 160 MB) -- the size classes and handed-over
+carries v0.18.38-39 gave the named-file route.  ROADMAP 37.
+
+**Not measured:** the decompress batch tuner's 3-5% at 48 GiB (from v0.18.1); another user's jobs took two
+of the eight cards before it ran.
+
+**Tests.**  Three default cells (570, `-e` 914).  On both builds, a named pipe decodes (process
+substitution, `/dev/stdin`, a FIFO, `-t`, `-t --tar`; it takes the pipe reader -- v0.18.39 fails every
+arm), and four bad bytes from a writer that holds the pipe open exit 4 at once on both readers, as does
+`0xFD2FB520` beside the pre-1.0 magics; and a piped decode hands its frames on as views,
+byte-exact: 160 MiB of random data in 3 MiB frames (a frame straddles each block end) and in 96 MiB frames
+(blocks of their own), every frame copied past a cap of no blocks, the copying reader, and on a GPU build
+`--gpu-only`.  On a host with three or more GPUs, a pipe starts two (compress and decode) and a `--gpu-only`
+input planned for four takes two under `--cold` and when evicted from the page cache, and keeps four cached.
+Mutation-checked: views never used, the tail not carried, the cap ignored, the pipe rule off, the cold cap
+off, the residency ignored (caught only by the evicted arm), the four-byte probe off, the legacy-magic
+range widened -- each fails its cell.  Suites on the final code: `-e` on the GPU build 913 passed, 0 failed, 1 skipped
+(the trivial-batch cell), CPU-only 410 / 0 / 130, both as expected.  The first `-e` run failed the
+live-pipe `--keep-going` cell until the probe kept a pipe's reads on 4 MiB boundaries (above).  Codex,
+text-only, SAFE TO COMMIT in round 5 (rounds 1-3 NOT SAFE: a null `memset` in a debug hook on the view
+path, a bad prefix on a held-open pipe read to EOF, four bad bytes behind a bulk read and a legacy-magic
+mask admitting two bad magics -- all fixed as described).
 
 
 ## v0.18.39 — a buffered output fits a memory limit (512 MiB under 128 MB in ~1 s, where v0.18.38 was killed 3 times in 12 or crawled 10-44 s), a decode fits 88 MB (96 MB was killed), `--gpu-only` starts one GPU per 4 GiB of input (a 64 MiB compress 5.5 -> 1.5 s on the 8-GPU server), and `-vv` no longer paces a decoder behind a slow pipe

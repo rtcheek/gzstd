@@ -306,6 +306,9 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    compresses in 1.28 s, so neither tool is pipe-bound. Not triaged: measure what the reader does per
    read (sizes, syscalls, the pipe's buffer, `F_SETPIPE_SZ`) before guessing.
 17. **Piped hybrid decompress pays ~1 s for GPUs it never uses.** PARTLY FIXED v0.18.12; DECIDED v0.18.13
+   **v0.18.40:** the count, not the decision -- a pipe starts two GPUs, not every card (piped hybrid -d of
+   a 12 GiB archive 5.56-6.01 s on eight, 4.55-4.81 on two, `--cpu-only` 4.44-5.10), and the pipe reader
+   no longer copies every frame (the same decode 9.15-10.39 s before; `--cpu-only` 7.41-11.46 -> 4.02-4.44).
    (owner, 2026-10-15): it is an --adapt behaviour.  Under --adapt a pipe starts its GPUs only when
    the CPU pool falls behind -- a GPU batch's worth of frames waiting (or a full queue), held for the
    0.15 s sample window -- and the 4 s fallback is gone, so a pipe the CPUs keep up with never starts
@@ -382,6 +385,14 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    whether it gets a frame or not, and on the server all eight lost to one or two at every size up to
    16 GiB (64 MiB 5.5 -> 1.5 s; 16 GiB 7.10 -> 5.5).  A per-host model would place the count better
    (the best there was about one per 8 GiB; a slower card wants more); --adapt's is still compress-only.
+   **v0.18.40: a pipe starts two devices** (every GPU backend, compress, -d and -t, without --adapt or
+   --gpu-devices): eight were never the fastest of 29 piped cells, two beat them by 0.7-1.9 s (CHANGELOG
+   has the table).  **And a cold --gpu-only input two at most**: the drive sets the rate, and two H100s
+   outrun one NVMe (cold 32 GiB 11.7-12.0 s on the rule's eight, 8.6-8.8 on two).  Still open: cached
+   inputs keep one per 4 GiB though one per 8 GiB measured better here (32 GiB compress: four 7.1-7.6 s,
+   the rule's eight 8.0-8.9; a 24 GiB archive's decode: four 4.7-4.9, the rule's six 6.1-6.2); a slower
+   card on a faster drive would want more than two cold.  Both want a per-host rate, which only --adapt
+   measures.
 20. **Nothing ranks the cards by measured speed.**  Which GPUs a run uses is CUDA's order (a static
    fastest-first heuristic from device properties), or with `--gpu-order=ranked` the current load
    (utilization, then free memory, from the driver probe); a `--gpu-devices N` subset takes the N
@@ -860,6 +871,26 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       24-27% came from its four Zen4 CPUs carrying more of the work.  A cheaper cached read (handing
       frames out of the page cache without the copy) stays the lever if a host shows the loss
       beside the probe; this one does not.
+37. **A piped input under 128 MB is killed** (found v0.18.40; v0.18.39 the same).  v0.18.38-39 fitted
+    a 2 GiB decode to a 128 MB limit, 88 MB since v0.18.39, from a NAMED file (the parallel reader's
+    shrunk blocks, exact carries, size classes, one decoded frame below seven).  Through a pipe the
+    sequential reader runs, which under 2 GiB left copies every frame (v0.18.40's views need memory
+    to spare).  v0.18.40 stopped its parse buffer doubling (16 -> 32 MiB mid-run, both alive): live
+    peak 128.4 -> 116.5 MiB, 132 MB passes (v0.18.39 0/3), 128 MB still killed in ~0.15 s.  MEASURED
+    with the heap tracer at 256 MB: five 12.06 MiB compressed copies alive against a 2-frame throttle,
+    two 16 MiB decoded frames, the 24 MiB parse buffer; the scope's anon at 160 MB 129 MiB, ~13 MiB
+    above the live heap (fragmentation: exact-size copies of slightly different sizes).  Next: the
+    named route's size classes for these copies, then why five copies (queue + decoding + the push +
+    frames waiting to be written holding their input?), or views of small blocks under a limit.
+    `cat g2.zst | systemd-run --user --scope -p MemoryMax=128M -p MemorySwapMax=0 gzstd -d -c >
+    /dev/null`; the FIFO form works for memprobe since v0.18.40 (a named pipe decodes).
+38. **A pipe whose bytes stop being zstd after its first frame is read to the end** (pre-existing on
+    stdin; v0.18.40 refuses a bad FIRST magic at once).  The pipe reader takes any
+    `ZSTD_findFrameCompressedSize` error for an incomplete frame until EOF, so garbage after valid
+    frames waits for the writer to close and grows the parse buffer meanwhile.  The verdict at EOF is
+    right (exit 4, or a tolerated damaged trailer); the wait and the growth are not.  A definite error
+    (anything but `srcSize_wrong`) could end the read -- but the damaged-trailer tolerance judges the
+    whole tail, so it would need a bounded look-ahead, not the full rest of the input.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
