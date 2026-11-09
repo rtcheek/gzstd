@@ -1,12 +1,74 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.41  
+**Covers:** v0.9.50 → v0.18.42  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.42 — a damaged first frame through a pipe is reported at once (it was held, all of the input, until the end: a 1.6 GB archive peaked at 3.2 GB resident), and three fixes from the pre-tag review to what `--adapt` learns about GPU streams
+
+**A first frame that does not parse.**  v0.18.41 made a parse error after a data frame final at once, but
+before the first data frame the pipe reader still waited for the end of the input, holding everything it
+read (then a copy of it as the fallback's input).  MEASURED, 8-H100 server, a 1.6 GB archive of 16 MiB
+frames through `cat` with its first block marked type 3 (reserved): exit 4 after 3.38 s at 3.2 GB peak
+resident, where zstd stops at the block.  Under a memory limit that is a kill instead of exit 4, and a
+writer that holds the pipe open kept the run waiting.  Now a definite error there (anything but
+`srcSize_wrong`) hands the stream on at once, as a sizeless frame is (the `stream_rest` route): the CPU
+streaming decoder takes it from that frame, reads on through the input itself, and stops at the damage --
+12 MB peak, 0.01 s.  The sizeless hand-off and this one share one helper (`hand_off_rest`); a flag tells
+`gz_stream_rest` the reason, so `-v` says the first frame does not parse instead of the GPU build's
+"first frame has no content-size header" warning.  A truncated first frame (`srcSize_wrong`) can only be
+known at the end, as before.
+
+Same input, v0.18.41 against v0.18.42, through a pipe and as a named file (a file this size takes the same
+reader): a reserved block type, a reserved header bit, and a skippable frame before the damaged one --
+
+| | v0.18.41 | v0.18.42 |
+|---|---|---|
+| exit | 4 | 4 |
+| under `--keep-going` | 4 for the piped and named block damage (the old fallback did not apply it), 7 for the named header bit | 7 everywhere, `RECOVERY STOPPED after 0 frame(s)` |
+| message | `ZSTD decompress error: ...`, piped with a `frame sizes unknown (no content-size headers)` warning first | `ZSTD decompress error: Data corruption detected` / `Unsupported frame parameter`, no warning |
+| writer holds the pipe open | waits | 0.02 s (`-t`, `--cpu-only` the same; `--gpu-only` 1.65 s, its GPU first) |
+
+Left as is: a pre-1.0 (legacy) first frame, which `ZSTD_getFrameContentSize` cannot size, still reads
+the rest of the input into memory before the streaming decoder runs (no legacy archive to test with).
+
+**Pre-tag review (everything since v0.18.35).**  Codex (sandboxed, max effort) reviewed v0.18.36-42 across
+versions: SAFE TO TAG, no blocker, and three MAJOR defects in what `--adapt` learns -- all in the profile,
+none in the data:
+
+- **Staged compression never learned its stream count.**  v0.18.36's stream lever filed a rate only when
+  the GPU-count model had a sample, and v0.18.38 stopped the default's staging (with its CPU pool) from
+  taking one, its CPUs carrying frames too: `streams_staged_*` never filled.  It now files when a GPU
+  delivered work (`g_adapt_gpu_engaged`); a faulted run still files nothing.
+- **A driver change kept the stream rates.**  The save that stamps the new driver cleared the older GPU
+  keys and the device-count model but not `streams_*`, so the next run read the old driver's stream
+  rates and attempt stamps as this driver's.  They are cleared with the rest.
+- **A short stream probe repeated every run.**  A run below the save floor saves only to stamp an attempt,
+  and the gate counted backend and budget probes but not a stream-only one, so the merge's stream stamp
+  never ran and the next run probed again.  The gate now counts the stream probe and the wide no-fit.
+
+Each was checked against the code first; the three cells Codex extended pass with the fixes (the three
+sections, 34 of 34) and fail without them, each with its own message (31 of 34).  Asked to review its own
+repairs, Codex found one more in the third: on a profile settled on six streams, a card that fits two
+would save every short run as a stamped no-fit probe -- `runs` and the stamp advancing each time, and a
+probe announced that never ran.  A short no-fit now counts only when six were chosen to be measured (never
+measured, or due for the recheck): `g_adapt_streams_wide_probe`.  The stream-lever cell gains both sides
+(a settled short no-fit leaves the profile byte-identical; an unmeasured one is stamped and held off next
+run); without the change it fails (33 of 34).  Verdict on the repaired tree: SAFE TO TAG.
+
+**Tests.**  No new cells (570, `-e` 914).  The named-pipe cell gains the damaged first frame from a writer
+holding the FIFO open: exit 4 within 20 s with zstd's message, and 7 under `--keep-going`.  v0.18.41 and a
+mutant without the early hand-off time out on both arms.  The device-count cell's driver change now also
+seeds stream rates and attempt stamps in both directions and requires them cleared; the stream-lever cell
+gains a probe below the save floor (its attempt stamped without rates, and not repeated next run); the
+staged budget cell requires the staged CPU pool, GPU work, and a filed staged stream rate.  Suites on the
+final tree: CPU-only 410/0/130 (as expected without a GPU), `-e` 913/0/1 in 26 min (the one: "trivial
+skip parks, never retires a GPU", which this host could not provoke).
 
 
 ## v0.18.41 — a piped decode fits 128 MB (it was killed; base64 frames now down to 88 MB, as from a file), a pipe is read for what it holds (bytes that stop being zstd end the run, and whole frames decode, while the writer keeps the pipe open), the decompress batch tuner on several GPUs no longer trails a pinned batch by 15-25%, and `--gpu-only` starts one GPU per 8 GiB of cached input

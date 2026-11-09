@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.41";
+static constexpr const char * GZSTD_VERSION = "0.18.42";
 //
 // Architecture overview:
 //
@@ -7232,10 +7232,11 @@ static std::atomic<int> g_adapt_budget_slot{-1};
 static std::atomic<int> g_adapt_budget_explored{0};
 // --adapt's GPU stream lever (v0.18.36, adapt_streams_choose): the slot this
 // run is filed under ({staged, --gpu-only} x {cold, warm}; -1 none), whether
-// it is exploring the narrow count, and the most streams any device created.
+// it is probing either count, and the most streams any device created.
 static constexpr int ADAPT_STREAMS_SLOTS = 4;
 static std::atomic<int> g_adapt_streams_slot{-1};
 static std::atomic<bool> g_adapt_streams_explore{false};
+static std::atomic<bool> g_adapt_streams_wide_probe{false}; // wide unmeasured or due for recheck
 static std::atomic<int> g_gpu_streams_created{0};
 static std::atomic<int> g_adapt_streams_asked{0};   // what adapt_streams_choose returned
 static const char * adapt_streams_slot_name(int slot)
@@ -9602,8 +9603,10 @@ struct AdaptObs {
   int budget_explored = 0;                       // arm a budget probe explored (0/1/2/3)
   int streams_slot = -1;                         // the stream lever's slot (g_adapt_streams_slot)
   bool streams_explore = false;                  // this run explored the narrow stream count
+  bool streams_wide_probe = false;               // wide chosen to measure, rather than as settled best
   int streams_created = 0;                       // most streams a GPU device created
   int streams_asked = 0;                         // the count the lever asked for
+  bool streams_gpu_engaged = false;              // a GPU delivered work, including mixed staging
   // Which backend actually ran, so the end-to-end rate is filed under it.
   // 0 = do not record (gpu-only, or a run that never chose).  3 = the staged
   // path (--direct-stage's), which only the budget-keyed prior consumes.
@@ -9645,8 +9648,10 @@ struct AdaptObs {
     if (compress_dir) {
       streams_slot    = g_adapt_streams_slot.load(std::memory_order_relaxed);
       streams_explore = g_adapt_streams_explore.load(std::memory_order_relaxed);
+      streams_wide_probe = g_adapt_streams_wide_probe.load(std::memory_order_relaxed);
       streams_created = g_gpu_streams_created.load(std::memory_order_relaxed);
       streams_asked   = g_adapt_streams_asked.load(std::memory_order_relaxed);
+      streams_gpu_engaged = g_adapt_gpu_engaged.load(std::memory_order_relaxed);
     }
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
@@ -9885,14 +9890,16 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     // THE STREAM LEVER (adapt_streams_choose): the same end-to-end rate, filed by
     // the stream count that RAN -- wide when a device created three or more (the
     // guard can trim six to two, and then two is what was measured) -- and only
-    // when a device compressed bytes (obs.gpuc: a staged run rebuilt on the CPU
-    // measured the CPU).  An exploration that could not be measured stamps the
+    // when a device delivered work.  The GPU-count samples cannot prove that:
+    // mixed staging deliberately records none, because its CPUs carry frames too.
+    // Fault/rebuild observations already returned above without merging rates.
+    // An exploration that could not be measured stamps the
     // narrow attempt.  Six asked and two created (the card fits no third
     // stream) stamps the wide attempt, so the lever asks for two until the
     // recheck instead of claiming six every run (review, v0.18.36).
     if (obs.streams_slot >= 0) {
       const std::string base = std::string("streams_") + adapt_streams_slot_name(obs.streams_slot);
-      const bool measured = obs.streams_created > 0 && !obs.gpuc.empty() && long_enough_for_backend;
+      const bool measured = obs.streams_created > 0 && obs.streams_gpu_engaged && long_enough_for_backend;
       if (measured) {
         const std::string k = base + (obs.streams_created >= 3 ? "_wide" : "_narrow");
         dir.put_num(k, ema(dir.gnum(k, 0), rate));
@@ -10559,11 +10566,11 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
                          [](const std::pair<std::string, AdaptJv> & kv) {
                            return kv.first == "gpu_batch"; }),
                      d2.obj.end());
-        // The count model is GPU-derived too.  Clearing only the older keys
-        // would stamp the new driver above stale count rates on this save;
+        // The count model and stream lever are GPU-derived too.  Clearing only
+        // the older keys would stamp the new driver above their stale rates;
         // the next load would then accept them as measurements of that driver.
         for (auto & kv : d2.obj)
-          if (kv.first.rfind("gpu_devices_", 0) == 0) {
+          if (kv.first.rfind("gpu_devices_", 0) == 0 || kv.first.rfind("streams_", 0) == 0) {
             kv.second.t = AdaptJv::NUM;
             kv.second.num = 0;
           }
@@ -10653,7 +10660,9 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
       filed += std::string("; the ") + bk[probed]
             + " probe stamped as tried";
   } else if (obs.stamp_only) {
-    filed = std::string("the ") + bk[probed]
+    const char * attempt = probed ? bk[probed]
+                        : obs.streams_explore ? "two-stream" : "wide-stream no-fit";
+    filed = std::string("the ") + attempt
           + " probe stamped as tried; the run was too short for a rate";
   } else {
     filed = "regime " + obs.regime;
@@ -19186,6 +19195,11 @@ private:
   std::thread thr_;
 };
 
+// Set by stream_frames_to_queue when it hands the stream on at a FIRST frame
+// that does not parse (v0.18.42), not at a huge or sizeless one; gz_stream_rest
+// takes it, so that run is not told the frame merely declares no size.
+static std::atomic<bool> g_stream_rest_unparsed{false};
+
 // Say why a single-frame (or sizeless) stream is decoded on one CPU thread.  The
 // named-file route and the pipe route (stream_frames_to_queue's stream_rest)
 // both land in decompress_stream_from_file and print the same thing.
@@ -19655,7 +19669,11 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
 static void gz_stream_rest(FILE * in, FILE * out, const Options & opt, Meter * m,
                            const std::vector<char> & prefix, uint64_t decomp)
 {
-  gz_note_single_frame_stream(opt, decomp);
+  if (g_stream_rest_unparsed.exchange(false, std::memory_order_relaxed))
+    vlog(V_VERBOSE, opt, "[INIT] decompress: the first frame does not parse; the streaming "
+                         "decoder takes the input from there and says where it breaks\n");
+  else
+    gz_note_single_frame_stream(opt, decomp);
   const uint64_t wrote_before = m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0;
   if (m && decomp > 0) {
     // --tar can share one meter across several input archives.
@@ -23485,6 +23503,28 @@ static size_t stream_frames_to_queue(
     }
   };
 
+  // Hand the rest of the stream -- what this reader holds from buf_off, then what
+  // `in` still has -- to the CPU streaming decoder (the caller's stream_rest
+  // route).  `first_size`: the first frame's declared size for the caller's meter,
+  // 0 when none; after queued frames the largest of those is reported instead, as
+  // every other return reports it (the GPU driver sizes buffers from this, and the
+  // streamed frame never reaches a GPU).
+  auto hand_off_rest = [&](uint64_t first_size) {
+#ifndef _WIN32
+    // O_DIRECT reads above use pread on a separate descriptor, so they leave the
+    // FILE* at its old offset.  The streaming decoder reads the prefix first,
+    // then continues through that FILE*.
+    if (use_direct && ::fseeko(in, din_off, SEEK_SET) != 0)
+      die_io("cannot position input after O_DIRECT stream prefix: " + opt.input);
+#endif
+    *fallback = true;
+    *stream_rest = true;
+    gz_late_set_handoff(out_off_acc);    // where the stream's frames begin in the output
+    if (raw_data) raw_data->assign(bp + buf_off, bp + buf_len);
+    if (max_frame_decomp_out)
+      *max_frame_decomp_out = seq > 0 ? max_frame_decomp : (size_t)first_size;
+  };
+
   while (!eof) {
     // Caller asked us to stop early (e.g. --gpu-only but the deferred bringup
     // thread found no CUDA device).  Return what we have; the caller errors.
@@ -23682,25 +23722,8 @@ static size_t stream_frames_to_queue(
         if (need == 0 && zfh.frameType == ZSTD_frame
             && (zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
                 || zfh.frameContentSize > (unsigned long long)SINGLE_FRAME_STREAM_MIN)) {
-#ifndef _WIN32
-          // O_DIRECT reads above use pread on a separate descriptor, so they
-          // leave the FILE* at its old offset.  The streaming decoder reads
-          // the prefix first, then continues through that FILE*.
-          if (use_direct && ::fseeko(in, din_off, SEEK_SET) != 0)
-            die_io("cannot position input after O_DIRECT stream prefix: " + opt.input);
-#endif
-          *fallback = true;
-          *stream_rest = true;
-          gz_late_set_handoff(out_off_acc);    // where the stream's frames begin in the output
-          if (raw_data) raw_data->assign(bp + buf_off, bp + buf_len);
-          // First frame: its declared size, for the caller's meter and
-          // preallocation.  Later: the largest QUEUED frame, as every other
-          // return reports it -- the GPU driver sizes buffers from this, and
-          // the frame being streamed never reaches a GPU.
-          if (max_frame_decomp_out)
-            *max_frame_decomp_out = seq > 0 ? max_frame_decomp
-                                  : zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
-                                    ? 0 : (size_t)zfh.frameContentSize;
+          hand_off_rest(zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
+                        ? 0 : zfh.frameContentSize);
           return seq;
         }
       }
@@ -23732,6 +23755,24 @@ static size_t stream_frames_to_queue(
         // open, the parse buffer growing all the while.  Before the first data
         // frame the end-of-input route below still decides (the streaming
         // decoder's fallback reads the rest of the input itself).
+        //
+        // A FIRST FRAME THAT DOES NOT PARSE IS HANDED ON AT ONCE (v0.18.42).  The
+        // rule above waited for the end of the input there, holding everything read
+        // until then: a 1.6 GB archive piped in with its first block damaged peaked
+        // at 3.2 GB resident (the parse buffer, then its copy as the fallback's
+        // input) before the verdict, where zstd stops at the block -- under a memory
+        // limit a kill instead of exit 4, and a writer that held the pipe open kept
+        // the run waiting.  Now the streaming decoder takes it from this frame, as it
+        // takes a sizeless one (stream_rest), reads on through `in` itself and
+        // reports the damage where it is, under --keep-going too.  A truncated
+        // first frame (srcSize_wrong) is still only known at the end; a caller with
+        // no stream_rest keeps the old route.
+        if (!eof && seq == 0 && stream_rest
+            && ZSTD_getErrorCode(frame_comp) != ZSTD_error_srcSize_wrong) {
+          g_stream_rest_unparsed.store(true, std::memory_order_relaxed);
+          hand_off_rest(0);
+          return seq;
+        }
         if (!eof && (seq == 0 || ZSTD_getErrorCode(frame_comp) == ZSTD_error_srcSize_wrong))
           break;
         // At EOF (or a final error after data frames): no more data that could help
@@ -53926,7 +53967,11 @@ static int gzstd_main(int argc, char ** argv)
   if (g_adapt_gpu_faulted.load(std::memory_order_relaxed))
     adapt_obs.fault = true;   // a rescued decompress fault (v0.18.13): see the flag
   const bool adapt_stamp_only =
-      (adapt_obs.explored != 0 || adapt_obs.budget_explored != 0)
+      (adapt_obs.explored != 0 || adapt_obs.budget_explored != 0
+       || adapt_obs.streams_explore
+       || (adapt_obs.streams_wide_probe
+           && adapt_obs.streams_slot >= 0 && adapt_obs.streams_asked >= 3
+           && adapt_obs.streams_created > 0 && adapt_obs.streams_created <= 2))
       && adapt_obs.wall_ns < adapt_save_min_ns()
       && !adapt_obs.fault;
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
@@ -54757,6 +54802,14 @@ static size_t adapt_streams_choose(const Options & opt, bool staged)
     say(what, DEFAULT_GPU_STREAMS);
     return DEFAULT_GPU_STREAMS;
   };
+  // Only a deliberate wide measurement admits a sub-floor no-fit stamp.  A
+  // settled wide winner can fit just two streams under this run's memory cap;
+  // that ordinary short run must not advance runs/updated on every invocation.
+  auto probe_wide = [&](const char * what) {
+    g_adapt_streams_wide_probe.store(true, std::memory_order_relaxed);
+    say(what, DEFAULT_GPU_WIDE_STREAMS);
+    return DEFAULT_GPU_WIDE_STREAMS;
+  };
   if (g_adapt_budget_explored.load(std::memory_order_relaxed) != 0) {
     say(" (the budget prior explores this run)", DEFAULT_GPU_WIDE_STREAMS);
     return DEFAULT_GPU_WIDE_STREAMS;
@@ -54765,7 +54818,7 @@ static size_t adapt_streams_choose(const Options & opt, bool staged)
     say(" (six did not fit here)", DEFAULT_GPU_STREAMS);
     return DEFAULT_GPU_STREAMS;
   }
-  if (rw <= 0.0) { say(" (the default, measured this run)", DEFAULT_GPU_WIDE_STREAMS); return DEFAULT_GPU_WIDE_STREAMS; }
+  if (rw <= 0.0) return probe_wide(" (the default, measured this run)");
   const bool narrow_recent = sn > 0.0 && D.runs - sn < ADAPT_BACKEND_RECHECK_RUNS;
   if (rn <= 0.0) {
     if (explorable && !narrow_recent) return probe_narrow(" (exploring)");
@@ -54776,7 +54829,7 @@ static size_t adapt_streams_choose(const Options & opt, bool staged)
     const bool n_stale = D.runs - sn >= ADAPT_BACKEND_RECHECK_RUNS;
     const bool w_stale = D.runs - sw >= ADAPT_BACKEND_RECHECK_RUNS;
     if (n_stale && (!w_stale || sn <= sw)) return probe_narrow(" (re-measuring)");
-    if (w_stale) { say(" (re-measuring)", DEFAULT_GPU_WIDE_STREAMS); return DEFAULT_GPU_WIDE_STREAMS; }
+    if (w_stale) return probe_wide(" (re-measuring)");
   }
   if (rn > rw * 1.05) { say(" (measured faster here)", DEFAULT_GPU_STREAMS); return DEFAULT_GPU_STREAMS; }
   say("", DEFAULT_GPU_WIDE_STREAMS);

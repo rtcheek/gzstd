@@ -1523,7 +1523,7 @@ rm -f "$TMPDIR/pv.bin" "$TMPDIR/pv.zst" "$TMPDIR/pv96.zst" "$TMPDIR/pv.out" "$TM
 # decodes them.  Each must round-trip, a named pipe must take the pipe reader (not
 # the single-thread sizeless-frame decoder the failed peek chose), and bad bytes
 # through one must still fail.
-t0=$(now_ms); why=""; np_t="a named pipe decodes: <(...), /dev/stdin, a FIFO, -t and --tar; bad bytes end it, and frames decode, while the writer waits"
+t0=$(now_ms); why=""; np_t="a named pipe decodes: <(...), /dev/stdin, a FIFO, -t and --tar; bad bytes (first frame too) end it, and frames decode, while the writer waits"
 "$GZSTD" -q -f --cpu-only --chunk-size=1 -c "$TMPDIR/large.bin" > "$TMPDIR/np.zst" 2>/dev/null
 np_to() { timeout --foreground -k 5 120 "$@"; }
 np_to "$GZSTD" -d -v -c <(cat "$TMPDIR/np.zst") 2>"$TMPDIR/np.err" | cmp -s - "$TMPDIR/large.bin" || why+=" procsub"
@@ -1571,6 +1571,28 @@ np_after() {   # name, extra flags, wanted exit
 }
 np_after after-frames "" 4
 np_after after-frames-kg "--keep-going" 7
+# And a FIRST frame that does not parse (v0.18.42): the reader waited for the end of
+# the input there, holding all of it (a 1.6 GB archive peaked at 3.2 GB resident),
+# so a writer holding the pipe open kept the run waiting.  Its first block marked
+# type 3 (reserved): the streaming decoder now takes the stream from that frame and
+# stops at the block.  Exit 4, and 7 under --keep-going.
+np_fhd=$(od -An -tu1 -j4 -N1 "$TMPDIR/np.zst"); np_ss=$(( (np_fhd >> 5) & 1 ))
+np_did=(0 1 2 4); np_fcs=("$np_ss" 2 4 8)
+np_pos=$(( 5 + 1 - np_ss + ${np_did[$((np_fhd & 3))]} + ${np_fcs[$((np_fhd >> 6))]} ))
+np_b=$(od -An -tu1 -j"$np_pos" -N1 "$TMPDIR/np.zst")
+cp "$TMPDIR/np.zst" "$TMPDIR/np.bad0.zst"
+printf "\\x$(printf %02x $(( np_b | 6 )))" | dd of="$TMPDIR/np.bad0.zst" bs=1 seek="$np_pos" conv=notrunc status=none
+np_first() {   # name, extra flags, wanted exit
+  rm -f "$TMPDIR/np.fifo"; mkfifo "$TMPDIR/np.fifo"
+  { cat "$TMPDIR/np.bad0.zst"; exec sleep 30; } > "$TMPDIR/np.fifo" 2>/dev/null &
+  local wp=$! rc=0
+  timeout --foreground -k 5 20 "$GZSTD" -d -c $2 "$TMPDIR/np.fifo" >/dev/null 2>"$TMPDIR/np.err" || rc=$?
+  kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
+  [[ $rc -eq $3 ]] || why+=" $1:exit-$rc(want-$3;124=waited)"
+  grep -qa 'Data corruption detected' "$TMPDIR/np.err" || why+=" $1:message"
+}
+np_first first-frame "" 4
+np_first first-frame-kg "--keep-going" 7
 # And whole frames are decoded while the writer waits: every byte of the archive's
 # output reaches stdout before the writer closes, through both readers.  Until
 # v0.18.41 the frames in the last 4 MiB that had not filled (the last MiB of this
@@ -1607,7 +1629,7 @@ fi
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "$np_t" || fail "$np_t" "$why"
 rm -rf "$TMPDIR/np.zst" "$TMPDIR/np.err" "$TMPDIR/np.fifo" "$TMPDIR/np.src" "$TMPDIR/np.tzst" \
-       "$TMPDIR/np.out" "$TMPDIR/np.rc" "$TMPDIR/np.notable.zst"
+       "$TMPDIR/np.out" "$TMPDIR/np.rc" "$TMPDIR/np.notable.zst" "$TMPDIR/np.bad0.zst"
 rm -f "$TMPDIR/pipe.zst" "$TMPDIR/pipe.recovered" "$TMPDIR/pipeline.recovered" \
       "$TMPDIR/pg-in.err" "$TMPDIR/pg-out.err" "$TMPDIR/pc.json"
 
@@ -9503,10 +9525,28 @@ PYEOF2
   python3 - "$GCP" <<'PYEOF2'
 import json, sys
 p = sys.argv[1]; j = json.load(open(p))
-for e in j['entries'].values(): e['driver'] = 'an-older-driver'
+for e in j['entries'].values():
+    e['driver'] = 'an-older-driver'
+    # A save in one direction must clear the stream lever in BOTH: otherwise
+    # writing the new driver makes the other direction's old rates valid again.
+    for dn in ('compress', 'decompress'):
+        c = e.setdefault(dn, {})
+        for slot in ('staged_cold', 'staged_warm', 'gpuonly_cold', 'gpuonly_warm'):
+            for width in ('wide', 'narrow'):
+                k = 'streams_' + slot + '_' + width
+                c[k], c[k + '_run'] = 9, 3
 json.dump(j, open(p, 'w'))
 PYEOF2
   env XDG_CACHE_HOME="$GC/xdg" $AQ "$GZSTD" --adapt --cpu-only -q -k -f "$GC/small.txt" -o /dev/null 2>/dev/null
+  python3 -I - "$GCP" <<'PYEOF2'
+import json, sys
+for e in json.load(open(sys.argv[1]))['entries'].values():
+    for dn in ('compress', 'decompress'):
+        for k, v in e.get(dn, {}).items():
+            if k.startswith('streams_'):
+                assert v == 0, (dn, k, v)
+PYEOF2
+  [[ $? -eq 0 ]] || why+=" [old stream rates or attempt stamps survived the driver change]"
   gpuc_want after "$GC/in200" 8 "exploring 8"
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "device count: a GPU driver change clears the model" \
@@ -13450,6 +13490,65 @@ PYEOF
   dsa_case narrower  5 6   "2 (measured faster here)"            2
   dsa_case tie       5 5.1 "6"                                   6
   dsa_case nofit    -1 4   "2 (six did not fit here)"            2
+  # A stream-only probe below the save floor must persist its ATTEMPT, without
+  # rates.  The crafted input_gibs predicts over 600 s, admitting exploration;
+  # the actual run is bounded at 120 s, so this cannot pass by clearing the floor.
+  dsa_prof 5 0; cat "$dsc_src" > /dev/null
+  GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 dsa_run "$TMPDIR/dsa-short.log" \
+    || dsa_why+=" [short probe exit $?]"
+  [[ "$(dsa_line "$TMPDIR/dsa-short.log")" == "2 (exploring)" ]] \
+    || dsa_why+=" [short probe did not explore]"
+  python3 -I - "$dsa_x/gzstd/profile.json" "$dsa_hash" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))['entries'][sys.argv[2]]['compress']
+assert c['runs'] == 4 and c['streams_gpuonly_warm_narrow_run'] == 4, c
+assert 'streams_gpuonly_warm_narrow' not in c and c['streams_gpuonly_warm_wide'] == 5, c
+assert c['input_gibs'] == 0.0001 and not any(k.startswith('gpu_devices_') for k in c), c
+PYEOF
+  [[ $? -eq 0 ]] || dsa_why+=" [short stream attempt not stamped, or rates merged]"
+  GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 dsa_run "$TMPDIR/dsa-after-short.log" \
+    || dsa_why+=" [after short probe exit $?]"
+  [[ "$(dsa_line "$TMPDIR/dsa-after-short.log")" == "6 (2 untried here)" ]] \
+    || dsa_why+=" [short stream probe immediately repeated]"
+  # -M16M bounds this one-device, six-stream run to fewer than eight frames
+  # per stream, so the guard retains two.  On a settled profile that is NOT a
+  # probe: a short no-fit must leave the whole profile unchanged (runs, updated,
+  # regime and rates included), rather than file an attempt on every run.
+  dsa_prof 5 4; cat "$dsc_src" > /dev/null
+  cp "$dsa_x/gzstd/profile.json" "$TMPDIR/dsa-settled-profile.json"
+  GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 dsa_run "$TMPDIR/dsa-settled-short.log" -M16M \
+    || dsa_why+=" [settled short no-fit exit $?]"
+  [[ "$(dsa_line "$TMPDIR/dsa-settled-short.log")" == "6" \
+      && "$(dsc_streams "$TMPDIR/dsa-settled-short.log")" == 2 ]] \
+    || dsa_why+=" [settled short no-fit did not ask six and create two]"
+  cmp -s "$dsa_x/gzstd/profile.json" "$TMPDIR/dsa-settled-profile.json" \
+    || dsa_why+=" [ordinary short no-fit rewrote the profile]"
+  grep -aq 'probe stamped as tried' "$TMPDIR/dsa-settled-short.log" \
+    && dsa_why+=" [ordinary short no-fit claimed a probe]"
+  # A wide count never measured IS an attempt worth stamping, even below the
+  # floor.  Keep that exception, and prove its next run holds off the attempt.
+  dsa_prof 0 4; cat "$dsc_src" > /dev/null
+  GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 dsa_run "$TMPDIR/dsa-new-short.log" -M16M \
+    || dsa_why+=" [new short no-fit exit $?]"
+  [[ "$(dsa_line "$TMPDIR/dsa-new-short.log")" == "6 (the default, measured this run)" \
+      && "$(dsc_streams "$TMPDIR/dsa-new-short.log")" == 2 ]] \
+    || dsa_why+=" [new short no-fit did not ask six and create two]"
+  python3 -I - "$dsa_x/gzstd/profile.json" "$dsa_hash" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))['entries'][sys.argv[2]]['compress']
+assert c['runs'] == 4 and c['streams_gpuonly_warm_wide_run'] == 4, c
+assert 'streams_gpuonly_warm_wide' not in c and c['streams_gpuonly_warm_narrow'] == 4, c
+assert c['streams_gpuonly_warm_narrow_run'] == 3 and c['input_gibs'] == 0.0001, c
+PYEOF
+  [[ $? -eq 0 ]] || dsa_why+=" [new short wide no-fit not stamped, or rates merged]"
+  cp "$dsa_x/gzstd/profile.json" "$TMPDIR/dsa-settled-profile.json"
+  GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 dsa_run "$TMPDIR/dsa-after-new-short.log" -M16M \
+    || dsa_why+=" [after new short no-fit exit $?]"
+  [[ "$(dsa_line "$TMPDIR/dsa-after-new-short.log")" == "2 (six did not fit here)" ]] \
+    || dsa_why+=" [short wide no-fit immediately repeated]"
+  cmp -s "$dsa_x/gzstd/profile.json" "$TMPDIR/dsa-settled-profile.json" \
+    || dsa_why+=" [held-off short no-fit rewrote the profile]"
+  rm -f "$TMPDIR/dsa-settled-profile.json"
   dsa_prof 5 0; dsa_run "$TMPDIR/dsa-user.log" --gpu-streams=3 || dsa_why+=" [user exit $?]"
   grep -aq '\[ADAPT\] GPU streams' "$TMPDIR/dsa-user.log" && dsa_why+=" [--gpu-streams=3 still chose]"
   [[ "$(dsc_streams "$TMPDIR/dsa-user.log")" == 3 ]] || dsa_why+=" [--gpu-streams=3 ran $(dsc_streams "$TMPDIR/dsa-user.log")]"
@@ -14261,15 +14360,36 @@ PYEOF
     [[ -z "$why" ]] && pass "--adapt's budget prior: the default runs, then each backend is tried" \
       || fail "--adapt's budget prior: the default runs, then each backend is tried" "$why"
     # 9. A staged run long enough to count (the reader is held 4.5 s on frame 0)
-    # is filed under its budget slot as staged.
+    # is filed under its budget slot as staged.  Stream learning must also work
+    # with the staged CPU pool: the GPU-count model deliberately excludes it.
+    # Delay CPU permit requests, so a GPU gets work before those workers can
+    # drain this tiny fixture; no timing-only inference from a pool-start line.
     why=""
     rm -rf "$bs_x"; mkdir -p "$bs_x"
+    cat "$bs_src" > /dev/null
     "${bs_env[@]}" XDG_CACHE_HOME="$bs_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:4500 \
-      taskset -c "$bs4" "$GZSTD" --adapt -v -f -o "$bs_out" "$bs_src" 2> "$bs_log" || why+=" [exit $?]"
+      GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES=1 GZSTD_DEBUG_ACQUIRE_DELAY_US=1000000 \
+      timeout --foreground -k 10 120 taskset -c "$bs4" "$GZSTD" --adapt -vv -f -o "$bs_out" "$bs_src" \
+      2> "$bs_log" || why+=" [exit $?]"
     bs_filed_slot=$(grep -a -o "budget prior ($bs_ncpu CPUs, ${bs_class}_[a-z]*)" "$bs_log" | head -1 | grep -o "${bs_class}_[a-z]*")
     [[ -n "$bs_filed_slot" ]] && grep -q "\"budget_staged_${bs_filed_slot}\"" "$bs_x/gzstd/profile.json" 2>/dev/null \
       || why+=" [no budget_staged_${bs_filed_slot:-unknown}]"
     grep -q '"overall_gibs_hybrid"\|"overall_gibs_cpu"' "$bs_x/gzstd/profile.json" 2>/dev/null && why+=" [filed in the cpu/hybrid pair]"
+    bs_lines "$bs_log" | grep -aqE '^\[DSTAGE\] [1-9][0-9]* CPU workers? compress from the staging slots' \
+      || why+=" [no staged CPU pool]"
+    bs_lines "$bs_log" | grep -aqE '^\[GPU[0-9]+/S[0-9]+\] take batch=[1-9]' \
+      || why+=" [no GPU work: NOT TESTED]"
+    bs_made=$(bs_lines "$bs_log" | grep -aoE '\[GPU[0-9]+/S[0-9]+\] subchunk=' | sort -u | wc -l)
+    python3 -I - "$bs_x/gzstd/profile.json" "$bs_hash" "$bs_made" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))['entries'][sys.argv[2]]['compress']
+assert int(sys.argv[3]) > 0
+k = 'streams_staged_warm_' + ('wide' if int(sys.argv[3]) >= 3 else 'narrow')
+assert c.get(k, 0) > 0 and c.get(k + '_run') == c['runs'], c
+assert not any(k.startswith('gpu_devices_') for k in c), c
+PYEOF
+    [[ $? -eq 0 ]] || why+=" [staged stream rate missing, or mixed run entered device-count model]"
+    "$GZSTD" -d -q -c "$bs_out" 2>/dev/null | cmp -s - "$bs_src" || why+=" [bytes]"
     [[ -z "$why" ]] && pass "--adapt files a staged run under its CPU budget" \
       || fail "--adapt files a staged run under its CPU budget" "$why"
     rm -rf "$bs_x"

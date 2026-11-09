@@ -889,6 +889,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     is waiting.  Whole frames decode and bad bytes or a damaged block are judged while the writer holds the
     pipe open; v0.18.40's four-byte probe and 4 MiB read alignment are gone.  Still so: to a pipe, stdio
     holds the last part of a 4 KiB output buffer until more output or the end.
+39. ~~**A first frame that does not parse is held until the end of a pipe**~~ **FIXED v0.18.42.**  Before
+    the first data frame the reader still waited for the end of the input on any parse error, holding all
+    of it (a 1.6 GB archive with its first block damaged peaked at 3.2 GB resident; a writer holding the
+    pipe open kept the run waiting).  A definite error there now hands the stream to the streaming decoder
+    at once, which stops at the damage (12 MB, 0.01 s; 7 under `--keep-going`).  Still so: a legacy
+    (pre-1.0) first frame, which cannot be sized, is read whole before streaming -- untested, no fixture.
 
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
