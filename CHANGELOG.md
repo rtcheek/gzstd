@@ -1,12 +1,143 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.40  
+**Covers:** v0.9.50 → v0.18.41  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.41 — a piped decode fits 128 MB (it was killed; base64 frames now down to 88 MB, as from a file), a pipe is read for what it holds (bytes that stop being zstd end the run, and whole frames decode, while the writer keeps the pipe open), the decompress batch tuner on several GPUs no longer trails a pinned batch by 15-25%, and `--gpu-only` starts one GPU per 8 GiB of cached input
+
+**A piped input under a memory limit (ROADMAP 37).**  v0.18.38-39 fitted a 2 GiB decode to 128 MB, later
+88 MB, from a named file; through a pipe it was killed at 128 MB (v0.18.40 fit 132 MB by stopping the
+parse buffer doubling).  A pipe under 2 GiB left runs the copying reader, and an allocation log at the
+kill (every allocation of 8 MiB or more, written as it happened) showed 104.2 MiB in large blocks: four
+12.06 MiB compressed copies, two 16 MiB decoded frames and the 24 MiB parse buffer.  Four copies because
+the queue blocks a push only once it holds its byte cap -- an eighth of the memory, 16 MiB here -- and two
+12.06 MiB copies fit under it, where the named route's carries, reserved at a frame's compress bound
+(16.06 MiB) and counted at that, admit one.  And the exact copies, a few KiB apart in size, left holes
+nothing later fit: 129.2 MiB anonymous at 136 MB, against 108.8 for the named file at 128 MB.  Under a
+limit a pipe's copy is now the named route's: reserved at the frame's compress bound, the queue counting
+the reservation (`Task::count_capacity`), so the sizes repeat and the queue holds one; and the parse
+buffer grows in 1 MiB steps there, not 4.  `-v`: `[READER] pipe: N frames copied at their compress
+bound`.  Under a real scope, two runs each, 2 GiB archives, CPU-only build:
+
+| limit | archive | pipe: /dev/null | pipe: `-o` file | pipe: `-c >` file | named: /dev/null | named: `-o` | named: `-c >` |
+|---|---|---|---|---|---|---|---|
+| 128 MB | base64 | 1.8 s | 1.8 | 2.9 | 1.8 | 1.8 | 3.4 |
+| 128 MB | random | 0.9 | 0.9 | 3.1-3.3 | 0.4 | 0.7 | 3.8-6.9 |
+| 112 MB | base64 | 1.8 | 2.4 | 5.7-5.8 | 1.8 | 2.4 | 6.6-6.9 |
+| 112 MB | random | 0.8 | 1.2 | 3.5-4.0 | 0.4 | 1.2 | 4.8-5.3 |
+
+All passed (v0.18.40: every pipe arm at 128 MB killed).  Lower, through a pipe to a file: base64 passes 3
+of 3 at 104, 96 and 88 MB (5-9 s); random at 104 MB (13-28 s), at 96 MB it survives but crawls (90-181 s
+to a redirected stdout -- the named file does the same there, 217 s), and at 88 MB it is killed.  Named
+random to `/dev/null` is killed at 96 MB too: the floors below 112 MB depend on the sink for both routes.
+
+**Bytes that stop being zstd after valid frames (ROADMAP 38).**  The pipe reader took every
+`ZSTD_findFrameCompressedSize` error for an incomplete frame and read on until the end of the input:
+a writer that held the pipe open kept the run waiting, and one that kept writing grew the parse buffer
+(or the view path's blocks) without bound.  Only `srcSize_wrong` means "more input would help"; any
+other error -- a magic that is not a frame, a reserved block type, an unsupported parameter -- is final at
+that position.  After a data frame it is now the trailing-bytes verdict at once (exit 4, `truncated zstd
+stream: N trailing bytes after M frames`; under `--keep-going` the frames before it and exit 7).  Before
+the first data frame the end-of-input route still decides.  A writer that only pauses mid-frame still
+waits (a 3 s pause decoded byte-identical).
+
+**A pipe is read for what it holds (ROADMAP 38).**  Both pipe readers -- the frame splitter, and the
+streaming decoder it hands a sizeless or huge frame to -- waited for whole 4 MiB reads (`fread`), so
+whatever a writer had sent short of the next 4 MiB waited for the rest or for the end: whole frames went
+undecoded, bad bytes unjudged, a damaged block in a sizeless stream unfound.  A pipe is now read with
+`read(2)` for what it holds.  The splitter waits only for the bytes its parse stopped for -- the rest of a
+magic, a frame header, a skippable frame, or the block a frame has reached, which a walk over the block
+headers (`gz_frame_need`) says, resumed at each read where zstd's would start from the frame's first block
+every time (the reader's parse share 1.8% that way against 0.6%).  The streaming decoder's read-ahead
+takes at least a byte and whatever else is already waiting, up to 4 MiB.  v0.18.40's four-byte magic probe
+and its 4 MiB read alignment, workarounds for the same waits, are gone.  Compress keeps whole reads: its
+frames follow them.
+
+| a writer holds the pipe open after | before | now |
+|---|---|---|
+| valid frames and 8 bytes of garbage | waits for the writer | exit 4 in 0.02 s (7 under `--keep-going`) |
+| a 16 MiB archive (32 MiB out) | 31 of the 32 MiB out | all 32 MiB out in 0.07 s |
+| the same, its seek table cut off (it ends on a frame's last byte) | 31 of 32 | all 32 |
+| a sizeless stream, 4 KiB past a damaged block 9.3 MiB in | waits | exit 4 in 0.04 s (7 under `--keep-going`) |
+
+Throughput, the old and new builds interleaved: a 12 GiB archive through `cat` unchanged (4.14-4.20 s,
+`-t` 4.12-4.19; the copying reader 7.4-7.9 against 7.3-8.0), a 4 GiB sizeless stream unchanged
+(3.58-3.60), and the same under `--keep-going`, which reads on the decoding thread, 4.84-4.95 -> 4.37-4.62.
+The piped 2 GiB decodes at 128, 112, 96 and 88 MB pass as before.  Byte-exact through a writer that sends
+random pieces of 1 byte to 200 KB: raw, RLE and compressed blocks, frames with and without checksums, an
+empty frame, a skippable frame, 500 frames of ~130 bytes, and sized frames followed by a sizeless one.
+The output side is unchanged: to a pipe, stdio holds the last part of a 4 KiB buffer until more output or
+the end (zstd's CLI holds up to 1 MiB).  Codex (sandboxed) reviewed this part on its own: SAFE TO COMMIT,
+with one fix taken -- the read-ahead's optional extra read counted a bare `POLLHUP` as bytes waiting, so a
+FIFO a second writer reopened in between could hold back bytes already collected; only `POLLIN` counts.
+
+**The decompress batch tuner on several GPUs (ROADMAP, open since v0.18.1).**  Re-measured on idle
+H100s, a 36 GiB archive of 16 MiB frames, cached, `--gpu-only -d`: auto trailed the best pinned batch by
+15-25%, not 3-5%.  Two causes, both fixed:
+
+- **The start was one card's.**  2 GiB a batch (128 frames) was measured on ONE H100, where this archive
+  is 24 batches; on four cards it is six a card, the run ends before the tuner has measured anything else,
+  and the last batches finish unevenly.  A decompress start is now at most an eighth of a device's share
+  of the input (one card keeps input/16): 128 on two cards, 64 on four, 32 on six -- each the best pinned
+  batch measured there.
+- **A doubling into a size never run cost a second.**  A size's first batch sets up its host buffers (the
+  device-to-host copy of a first 256-frame batch took 1,134 ms against 233 after), so on a short run the
+  climb from 128 to 256 paid a second it never paid back, then settled back on 128.  Such a doubling now
+  passes the cost gate that exploring past the allocation already had (one window may read at most a
+  tenth of the input left), when the input's size is known; a pipe explores as before, and so does
+  compress, whose tuner records no input size (its own start, 512 MiB, is unchanged).
+
+| 36 GiB archive | auto before | auto now | best pinned |
+|---|---|---|---|
+| 2 cards | 6.94-7.27 s | 5.68-5.96 | 5.86-6.04 (128) |
+| 4 cards | 6.01-6.31 | 5.35-5.59 | 5.01-5.28 (64) |
+| 6 cards | 6.62-7.20 | 5.69-6.29 | 5.45-6.09 (32) |
+
+Compress is unchanged (measured anyway, 32 and 48 GiB on four cards: the same within noise).  Codex,
+sandboxed (the tree readable for the first time on this host), SAFE TO COMMIT in round 1.
+
+**`--gpu-only` on cached input: one GPU per 8 GiB, not 4.**  v0.18.39 chose 4 for slower cards though one
+per ~8 GiB measured best; re-measured on 2-6 idle H100s, cached, three runs each:
+
+| input | 2 | 3 | 4 | 5 | 6 | v0.18.39's count |
+|---|---|---|---|---|---|---|
+| compress 16 GiB | 5.03-5.26 s | 5.15-5.39 | 5.15-5.50 | | | 4 |
+| compress 32 GiB | | 6.87-7.20 | 6.45-7.05 | | 7.30-7.74 | 8 (8.0-8.9 in v0.18.40) |
+| compress 48 GiB | | | 8.27-9.11 | 8.24-8.37 | 8.15-8.80 | 8 |
+| decode, 24 GiB archive | | 4.55-5.18 | 4.75-4.94 | | 5.38-5.95 | 7 |
+| decode, 36 GiB archive | | | 5.85-5.86 | 5.58-6.39 | 7.06-7.14 | 8 |
+
+Past about four cards the host side sets the rate here, and every further card only starts and exits.
+A cold input still takes two at most.  (Two of the eight cards carried other users' jobs throughout;
+`--gpu-devices N` ranks by load, so every arm ran on idle cards.)
+
+**Tests.**  No new cells (570, `-e` 914); the v0.18.39 device-count cell is renamed for 8 GiB (its 32 MiB
+fixture starts one device either way).  The 128 MB cell gains pipe arms for both archives (exit 0,
+byte-exact, and the bound-copy count).  The named-pipe cell gains eight bytes of garbage after valid
+frames from a writer that holds the FIFO open (exit 4 within 20 s; 7 under `--keep-going`), and a
+writer that holds it open after a whole archive, with and without its seek table, through both readers
+(every byte out before the writer ends).  The `-e` live-pipe cell stops 4 KiB past its damaged block
+rather than on a 4 MiB boundary, so a reader that waits for whole reads hangs there.  Mutants, each
+caught: exact copies under a limit (the pipe arms lose their count), the early verdict reverted (both
+garbage arms time out), the splitter reading whole chunks (every pipe arm of the named-pipe cell), the
+streaming decoder reading whole chunks (the live-pipe cell), and the block walk asking one byte too
+many at a frame's end (the two seek-table-less arms).
+
+The `-e` run found one more cell built on 4 MiB reads: the hybrid reclaim cell (v0.18.13) trickled its
+2.3 MiB archive in 40 pieces 60 ms apart and relied, unknowingly, on the reader holding it all until the
+end -- by then the one GPU had registered and took a batch for the stall to wedge.  Read for what it
+holds, each frame went to the CPU worker as it arrived, the GPU had nothing to wedge, and the cell said
+`no reclaim announced: NOT TESTED` (3 of 3; the old build reclaims 3 of 3 on the same shape).  The
+archive now goes in whole once the run logs that the GPU stream has registered (`-vv`): 10 of 10
+reclaimed, and with the CPU pool's v0.18.13 hold removed, 5 of 5 fail as the cell was written to catch
+(`writer stuck ... frame 1 of 48 missing`, exit 1).  Suites before that edit: CPU-only 410/0/130 (as
+expected without a GPU), `-e` 912/1/1 (the cell above; 913 ran, one this host could not exercise).
 
 
 ## v0.18.40 — a named pipe decodes (`gzstd -d <(...)`, `/dev/stdin` and FIFOs exited 4), a piped decode no longer copies every frame (a 12 GiB archive through `cat` 7.4-11.5 -> 4.0-4.4 s), a pipe starts two GPUs rather than every card (hybrid compress 16 GiB 7.2 -> 5.7 s on the 8-GPU server), and a cold `--gpu-only` input two (32 GiB 11.7-12.0 -> 8.6-8.8 s)

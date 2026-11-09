@@ -1523,7 +1523,7 @@ rm -f "$TMPDIR/pv.bin" "$TMPDIR/pv.zst" "$TMPDIR/pv96.zst" "$TMPDIR/pv.out" "$TM
 # decodes them.  Each must round-trip, a named pipe must take the pipe reader (not
 # the single-thread sizeless-frame decoder the failed peek chose), and bad bytes
 # through one must still fail.
-t0=$(now_ms); why=""; np_t="a named pipe decodes: <(...), /dev/stdin, a FIFO, -t and --tar"
+t0=$(now_ms); why=""; np_t="a named pipe decodes: <(...), /dev/stdin, a FIFO, -t and --tar; bad bytes end it, and frames decode, while the writer waits"
 "$GZSTD" -q -f --cpu-only --chunk-size=1 -c "$TMPDIR/large.bin" > "$TMPDIR/np.zst" 2>/dev/null
 np_to() { timeout --foreground -k 5 120 "$@"; }
 np_to "$GZSTD" -d -v -c <(cat "$TMPDIR/np.zst") 2>"$TMPDIR/np.err" | cmp -s - "$TMPDIR/large.bin" || why+=" procsub"
@@ -1554,9 +1554,60 @@ np_bad() {   # name, the four bytes (printf), extra env
 np_bad bad-views '\0\0\0\0' ""
 np_bad bad-copy '\0\0\0\0' "GZSTD_DEBUG_READER_COPY=1"
 np_bad bad-fd2fb520 '\x20\xb5\x2f\xfd' ""
+# Bytes that stop being zstd AFTER valid frames (v0.18.41, ROADMAP 38): a final
+# parse error -- anything but "need more input" -- is the trailing-bytes verdict
+# once those bytes are in, not at the end of the input, which a writer holding the
+# pipe open never sends (and until which the reader kept reading and growing its
+# buffer).  Eight of them: a pipe is read for what it holds, where until v0.18.41
+# a read waited for 4 MiB.  Exit 4, and 7 with every frame before them under
+# --keep-going.
+np_after() {   # name, extra flags, wanted exit
+  rm -f "$TMPDIR/np.fifo"; mkfifo "$TMPDIR/np.fifo"
+  { cat "$TMPDIR/np.zst"; printf 'not zstd'; exec sleep 30; } > "$TMPDIR/np.fifo" 2>/dev/null &
+  local wp=$! rc=0
+  timeout --foreground -k 5 20 "$GZSTD" -d -c $2 "$TMPDIR/np.fifo" >/dev/null 2>"$TMPDIR/np.err" || rc=$?
+  kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
+  [[ $rc -eq $3 ]] || why+=" $1:exit-$rc(want-$3;124=waited)"
+}
+np_after after-frames "" 4
+np_after after-frames-kg "--keep-going" 7
+# And whole frames are decoded while the writer waits: every byte of the archive's
+# output reaches stdout before the writer closes, through both readers.  Until
+# v0.18.41 the frames in the last 4 MiB that had not filled (the last MiB of this
+# 16 MiB archive) waited for the writer.  head ends the wait once all 32 MiB are
+# in, by ending the writer; a run that holds any back is ended by the timeout.
+# Also with the seek table cut off, so the writer stops on a data frame's last
+# byte: a reader that asks for even one more before taking that frame
+# (gz_frame_need's answer, mutation-tested) waits here, where the table's own
+# bytes would have hidden it.
+np_live() {   # name, archive, extra env
+  rm -f "$TMPDIR/np.fifo"; mkfifo "$TMPDIR/np.fifo"
+  { cat "$2"; exec sleep 30; } > "$TMPDIR/np.fifo" 2>/dev/null &
+  local wp=$!
+  ( env $3 timeout --foreground -k 5 20 "$GZSTD" -d -c "$TMPDIR/np.fifo" 2>/dev/null
+    echo $? > "$TMPDIR/np.rc" ) \
+    | { head -c $((32 * 1048576)) > "$TMPDIR/np.out"; kill "$wp" 2>/dev/null; cat > /dev/null; }
+  wait "$wp" 2>/dev/null
+  cmp -s "$TMPDIR/np.out" "$TMPDIR/large.bin" \
+    || why+=" $1:$(stat -c %s "$TMPDIR/np.out" 2>/dev/null || echo 0)-of-$((32 * 1048576))-before-the-writer-ended"
+  [[ "$(cat "$TMPDIR/np.rc" 2>/dev/null)" == 0 ]] || why+=" $1:exit-$(cat "$TMPDIR/np.rc" 2>/dev/null)"
+}
+np_live live-views "$TMPDIR/np.zst" ""
+# The seek table is the archive's last frame, its 9-byte footer last: frame count,
+# descriptor (bit 7: 4-byte checksums per entry), magic 0x8F92EAB1.
+read -r np_n0 np_n1 np_n2 np_n3 np_d np_m0 np_m1 np_m2 np_m3 <<< "$(tail -c 9 "$TMPDIR/np.zst" | od -An -tu1)"
+if [[ "$np_m0 $np_m1 $np_m2 $np_m3" == "177 234 146 143" ]]; then
+  np_tb=$(( 8 + (np_n0 + np_n1 * 256 + np_n2 * 65536 + np_n3 * 16777216) * (8 + 4 * ((np_d >> 7) & 1)) + 9 ))
+  head -c $(( $(stat -c %s "$TMPDIR/np.zst") - np_tb )) "$TMPDIR/np.zst" > "$TMPDIR/np.notable.zst"
+  np_live live-end-views "$TMPDIR/np.notable.zst" ""
+  np_live live-end-copy "$TMPDIR/np.notable.zst" "GZSTD_DEBUG_READER_COPY=1"
+else
+  why+=" live-end:no-seek-table-footer[$np_m0 $np_m1 $np_m2 $np_m3]"
+fi
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "$np_t" || fail "$np_t" "$why"
-rm -rf "$TMPDIR/np.zst" "$TMPDIR/np.err" "$TMPDIR/np.fifo" "$TMPDIR/np.src" "$TMPDIR/np.tzst"
+rm -rf "$TMPDIR/np.zst" "$TMPDIR/np.err" "$TMPDIR/np.fifo" "$TMPDIR/np.src" "$TMPDIR/np.tzst" \
+       "$TMPDIR/np.out" "$TMPDIR/np.rc" "$TMPDIR/np.notable.zst"
 rm -f "$TMPDIR/pipe.zst" "$TMPDIR/pipe.recovered" "$TMPDIR/pipeline.recovered" \
       "$TMPDIR/pg-in.err" "$TMPDIR/pg-out.err" "$TMPDIR/pc.json"
 
@@ -7426,7 +7477,7 @@ if has_gpu 2>/dev/null; then
     skip_host "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
   fi
 
-  # --gpu-only STARTS ONE DEVICE PER 4 GiB OF INPUT (v0.18.39).  Every visible
+  # --gpu-only STARTS ONE DEVICE PER 8 GiB OF INPUT (v0.18.39; 4 GiB until v0.18.41).  Every visible
   # card is paid for at cuInit and again for its context and pools, whether it
   # gets a frame or not: on the 8-H100 server a 64 MiB --gpu-only compress took
   # 5.5 s on all eight, seven idle, and 1.6 s on one.  The suite masks every
@@ -7434,7 +7485,7 @@ if has_gpu 2>/dev/null; then
   # only this cell exercises the rule: the mask cleared, on a host whose mask is
   # the suite's own (a caller's is never escaped).  The 32 MiB fixture must
   # start one device and an explicit --gpu-devices=2 two.
-  gd_t="--gpu-only starts one device per 4 GiB of input, not every card"
+  gd_t="--gpu-only starts one device per 8 GiB of input, not every card"
   if [[ "${GPU_ALL_DEVICES:-}" == *,* && "${GPU_ALL_DEVICES:-}" == "${GPU_HOST_UUIDS:-}" ]] \
      && (( ${#mg_cards[@]} >= 2 )); then
     gd_why=""
@@ -9936,6 +9987,23 @@ if has_gpu 2>/dev/null; then
   grep -q 'would read ~[0-9]* MiB of ~[0-9]* MiB left; not exploring' "$TUN/r3.err" \
     || why+=" gate-did-not-refuse"
   grep -q 'exploring 512' "$TUN/r3.err" && why+=" gate-explored-anyway"
+  # ...and since v0.18.41 the climb itself: a doubling into a size never run is
+  # an exploration too (its first batch sets up new buffers), so the shipped gate
+  # refuses it inside the allocation, before the 256 ceiling is reached.
+  grep -q 'a window at [0-9]* would read ~[0-9]* MiB of ~[0-9]* MiB left; not exploring it' "$TUN/r3.err" \
+    || why+=" in-range-gate-did-not-refuse"
+  # A decompress start is per device (v0.18.41): on four cards an eighth of a
+  # card's share of this archive (~1125 MiB / 32 = ~35 frames -> 32), where one
+  # card takes a sixteenth of the input (64, above).  Needs four cards with room.
+  st_cards=()
+  [[ "${GPU_ALL_DEVICES:-}" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]] \
+    && mapfile -t st_cards < <(gpu_uuids_by_free 4096 "$GPU_ALL_DEVICES")
+  if (( ${#st_cards[@]} >= 4 )); then
+    env CUDA_VISIBLE_DEVICES="${st_cards[0]},${st_cards[1]},${st_cards[2]},${st_cards[3]}" \
+      "$GZSTD" -v --no-progress -f -d --gpu-only "$TUN/a.zst" -o /dev/null 2>"$TUN/s4.err" || why+=" four:rc=$?"
+    grep -q 'GPU0 f1: starting at 32$' "$TUN/s4.err" \
+      || why+=" four-start($(grep -o 'GPU0 f1: starting at [0-9]*' "$TUN/s4.err"))"
+  fi
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "tuner explores past its allocation; the profile keeps only what ran" \
     || fail "tuner explores past its allocation; the profile keeps only what ran" "got$why"
@@ -11046,18 +11114,25 @@ if has_gpu 2>/dev/null; then
   # CPU worker used to leave as soon as the queue was empty and the producer done,
   # though a GPU stream still held frames.  The reclaimer then requeued the wedged
   # batch into a queue nobody read: "internal error: writer stuck ... frame 1 of 48
-  # missing", exit 1 (v0.18.11 and v0.18.12, 3 of 3).  The trickle keeps frames
-  # arriving after the one GPU registers, so its queue floor reserves it a batch;
-  # the stall wedges that batch; one CPU worker finishes the rest; the reclaim comes
-  # 6 s in.  Compressible 1 MiB frames, not base64: the CPU must keep up here.
+  # missing", exit 1 (v0.18.11 and v0.18.12, 3 of 3).  The archive arrives whole once
+  # the one GPU stream has registered with the scheduler (the run's own -vv line), so
+  # a waiting GPU takes the first batch; the stall wedges it; one CPU worker finishes
+  # the rest; the reclaim comes 6 s in.  Compressible 1 MiB frames, not base64: the
+  # CPU must keep up here.  Until v0.18.41 the archive trickled in 40 pieces 60 ms
+  # apart, and that worked only because a pipe was read 4 MiB at a time: the 2.3 MiB
+  # archive reached the queue at its end, after the GPU had registered.  Read for
+  # what it holds, each frame came as it arrived, the CPU worker took every one and
+  # the GPU had no batch (NOT TESTED, 3 of 3).  The wait for that line: 10 of 10
+  # reclaimed; with the CPU pool's hold removed, 5 of 5 exit 1 short.
   rc=0
   seq 1 20000000 2>/dev/null | head -c $((48*1048576)) > "$dr_src"
   "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dr_src" -o "$dr_zst" 2>/dev/null
-  dr_n=$(stat -c %s "$dr_zst"); dr_step=$(( (dr_n + 39) / 40 ))
-  { for i in $(seq 0 39); do
-      dd if="$dr_zst" bs=$dr_step skip=$i count=1 status=none; sleep 0.06; done; } \
+  : > "$dr_log"     # the wait below must not see an earlier arm's line
+  { timeout 30 bash -c 'until tr "\r" "\n" < "$1" | grep -aq "decode ready: [0-9]* stream"; do
+                          sleep 0.05; done' _ "$dr_log"
+    cat "$dr_zst"; } \
     | timeout --foreground -k 10 60 env GZSTD_DEBUG_DECOMP_STALL=-1:60 \
-      "$GZSTD" -d -v -T1 -c > "$dr_out" 2> "$dr_log"
+      "$GZSTD" -d -vv -T1 -c > "$dr_out" 2> "$dr_log"
   rc=${PIPESTATUS[1]}
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
     fail "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained" "TIMED OUT"
@@ -12359,12 +12434,13 @@ PFPY
   else
     pf_why+=" [fixture: zstd's own partial output ($pf_z bytes) is not a prefix of the input]"
   fi
-  # Keep the pipe open after three full read chunks.  Corruption in the third
-  # makes --keep-going stop while the reader is waiting for the fourth; joining
-  # that speculative read would wait forever for bytes we will not send.
-  # GEOMETRY: this assumes 4 MiB reads in both the frame splitter (the prefix)
-  # and the streaming decoder.  If either changes, revisit the 12 MiB / 9 MiB
-  # numbers: a larger prefix could put the broken block inside it.
+  # Keep the pipe open a little past a broken block ~9 MiB in.  --keep-going must
+  # stop there while the reader waits for more; joining that read would wait
+  # forever for bytes we will not send.  And the broken block must be FOUND with
+  # the pipe open: since v0.18.41 both the frame splitter (the prefix) and the
+  # streaming decoder read a pipe for what it holds, where until then each waited
+  # for whole 4 MiB reads -- this stops 4 KiB past the block's header, inside a
+  # 4 MiB read that never fills, so a reader that waits for one hangs here.
   rc=0
   python3 - "$GZSTD" "$pf/sizeless.zst" <<'PFPY' >/dev/null 2>&1 || rc=$?
 import os, select, subprocess, sys, time
@@ -12376,6 +12452,7 @@ while pos < 9 * 1048576:
     btype, bsize = (h >> 1) & 3, h >> 3
     pos += 3 + (1 if btype == 1 else bsize)
 b[pos] |= 0x06                         # block type 3: reserved
+del b[pos + 3 + 4096:]                 # off any 4 MiB boundary of the stream
 p = subprocess.Popen([sys.argv[1], '-d', '-q', '-c', '--cpu-only', '--keep-going'],
                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
@@ -15686,7 +15763,7 @@ rm -f "$TMPDIR/pm7.bin" "$TMPDIR/pm7.zst" "$TMPDIR/pm7.err"
 #     arm below (v0.18.38; see the arms for v0.18.39).  A real scope, not a fake
 #     tree: the kernel counts what the heap keeps, and what the output's page
 #     cache takes, which no estimate in gzstd does.
-pm_t7b="memory: a decode fits a real 128 MB limit, stored and compressible frames"
+pm_t7b="memory: a decode fits a real 128 MB limit, stored and compressible frames, named and piped"
 pm_fs=$(stat -f -c %T "$TMPDIR" 2>/dev/null)
 if ! command -v systemd-run >/dev/null 2>&1 \
    || ! systemd-run --user --scope -q -p MemoryMax=128M -p MemorySwapMax=0 true >/dev/null 2>&1; then
@@ -15772,6 +15849,23 @@ else
       grep -qa '\[THROTTLE\] 1 frames' "$TMPDIR/pm7b-r-96.err" \
         || pm_why+=" r:96M:[$(grep -aoh '\[THROTTLE\] [0-9]* frames' "$TMPDIR/pm7b-r-96.err")]"
     fi
+    # THROUGH A PIPE (v0.18.41, ROADMAP 37).  The pipe reader copied each frame at
+    # its exact size: two 12.06 MiB copies fit the queue's 16 MiB cap where the
+    # named route's 16.06 admits one, and copies a few KiB apart left holes in the
+    # heap -- 129 MiB anonymous against the named file's 109, a 2 GiB decode killed
+    # at 128 MB (both archives, v0.18.40 and before).  Under a limit a pipe's copy
+    # is now reserved at its frame's compress bound and the queue counts that, as
+    # the named route's carries.  Mutant (exact copies): killed on both arms.
+    for pm_k in r b; do
+      rm -f "$TMPDIR/pm7b.out"
+      cat "$TMPDIR/pm7b-$pm_k.zst" | systemd-run --user --scope -q -p MemoryMax=128M -p MemorySwapMax=0 \
+        "$GZSTD" -d -v -f -o "$TMPDIR/pm7b.out" 2>"$TMPDIR/pm7b-$pm_k-pipe.err"
+      pm_rc=${PIPESTATUS[1]}
+      { (( pm_rc == 0 )) && cmp -s "$TMPDIR/pm7b.out" "$TMPDIR/pm7b-$pm_k.bin"; } || pm_why+=" $pm_k:pipe:rc=$pm_rc"
+      tr '\r' '\n' < "$TMPDIR/pm7b-$pm_k-pipe.err" \
+        | grep -qaE '\[READER\] pipe: [1-9][0-9]* frames copied at their compress bound' \
+        || pm_why+=" $pm_k:pipe:[$(tr '\r' '\n' < "$TMPDIR/pm7b-$pm_k-pipe.err" | grep -aoh 'READER\] pipe.*' | tr '\n' ' ')]"
+    done
     # Stored frames are handed over, and since v0.18.39 so are base64's (a
     # 12 MiB frame in its 16.06 MiB bound fills more than two thirds of it).
     for pm_e in r-file b-file; do

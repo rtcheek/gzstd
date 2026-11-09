@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.40";
+static constexpr const char * GZSTD_VERSION = "0.18.41";
 //
 // Architecture overview:
 //
@@ -6097,7 +6097,7 @@ static void print_help_long()
 "     each costs ~0.5 s to start, frames or not (a 64 MiB --gpu-only\n"
 "     compress took 5.5 s on eight GPUs and 1.6 s on one), so a pipe\n"
 "     starts two (one stream: two carry it), and --gpu-only on regular\n"
-"     files one per 4 GiB of input, two at most when most of it is not\n"
+"     files one per 8 GiB of input, two at most when most of it is not\n"
 "     cached (the drive sets the rate).  --gpu-order=ranked keeps them\n"
 "     all, a caller's CUDA_VISIBLE_DEVICES is used as given, and --adapt\n"
 "     decides for itself: a single-file --gpu-only compress uses the\n"
@@ -11516,6 +11516,135 @@ static inline void check_read_error(FILE * f, const std::string & what)
   if (f && std::ferror(f))
     die_io("read error on " + (what.empty() ? std::string("input") : what)
            + " (" + std::strerror(errno) + ")");
+}
+
+#ifndef _WIN32
+// Bytes stdio already holds for `f` and has not handed out -- gnulib's
+// freadahead, from glibc's own read pointers (the ungetc backup area included).
+// 0 where they cannot be read: no route reads a pipe through stdio before
+// gz_pipe_read takes it over, so this is a backstop, not a requirement.
+static size_t gz_stdio_held(FILE * f)
+{
+#if defined(__GLIBC__)
+  if (f->_IO_write_ptr > f->_IO_write_base) return 0;
+  return (size_t)(f->_IO_read_end - f->_IO_read_ptr)
+       + ((f->_flags & 0x100 /* _IO_IN_BACKUP */) ? (size_t)(f->_IO_save_end - f->_IO_save_base) : 0);
+#else
+  (void)f;
+  return 0;
+#endif
+}
+
+static bool gz_fd_readable_now(int fd)
+{
+  struct pollfd p{fd, POLLIN, 0};
+  int r;
+  do r = ::poll(&p, 1, 0); while (r < 0 && errno == EINTR);
+  // POLLIN only.  A pipe with bytes left reports it, with or without POLLHUP; a
+  // hang-up alone means none are waiting, and a read then could block: a FIFO
+  // another writer opens in between holds back the bytes already collected
+  // (review).  The caller's next required read sees the end or the error.
+  return r > 0 && (p.revents & POLLIN) != 0;
+}
+
+// A PIPE IS READ FOR WHAT IT HOLDS, NOT FOR WHAT FILLS A CHUNK (v0.18.41,
+// ROADMAP 38).  fread(3) returns once it has every byte asked for or the end of
+// the input, so a decoder reading a pipe 4 MiB at a time held whatever the writer
+// had sent short of the next 4 MiB until more came: frames already whole went
+// undecoded, and bytes that ended the stream -- garbage after the frames, a
+// damaged block -- went unjudged, for as long as the writer kept the pipe open.
+//
+// Reads at least `need` bytes (the caller cannot go on without them) and at most
+// `max`, each read(2) taking what the pipe holds; fewer than `need` only at the
+// end of the input.  With `more` it also takes what is already waiting, up to
+// `max`, one poll(2) per read -- for a consumer that prefers full chunks -- but
+// never waits for it.  `bounce` (GZ_PIPE_BOUNCE bytes) or null: through it with
+// streaming stores, as gz_pipe_fill, the copy timed into *copy_ns.  A read error
+// is fatal as check_read_error makes fread's, or, with `err`, returned there
+// (the read stops; the bytes before it are counted).
+static size_t gz_pipe_read(FILE * in, char * dst, size_t need, size_t max, char * bounce,
+                           uint64_t * copy_ns, const std::string & what, bool more = false,
+                           int * err = nullptr)
+{
+  need = std::max<size_t>(need, 1);
+  size_t n = 0;
+  // Anything stdio holds came off the pipe first.  fread for no more than it holds
+  // is served from its buffer: no wait.
+  for (size_t held; n < max && (held = gz_stdio_held(in)) > 0; ) {
+    const size_t got = std::fread(dst + n, 1, std::min(held, max - n), in);
+    n += got;
+    if (got == 0) break;
+  }
+  const int fd = ::fileno(in);
+  while (n < max && (n < need || (more && gz_fd_readable_now(fd)))) {
+    char * const to = bounce ? bounce : dst + n;
+    const size_t ask = bounce ? std::min(GZ_PIPE_BOUNCE, max - n) : max - n;
+    const ssize_t r = ::read(fd, to, ask);
+    if (r > 0) {
+      if (bounce) {
+        const uint64_t t0 = copy_ns ? now_ns() : 0;
+        gz_stream_copy(dst + n, bounce, (size_t)r);
+        if (copy_ns) *copy_ns += now_ns() - t0;
+      }
+      n += (size_t)r;
+      continue;
+    }
+    if (r == 0) break;                       // the end of the input
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      // A descriptor someone left non-blocking: wait as a blocking one would.
+      struct pollfd p{fd, POLLIN, 0};
+      if (::poll(&p, 1, -1) >= 0 || errno == EINTR) continue;
+    }
+    if (err) { *err = errno ? errno : EIO; break; }
+    die_io("read error on " + (what.empty() ? std::string("input") : what)
+           + " (" + std::strerror(errno) + ")");
+  }
+  return n;
+}
+#endif
+
+// WHERE A PARTLY READ ZSTD FRAME CAN NEXT BE SETTLED (v0.18.41, ROADMAP 38).
+// ZSTD_findFrameCompressedSize walks a frame's block headers from its start and
+// answers srcSize_wrong until the last block is in.  Asked after every read of a
+// pipe -- up to 256 KiB each (the bounce buffer; up to the pipe's 1 MiB on the
+// copying reader), now that a pipe is read for what it holds -- it walks each
+// frame once per read, quadratic in the frame's size.  MEASURED, 8-H100 server, a
+// 12 GiB archive of 12 MiB frames through `cat`: the reader's parse share 1.8%
+// that way, 0.6% with this, as it was with 4 MiB reads.  This walks the headers
+// once, resuming at *pos (0: the frame header is not walked yet; *ck is its
+// checksum flag), and returns how many bytes from the frame's start must be
+// present before asking zstd can tell anything new: more than `avail` only where
+// zstd answers srcSize_wrong for every length short of it.  What it does not walk
+// as zstd does -- a header zstd refuses, a legacy or skippable magic, a reserved
+// block type, a block larger than zstd writes -- returns `avail`: zstd is asked,
+// and decides.  An answer one byte too many leaves a writer that stops on a
+// frame's last byte waiting (the named-pipe cell's live-end arms).
+static size_t gz_frame_need(const unsigned char * p, size_t avail, size_t * pos, bool * ck)
+{
+  if (*pos == 0) {
+    if (avail < 4) return 4;
+    if (rd_le32(p) != 0xFD2FB528u) return avail;
+    ZSTD_frameHeader zfh;
+    const size_t r = ZSTD_getFrameHeader(&zfh, p, avail);
+    if (ZSTD_isError(r)) return avail;
+    if (r > 0) return r;                     // the header itself is not all here
+    if (zfh.frameType != ZSTD_frame) return avail;
+    *pos = zfh.headerSize;
+    *ck = zfh.checksumFlag != 0;
+  }
+  for (;;) {
+    const size_t q = *pos;
+    if (q + 3 > avail) return q + 3;         // the next block header
+    const uint32_t h = (uint32_t)p[q] | ((uint32_t)p[q + 1] << 8) | ((uint32_t)p[q + 2] << 16);
+    const unsigned type = (h >> 1) & 3u;
+    const size_t bsz = h >> 3;
+    if (type == 3 || bsz > ZSTD_BLOCKSIZE_MAX) return avail;
+    const size_t end = q + 3 + (type == 1 ? 1 : bsz);   // RLE: one byte
+    if (h & 1u) return end + (*ck ? 4 : 0);   // the last block: the frame ends there
+    if (end > avail) return end;
+    *pos = end;
+  }
 }
 
 // A SEEKABLE STDIN THAT IS NOT AT ITS START CANNOT BE READ CORRECTLY HERE.
@@ -18873,10 +19002,16 @@ static std::atomic<long> g_debug_mt_pread_count{0};
 
 // Reads a FILE ahead on its own thread, in order, `depth` chunks at a time
 // (v0.17.91: --sliding-window and the single-frame decoder).  take() hands out
-// the next chunk; a count below the chunk size means the stream ended there, by
+// the next chunk; a chunk marked `end` (before v0.18.41 a count below the chunk
+// size, which it still is for whole-chunk reads) is the end of the stream, by
 // EOF or by error, and the reader has stopped touching the input, so the caller
 // may test ferror() on the FILE and read_error() here -- and must not take()
-// again.  give_back() returns the buffer for reuse.  The destructor stops the
+// again.  give_back() returns the buffer for reuse.
+//
+// `pipe` (v0.18.41, ROADMAP 38; the decoder only -- --sliding-window's frames
+// follow its reads): a chunk is what the pipe holds, read with gz_pipe_read --
+// at least a byte, and what else is already waiting up to the chunk size -- so
+// the decoder sees bytes as they come rather than once 4 MiB have.  The destructor stops the
 // reader after any read in progress; a pipe read can block indefinitely, so
 // callers must not stop consuming early.
 //
@@ -18892,9 +19027,9 @@ static std::atomic<long> g_debug_mt_pread_count{0};
 // stops the reader and is reported by read_error(), which ferror() cannot see.
 class ChunkPrefetcher {
 public:
-  struct Chunk { const char * data = nullptr; size_t n = 0; int slot = -1; };
-  ChunkPrefetcher(FILE * in, size_t chunk, int depth)
-    : in_(in), chunk_(chunk), vecs_((size_t)std::max(depth, 1)) {
+  struct Chunk { const char * data = nullptr; size_t n = 0; int slot = -1; bool end = false; };
+  ChunkPrefetcher(FILE * in, size_t chunk, int depth, bool pipe = false)
+    : in_(in), chunk_(chunk), pipe_(pipe), vecs_((size_t)std::max(depth, 1)) {
     // Allocated here, on the caller's thread, as before v0.18.4: from the
     // reader thread they came from its own malloc arena, and a run inside one
     // L3 cache measured 2.5% slower (2.10-2.14 s against 2.05-2.07).  No pages
@@ -18956,6 +19091,8 @@ private:
   size_t fill(char * b) {
 #ifndef _WIN32
     if (direct_) return fill_direct(b);
+    if (pipe_) return gz_pipe_read(in_, b, 1, chunk_, nullptr, nullptr, std::string(),
+                                   /*more=*/true, &err_);
 #endif
     return std::fread(b, 1, chunk_, in_);
   }
@@ -19010,12 +19147,15 @@ private:
         }
         char * b = slot_buf(s);
         const size_t n = fill(b);
+        // A pipe's chunk is short whenever the writer is slower: only nothing at
+        // all, or an error, ends it.
+        const bool end = pipe_ ? (n == 0 || err_ != 0) : n < chunk_;
         {
           std::lock_guard<std::mutex> lk(m_);
-          full_.push_back(Chunk{b, n, s});
+          full_.push_back(Chunk{b, n, s, end});
         }
         cv_.notify_all();
-        if (n < chunk_) return;   // EOF or error: the input is the caller's again
+        if (end) return;          // EOF or error: the input is the caller's again
       }
     } catch (const std::bad_alloc &) {
       die("out of memory");
@@ -19027,6 +19167,7 @@ private:
   }
   FILE * in_;
   size_t chunk_;
+  bool pipe_ = false;            // gz_pipe_read: what the pipe holds, not whole chunks
   std::vector<FrameVec> vecs_;   // buffered: one per slot
 #ifndef _WIN32
   DirectReadPool pool_;          // O_DIRECT: slot i is pool_.buf(i)
@@ -19359,6 +19500,14 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
 #endif
   std::unique_ptr<ChunkPrefetcher> reader;
   bool reads_direct = false;
+  // A pipe is read for what it holds (gz_pipe_read, v0.18.41): a writer that
+  // pauses has its bytes decoded -- and a damaged block found -- before it sends
+  // more, where whole-chunk reads waited for the rest of 4 MiB or the end.
+#ifndef _WIN32
+  const bool pipe_in = in && !gz_input_rewindable(in);
+#else
+  const bool pipe_in = false;
+#endif
   // --keep-going reads buffered input on this thread: a prefetch thread can
   // sit in a pipe read after the decoder has found damage.  O_DIRECT uses a
   // single-slot reader under --keep-going.  The slot is held until feed()
@@ -19375,7 +19524,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       }
 #endif
       if (!reader && !opt.keep_going)
-        reader = std::make_unique<ChunkPrefetcher>(in, IO_CHUNK, 4);
+        reader = std::make_unique<ChunkPrefetcher>(in, IO_CHUNK, 4, pipe_in);
     }
     catch (const std::exception &) {
 #ifndef _WIN32
@@ -19391,12 +19540,21 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   bool direct_counted = false;
   if (!reader) {
     // A corrupt frame can make feed() stop before EOF.  With a pipe still open,
-    // a prefetch thread may already be blocked in fread for the next full
-    // chunk; joining it would hang the recovery exit.  Read on this thread so
+    // a prefetch thread may already be blocked in a read for the next chunk;
+    // joining it would hang the recovery exit.  Read on this thread so
     // decode_broke stops input immediately, including when the prefix broke.
+    // A pipe gives what it holds (only nothing at all is its end).
     try {
       std::vector<char> inbuf(IO_CHUNK);
       while (!decode_broke) {
+#ifndef _WIN32
+        if (pipe_in) {
+          const size_t n = gz_pipe_read(in, inbuf.data(), 1, IO_CHUNK, nullptr, nullptr, opt.input);
+          if (n > 0) feed(inbuf.data(), n);
+          if (n == 0) { drain(); break; }
+          continue;
+        }
+#endif
         const size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
         if (n > 0) feed(inbuf.data(), n);
         if (n < IO_CHUNK) { drain(); check_read_error(in, opt.input); break; }
@@ -19410,9 +19568,9 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
     }
   } else {
     // Read ahead too, except that --keep-going holds its one slot until feed()
-    // succeeds.  A short chunk is the end of the stream (EOF or error); the reader
-    // has stopped, so check it -- ferror() for a buffered read, read_error()
-    // for an O_DIRECT one -- and stop asking.  A broken frame under
+    // succeeds.  A chunk marked `end` is the end of the stream (EOF or error); the
+    // reader has stopped, so check it -- ferror() for a buffered read, read_error()
+    // for an O_DIRECT or a pipe one -- and stop asking.  A broken frame under
     // --keep-going (O_DIRECT only, see above) stops input exactly where the
     // synchronous loop does: feed() does not stop on its own.  Catch
     // exceptions while the reader is still alive: unwinding its destructor
@@ -19422,7 +19580,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         const ChunkPrefetcher::Chunk chunk = reader->take();
         const size_t n = chunk.n;
         if (n > 0) feed(chunk.data, n);
-        if (n < IO_CHUNK) {
+        if (chunk.end) {
           drain();
           check_read_error(in, opt.input);
           if (const int e = reader->read_error())
@@ -23123,11 +23281,11 @@ static size_t stream_frames_to_queue(
   // dropped this copy in v0.17.47 (stream_frames_to_queue_mt); a pipe now does
   // the same with the compress readers' machinery (v0.18.12): recycled 64 MiB
   // blocks filled through a 256 KiB bounce buffer with streaming stores
-  // (gz_pipe_fill), and every frame inside a block handed on as a view that pins
-  // the block until the frame is released.  A block is never compacted -- frames
-  // already handed on point into it -- so when it cannot take another read the
-  // unparsed tail (part of one frame) moves to a fresh block, and a frame longer
-  // than a block gets a block of its own.
+  // (gz_pipe_read for a pipe, gz_pipe_fill for a device), and every frame inside
+  // a block handed on as a view that pins the block until the frame is released.
+  // A block is never compacted -- frames already handed on point into it -- so
+  // when it cannot take another read the unparsed tail (part of one frame) moves
+  // to a fresh block, and a frame longer than a block gets a block of its own.
   // Only with memory to spare: a view pins its whole block, which the queue's
   // byte cap does not count, so like the named-file reader the blocks may hold an
   // eighth of the memory left, past which frames are copied again; below 2 GiB
@@ -23138,6 +23296,7 @@ static size_t stream_frames_to_queue(
   // named-file reader.
   const size_t PV_BLOCK = (size_t)64 * ONE_MIB;
   bool pipe_views = false;
+  bool pipe_tight = false;         // a pipe under 2 GiB left: copies sized as the named route's
   uint64_t pv_cap_bytes = 0;
 #ifndef _WIN32
   {
@@ -23152,6 +23311,7 @@ static size_t stream_frames_to_queue(
         if (const char * e = std::getenv("GZSTD_DEBUG_ZC_MAX_BLOCKS"))
           pv_cap_bytes = (uint64_t)std::strtoull(e, nullptr, 10) * PV_BLOCK;
       } else {
+        pipe_tight = !pv_off;
         vlog(V_VERBOSE, opt, std::string("[READER] pipe: frames copied out of the read buffer (")
              + (pv_off ? "GZSTD_DEBUG_READER_COPY" : "under 2 GiB of memory left") + ")\n");
       }
@@ -23170,16 +23330,25 @@ static size_t stream_frames_to_queue(
   size_t pv_blk_cap = 0;
   // Bytes of the blocks of their own (frames longer than a block) still alive.
   std::shared_ptr<std::atomic<uint64_t>> pv_big;
-  size_t pv_views = 0, pv_copied = 0, pv_blocks = 0, pv_own = 0;
+  size_t pv_views = 0, pv_copied = 0, pv_blocks = 0, pv_own = 0, pv_bound_copies = 0;
   uint64_t pv_carried = 0, pv_peak = 0;
   if (pipe_views) {
     pv_big = std::make_shared<std::atomic<uint64_t>>(0);
     pv_pool.reset(new GzPipeBlocks(PV_BLOCK));
     pv_bounce.reset(new char[GZ_PIPE_BOUNCE]);
   }
-  // A pipe's magic is judged from its first four bytes before any bulk read (below).
-  const bool probe_magic_first = !gz_input_rewindable(in);
-  uint64_t rd_total = 0;           // bytes this reader has read (a pipe's reads stay aligned)
+  // A pipe (anything that cannot be rewound) is read for what it holds, waiting
+  // only for the bytes the parse below cannot go on without (gz_pipe_read).
+#ifndef _WIN32
+  const bool pipe_in = !gz_input_rewindable(in);
+#else
+  const bool pipe_in = false;
+#endif
+  size_t read_need = 1;            // bytes the next read must bring (set where the parse stops)
+  uint64_t rd_total = 0;           // bytes this reader has read
+  uint64_t walk_at = UINT64_MAX;   // gz_frame_need's frame (its stream offset) and state
+  size_t walk_pos = 0;
+  bool walk_ck = false;
   auto pv_pinned = [&]() -> uint64_t {
     return (uint64_t)pv_pool->alive() * PV_BLOCK + pv_big->load(std::memory_order_relaxed);
   };
@@ -23326,8 +23495,10 @@ static size_t stream_frames_to_queue(
 
     if (pipe_views) {
       // Never compacted (frames handed on point into the block): when the block
-      // cannot take another read, the unparsed tail moves to a fresh one.
-      if (pv_blk_cap - buf_len < READ_CHUNK) {
+      // cannot take another read, the unparsed tail moves to a fresh one.  A
+      // pipe's reads take what it holds, up to the room left (below): its block
+      // is used to within a bounce buffer of its end, not a whole READ_CHUNK.
+      if (pv_blk_cap - buf_len < (pipe_in ? GZ_PIPE_BOUNCE : READ_CHUNK)) {
         const size_t tail = buf_len - buf_off;
         std::shared_ptr<char> nb;
         size_t ncap = PV_BLOCK;
@@ -23389,7 +23560,8 @@ static size_t stream_frames_to_queue(
              && dz <= (unsigned long long)SINGLE_FRAME_STREAM_MIN)
             ? ZSTD_compressBound((size_t)dz) + READ_CHUNK : 0;
         want = by_bound > want ? by_bound : std::max(want, 2 * buf.size());
-        want = (want + READ_CHUNK - 1) / READ_CHUNK * READ_CHUNK;
+        const size_t step = pipe_tight ? ONE_MIB : READ_CHUNK;   // tight: no 4 MiB of slack
+        want = (want + step - 1) / step * step;
         FrameVec grown;
         grown.reserve(want);
         grown.resize(want);              // default-initialised: nothing zeroed
@@ -23404,33 +23576,33 @@ static size_t stream_frames_to_queue(
     uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
     uint64_t rd_cp = 0;
     size_t n;
-    // A PIPE'S READS STILL END ON READ_CHUNK BOUNDARIES OF THE STREAM: the read
-    // after the four-byte probe takes READ_CHUNK less what was read.  A hand-off
-    // to the streaming decoder passes it what this reader holds, and its own
-    // READ_CHUNK reads then start where they did before the probe -- off by four,
-    // a writer that sent whole chunks and held the pipe open left the decoder
-    // waiting on four bytes that never came (the live-pipe --keep-going cell).
-    const size_t want = probe_magic_first ? READ_CHUNK - (size_t)(rd_total % READ_CHUNK)
-                                          : READ_CHUNK;
-    if (probe_magic_first && total_frames == 0 && buf_len < 4) {
-      // A pipe's first four bytes alone, so a bad magic is refused below before a
-      // bulk read waits on a writer that holds the pipe open (review): fread
-      // returns once it has these four, where it would wait for 4 MiB or EOF.
-      const size_t ask = 4 - buf_len;
-      n = std::fread(bp + buf_len, 1, ask, in);
-      if (n < ask) check_read_error(in, opt.input);
-    } else if (pipe_views) {
-      n = gz_pipe_fill(in, bp + buf_len, want, pv_bounce.get(),
+    // A PIPE IS READ FOR WHAT IT HOLDS (v0.18.41, ROADMAP 38): at least
+    // `read_need` bytes -- what the parse stopped for: the rest of a magic, a
+    // frame header, the block it is in (gz_frame_need), a skippable frame -- and
+    // whatever else the pipe already has, up to the room.  Until v0.18.41 every
+    // read waited for a whole READ_CHUNK (fread), so a writer that paused held
+    // back the frames before the pause, and bytes that stopped being zstd went
+    // unjudged, until it sent the rest of 4 MiB or closed.  v0.18.40's four-byte
+    // magic probe and its READ_CHUNK alignment worked around that for the first
+    // frame and the hand-off to the streaming decoder; neither is needed now
+    // (that decoder reads a pipe the same way).
+#ifndef _WIN32
+    if (pipe_in) {
+      const size_t room = pipe_views ? std::min(READ_CHUNK, pv_blk_cap - buf_len) : READ_CHUNK;
+      n = gz_pipe_read(in, bp + buf_len, std::min(read_need, room), room,
+                       pipe_views ? pv_bounce.get() : nullptr,
+                       (g_perf || m) ? &rd_cp : nullptr, opt.input);
+    } else
+#endif
+    if (pipe_views) {
+      // Another input that is not a regular file (a device): whole chunks.
+      n = gz_pipe_fill(in, bp + buf_len, READ_CHUNK, pv_bounce.get(),
                        (g_perf || m) ? &rd_cp : nullptr);
-      if (n < want) check_read_error(in, opt.input);   // as read_chunk does
-    } else if (probe_magic_first) {
-      // A pipe on the copying reader: read_chunk's buffered read, at `want`
-      // (never O_DIRECT here -- that needs a regular file).
-      n = std::fread(bp + buf_len, 1, want, in);
-      if (n < want) check_read_error(in, opt.input);
+      if (n < READ_CHUNK) check_read_error(in, opt.input);   // as read_chunk does
     } else {
       n = read_chunk(bp + buf_len);
     }
+    read_need = 1;
     rd_total += n;
     if ((g_perf || m) && n > 0) {
       const uint64_t r_dt = now_ns() - rd_t0 - rd_cp;
@@ -23444,24 +23616,28 @@ static size_t stream_frames_to_queue(
     buf_len += n;
     if (n == 0) eof = true;
 
-    // Parse as many complete frames as we can from buf[buf_off..buf_len)
+    // Parse as many complete frames as we can from buf[buf_off..buf_len).  Each
+    // stop for more input says how much more (read_need), so a pipe's next read
+    // waits for that and no more.
     while (buf_off < buf_len) {
       const char * ptr = bp + buf_off;
       size_t remaining = buf_len - buf_off;
+      // Stop for input: the frame at ptr needs `upto` bytes before it can go on.
+      auto stop_for = [&](size_t upto) { read_need = upto > remaining ? upto - remaining : 1; };
 
       // Need at least 4 bytes for magic number
-      if (remaining < 4) break;
+      if (remaining < 4) { stop_for(4); break; }
 
       // Skip skippable frames (magic 0x184D2A5?)
       {
         uint32_t magic = 0;
         magic = rd_le32(ptr);
         if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {
-          if (remaining < 8) break;  // need more data for skip size
+          if (remaining < 8) { stop_for(8); break; }  // need more data for skip size
           uint32_t skip_size = 0;
           skip_size = rd_le32(ptr + 4);
           size_t total_skip = 8 + (size_t)skip_size;
-          if (total_skip > remaining) break;  // need more data
+          if (total_skip > remaining) { stop_for(total_skip); break; }  // need more data
           gz_late_note_skippable((const unsigned char *)ptr, total_skip);   // a pipe's seek table
           buf_off += total_skip;
           ++total_frames;            // a complete frame, just not a DATA one
@@ -23502,7 +23678,7 @@ static size_t stream_frames_to_queue(
       if (stream_rest) {
         ZSTD_frameHeader zfh;
         const size_t need = ZSTD_getFrameHeader(&zfh, ptr, remaining);
-        if (need > 0 && !ZSTD_isError(need) && !eof) break;   // header incomplete
+        if (need > 0 && !ZSTD_isError(need) && !eof) { stop_for(need); break; }   // header incomplete
         if (need == 0 && zfh.frameType == ZSTD_frame
             && (zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
                 || zfh.frameContentSize > (unsigned long long)SINGLE_FRAME_STREAM_MIN)) {
@@ -23530,15 +23706,35 @@ static size_t stream_frames_to_queue(
       }
       // Try to find the compressed frame size (the sequential parse spine —
       // each frame's blocks must be walked to locate the next frame's start).
+      // Not until gz_frame_need says the bytes could settle it: a frame still
+      // arriving is walked once, its walk resumed at each read, rather than
+      // from its start by zstd at every one.
       uint64_t ps_t0 = m ? now_ns() : 0;
+      if (!eof) {
+        const uint64_t at = rd_total - (uint64_t)remaining;   // the frame's offset in the stream
+        if (at != walk_at) { walk_at = at; walk_pos = 0; walk_ck = false; }
+        const size_t upto = gz_frame_need((const unsigned char *)ptr, remaining, &walk_pos, &walk_ck);
+        if (upto > remaining) {
+          if (m) m->reader_parse_ns.fetch_add(now_ns() - ps_t0, std::memory_order_relaxed);
+          stop_for(upto);
+          break;
+        }
+      }
       size_t frame_comp = ZSTD_findFrameCompressedSize(ptr, remaining);
       if (m) m->reader_parse_ns.fetch_add(now_ns() - ps_t0, std::memory_order_relaxed);
       if (ZSTD_isError(frame_comp)) {
-        if (!eof) {
-          // Incomplete frame data -- need to read more.
+        // Incomplete frame data -- need to read more.  ONLY srcSize_wrong means
+        // that (v0.18.41, ROADMAP 38): any other error (a magic that is not a
+        // frame, a reserved block type, an unsupported parameter) is final at this
+        // position however much follows, and after a data frame it is the
+        // trailing-bytes verdict below.  Waiting for EOF there left a pipe whose
+        // bytes stopped being zstd mid-stream waiting on a writer that held it
+        // open, the parse buffer growing all the while.  Before the first data
+        // frame the end-of-input route below still decides (the streaming
+        // decoder's fallback reads the rest of the input itself).
+        if (!eof && (seq == 0 || ZSTD_getErrorCode(frame_comp) == ZSTD_error_srcSize_wrong))
           break;
-        }
-        // At EOF: no more data coming
+        // At EOF (or a final error after data frames): no more data that could help
         if (seq == 0) {
           // Bytes present but no frame parsed: foreign or unknown-content-size
           // stream — hand it to the CPU streaming decoder.  (The zero-BYTE case
@@ -23592,7 +23788,7 @@ static size_t stream_frames_to_queue(
       }
 
       // If the frame extends past what we\'ve read, wait for more data
-      if (frame_comp > remaining) break;
+      if (frame_comp > remaining) { stop_for(frame_comp); break; }
 
       // Get decompressed size from the frame header
       gz_enforce_window_limit(ptr, remaining);
@@ -23624,6 +23820,18 @@ static size_t stream_frames_to_queue(
         ++pv_views;
       } else {
         uint64_t cp_t0 = m ? now_ns() : 0;
+        if (pipe_tight && frame_decomp > 0) {
+          // UNDER A LIMIT A PIPE'S COPY IS THE NAMED ROUTE'S (v0.18.41, ROADMAP 37): reserved
+          // at the frame's compress bound, and the queue charges what it reserved
+          // (Task::count_capacity).  Exact copies of frames a few KiB apart (a base64
+          // archive's 12.05-12.07 MiB) left holes no later copy fit, and at 12.06 MiB two
+          // fit the queue's 16 MiB cap where the named route's 16.06 admits one: a 2 GiB
+          // decode through a pipe peaked at 129 MiB anonymous, killed at 128 MB, where the
+          // named file peaks at 109.
+          t.data.reserve(std::max(frame_comp, ZSTD_compressBound((size_t)frame_decomp)));
+          t.count_capacity = true;
+          ++pv_bound_copies;
+        }
         t.data.assign(ptr, ptr + frame_comp);   // copy compressed bytes out of the parse buffer
         if (m) m->reader_copy_ns.fetch_add(now_ns() - cp_t0, std::memory_order_relaxed);
         if (pipe_views) ++pv_copied;           // past the memory cap
@@ -23655,6 +23863,9 @@ static size_t stream_frames_to_queue(
       }
     }
   }
+  if (pipe_tight && opt.verbosity >= V_VERBOSE)
+    vlog(V_VERBOSE, opt, "[READER] pipe: " + std::to_string(pv_bound_copies)
+         + " frames copied at their compress bound (the queue counts what they hold)\n");
   if (pipe_views && opt.verbosity >= V_VERBOSE) {
     char zb[320];
     std::snprintf(zb, sizeof zb,
@@ -36119,9 +36330,23 @@ static size_t tune_prior_budget(size_t frame_bytes, size_t gpu_streams,
 // input/16 target is subject to the eight-frame floor on tiny inputs.
 static constexpr uint64_t TUNE_DECOMPRESS_START_BYTES = uint64_t(2) << 30;
 static constexpr uint64_t TUNE_COMPRESS_START_BYTES   = uint64_t(512) << 20;
-static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool decompress) {
+// A DECOMPRESS START IS PER DEVICE (v0.18.41): the 2 GiB target was measured on
+// ONE H100, where a 36 GiB archive is 24 batches of 128; split over four cards
+// it is six a card, the run ends before the tuner has measured anything else,
+// and the last batches finish unevenly.  So no more than an eighth of a
+// device's share of the input.  MEASURED, 8-H100 server, 36 GiB archive of
+// 16 MiB frames, cached, --gpu-only -d, pinned batches (three runs each):
+//   2 devices  64: 5.60-5.79 s   128: 5.57-6.09               (start 128, as before)
+//   4 devices  32: 4.80-5.72     64: 5.15-5.61   128 (auto): 5.74-5.95   (start 64)
+//   6 devices  32: 5.35-5.99     64: 5.71-6.23   auto: 6.78-7.04         (start 32)
+// One device keeps input/16.  Compress keeps its target: its 512 MiB start is
+// already a fraction of a share at the sizes measured.
+static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool decompress,
+                                 int devices = 1) {
   uint64_t target = decompress ? TUNE_DECOMPRESS_START_BYTES : TUNE_COMPRESS_START_BYTES;
   if (input_bytes) target = std::min<uint64_t>(target, input_bytes / 16);
+  if (input_bytes && decompress && devices > 1)
+    target = std::min<uint64_t>(target, input_bytes / (8 * (uint64_t)devices));
   const size_t n = size_t(target / std::max<size_t>(1, frame_bytes));
   size_t p = 1;
   while (p * 2 <= n) p <<= 1;
@@ -36537,33 +36762,39 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   };
+  // What one window at `next` would read, using only full batches to estimate
+  // input bytes per frame.  A valid window may still contain one short batch;
+  // including its bytes while dividing by batches * cur would understate the
+  // cost.  The worker visits every stream before its next tick, so round the
+  // minimum batch count up to a whole stream sweep.  `left` is 0 and the input
+  // size unknown (*known false) for a pipe.
+  auto window_cost = [&](size_t next, double * left_out, bool * known) -> double {
+    const uint64_t total = R.input_bytes.load(std::memory_order_relaxed);
+    const uint64_t done = m ? m->read_bytes.load(std::memory_order_relaxed)
+                            + m->skipped_input_bytes.load(std::memory_order_relaxed) : 0;
+    *left_out = total > done ? double(total - done) : 0.0;
+    *known = total > 0;
+    const double per_frame = double(full_bytes) / double(full)
+                           / double(std::max<size_t>(1, cur));
+    // ...plus the warm-up batches a change of size leaves out in normal runs.
+    // FAST skips per-change warm-up, so its cost gate must skip that charge.
+    const size_t streams = std::max<size_t>(1, T.streams);
+    const size_t min_batches = fast ? 1u : DeviceTune::MIN_BATCHES;
+    const size_t probe_batches = (1 + (min_batches - 1) / streams) * streams
+                               + (fast ? 0 : streams);
+    return double(probe_batches) * double(next) * per_frame;
+  };
   // At the ceiling and still improving: explore past it if this path can grow
   // its buffers and the throttle can always grant a pop that large.
   size_t want = 0;
   auto top_out = [&]() {
     const size_t xmax = R.explore_max.load(std::memory_order_relaxed);
-    // What one exploratory window would read, using only full batches to
-    // estimate input bytes per frame.  A valid window may still contain one
-    // short batch; including its bytes while dividing by batches * cur would
-    // understate the cost.  The worker visits every stream before its next
-    // tick, so round the minimum batch count up to a whole stream sweep.
     bool affordable = false;
     if (R.explore_ok && !T.explore_blocked && xmax > C) {
       const size_t next = std::min<size_t>(C * 2, xmax);
-      const uint64_t total = R.input_bytes.load(std::memory_order_relaxed);
-      const uint64_t done = m ? m->read_bytes.load(std::memory_order_relaxed)
-                              + m->skipped_input_bytes.load(std::memory_order_relaxed) : 0;
-      const double left = total > done ? double(total - done) : 0.0;
-      const double per_frame = double(full_bytes) / double(full)
-                             / double(std::max<size_t>(1, cur));
-      // ...plus the warm-up batches a change of size leaves out in normal runs.
-      // FAST skips per-change warm-up, so its cost gate must skip that charge.
-      const size_t streams = std::max<size_t>(1, T.streams);
-      const size_t min_batches = fast ? 1u : DeviceTune::MIN_BATCHES;
-      const size_t probe_batches = (1 + (min_batches - 1) / streams) * streams
-                                 + (fast ? 0 : streams);
-      const double cost = double(probe_batches) * double(next) * per_frame;
-      affordable = total > 0 && cost <= tune_explore_fraction() * left;
+      double left = 0.0; bool known = false;
+      const double cost = window_cost(next, &left, &known);
+      affordable = known && cost <= tune_explore_fraction() * left;
       if (!affordable && opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, tag + "at its allocation (" + std::to_string(C) + ") and still "
              "improving, but a window at " + std::to_string(next) + " would read ~"
@@ -36630,7 +36861,26 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     }
     if (improving) {
       const size_t dbl = std::min(cur * 2, C);
-      if (dbl > cur) tune_propose(T, dbl);
+      // A SIZE NEVER RUN IS AN EXPLORATION, inside the allocation too (v0.18.41):
+      // the same cost gate as past it.  Its first batch also sets up that size's
+      // host buffers -- MEASURED, decompress 16 MiB frames on an H100: a first
+      // batch of 128 took 1,026 ms in the device-to-host copy against 121 ms
+      // after, of 256 1,134 against 233 -- so on a short run the trial cost a
+      // second it never paid back: a 36 GiB archive on two cards took 6.86-7.05 s
+      // auto, 5.57-6.09 pinned at the 128 auto settled back on.  Only a known size
+      // is gated -- a pipe explores as before, and so does compress, whose TuneRun
+      // records no input size -- and only a size this device has not measured.
+      double left = 0.0; bool known = false;
+      const bool unproven = dbl > cur && dbl > T.measured_max;
+      const double cost = unproven ? window_cost(dbl, &left, &known) : 0.0;
+      if (unproven && known && cost > tune_explore_fraction() * left) {
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, tag + "a window at " + std::to_string(dbl) + " would read ~"
+               + std::to_string((uint64_t)(cost / ONE_MIB)) + " MiB of ~"
+               + std::to_string((uint64_t)(left / ONE_MIB)) + " MiB left; not exploring it\n");
+        settle("settled at");
+      }
+      else if (dbl > cur) tune_propose(T, dbl);
       else if (cur == T.best_batch) top_out();
       else settle("settled at");
     } else if ((cur > T.best_batch ? cur - T.best_batch : T.best_batch - cur) > 2) {
@@ -47454,7 +47704,8 @@ gds_out_declined:
                       : opt.gpu_batch_user_set || opt.region_staged()
                         ? opt.gpu_batch_cap
                       : decomp_src_bytes == 0 ? DEFAULT_GPU_DECOMP_BATCH_CAP
-                      : tune_default_start(decomp_frame_cap(opt), decomp_src_bytes, /*decompress=*/true),
+                      : tune_default_start(decomp_frame_cap(opt), decomp_src_bytes, /*decompress=*/true,
+                                           gpu_count),
                       decomp_frame_cap(opt), bp_ptr ? bp_ptr->max_permits() : 0,
                       /*by_device=*/false);
     for (int i = 0; i < gpu_count; ++i) {
@@ -54839,8 +55090,8 @@ static void apply_backend_defaults(Options & opt)
   }
 #endif
   // --gpu-only STARTS NO MORE DEVICES THAN THE INPUT CAN USE (v0.18.39): one per
-  // 4 GiB of input, without --adapt (whose profile picks the count above) or an
-  // explicit --gpu-devices.  Every visible device is paid for at cuInit and again
+  // 8 GiB of input (4 until v0.18.41, below), without --adapt (whose profile
+  // picks the count above) or an explicit --gpu-devices.  Every visible device is paid for at cuInit and again
   // for its context and pools, ~0.5 s each on the 8-H100 server (cuInit alone
   // 0.9 s for one, 2.85 for eight), whether or not it gets a frame: a 64 MiB
   // --gpu-only compress ran 5.5 s on eight with seven idle, 1.6 on one.
@@ -54848,10 +55099,20 @@ static void apply_backend_defaults(Options & opt)
   //   1 GiB   1.98 / 2.19 / 3.12 / 5.07 s     16 GiB  5.78 / 5.17 / 5.88 / 7.10
   //   4 GiB   2.82 / 3.14 / 4.07 / 5.66       32 GiB  8.79 / 8.49 / 7.18 / 8.16
   // and decode 4 GiB 3.22 / 3.09 / - / 5.27, 16 GiB 4.92 / 3.91 / - / 6.15.  The
-  // best there is one device per ~8 GiB; 4 is the general choice, so a slower
-  // card still gets seconds of work per startup it costs.  The total of regular
-  // input files; a tree, a caller's CUDA_VISIBLE_DEVICES, --gpu-order=ranked or a
-  // staged run (one device already) is left alone.
+  // best there is one device per ~8 GiB; v0.18.39 took 4, so a slower card
+  // would still get seconds of work per startup it costs.  ONE PER 8 GiB SINCE
+  // v0.18.41: past about four cards the host side sets the rate here, and every
+  // further card only starts and exits.  MEASURED, the same server, cached, three
+  // runs each (with v0.18.39's count in brackets):
+  //   compress 16 GiB   2: 5.03-5.26 s   3: 5.15-5.39   4: 5.15-5.50 [4]
+  //   compress 32 GiB   3: 6.87-7.20     4: 6.45-7.05   6: 7.30-7.74   [8: 8.0-8.9]
+  //   compress 48 GiB   4: 8.27-9.11     5: 8.24-8.37   6: 8.15-8.80   [8]
+  //   decode, 24 GiB archive  3: 4.55-5.18   4: 4.75-4.94   6: 5.38-5.95   [7]
+  //   decode, 36 GiB archive  4: 5.85-5.86   5: 5.58-6.39   6: 7.06-7.14   [8]
+  // A slower card than an H100 would want more; --adapt's model and --gpu-devices
+  // are the per-host answers.  The total of regular input files; a tree, a
+  // caller's CUDA_VISIBLE_DEVICES, --gpu-order=ranked or a staged run (one device
+  // already) is left alone.
   // --gpu-order=ranked asks for the whole set in an order, so it keeps it (review).
   //
   // A COLD INPUT TAKES TWO AT MOST (v0.18.40).  When most of the input is not in
@@ -54935,7 +55196,7 @@ static void apply_backend_defaults(Options & opt)
       static const uint64_t PER_DEVICE = [] {
         const char * e = ::getenv("GZSTD_DEBUG_GPU_BYTES_PER_DEVICE");
         const unsigned long long v = e ? std::strtoull(e, nullptr, 10) : 0ULL;
-        return v > 0 ? (uint64_t)v : uint64_t(4) << 30;
+        return v > 0 ? (uint64_t)v : uint64_t(8) << 30;
       }();
       n = (int)std::min<uint64_t>((uint64_t)devices,
                                   std::max<uint64_t>(1, (total + PER_DEVICE - 1) / PER_DEVICE));
@@ -54958,7 +55219,7 @@ static void apply_backend_defaults(Options & opt)
       }
 #endif
       char tb[32]; human_bytes(double(total), tb, sizeof(tb));
-      why = std::string(tb) + " of input (one per 4 GiB: each costs ~0.5 s to start"
+      why = std::string(tb) + " of input (one per 8 GiB: each costs ~0.5 s to start"
           + (cold ? "; two at most from a cold input, whose drive sets the rate" : "")
           + "; --gpu-devices sets the count)";
     }

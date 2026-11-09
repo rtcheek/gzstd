@@ -392,7 +392,10 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    inputs keep one per 4 GiB though one per 8 GiB measured better here (32 GiB compress: four 7.1-7.6 s,
    the rule's eight 8.0-8.9; a 24 GiB archive's decode: four 4.7-4.9, the rule's six 6.1-6.2); a slower
    card on a faster drive would want more than two cold.  Both want a per-host rate, which only --adapt
-   measures.
+   measures.  **v0.18.41: cached inputs one per 8 GiB** (measured on 2-6 idle H100s: compress 16 GiB
+   best at 2-3 cards, 32 GiB at 4 (8: 8.0-8.9 s, 4: 6.45-7.05), 48 GiB flat from 4 to 6; decode of a
+   24 GiB archive best at 3-4, a 36 GiB one at 4-5, six cards losing on both).  Cards past the
+   host's rate only start and exit; a slower card than an H100 would want more.
 20. **Nothing ranks the cards by measured speed.**  Which GPUs a run uses is CUDA's order (a static
    fastest-first heuristic from device properties), or with `--gpu-order=ranked` the current load
    (utilization, then free memory, from the driver probe); a `--gpu-devices N` subset takes the N
@@ -871,26 +874,22 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       24-27% came from its four Zen4 CPUs carrying more of the work.  A cheaper cached read (handing
       frames out of the page cache without the copy) stays the lever if a host shows the loss
       beside the probe; this one does not.
-37. **A piped input under 128 MB is killed** (found v0.18.40; v0.18.39 the same).  v0.18.38-39 fitted
-    a 2 GiB decode to a 128 MB limit, 88 MB since v0.18.39, from a NAMED file (the parallel reader's
-    shrunk blocks, exact carries, size classes, one decoded frame below seven).  Through a pipe the
-    sequential reader runs, which under 2 GiB left copies every frame (v0.18.40's views need memory
-    to spare).  v0.18.40 stopped its parse buffer doubling (16 -> 32 MiB mid-run, both alive): live
-    peak 128.4 -> 116.5 MiB, 132 MB passes (v0.18.39 0/3), 128 MB still killed in ~0.15 s.  MEASURED
-    with the heap tracer at 256 MB: five 12.06 MiB compressed copies alive against a 2-frame throttle,
-    two 16 MiB decoded frames, the 24 MiB parse buffer; the scope's anon at 160 MB 129 MiB, ~13 MiB
-    above the live heap (fragmentation: exact-size copies of slightly different sizes).  Next: the
-    named route's size classes for these copies, then why five copies (queue + decoding + the push +
-    frames waiting to be written holding their input?), or views of small blocks under a limit.
-    `cat g2.zst | systemd-run --user --scope -p MemoryMax=128M -p MemorySwapMax=0 gzstd -d -c >
-    /dev/null`; the FIFO form works for memprobe since v0.18.40 (a named pipe decodes).
-38. **A pipe whose bytes stop being zstd after its first frame is read to the end** (pre-existing on
-    stdin; v0.18.40 refuses a bad FIRST magic at once).  The pipe reader takes any
-    `ZSTD_findFrameCompressedSize` error for an incomplete frame until EOF, so garbage after valid
-    frames waits for the writer to close and grows the parse buffer meanwhile.  The verdict at EOF is
-    right (exit 4, or a tolerated damaged trailer); the wait and the growth are not.  A definite error
-    (anything but `srcSize_wrong`) could end the read -- but the damaged-trailer tolerance judges the
-    whole tail, so it would need a bounded look-ahead, not the full rest of the input.
+37. ~~**A piped input under 128 MB is killed**~~ **FIXED v0.18.41.**  Under a limit a pipe's copies are
+    reserved at their frame's compress bound and counted at that, as the named route's carries (the exact
+    12.06 MiB copies let two into the queue's 16 MiB cap and fragmented the heap: 129 MiB anonymous
+    against 109).  2 GiB piped decodes pass at 128 and 112 MB on every sink, base64 down to 88 MB; random
+    stored frames pass at 104 MB and crawl at 96 MB on a redirected stdout, as a named file does there.
+38. ~~**A pipe's reader fills 4 MiB at a time**~~ **FIXED v0.18.41.**  Bytes that stop being zstd after
+    valid frames were read to the end of the input -- any `ZSTD_findFrameCompressedSize` error taken for an
+    incomplete frame -- so a writer holding the pipe open kept the run waiting and one that kept writing
+    grew the buffer without bound; only `srcSize_wrong` waits now.  And both pipe readers (the frame
+    splitter, the streaming decoder it hands sizeless or huge frames to) read with `read(2)` for what the
+    pipe holds instead of `fread`'s whole 4 MiB: the splitter waits only for what its parse stopped for
+    (`gz_frame_need` walks the block headers, resumed at each read), the decoder's read-ahead takes what
+    is waiting.  Whole frames decode and bad bytes or a damaged block are judged while the writer holds the
+    pipe open; v0.18.40's four-byte probe and 4 MiB read alignment are gone.  Still so: to a pipe, stdio
+    holds the last part of a 4 KiB output buffer until more output or the end.
+
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
@@ -1718,9 +1717,15 @@ report follows.
   - **Still OPEN:** the L2 proxy is fitted to two architectures (Turing; Hopper PCIe and NVL). An
     Ampere or Ada card is the next data point: big-L2 Ada cards are capped at the H100 target and
     unmeasured.
-  - **Still OPEN:** decompress auto trails by 3–5% at 48 GiB (2–15% at 24 GiB). Its start sits on or
-    one step from the best, so the start is not the cause: the in-run windows rate the 88-frame
-    allocation above 64, while whole pinned runs put 64 ahead by 2%.
+  - ~~**Still OPEN:** decompress auto trails by 3–5% at 48 GiB (2–15% at 24 GiB).~~ **FIXED v0.18.41
+    for several devices.**  Re-measured on 2-6 H100s (a 36 GiB archive, cached, --gpu-only -d) it
+    trailed the best pinned batch by 15-25%, for two reasons: the 2 GiB start was one H100's, so
+    across four or six cards the run ended before the tuner measured anything else (start now an
+    eighth of a device's share: 64 on four cards, 32 on six); and its doubling into a size never run
+    paid ~1 s setting up that size's host buffers on a run too short to pay it back (now under the
+    same cost gate as exploring past the allocation, for a known input size).  Auto 6.94-7.27 ->
+    5.68-5.96 s on 2 cards (pinned best 5.86-6.04), 6.01-6.31 -> 5.35-5.59 on 4 (5.01-5.28), 6.62-7.20
+    -> 5.69-6.29 on 6 (5.45-6.09).  One card unchanged (its start was measured).
 - **CLOSED v0.18.1: a source-bound reading no longer freezes the tuner.** It was a latch
   (`SETTLED` at the current batch, never released, nothing recorded). A 0.6 s reading at the end
   of warm-up froze every fresh-profile `--adapt` GPU compress at its start on the two-card Gen3
