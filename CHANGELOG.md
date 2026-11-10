@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.42  
+**Covers:** v0.9.50 → v0.18.43  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,117 @@
 
 ---
 
+
+## v0.18.43 — `--gpu-only` starts the number of GPUs this machine's measurements predict is fastest, not one per 8 GiB (two RTX 2080 Ti: a 6 GiB compress 7.5-8.2 -> 4.9-5.0 s, a 4.5 GiB archive 3.3-3.8 -> 2.5-2.7), `--calibrate ARCHIVE` measures the decompress side, `--adapt -d` chooses its count (it started every card, as `--adapt` compress did with nothing measured), and a hybrid decode starts no GPU it cannot feed
+
+**The rule was an H100's.**  v0.18.39-41 fitted `--gpu-only`'s device count on the 8-H100 server: one
+card per 8 GiB of input, two at most from a cold input.  The workstation checks of v0.18.42 found it
+wrong by a wide margin on the 2080 Ti box.  MEASURED there, warm, to /dev/null, three interleaved rounds:
+
+| input | compress, 1 card | 2 cards | decompress (decoded size), 1 card | 2 cards |
+|---|---|---|---|---|
+| 512 MiB | 1.07-1.22 s | 0.94-1.04 | 0.73-0.74 | 0.75-0.77 |
+| 1 GiB | 1.67-1.70 | 1.39-1.47 | 1.27-1.29 | 0.95-1.12 |
+| 4 GiB | 5.02-5.52 | 3.36-3.49 | 3.00-3.73 | 2.28-2.51 |
+| 6 GiB (the rule: 1) | 7.51-8.27 | 4.76-4.85 | 3.27-3.78 | 2.48-2.64 |
+
+Not a stream-layout effect: one card with four streams (batches 12/11/9) and with two (49/33) both took
+8.2-8.3 s.  The card is ~5x slower than an H100 (~0.8 GiB/s compress) and a second one starts in ~0.12 s
+(its context, after the first's), against ~0.5 s on the server, ~0.28 s of it in `cuInit`.  Break-even
+moves from ~5 GiB to ~0.3 GiB, and neither number can be read before CUDA starts, which is where the
+count must be fixed: CUDA initializes every visible device.
+
+**The fix reads what `--calibrate` already measures.**  Its device-count pass (v0.17.73) runs a child
+per candidate count (1, 2, 4, ... all), each paying its own `cuInit`, and files each count's overhead
+and rate -- read until now only by `--adapt`.  `gpuc_default_choice` lets a `--gpu-only` run on regular
+files without `--adapt` take the count with the least predicted `overhead + size / rate` (within 3%,
+fewer), the same scoring as `--adapt`'s exploit step (`gpuc_best_measured`, shared so the two cannot
+drift).  It does so only when EVERY candidate count in that direction has both numbers; otherwise the
+rule stands, because a partial model cannot see the counts it lacks.  It never explores.  The cold cap
+of two still applies; `--no-profile` keeps the rule; `GZSTD_DEBUG_GPU_BYTES_PER_DEVICE` (the suite's
+rule hook) keeps the profile out.  `-v` names the source:
+`[GPU] devices: 2 of 2 for 6.00 GiB of input (this machine's measured compress model: predicted 4.6 s
+...)`, printed even when the model picks every card.
+
+**The decompress side.**  The count model existed for compress only.  `decompress_nvcomp` now arms the
+same taps (`--gpu-only --adapt`, not `--tar`, not the staged readers), filing the ARCHIVE's bytes per
+busy second, since the rule sizes a decode by its archive; `--calibrate` runs a second child pass with
+`-d`.  `--calibrate` takes up to two files, told apart by content (a zstd or skippable frame first is
+the ARCHIVE): FILE gives compress rates, ARCHIVE decompress rates, and without one a pass stages the
+corpus (or its archive) for the overhead alone, as compress did.  `-o` with both is allowed under
+`--calibrate`, whose `-o` names the sink it measures.  The findings say what `--gpu-only` will start at
+1, 10 and 100 GiB in each direction, or that the rule still holds and why.  `-t` uses the decompress
+model.
+
+**An epoch, so an old profile cannot mislead the default.**  A model filed by an older gzstd can
+describe a startup it no longer has: TUNING.md's own 8-H100 example gives one card 3.19 s of overhead,
+where v0.18.39 ran a whole 1 GiB compress in 1.98 s, and that model puts a cached 16 GiB on one card
+(5.78 s) where two take 5.17.  Each filed count now carries `gpu_devices_N_epoch` (`GPUC_EPOCH` = 1); the
+default trusts only current-epoch counts, and a filing over an older count REPLACES it (its rate dropped
+if the new sample has none) rather than averaging, so one `--calibrate` brings a model current.  A driver
+change still clears the model.  `--adapt`'s own choice reads the model as before.
+
+**`--adapt -d` and `-t` choose their count.**  `--adapt` chose a device count for compress only, and the
+default's rule stood aside for every `--adapt` run, so `--adapt --gpu-only -d` started every card -- on the
+server all eight, where the rule (v0.18.41) starts three for a cached 24 GiB archive (4.55-5.18 s against
+5.38-5.95 on six) -- and filed only that count, so its model could not fill in.  The chooser now covers
+`-d` and `-t` with the decompress model, exploring (all devices, then halving, on archives of 8 GiB or
+more), rechecking after 20 runs and predicting as compress does.
+
+**What `--adapt` cannot settle takes the default's rule**, in both directions: nothing measured and an
+input too small to explore (`GpucChoice::unmeasured`), several inputs, more devices than the model's 64.
+Since v0.17.73 compress started every card there -- the 64 MiB `--gpu-only` compress that took 5.5 s on
+eight H100s and 1.6 s on one, which v0.18.39 fixed only without `--adapt` -- and so, from now, would every
+decode.  A caller's `CUDA_VISIBLE_DEVICES` and `--gpu-order=ranked` still keep every visible card (the rule
+leaves them alone too), and a pipe stays with `--adapt`'s pipe gate.  The choice hook reports such a count
+as `rule`.  MEASURED, the 2080
+Ti box, a 9 GiB archive, empty profile, three `--adapt -d` runs: exploring 2 (3.54 s), exploring 1 (5.27 s),
+then 2 predicted 3.3 s (3.33 s) -- after which the plain default reads the same complete model.
+
+**A hybrid decode starts no GPU while its CPU pool keeps up with the reader.**  Measured on the 2080 Ti box
+(24 CPUs), cached, to /dev/null: a 96 GiB compress is the default's best with both cards (11.86-11.92 s
+against --cpu-only's 12.48-12.53 and one card's 12.07-12.21; the GPUs took 15.5% of the frames), but its
+72 GiB archive decoded in 8.11-8.20 s against --cpu-only's 7.93-7.94, and the GPUs decoded ZERO frames.
+The bringup sample asked only whether the work left would outlast startup (7.4 s against the 4 s guard:
+engage), and the decode was read-bound -- the reader's three threads 99% busy, the decoders waiting 7.2 s
+of 7.9 for blocks -- so the 22 CPU workers popped each frame as it landed.  A GPU's intake waits for a
+full batch (`wait_for_batch_or_cap`, 88 frames here), and with the queue floor released for a bounded
+producer (its premise, that GPUs pop single frames, has not held since v0.14.58) none ever formed.
+Instrumented before the rule: the backlog through that sample never passed 8 frames; at 4 CPUs it held
+181 and the cards took 81-83% of the frames.  So a known-size decode now engages only after a sample
+window that kept at least the CPU pool's worker count of frames waiting (`behind_frames`); a pool that
+never falls behind is skipped at the sampling budget (~2.1 s), saying why at -v.  Compress is untouched:
+its mmap reader queues the whole input, so the backlog says nothing there.  `--cpu-share` and the
+suite's forced bringup bypass it.  `GZSTD_DEBUG_GPU_BEHIND_FRAMES` sets the threshold (test hook).
+
+| CPUs | --cpu-only | default, v0.18.43 | GPUs forced on | GPU share |
+|---|---|---|---|---|
+| 24 | 7.91-7.96 s | 7.91-7.95 (skips) | 8.14-8.22 | 0% |
+| 12 | 8.24-8.26 | 8.84-8.90 (engages) | 8.58-8.92 | ~25% |
+| 8 | 12.95-12.97 | 11.08-11.50 | 10.72-10.82 | ~45% |
+| 4 | 25.96-25.98 | 16.85-16.96 | 16.51-16.78 | ~83% |
+
+LEFT OPEN: at 12 CPUs the pool is behind (26-35 frames waiting for 10 workers) but only just -- the
+reader caps the run at ~7.9 s whatever decodes it -- and the cards cost ~7%, as they did before this
+change.  "Behind" is necessary, not sufficient: the gain a GPU can capture is the deficit, and paying
+for its startup and its feeding needs a deficit larger than that.  ROADMAP 40.
+
+MEASURED, the 2080 Ti box, default `--gpu-only` after `--calibrate 4GiB-file its-archive` (39 s): 6 GiB
+compress 4.85-4.97 s (empty profile 7.54-8.21), 4.5 GiB archive 2.48-2.66 (3.27-3.80); a 384 MiB archive
+stays on one card, the sweep's tie.  The calibration measured 0.80 / 1.49 GiB/s compress and 1.16 / 1.67
+decompress on one / two cards.  NOT MEASURED on the server: its count changes only where its profile
+holds a complete current-epoch model, which no profile written before this release can.
+
+Tests: +1 default GPU cell (a planted model where two win puts the 32 MiB fixture on two cards in both
+directions; a model missing one rate, a pre-epoch model and `--no-profile` keep the rule), the existing
+rule cell given a private cache (and an `--adapt` arm: with nothing measured the rule must RUN, compress
+and decompress, which the choice hook cannot show), +1 default nvCOMP cell (`--adapt` on -d and -t:
+explores from an empty decompress model without borrowing the compress one, predicts 4 / 2 / 1 of eight
+at 200 / 20 / 1 GiB; a small input with nothing measured, compress or decompress, and several inputs
+report `rule`; the over-64-devices arm of the unchanged-branches cell now does too), and the `-e` calibrate cells check the decompress keys plus +1
+cell (`--calibrate ARCHIVE FILE`, archive first), and +1 -e cell (a decode starts no GPU while its CPU pool
+keeps up with the reader: a threshold no queue reaches must skip with the reason, the real one under
+`-T 1` must engage).  Each new arm was mutation-tested against a build without the check it guards.
 
 ## v0.18.42 — a damaged first frame through a pipe is reported at once (it was held, all of the input, until the end: a 1.6 GB archive peaked at 3.2 GB resident), and three fixes from the pre-tag review to what `--adapt` learns about GPU streams
 

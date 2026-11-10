@@ -896,6 +896,17 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     at once, which stops at the damage (12 MB, 0.01 s; 7 under `--keep-going`).  Still so: a legacy
     (pre-1.0) first frame, which cannot be sized, is read whole before streaming -- untested, no fixture.
 
+40. **A hybrid decode just behind its reader engages GPUs that cost more than they capture.**  v0.18.43
+    stopped a decode from starting GPUs while its CPU pool keeps up with the reader (on two RTX 2080 Ti
+    with 24 CPUs they decoded zero frames, 2-3% slower than `--cpu-only`), but "behind" is necessary,
+    not sufficient.  MEASURED there, a cached 72 GiB archive: at 12 CPUs the pool is behind (26-35
+    frames waiting for 10 workers), the cards take ~25% of the frames, and the run is ~7% SLOWER (8.84-8.90
+    s against 8.24-8.26), because the reader caps it at ~7.9 s whatever decodes it; at 8 CPUs the same
+    rule wins 11-15%.  The gain a GPU can capture is the deficit -- the reader's rate less the pool's --
+    so the test wants a deficit large enough to pay for the GPUs' start and their feeding, e.g. the
+    queue's growth per window against what the pool consumed in it (in bytes, so the frame size drops
+    out; a queue at its depth cap counts as far behind).  Needs the overhead side measured, and a second
+    host, before a constant goes in.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

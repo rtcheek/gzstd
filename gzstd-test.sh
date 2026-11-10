@@ -633,8 +633,16 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=570
-$EXTENSIVE && EXPECTED_TESTS=914
+EXPECTED_TESTS=572
+$EXTENSIVE && EXPECTED_TESTS=918
+# v0.18.43: +1 default GPU cell (--gpu-only takes this machine's measured device-count
+# model when it covers every count; a single-GPU host or a caller's mask skips it as
+# host-unexercisable), +1 default nvCOMP cell (--adapt device count: -d and -t explore
+# and choose from the decompress model) and +1 -e GPU cell (--calibrate ARCHIVE FILE
+# records every decompress and compress count), so the no-GPU deltas +2 and +3 (160 ->
+# 162, 240 -> 243) and the GDS delta is unchanged: 570 -> 572, -e 914 -> 917.  Then +1
+# -e GPU cell (a decode starts no GPU while its CPU pool keeps up with the reader):
+# -e 917 -> 918, its no-GPU delta 243 -> 244.  DERIVED.
 # v0.18.40: +2 default cells on both builds (a piped decode hands its frames on as
 # views of recycled blocks; a named pipe decodes) and +1 default GPU cell (a pipe
 # starts two GPUs, and a cold --gpu-only input two; a host with fewer than three
@@ -998,8 +1006,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=160   # + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=240   # + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=162   # + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=244   # + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7137,6 +7145,39 @@ if has_gpu; then
 guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   fi
 
+  # A DECODE ENGAGES ONLY BEHIND A CPU POOL THAT FALLS BEHIND (v0.18.43).  With a
+  # pool that keeps up with the reader, a GPU's intake waits for a full batch that
+  # never forms: on two RTX 2080 Ti with 24 CPUs a cached 72 GiB archive started
+  # both cards and decoded ZERO frames on them, 2-3% slower than --cpu-only.  So
+  # the sample engages only after a window that kept the pool's worker count of
+  # frames waiting.  -e: the fixture must outlast the sample (~0.25 s at the tiny
+  # guard here).  GZSTD_DEBUG_GPU_BEHIND_FRAMES sets the test's threshold: one no
+  # queue reaches must skip with the reason, and the real one under -T 1, whose
+  # single worker the reader outruns, must engage.
+  if $EXTENSIVE; then
+    bh_t="a decode starts no GPU while its CPU pool keeps up with the reader"
+    bh_why=""
+    head -c 805306368 /dev/urandom 2>/dev/null | base64 -w0 2>/dev/null | head -c 1073741824 > "$TMPDIR/bh.b64"
+    "$GZSTD" -q --cpu-only -k -f "$TMPDIR/bh.b64" -o "$TMPDIR/bh.zst" 2>/dev/null || bh_why+=" fixture"
+    bh_run() {   # bh_run NAME ENV... -> $TMPDIR/bh.err
+      local name=$1; shift
+      env GZSTD_DEBUG_GPU_GUARD_SEC=0.05 "$@" timeout --foreground -k 10 120 "$GZSTD" -d --hybrid -T 1 -vv \
+        -k -f "$TMPDIR/bh.zst" -o "$TMPDIR/bh.out" 2>"$TMPDIR/bh.err" || bh_why+=" $name:rc=$?"
+      cmp -s "$TMPDIR/bh.out" "$TMPDIR/bh.b64" || bh_why+=" $name:bytes"
+    }
+    bh_err() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -aE 'bringup sample|skipping GPU|online' | tr '\n' ' '; }
+    bh_run keeps-up GZSTD_DEBUG_GPU_BEHIND_FRAMES=1000000000
+    { grep -qa 'bringup sample:.*the CPU pool keeps up with the reader.*-> skip' "$TMPDIR/bh.err" \
+        && grep -qa 'the CPU pool keeps up with the reader, so a GPU would wait for frames; skipping GPU bringup' \
+             "$TMPDIR/bh.err" \
+        && ! grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" keeps-up:[$(bh_err)]"
+    bh_run behind
+    { grep -qa 'bringup sample:.*the queue held >= [0-9]* frames through the window (the CPU pool: 1).*-> engage' \
+        "$TMPDIR/bh.err" && grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" behind:[$(bh_err)]"
+    rm -f "$TMPDIR/bh.b64" "$TMPDIR/bh.zst" "$TMPDIR/bh.out" "$TMPDIR/bh.err"
+    [[ -z "$bh_why" ]] && pass "$bh_t" || fail "$bh_t" "$bh_why"
+  fi
+
   # A PIPE IS HELD TO THE SAME GATE (v0.18.5).  It has no size, so the gate
   # above cannot decide up front, and the bringup engaged at once: ANY piped
   # input cost a GPU build ~2 s of cuInit it never used (1 MiB: 2.13 s against
@@ -7506,28 +7547,121 @@ if has_gpu 2>/dev/null; then
   # other cell to one card (see the top), and a caller's mask is left alone, so
   # only this cell exercises the rule: the mask cleared, on a host whose mask is
   # the suite's own (a caller's is never escaped).  The 32 MiB fixture must
-  # start one device and an explicit --gpu-devices=2 two.
+  # start one device and an explicit --gpu-devices=2 two.  Its cache is private
+  # and empty: since v0.18.43 a host's measured profile decides instead (below).
   gd_t="--gpu-only starts one device per 8 GiB of input, not every card"
   if [[ "${GPU_ALL_DEVICES:-}" == *,* && "${GPU_ALL_DEVICES:-}" == "${GPU_HOST_UUIDS:-}" ]] \
      && (( ${#mg_cards[@]} >= 2 )); then
     gd_why=""
-    env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 "$GZSTD" --gpu-only -v -k -f \
-      "$TMPDIR/large.bin" -o "$TMPDIR/gdev.zst" 2>"$TMPDIR/gdev.err" || gd_why+=" one:rc=$?"
+    env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/gdev-xdg" timeout --foreground -k 10 120 \
+      "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gdev.zst" 2>"$TMPDIR/gdev.err" \
+      || gd_why+=" one:rc=$?"
     "$GZSTD" -d -q -c "$TMPDIR/gdev.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || gd_why+=" one:bytes"
     gd_n=$(tr ',' '\n' <<< "$GPU_ALL_DEVICES" | wc -l)
     grep -qaE "\[GPU\] devices: 1 of $gd_n for " "$TMPDIR/gdev.err" \
       && grep -qa '1 device worker online' "$TMPDIR/gdev.err" \
       || gd_why+=" one:[$(grep -ah 'GPU\] devices\|online' "$TMPDIR/gdev.err" | tr '\n' ' ')]"
-    env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=2 -v -k -f \
-      "$TMPDIR/large.bin" -o "$TMPDIR/gdev.zst" 2>"$TMPDIR/gdev.err" || gd_why+=" two:rc=$?"
+    env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/gdev-xdg" timeout --foreground -k 10 120 \
+      "$GZSTD" --gpu-only --gpu-devices=2 -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gdev.zst" \
+      2>"$TMPDIR/gdev.err" || gd_why+=" two:rc=$?"
     grep -qa '2 device workers online' "$TMPDIR/gdev.err" && ! grep -qa '\[GPU\] devices:' "$TMPDIR/gdev.err" \
       || gd_why+=" two:[$(grep -ah 'GPU\] devices\|online' "$TMPDIR/gdev.err" | tr '\n' ' ')]"
-    rm -f "$TMPDIR/gdev.zst" "$TMPDIR/gdev.err"
+    rm -rf "$TMPDIR/gdev.zst" "$TMPDIR/gdev.err" "$TMPDIR/gdev-xdg"
     [[ -z "$gd_why" ]] && pass "$gd_t" || fail "$gd_t" "$gd_why"
   elif [[ "${GPU_ALL_DEVICES:-}" != *,* ]]; then
     skip_host "$gd_t" "single GPU host"
   else
     skip_host "$gd_t" "a caller's CUDA_VISIBLE_DEVICES, or fewer than 2 GPUs with ${mg_min_mib} MiB free"
+  fi
+
+  # ...UNLESS THIS MACHINE'S PROFILE MEASURES EVERY COUNT (v0.18.43).  One per
+  # 8 GiB was fitted on H100s; two RTX 2080 Ti beat one from 512 MiB, by 38% at
+  # 6 GiB.  With an overhead and a rate for every candidate count in a direction,
+  # --gpu-only takes the count that model predicts fastest -- here a planted
+  # model where two win outright, so the 32 MiB fixture the rule gives one card
+  # must start two, compress and decompress.  A model missing one count's rate
+  # keeps the rule (it cannot see the count it lacks), so does a model filed
+  # before the epoch the default trusts (GPUC_EPOCH: its startup may be one gzstd
+  # no longer has), so does --no-profile, and so does --adapt with nothing
+  # measured.
+  # The entry is seeded by a real --adapt save (the host's own fingerprint and
+  # driver), then the model is written into it.
+  gm_t="--gpu-only takes this machine's measured device-count model when it covers every count"
+  if [[ "${GPU_ALL_DEVICES:-}" == *,* && "${GPU_ALL_DEVICES:-}" == "${GPU_HOST_UUIDS:-}" ]] \
+     && (( ${#mg_cards[@]} >= 2 )) && command -v python3 >/dev/null 2>&1; then
+    gm_why=""; gm_x="$TMPDIR/gmodel-xdg"; rm -rf "$gm_x"
+    gm_n=$(tr ',' '\n' <<< "$GPU_ALL_DEVICES" | wc -l)
+    env XDG_CACHE_HOME="$gm_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt --cpu-only -q -k -f \
+      "$TMPDIR/large.bin" -o /dev/null 2>/dev/null || gm_why+=" seed:rc=$?"
+    gm_plant() {   # gm_plant MISSING EPOCH: two win; MISSING > 0 drops that count's compress rate
+      python3 -I - "$gm_x/gzstd/profile.json" "$gm_n" "$1" "$2" <<'PYEOF_GM' || gm_why+=" plant:fail"
+import json, sys
+path, devices, missing, epoch = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+j = json.load(open(path))
+cand = []
+n = 1
+while n < devices:
+    cand.append(n); n *= 2
+cand.append(devices)
+for e in j['entries'].values():
+    for d in ('compress', 'decompress'):
+        D = e.setdefault(d, {})
+        for c in cand:
+            D['gpu_devices_%d_overhead_s' % c] = 0.1
+            D['gpu_devices_%d_gibs' % c] = 1000.0 if c == 2 else 0.001
+            D['gpu_devices_%d_epoch' % c] = epoch
+        if missing and d == 'compress':
+            D['gpu_devices_%d_gibs' % missing] = 0
+json.dump(j, open(path, 'w'))
+PYEOF_GM
+    }
+    gm_err() { tr '\r' '\n' < "$TMPDIR/gm.err" | grep -ah 'GPU\] devices\|online' | tr '\n' ' '; }
+    gm_run() {   # gm_run NAME ARGS... -> $TMPDIR/gm.err
+      local name=$1; shift
+      env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$gm_x" timeout --foreground -k 10 120 "$GZSTD" \
+        --gpu-only -v "$@" 2>"$TMPDIR/gm.err" || gm_why+=" $name:rc=$?"
+    }
+    gm_plant 0 1
+    gm_run model -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gm.zst"
+    "$GZSTD" -d -q -c "$TMPDIR/gm.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || gm_why+=" model:bytes"
+    { grep -qaE "\[GPU\] devices: 2 of $gm_n for .*measured compress model" "$TMPDIR/gm.err" \
+        && grep -qa '2 device workers online' "$TMPDIR/gm.err"; } || gm_why+=" model:[$(gm_err)]"
+    gm_run model-d -d -c "$TMPDIR/gm.zst" > "$TMPDIR/gm.out"
+    cmp -s "$TMPDIR/gm.out" "$TMPDIR/large.bin" || gm_why+=" model-d:bytes"
+    grep -qaE "\[GPU\] devices: 2 of $gm_n for .*measured decompress model" "$TMPDIR/gm.err" \
+      || gm_why+=" model-d:[$(gm_err)]"
+    gm_run no-profile --no-profile -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gm.zst"
+    { grep -qaE "\[GPU\] devices: 1 of $gm_n for .*one per 8 GiB" "$TMPDIR/gm.err" \
+        && grep -qa '1 device worker online' "$TMPDIR/gm.err"; } || gm_why+=" no-profile:[$(gm_err)]"
+    gm_plant 1 1
+    gm_run partial -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gm.zst"
+    { grep -qaE "\[GPU\] devices: 1 of $gm_n for .*one per 8 GiB" "$TMPDIR/gm.err" \
+        && grep -qa '1 device worker online' "$TMPDIR/gm.err"; } || gm_why+=" partial:[$(gm_err)]"
+    gm_plant 0 0
+    gm_run stale -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gm.zst"
+    { grep -qaE "\[GPU\] devices: 1 of $gm_n for .*one per 8 GiB" "$TMPDIR/gm.err" \
+        && grep -qa '1 device worker online' "$TMPDIR/gm.err"; } || gm_why+=" stale:[$(gm_err)]"
+    # --adapt with nothing measured takes the same rule, both ways (v0.18.43; it
+    # started every card): its count is unsettled, so the rule must RUN.
+    gm_ax="$TMPDIR/gmodel-adapt-xdg"; rm -rf "$gm_ax"
+    env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$gm_ax" timeout --foreground -k 10 120 "$GZSTD" \
+      --adapt --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/gm.zst" 2>"$TMPDIR/gm.err" \
+      || gm_why+=" adapt:rc=$?"
+    { grep -qaE "\[GPU\] devices: 1 of $gm_n for .*one per 8 GiB" "$TMPDIR/gm.err" \
+        && grep -qa '1 device worker online' "$TMPDIR/gm.err"; } || gm_why+=" adapt:[$(gm_err)]"
+    env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$gm_ax" timeout --foreground -k 10 120 "$GZSTD" \
+      --adapt --gpu-only -v -d -c "$TMPDIR/gm.zst" 2>"$TMPDIR/gm.err" > "$TMPDIR/gm.out" \
+      || gm_why+=" adapt-d:rc=$?"
+    cmp -s "$TMPDIR/gm.out" "$TMPDIR/large.bin" || gm_why+=" adapt-d:bytes"
+    grep -qaE "\[GPU\] devices: 1 of $gm_n for .*one per 8 GiB" "$TMPDIR/gm.err" \
+      || gm_why+=" adapt-d:[$(gm_err)]"
+    rm -rf "$gm_ax"
+    rm -rf "$gm_x" "$TMPDIR/gm.zst" "$TMPDIR/gm.out" "$TMPDIR/gm.err"
+    [[ -z "$gm_why" ]] && pass "$gm_t" || fail "$gm_t" "$gm_why"
+  elif [[ "${GPU_ALL_DEVICES:-}" != *,* ]]; then
+    skip_host "$gm_t" "single GPU host"
+  else
+    skip_host "$gm_t" "a caller's CUDA_VISIBLE_DEVICES, fewer than 2 GPUs with ${mg_min_mib} MiB free, or no python3"
   fi
 
   # A PIPE STARTS TWO GPUs, AND A COLD --gpu-only INPUT TWO (v0.18.40).  A pipe is
@@ -9393,12 +9527,13 @@ if has_nvcomp && command -v python3 >/dev/null 2>&1; then
   GCP="$GC/xdg/gzstd/profile.json"
   truncate -s 200G "$GC/in200"; truncate -s 20G "$GC/in20"; truncate -s 1G "$GC/in1"
   gpuc_set() {   # gpuc_set RUNS N:overhead_s:gibs:run ...  (gibs 0 = overhead only)
+    # GPUC_DIR=decompress plants the -d / -t model instead (v0.18.43).
     python3 - "$GCP" "$@" <<'PYEOF2'
-import json, sys
+import json, os, sys
 p, runs, specs = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
 j = json.load(open(p))
 for e in j['entries'].values():
-    c = e.setdefault('compress', {})
+    c = e.setdefault(os.environ.get('GPUC_DIR', 'compress'), {})
     for k in [k for k in c if k.startswith('gpu_devices_')]: del c[k]
     c['runs'] = runs
     for sp in specs:
@@ -9500,8 +9635,10 @@ PYEOF2
   t0=$(now_ms); why=""
   got=$(gpuc_probe 8 0,1,2,3,4,5,6,7 "$GC/in200" "$GC/in20")
   [[ $got == "all of ?: several input files" ]] || why+=" [multi-file: $got]"
+  # Since v0.18.43 a count --adapt cannot settle takes the default's rule
+  # ("rule"), except under a caller's mask, which keeps every card ("all").
   got=$(gpuc_probe 65 @unset "$GC/in200")
-  [[ $got == "all of 65: more than 64 devices" ]] || why+=" [over limit: $got]"
+  [[ $got == "rule of 65: more than 64 devices" ]] || why+=" [over limit: $got]"
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "device count: unchanged branches exit before cuInit" \
     || fail "device count: unchanged branches exit before cuInit" "$why"
@@ -9551,6 +9688,44 @@ PYEOF2
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "device count: a GPU driver change clears the model" \
     || fail "device count: a GPU driver change clears the model" "$why"
+
+  # -d AND -t CHOOSE FROM THEIR OWN MODEL, AND WHAT --adapt CANNOT SETTLE TAKES
+  # THE DEFAULT'S RULE (v0.18.43).  Until then --adapt chose a count for compress
+  # only, a --gpu-only decode started every card, and so did a compress with
+  # nothing measured and a small input, or several inputs.  The decompress model
+  # explores and chooses as compress does, from the archive's size, and never
+  # borrows the compress model.  Unsettled counts report "rule" (the hook exits
+  # before that rule runs); they need the mask cleared, since a caller's mask
+  # keeps every card.
+  truncate -s 200G "$GC/in200.zst"; truncate -s 20G "$GC/in20.zst"; truncate -s 1G "$GC/in1.zst"
+  gpuc_dprobe() { gpuc_probe 8 0,1,2,3,4,5,6,7 "$@" -o /dev/null; }
+  gpuc_dwant() {  # gpuc_dwant LABEL WANT-PREFIX ARGS... -> appends to $why on a miss
+    local label=$1 want=$2; shift 2
+    local got; got=$(gpuc_dprobe "$@")
+    [[ $got == "$want"* ]] || why+=" [$label: got '$got']"
+  }
+  gpuc_rwant() {  # gpuc_rwant LABEL WANT-PREFIX ARGS... : the mask cleared
+    local label=$1 want=$2; shift 2
+    local got; got=$(gpuc_probe 8 @unset "$@")
+    [[ $got == "$want"* ]] || why+=" [$label: got '$got']"
+  }
+  t0=$(now_ms); why=""
+  gpuc_set 1                                                # compress: nothing measured
+  gpuc_rwant c-small     "rule of 8: no compress count measured yet"  "$GC/in1" -o /dev/null
+  gpuc_rwant c-files     "rule of ?: several input files"  "$GC/in1" "$GC/in20"
+  gpuc_set 5 8:9:30:2 4:6:29:3 2:3.6:23:4 1:2.7:14.6:5      # compress: 2 best at 200 GiB
+  GPUC_DIR=decompress gpuc_set 1
+  gpuc_dwant d-empty     "8 of 8: exploring 8"  -d "$GC/in200.zst"
+  gpuc_rwant d-small     "rule of 8: no decompress count measured yet"  -d "$GC/in1.zst" -o /dev/null
+  # Predicted, 8 / 4 / 2 / 1 devices: 200 GiB 8.3 / 6.5 / 10.1 / 20.8 s; 20 GiB
+  # 5.3 / 2.0 / 1.9 / 2.8; 1 GiB 5.0 / 1.5 / 1.0 / 0.9.
+  GPUC_DIR=decompress gpuc_set 5 8:5:60:2 4:1.5:40:3 2:1:22:4 1:0.8:10:5
+  gpuc_dwant d-200GiB    "4 of 8: predicted"    -d "$GC/in200.zst"
+  gpuc_dwant t-20GiB     "2 of 8: predicted"    -t "$GC/in20.zst"
+  gpuc_dwant d-1GiB      "1 of 8: predicted"    -d "$GC/in1.zst"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: -d and -t choose from their own model; what --adapt cannot settle takes the rule" \
+    || fail "device count: -d and -t choose from their own model; what --adapt cannot settle takes the rule" "$why"
   rm -rf "$GC"
 else
   for c in "device count: explores all devices first, then halving" \
@@ -9561,7 +9736,8 @@ else
            "device count: UUID prefixes are validated and applied" \
            "device count: unchanged branches exit before cuInit" \
            "device count: stdin rate near-tie uses fewer devices" \
-           "device count: a GPU driver change clears the model"; do
+           "device count: a GPU driver change clears the model" \
+           "device count: -d and -t choose from their own model; what --adapt cannot settle takes the rule"; do
     skip "$c" "needs an nvCOMP build and python3"
   done
 fi
@@ -9610,7 +9786,8 @@ fi
 # only (a synthetic rate does not transfer to the user's data).  -e: every
 # child pays its own cuInit.  The suite masks every run to one card, so these
 # cells opt back in with the two freest cards (as the multi-GPU dispatch cell
-# does): candidates 1 and 2, two children per calibrate.
+# does): candidates 1 and 2, two children per direction (four per calibrate since
+# v0.18.43, when the decompress pass joined the compress one).
 if $EXTENSIVE; then
   gcal_cards=()
   if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
@@ -9623,12 +9800,12 @@ if $EXTENSIVE; then
   if has_gpu && (( ${#gcal_cards[@]} >= 2 )) && command -v python3 >/dev/null 2>&1; then
     GCC="$TMPDIR/gpucal"; mkdir -p "$GCC"
     gcal_devs="${gcal_cards[0]},${gcal_cards[1]}"
-    gpuc_keys() {  # gpuc_keys PROFILE -> "counts-with-overhead counts-with-rate"
-      python3 - "$1" <<'PYEOF2'
+    gpuc_keys() {  # gpuc_keys PROFILE [DIRECTION] -> "counts-with-overhead counts-with-rate"
+      python3 - "$1" "${2:-compress}" <<'PYEOF2'
 import json, sys, re
 j = json.load(open(sys.argv[1])); o = set(); r = set()
 for e in j['entries'].values():
-    for k in e.get('compress', {}):
+    for k in e.get(sys.argv[2], {}):
         m = re.match(r'gpu_devices_(\d+)_(overhead_s|gibs)$', k)
         if m: (o if m.group(2) == 'overhead_s' else r).add(int(m.group(1)))
 print(len(o), len(r))
@@ -9638,32 +9815,56 @@ PYEOF2
     env XDG_CACHE_HOME="$GCC/xf" CUDA_VISIBLE_DEVICES="$gcal_devs" $ACB GZSTD_DEBUG_CALIBRATE_GPUC=1 \
       timeout --foreground -k 10 300 "$GZSTD" --calibrate "$TMPDIR/large.bin" 2>"$GCC/f.err" || rc=$?
     LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    # Since v0.18.43 the decompress pass runs too: without an ARCHIVE, on the
+    # corpus's own archive, for the overhead alone.
     got=$(gpuc_keys "$GCC/xf/gzstd/profile.json" 2>/dev/null)
-    if [[ $rc -eq 0 && "$got" == "2 2" ]] && grep -q 'gpu devices: best' "$GCC/f.err"; then
+    dgot=$(gpuc_keys "$GCC/xf/gzstd/profile.json" decompress 2>/dev/null)
+    if [[ $rc -eq 0 && "$got" == "2 2" && "$dgot" == "2 0" ]] && grep -q 'gpu devices: best' "$GCC/f.err"; then
       pass "--calibrate FILE records every device count (overhead and rate)"
     else
       fail "--calibrate FILE records every device count (overhead and rate)" \
-           "rc=$rc, recorded [$got], want [2 2]: $(grep 'gpu devices' "$GCC/f.err" | head -3 | tr '\n' ' ')"
+           "rc=$rc, recorded [$got] / decompress [$dgot], want [2 2] / [2 0]: $(grep 'gpu devices' "$GCC/f.err" | head -3 | tr '\n' ' ')"
+    fi
+    # AN ARCHIVE BESIDE FILE, IN EITHER ORDER, MEASURES THE DECOMPRESS COUNTS
+    # (v0.18.43): told apart by content, the archive first here, each feeding
+    # only its own pass, and both directions file overhead and rate.
+    "$GZSTD" -q -k -c "$TMPDIR/large.bin" > "$GCC/a.zst" 2>/dev/null
+    t0=$(now_ms); rc=0
+    env XDG_CACHE_HOME="$GCC/xa" CUDA_VISIBLE_DEVICES="$gcal_devs" $ACB GZSTD_DEBUG_CALIBRATE_GPUC=1 \
+      timeout --foreground -k 10 300 "$GZSTD" --calibrate "$GCC/a.zst" "$TMPDIR/large.bin" 2>"$GCC/a.err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    got=$(gpuc_keys "$GCC/xa/gzstd/profile.json" 2>/dev/null)
+    dgot=$(gpuc_keys "$GCC/xa/gzstd/profile.json" decompress 2>/dev/null)
+    if [[ $rc -eq 0 && "$got" == "2 2" && "$dgot" == "2 2" ]] \
+       && grep -q 'gpu devices, decompress: best' "$GCC/a.err" \
+       && grep -q 'decompress of .*a.zst' "$GCC/a.err"; then
+      pass "--calibrate ARCHIVE FILE records every decompress and compress count"
+    else
+      fail "--calibrate ARCHIVE FILE records every decompress and compress count" \
+           "rc=$rc, recorded [$got] / decompress [$dgot], want [2 2] / [2 2]: $(grep 'gpu devices' "$GCC/a.err" | head -4 | tr '\n' ' ')"
     fi
     t0=$(now_ms); rc=0
     env XDG_CACHE_HOME="$GCC/xs" CUDA_VISIBLE_DEVICES="$gcal_devs" $ACB GZSTD_DEBUG_CALIBRATE_GPUC=1 \
       timeout --foreground -k 10 300 "$GZSTD" --calibrate 2>"$GCC/s.err" || rc=$?
     LAST_TEST_MS=$(( $(now_ms) - t0 ))
     got=$(gpuc_keys "$GCC/xs/gzstd/profile.json" 2>/dev/null)
-    if [[ $rc -eq 0 && "$got" == "2 0" ]]; then
+    dgot=$(gpuc_keys "$GCC/xs/gzstd/profile.json" decompress 2>/dev/null)
+    if [[ $rc -eq 0 && "$got" == "2 0" && "$dgot" == "2 0" ]]; then
       pass "--calibrate without FILE records device-count overhead only"
     else
       fail "--calibrate without FILE records device-count overhead only" \
-           "rc=$rc, recorded [$got], want [2 0]: $(grep 'gpu devices' "$GCC/s.err" | head -3 | tr '\n' ' ')"
+           "rc=$rc, recorded [$got] / decompress [$dgot], want [2 0] / [2 0]: $(grep 'gpu devices' "$GCC/s.err" | head -3 | tr '\n' ' ')"
     fi
     rm -rf "$GCC"
   elif has_gpu 2>/dev/null && command -v python3 >/dev/null 2>&1; then
     # The host has fewer than two such cards (skip_host); no GPU at all is in
     # EXPECTED_NOGPU_DELTA, and a missing python3 stays a plain skip.
     skip_host "--calibrate FILE records every device count (overhead and rate)" "needs two GPUs with 4 GiB free"
+    skip_host "--calibrate ARCHIVE FILE records every decompress and compress count" "needs two GPUs with 4 GiB free"
     skip_host "--calibrate without FILE records device-count overhead only" "needs two GPUs with 4 GiB free"
   else
     skip "--calibrate FILE records every device count (overhead and rate)" "needs two GPUs with 4 GiB free"
+    skip "--calibrate ARCHIVE FILE records every decompress and compress count" "needs two GPUs with 4 GiB free"
     skip "--calibrate without FILE records device-count overhead only" "needs two GPUs with 4 GiB free"
   fi
 fi  # $EXTENSIVE (--calibrate device-count pass)

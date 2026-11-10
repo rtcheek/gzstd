@@ -11,12 +11,16 @@ gzstd --calibrate                      # once per machine: a minute or two
 gzstd --adapt BIGFILE -o BIGFILE.zst   # from then on: every run, learning as it goes
 ```
 
-If the machine has **two or more GPUs** and you compress with `--gpu-only`, also calibrate once on a
-file like the ones you actually compress:
+If the machine has **two or more GPUs** and you use `--gpu-only`, also calibrate once on a file like
+the ones you actually compress, and an archive like the ones you decompress (either one alone works
+for its own direction):
 
 ```bash
-gzstd --calibrate /path/to/a/typical/large/file
+gzstd --calibrate /path/to/a/typical/large/file /path/to/a/typical/archive.zst
 ```
+
+From then on `--gpu-only` starts the number of GPUs those measurements predict is fastest, with or
+without `--adapt`. See [How many GPUs](#how-many-gpus-to-use-for---gpu-only).
 
 Everything is stored in one file per user, `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`. Delete
 it to start over. `--no-profile` makes a run neither read nor write it, which is what you want for
@@ -51,11 +55,12 @@ the profile, so that the first `--adapt` run already has them.
 | `gzstd --calibrate` | CPU and GPU compress and decompress rates, on generated data in memory. On a host with 2 or more GPUs, also what it costs to start each number of GPUs. |
 | `gzstd --calibrate -o /mnt/data/NEWFILE` | also the write rate of that filesystem: it writes a scratch file there, syncs it, then deletes it. The path must not already exist. |
 | `gzstd --calibrate FILE` | also the GPU compression rate at each number of GPUs, on your own data. See the next section. |
+| `gzstd --calibrate ARCHIVE` | also the GPU decompression rate at each number of GPUs, on your own `.zst`. gzstd recognizes an archive by its first bytes, not its name; give FILE and ARCHIVE together to measure both. |
 | add `--no-profile` | prints the measurements without saving them. |
 
 Calibrate again after a hardware change, a driver update, or a move to a different kind of storage.
 
-## How many GPUs to use for `--gpu-only` compress
+## How many GPUs to use for `--gpu-only`
 
 Using more GPUs isn't free. Before gzstd can use any GPU, the CUDA driver starts every GPU the process
 can see, one after another, and on some hosts that takes most of a second each. Past a few GPUs, the
@@ -80,6 +85,28 @@ Measured on a host with 256 CPU cores and 8 H100 GPUs, compressing 195 GiB from 
 path, and the default mode already uses it. `--gpu-only` is for hosts where CPU cores are scarce or
 needed for something else.)
 
+### Without `--adapt`
+
+A `--gpu-only` run on regular files starts one GPU per 8 GiB of input (for `-d` and `-t`, of the
+archive), and two at most when most of the input isn't in the page cache, because the drive then
+sets the speed. That rule was fitted on H100s. A slower card wants more GPUs sooner: on a
+workstation with two RTX 2080 Ti cards, each about five times slower than an H100 and quicker to
+start, two cards beat one from 512 MiB up. The rule's one card lost by 38% on a 6 GiB compress
+(7.5–8.2 s against 4.9–5.0) and by 25% on a 4.5 GiB archive (3.3–3.8 s against 2.5–2.7).
+
+Neither a card's speed nor its startup cost can be read before CUDA starts, so gzstd uses what it
+has measured on this machine. Once the profile has an overhead and a rate for **every** candidate
+number of GPUs in a direction, `--gpu-only` uses the number with the lowest predicted time instead
+of the rule, exactly as `--adapt` does, but it never runs a slower count to measure it. A profile
+missing a count keeps the rule, because it can't see the counts it lacks. `--calibrate FILE` fills
+every compress count and `--calibrate ARCHIVE` every decompress count in one run. The cold-input
+limit of two still applies, and `--no-profile` or `--gpu-devices N` sets the rule or the count
+directly. `-v` shows which one decided:
+
+```
+[GPU] devices: 2 of 2 for 6.00 GiB of input (this machine's measured compress model: predicted 4.6 s for 6.0 GiB (overhead 0.60 s, 1.49 GiB/s); --gpu-devices sets the count)
+```
+
 ### How `--adapt` chooses
 
 For each number of GPUs, the profile stores two measurements:
@@ -89,8 +116,11 @@ For each number of GPUs, the profile stores two measurements:
 
 The predicted time for an input is `overhead + size / rate`, and `--adapt` uses the number of GPUs with
 the lowest prediction. The candidates are 1, 2, 4, and so on (doubling), below the number of GPUs you
-have, plus all of them. This choice applies to a single-file `--gpu-only` compress. A command with
-several input files uses all visible GPUs because its one CUDA startup is shared across files.
+have, plus all of them. This choice applies to a single-file `--gpu-only` compress, and since
+v0.18.43 to a single-file `--gpu-only -d` or `-t`, which keeps its own measurements and sizes the
+input by the archive. When `--adapt` can't decide (several input files, nothing measured yet and an
+input under 8 GiB, or more than 64 GPUs), it uses the same count as without `--adapt`; until
+v0.18.43 it used all visible GPUs there.
 The current profile model supports up to 64 visible GPUs; larger fleets also use all visible GPUs.
 If `CUDA_VISIBLE_DEVICES` contains entries gzstd cannot verify before CUDA starts (such as MIG
 identifiers or a mix of numeric indices and UUIDs), it keeps that list unchanged rather than
@@ -99,8 +129,9 @@ narrowing it by a guessed count.
 - **Exploring.** On an input of 8 GiB or more, a number of GPUs that has never been measured is
   tried first: all of them, then half, then a quarter, down to 1. Each exploring run is a normal run
   and gives correct output; it may just be slower than the best choice. A count becomes eligible for
-  re-measurement after 20 compress runs; one stale count is selected per large run.
-- **Smaller inputs never explore.** They use the best number measured so far.
+  re-measurement after 20 runs in that direction; one stale count is selected per large run.
+- **Smaller inputs never explore.** They use the best number measured so far, or with none
+  measured, the count `--gpu-only` uses without `--adapt`.
 - **Close results go to fewer GPUs.** If two choices are predicted within 3% of each other, `--adapt`
   uses the smaller number, which leaves the other GPUs for other work.
 - **Input from stdin**, whose size gzstd can't know, uses the highest measured rate; within 3%, it
