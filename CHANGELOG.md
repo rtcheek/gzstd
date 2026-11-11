@@ -1,12 +1,109 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.44  
+**Covers:** v0.9.50 → v0.18.45  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.45 — a GPU decode on two or more cards starts at the nearest power of two to its frame-count law, not the one below it (two RTX 2080 Ti: 4 GiB of base64 2.12-2.20 -> 1.80-2.06 s, 5.5 GiB of text 7.66-7.71 -> 5.21-5.40, 1.4 GiB of text 4.67 -> 2.62-2.66); and v0.18.44's checks on the 2080 Ti box
+
+v0.18.44's two fitted constants were one RTX 5090's.  These are its checks on the workstation with two
+RTX 2080 Ti (11 GiB, PCIe Gen3, 24 CPUs), every GPU arm after a `--cpu-only` arm, arm order shuffled,
+inputs cached (residency 100%).  One rule was wrong in a way that showed only on two cards, and is fixed
+here; the other two changes pass as they are.
+
+### GPU decode start: the law held, the rounding did not
+
+v0.18.44 starts a decode at the largest power of two <= 2 x sqrt(frames per device).  `--gpu-only -d`,
+wall seconds, auto against the best pinned batch:
+
+| archive (frames) | 1 card: auto / best | 2 cards: auto / best | auto, v0.18.42 (1 / 2 cards) |
+|---|---|---|---|
+| base64 1 GiB (64) | 0.86-1.02 / 0.87 (32) | 1.03-1.06 / 0.89 (32) | 1.45 / 1.04 |
+| base64 4 GiB (256) | 2.25-2.37 / 2.17 (64) | **2.10-2.33 / 1.54 (32)** | 4.54 / 2.62 |
+| base64 16 GiB (1024) | 6.72-6.96 / 6.60 (32) | 4.47-4.48 / 4.01 (64) | 6.99 / 4.44 |
+| text-like 1.4 GiB (104) | 4.04 / 1.73 (64) | 4.68 / 1.51 (64) | 6.25 / 4.52 |
+| text-like 5.5 GiB (416) | 7.16-9.14 / 4.02 (64) | 7.66-7.90 / 2.91 (256) | 21.1 / 13.2 |
+| text-like 22 GiB (1664) | 13.10 / 11.96 (256) | 11.40-11.64 / 7.67 (256) | 51.7 / 25.7 |
+
+One card is within 4% on base64, and v0.18.44 is never slower than v0.18.42 (ties at worst).  Two cards
+miss: the 4 GiB row starts at 16 and runs 1.36x the best.  A least-squares fit of time(b) = T0 + s x b +
+(N/b) x p + N x q to the base64 sweeps (residual at most 0.44 s) puts the minimum at 2.2 x sqrt(N) on one
+card and 2.6 x sqrt(N per card) on two.  So the per-device law and its factor hold on this card too --
+no per-card term is needed -- and what is wrong is rounding DOWN.  time(b) is symmetric in log b about
+its minimum, so the largest power of two under the law is biased low by up to sqrt(2), and on two cards
+2 x sqrt(128) = 22.6 is the exact geometric midpoint of 16 and 32.  The frame counts measured before all
+had a law that is itself a power of two on one card, which is why it never showed.
+
+The start is now the largest power of two <= 3 x sqrt(frames per device): the nearest to 2.12 x sqrt.
+Not 2 x sqrt(2), which puts 128 frames a card exactly on 32.  Pinned, two cards, three runs each, against
+the unrounded law (which a batch need not be a power of two to run):
+
+| frames per card | 2 x sqrt, rounded down | 2 x sqrt, unrounded | v0.18.45 | best |
+|---|---|---|---|---|
+| 32 | 8: 1.01-1.26 | 11: 0.97-0.99 | 16: 0.93-0.94 | 32: 0.89-0.91 |
+| 128 | 16: 1.74-1.77 | 23: 1.63-1.71 | 32: 1.58-1.62 | 45: 1.51-1.60 |
+| 512 | 32: 4.04-4.08 | 45: 3.91-4.06 | 64: 3.98-4.11 | tie |
+
+Auto, end to end, three runs each:
+
+| two cards | v0.18.44 | v0.18.45 |
+|---|---|---|
+| base64 1 GiB | 1.02-1.05 (start 8) | 0.96-1.02 (16) |
+| base64 4 GiB | 2.12-2.20 (16) | 1.80-2.06 (32) |
+| base64 16 GiB | 4.51-4.55 (32) | 4.25-4.41 (64) |
+| text-like 1.4 GiB | 4.67 (8) | 2.62-2.66 (16) |
+| text-like 5.5 GiB | 7.66-7.71 (16) | 5.21-5.40 (32) |
+| text-like 22 GiB | 11.38-11.58 (32) | 9.47-9.56 (64) |
+
+One card at these frame counts starts where it did, as do the 5090's rows and the H100s' two- and
+six-card rows; four H100s go from 32 to 64, where v0.18.41 measured a tie (4.80-5.72 against 5.15-5.61 s).
+A 72 GiB archive on two cards starts at 128 under both rules (the byte rule's 2 GiB target decides),
+18.47-18.60 s.  Short runs on one card vary by ~0.3 s between identical binaries here, so the one-card
+rows are within noise of each other.
+
+**Still open (ROADMAP 41):** a two-card 4 GiB decode that now starts AND settles at 32 runs 1.80-2.06
+against 1.58-1.62 pinned there.  The difference is the tuner's halving window, which on an input this
+short is most of the run.  A cost gate on halving (the one doubling has) was tried and rejected: it won
+0.1-0.9 s on several rows and lost 37% on the 22 GiB text row on one card (13.1 -> 18.0 s), because the
+halving window is what supplies the steep-curve evidence that admits that row's climb to 88.  No ratio of
+window cost to input left separates the two (0.12 lost, 0.13 won).  The same tuner cost shows on a 24 GiB
+archive on two cards: auto 6.85-7.07 s, starting and settling at 64, against 6.51-6.54 pinned (v0.18.42
+measured 6.61-6.87 against 6.33-6.36).
+
+### Hybrid decode bringup: PASS
+
+The cached 72 GiB archive, `taskset -c 0-(N-1)`, three runs each; the `-vv` sample's growth over what the
+pool took (G/T) against the bar min(0.5, 3 / pool):
+
+| CPUs (pool) | `--cpu-only` | default | decision | G/T (bar) | before v0.18.44 |
+|---|---|---|---|---|---|
+| 24 (22) | 8.07-8.14 | 8.07-8.13 | skip, keeps up | 0 waiting | skip |
+| 12 (10) | 8.46-8.47 | 8.61-8.65 | skip, nearly keeps up | 0.20-0.26 (0.30) | engaged, 7% slower |
+| 8 (6) | 13.49-13.53 | 10.93-11.30 | engage | 0.94-1.19 (0.5) | engaged, 11-15% faster |
+| 6 (4) | 20.09-20.15 | 13.21-13.61 | engage | 2.0-2.4 (0.5) | |
+| 4 (3) | 26.94-27.00 | 17.78-17.88 | engage | 2.6-2.8 (0.5) | engaged, 35% faster |
+
+After a skip the queue ceiling comes down to 40 at 12 CPUs and 88 at 24, as specified.  A skip at 12 CPUs
+still costs 0.15-0.18 s (2%) against `--cpu-only`, where 24 costs nothing; not diagnosed (the background
+CUDA detection and the 2.2 s sample sharing 12 CPUs is a guess, unverified).
+
+### `--adapt` ranked rule: PASS
+
+A cached 32 GiB file compressed at 24 and 4 CPUs, and the 72 GiB archive decoded at 4, a fresh profile
+directory per series, three runs.  24 CPUs: every arm 4.19-4.23 s, no GPU in either.  4 CPUs compress:
+default 9.88-10.14, `--adapt` 9.80 and 9.90; decode: default 17.32-18.16, `--adapt` 17.92 and 17.60.  No
+run printed `ranked slow`, and the decode runs print the new "counts the input not read yet -> take".  The
+second run of each 4-CPU series ran CPU-only (13.86 and 27.12 s): that is the backend prior exploring the
+arm it has not measured ("exploring cpu-only"), as designed, not the ranked rule -- but on this box it
+costs that one run 40-53%.
+
+No suite run for this change.  Both configurations build without warnings; two-card decodes of the 4 GiB
+base64 and 1.4 GiB text archives at the new starts are byte-identical to their sources.
 
 
 ## v0.18.44 — `--adapt` no longer starves a GPU beside the staged CPU pool (a 32 GiB compress at 4 CPUs 9.5-11.6 -> 5.7-6.0 s), a short or compressible archive decodes on the GPU at a batch sized to its frame count (5.5 GiB of text 18.0 -> 5.9 s, 22 GiB 33 -> 9.5 s, 4 GiB of base64 1.9 -> 1.35 s), and a hybrid decode starts a GPU only when the reader outruns the CPU pool by more than the GPU costs it (10 CPUs: 8.6-9.6 -> 7.9 s) and reads like `--cpu-only` when it starts none

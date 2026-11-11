@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.44";
+static constexpr const char * GZSTD_VERSION = "0.18.45";
 //
 // Architecture overview:
 //
@@ -36753,13 +36753,34 @@ static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool 
 // 2 GiB target: a floor for short inputs, not a new answer for long ones.
 // `frames` is the archive's frame count (its seek table, else the frames read
 // so far scaled to the file); 0 = unknown, and the byte rule stands.
+//
+// ROUNDED TO THE NEAREST POWER OF TWO, NOT DOWN (v0.18.45).  v0.18.44 took the
+// largest power of two <= 2 x sqrt(frames per device).  Every row above has a
+// frame count whose 2 x sqrt is itself a power of two, so the rounding never
+// showed on one card; split over two it does.  time(b) above is symmetric in
+// log b about its minimum, so rounding down is biased low by up to sqrt(2), and
+// 2 x sqrt(128) = 22.6 is the exact geometric midpoint of 16 and 32.  MEASURED,
+// 2x RTX 2080 Ti (11 GiB, PCIe Gen3), --gpu-only -d, cached, wall seconds:
+//   archive (frames per card)        8      16     32     45     64     auto .44  auto .45
+//   base64 1 GiB, 2 cards (32)       1.01   0.93   0.89*                 1.02-1.05 0.96-1.02
+//   base64 4 GiB, 2 cards (128)             1.74   1.58   1.51*          2.12-2.20 1.80-2.06
+//   base64 16 GiB, 2 cards (512)                   4.04   3.91*  3.98    4.51-4.55 4.25-4.41
+//   text-like 5.5 GiB, 2 cards (208)        6.78   4.04          3.04    7.66-7.71 5.21-5.40
+// The cost model fitted to those cards' pinned sweeps puts the minimum at
+// 2.2 x sqrt(N) on one card and 2.6 x sqrt(N per card) on two: the law and its
+// factor hold there, and only the rounding was wrong.  So the largest power of
+// two <= 3 x sqrt(per_dev), which is the nearest to 2.12 x sqrt(per_dev) --
+// not 2 x sqrt(2) x sqrt, which puts 128 frames per card EXACTLY on 32, a
+// floating-point knife edge.  One card at the frame counts above starts where it
+// did; the H100 rows keep 64 on two cards and 32 on six, and four go 32 -> 64,
+// where v0.18.41 measured a tie.
 static size_t tune_decomp_start(size_t frame_bytes, uint64_t input_bytes, int devices,
                                 uint64_t frames) {
   const size_t base = tune_default_start(frame_bytes, input_bytes, /*decompress=*/true, devices);
   if (!frames) return base;
   const uint64_t per_dev = std::max<uint64_t>(1, frames / (uint64_t)std::max(1, devices));
-  size_t p = 1;                       // the largest power of two <= 2 x sqrt(per_dev)
-  while (p < HARD_BATCH_CAP && uint64_t(2 * p) * uint64_t(2 * p) <= 4 * per_dev) p <<= 1;
+  size_t p = 1;                       // the largest power of two <= 3 x sqrt(per_dev)
+  while (p < HARD_BATCH_CAP && uint64_t(2 * p) * uint64_t(2 * p) <= 9 * per_dev) p <<= 1;
   const size_t cap = std::max<size_t>(1, size_t(TUNE_DECOMPRESS_START_BYTES
                                                 / std::max<size_t>(1, frame_bytes)));
   return std::min<size_t>(std::max(base, std::min(p, cap)), AUTO_TUNE_BATCH_CEILING);

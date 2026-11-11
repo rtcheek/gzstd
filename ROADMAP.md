@@ -911,10 +911,24 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     when the backlog has grown by three workers' share of what the pool took since its first window
     (3 / pool, at most half), and a declined GPU now lowers the queue ceiling to the CPU pool's.  There,
     10 CPUs went 8.6-9.6 -> 7.9 s and 8 CPUs 9.0-10.9 -> 9.3 (`--cpu-only` 7.85 and 9.05-9.62); 6 and 4
-    CPUs still engage and win.  STILL OWED: this table on the 2080 Ti box (12 CPUs must now skip, 8 must
-    still engage -- its `-vv` sample line prints the growth, what the pool took and the bar) and on the
-    server; the bar at 4 CPUs is thin (0.56-0.68 against 0.5); and a reader held by its own block memory
-    stops the backlog growing, which the test reads as keeping up.
+    CPUs still engage and win.  **The 2080 Ti box (v0.18.45 checks): PASS** -- 12 CPUs now skip (G/T
+    0.20-0.26 against 0.30) at 8.61-8.65 s against `--cpu-only` 8.46-8.47, where it had engaged and lost
+    7%; 8 CPUs engage (0.94-1.19) and win 17-19%; 6 and 4 win 32-34%.  STILL OWED: the server's table;
+    the bar at 4 CPUs is thin on the 5090 box (0.56-0.68 against 0.5); the 2% a skip still costs at 12
+    CPUs there (24 costs nothing); and a reader held by its own block memory stops the backlog growing,
+    which the test reads as keeping up.
+
+41. **The GPU decode tuner's halving window costs a short run more than it learns.**  v0.18.45 starts a
+    two-card decode at the right batch, but a 4 GiB archive on two RTX 2080 Ti that starts AND settles at
+    32 runs 1.80-2.06 s against 1.58-1.62 pinned there, and a 24 GiB one settled at 64 runs 6.85-7.07
+    against 6.51-6.54.  The walk always halves first, and its window (four batches plus a warm-up at the
+    new size) is most of a short input.  Gating the halving the way an unproven doubling is gated (a
+    tenth of what is left) was tried and rejected: it removes the steep-curve evidence that lets
+    compressible data climb (22 GiB of text on one card 13.1 -> 18.0 s), and no window-cost ratio
+    separates the cases.  Wants a design that keeps the evidence without paying a full window for it --
+    e.g. a shorter probe, or reading the slope from the warm-up batches the start already runs.  A
+    "probe: 64 -> 48" after settling was also seen on that text row.  Measure on the server first: its
+    cuInit and card count change what a short run is.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
