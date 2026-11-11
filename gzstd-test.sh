@@ -633,8 +633,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=572
-$EXTENSIVE && EXPECTED_TESTS=918
+EXPECTED_TESTS=573
+$EXTENSIVE && EXPECTED_TESTS=919
+# v0.18.44: +1 default GPU cell (--adapt: a GPU ranked under the staged CPU pool takes
+# frames while input is unread), in the staged block's no-GPU skip list, so the no-GPU
+# deltas +1 (162 -> 163, 244 -> 245): 572 -> 573, -e 918 -> 919.  DERIVED.
 # v0.18.43: +1 default GPU cell (--gpu-only takes this machine's measured device-count
 # model when it covers every count; a single-GPU host or a caller's mask skips it as
 # host-unexercisable), +1 default nvCOMP cell (--adapt device count: -d and -t explore
@@ -1006,8 +1009,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=162   # + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=244   # + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=163   # + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=245   # + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7154,6 +7157,14 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   # guard here).  GZSTD_DEBUG_GPU_BEHIND_FRAMES sets the test's threshold: one no
   # queue reaches must skip with the reason, and the real one under -T 1, whose
   # single worker the reader outruns, must engage.
+  # BEHIND BY ENOUGH (v0.18.44): a pool that is behind engages a GPU only when the
+  # backlog grows by more than the GPU costs it (three workers' share of what the
+  # pool takes, at most half).  MEASURED 1x RTX 5090, 10 CPUs: 8.6-9.6 s engaged,
+  # 7.9 s skipped, --cpu-only 7.85.  GZSTD_DEBUG_GPU_BEHIND_SHARE sets the share:
+  # one nothing reaches must skip as "nearly keeps up".  And a decode whose GPU
+  # is declined reads like --cpu-only: its queue ceiling comes down to the CPU
+  # pool's (32 frames under -T 1), or the reader runs unchecked beside the
+  # decoders (8 CPUs: 9.96-10.26 s against 9.05-9.62).
   if $EXTENSIVE; then
     bh_t="a decode starts no GPU while its CPU pool keeps up with the reader"
     bh_why=""
@@ -7171,9 +7182,18 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
         && grep -qa 'the CPU pool keeps up with the reader, so a GPU would wait for frames; skipping GPU bringup' \
              "$TMPDIR/bh.err" \
         && ! grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" keeps-up:[$(bh_err)]"
+    bh_ceil() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -ao 'producer depth ceiling: [0-9]* frames' | tail -1 | grep -o '[0-9]*'; }
+    [[ "$(bh_ceil)" == 32 ]] || bh_why+=" keeps-up:ceiling-$(bh_ceil)"
+    bh_run nearly GZSTD_DEBUG_GPU_BEHIND_SHARE=1000000000
+    { grep -qa 'bringup sample:.*the CPU pool nearly keeps up with the reader (the queue grew -\{0,1\}[0-9]* frames while its 1 workers took [0-9]*;.*-> skip' "$TMPDIR/bh.err" \
+        && grep -qa 'the CPU pool nearly keeps up with the reader, so a GPU would take less than its own threads cost; skipping GPU bringup' \
+             "$TMPDIR/bh.err" \
+        && ! grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" nearly:[$(bh_err)]"
+    [[ "$(bh_ceil)" == 32 ]] || bh_why+=" nearly:ceiling-$(bh_ceil)"
     bh_run behind
     { grep -qa 'bringup sample:.*the queue held >= [0-9]* frames through the window (the CPU pool: 1).*-> engage' \
         "$TMPDIR/bh.err" && grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" behind:[$(bh_err)]"
+    [[ "$(bh_ceil)" -gt 32 ]] || bh_why+=" behind:ceiling-$(bh_ceil)"
     rm -f "$TMPDIR/bh.b64" "$TMPDIR/bh.zst" "$TMPDIR/bh.out" "$TMPDIR/bh.err"
     [[ -z "$bh_why" ]] && pass "$bh_t" || fail "$bh_t" "$bh_why"
   fi
@@ -14447,6 +14467,7 @@ if has_gpu 2>/dev/null && command -v python3 >/dev/null 2>&1 && command -v tasks
              "the default's staging finishes on the CPU when the GPU cannot carry it" \
              "--adapt's budget prior: the default runs, then each backend is tried" \
              "--adapt files a staged run under its CPU budget" \
+             "--adapt: a GPU ranked under the staged CPU pool takes frames while input is unread" \
              "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
              "several inputs and --tar stage by default; --tar rebuilds on the CPU"; do
       if grep -qE 'older than Gen4|O_DIRECT|no NVIDIA GPU|no usable GPU|older than this build|hides every GPU|cannot safely be narrowed' <<< "$bs_no"; then
@@ -14560,7 +14581,8 @@ PYEOF
     fi
     [[ -z "$why" ]] && pass "--adapt's budget prior: the default runs, then each backend is tried" \
       || fail "--adapt's budget prior: the default runs, then each backend is tried" "$why"
-    # 9. A staged run long enough to count (the reader is held 4.5 s on frame 0)
+    # 9. A staged run long enough to count (the reader is held 4.5 s on frame 0,
+    # then until a GPU stream is up: the hook's :gpu, so a slow card is waited for)
     # is filed under its budget slot as staged.  Stream learning must also work
     # with the staged CPU pool: the GPU-count model deliberately excludes it.
     # Delay CPU permit requests, so a GPU gets work before those workers can
@@ -14568,7 +14590,7 @@ PYEOF
     why=""
     rm -rf "$bs_x"; mkdir -p "$bs_x"
     cat "$bs_src" > /dev/null
-    "${bs_env[@]}" XDG_CACHE_HOME="$bs_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:4500 \
+    "${bs_env[@]}" XDG_CACHE_HOME="$bs_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:4500:gpu \
       GZSTD_DEBUG_WIDE_STREAMS_MIN_BYTES=1 GZSTD_DEBUG_ACQUIRE_DELAY_US=1000000 \
       timeout --foreground -k 10 120 taskset -c "$bs4" "$GZSTD" --adapt -vv -f -o "$bs_out" "$bs_src" \
       2> "$bs_log" || why+=" [exit $?]"
@@ -14594,6 +14616,49 @@ PYEOF
     [[ -z "$why" ]] && pass "--adapt files a staged run under its CPU budget" \
       || fail "--adapt files a staged run under its CPU budget" "$why"
     rm -rf "$bs_x"
+    # 9b. --adapt's ranked rule counts the input NOT READ YET as work left
+    # (v0.18.44).  The staging queue is capped at its slots less the CPU workers
+    # (here 4 - 3 = 1 frame), and through v0.18.43 a GPU ranked under the CPU pool
+    # waited for a queue depth that cap could never show: it took nothing, with
+    # the queue full and the input unread (MEASURED 1x RTX 5090, 4 CPUs, 32 GiB:
+    # 9.0-11.6 s against 5.7).  The reader is held on frame 0 until a GPU stream
+    # has registered (the stall hook's :gpu; no guess at a card's start time)
+    # (the PROGRAM opens the window), the injected rates rank every card just
+    # under the CPU pool, and one tick cannot re-rank it (three must agree).  The
+    # old rule then declines every intake, deterministically: 0 frames.  The rule
+    # asks for 8 + 1.43 x 8 frames per stream before a first batch reports its
+    # size, so the 65-frame fixture measures hosts that start up to 4 streams.
+    why=""
+    bs_big="$TMPDIR/bs_big.bin"
+    for _ in $(seq 16); do cat "$bs_src"; done > "$bs_big"
+    bs_inj="cpu=1.1"; for _d in $(seq 0 31); do bs_inj="$bs_inj,gpu$_d=1"; done
+    "${bs_env[@]}" GZSTD_DEBUG_DSTAGE_SLOTS=4 GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:1000:gpu \
+      GZSTD_DEBUG_ADAPT_RATES="$bs_inj" timeout --foreground -k 10 120 taskset -c "$bs4" \
+      "$GZSTD" --adapt --no-profile -vv -f -o "$bs_out" "$bs_big" 2> "$bs_log" || why+=" [exit $?]"
+    "$GZSTD" -d -q -c "$bs_out" 2>/dev/null | cmp -s - "$bs_big" || why+=" [bytes]"
+    bs_st=$(bs_lines "$bs_log" | grep -aoE '^\[GPU[0-9]+/S[0-9]+\] subchunk=' | sort -u \
+            | cut -d/ -f1 | uniq -c | sort -rn | awk 'NR==1{print $1}')
+    bs_gf=$(bs_lines "$bs_log" | grep -aoE '^\[DSTAGE\] [0-9]+ frames.*: [0-9]+ host -> VRAM' \
+            | grep -oE '[0-9]+ host' | grep -oE '[0-9]+')
+    bs_lines "$bs_log" | grep -aqE '^\[DSTAGE\] [1-9][0-9]* CPU workers? compress from the staging slots' \
+      || why+=" [no staged CPU pool]"
+    # The cap is the slots less the workers (1 here; 2 under a two-CPU quota): the
+    # cell needs only that it is far under what the old rule asked for (31+).
+    bs_qc=$(bs_lines "$bs_log" | grep -aoE 'producer depth ceiling: [0-9]+ frames' | grep -oE '[0-9]+' | head -1)
+    [[ -n "$bs_qc" && "$bs_qc" -le 3 ]] || why+=" [queue cap ${bs_qc:-none}, not 3 or fewer]"
+    # The KNOWN-SIZE arm decided, not the capacity escape a sizeless input takes
+    # (without compress's set_source_bytes the cell would pass on that alone).
+    bs_lines "$bs_log" | grep -aqE '^\[ADAPT\] gpu[0-9]+ ranked intake counts the input not read yet: .* -> take' \
+      || why+=" [the ranked rule never counted unread input]"
+    if [[ -z "$why" && -n "$bs_st" ]] && (( 8 + 12 * bs_st > 64 )); then
+      skip_host "--adapt: a GPU ranked under the staged CPU pool takes frames while input is unread" "$bs_st streams a device: the rule wants more frames than the fixture has"
+    else
+      [[ -n "$bs_st" ]] || why+=" [no GPU stream came up during the stall: NOT TESTED]"
+      [[ "${bs_gf:-0}" -ge 1 ]] || why+=" [the GPU took ${bs_gf:-no} frames]"
+      [[ -z "$why" ]] && pass "--adapt: a GPU ranked under the staged CPU pool takes frames while input is unread" \
+        || fail "--adapt: a GPU ranked under the staged CPU pool takes frames while input is unread" "$why"
+    fi
+    rm -f "$bs_big" "$bs_out"
     # 10. Grow the input at the staged pass's existing FIFO gate: all reads have
     # finished, but the driver's generation check has not run.  Opening the
     # write end rendezvous with that gate, even if CUDA setup takes seconds.
@@ -14846,6 +14911,7 @@ else
            "the default's staging finishes on the CPU when the GPU cannot carry it" \
            "--adapt's budget prior: the default runs, then each backend is tried" \
            "--adapt files a staged run under its CPU budget" \
+           "--adapt: a GPU ranked under the staged CPU pool takes frames while input is unread" \
            "an input that grows while staged: the default rebuilds through EOF, --direct-stage exits 3" \
            "several inputs and --tar stage by default; --tar rebuilds on the CPU" \
            "a level, a pipe, --hybrid, -d or enough CPUs keep the default" \

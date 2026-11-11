@@ -907,6 +907,14 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     queue's growth per window against what the pool consumed in it (in bytes, so the frame size drops
     out; a queue at its depth cap counts as far behind).  Needs the overhead side measured, and a second
     host, before a constant goes in.
+    **v0.18.44 put a first constant in, from ONE host** (1x RTX 5090, 16 cores): the sample engages only
+    when the backlog has grown by three workers' share of what the pool took since its first window
+    (3 / pool, at most half), and a declined GPU now lowers the queue ceiling to the CPU pool's.  There,
+    10 CPUs went 8.6-9.6 -> 7.9 s and 8 CPUs 9.0-10.9 -> 9.3 (`--cpu-only` 7.85 and 9.05-9.62); 6 and 4
+    CPUs still engage and win.  STILL OWED: this table on the 2080 Ti box (12 CPUs must now skip, 8 must
+    still engage -- its `-vv` sample line prints the growth, what the pool took and the bar) and on the
+    server; the bar at 4 CPUs is thin (0.56-0.68 against 0.5); and a reader held by its own block memory
+    stops the backlog growing, which the test reads as keeping up.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

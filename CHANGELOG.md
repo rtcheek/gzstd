@@ -1,12 +1,141 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.43  
+**Covers:** v0.9.50 → v0.18.44  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.44 — `--adapt` no longer starves a GPU beside the staged CPU pool (a 32 GiB compress at 4 CPUs 9.5-11.6 -> 5.7-6.0 s), a short or compressible archive decodes on the GPU at a batch sized to its frame count (5.5 GiB of text 18.0 -> 5.9 s, 22 GiB 33 -> 9.5 s, 4 GiB of base64 1.9 -> 1.35 s), and a hybrid decode starts a GPU only when the reader outruns the CPU pool by more than the GPU costs it (10 CPUs: 8.6-9.6 -> 7.9 s) and reads like `--cpu-only` when it starts none
+
+Four findings from running v0.18.43's checks on the one-GPU workstation (1x RTX 5090, 16 cores / 32
+threads, PCIe Gen5).  Three were defects or misfits and are fixed here; the fourth was the measurement.
+All numbers below are that host.  **The constants in the second and third sections are one card's and one
+CPU's, and the same sweeps are owed on the 2080 Ti box and the server before they are trusted there.**
+
+### `--adapt`: the ranked rule waited for a queue depth that could not exist
+
+`--adapt` ranks every engine and lets a slower one take a batch only while the work left would keep the
+faster ones busy for longer than that batch takes (v0.15.4).  "Work left" was the queue's depth, which is
+the work left only when the queue holds the whole input -- an mmap'd file, what the rule was built on.
+The default's staging with its CPU pool (v0.18.38) queues at most its slots less the workers, 29 frames,
+however much is unread.  MEASURED, 4 CPUs, a cold 32 GiB file: the rule asked for 27 frames at batch 6 and
+31 once the tuner probed 7, so from the tick the card ranked under the CPU pool it took nothing, with the
+queue full and 80% of the file unread -- CPU 2.8 + GPU 3.2 GiB/s became CPU 3.2 alone.  A device that
+takes nothing delivers nothing, so its rate could only confirm the ranking.  The trigger was the device's
+own first tick: it comes online part way through it, and an average STARTS at its first sample (windows
+of 0.20, 3.80, 3.22, 3.02 GiB/s read as 0.20, 1.28, 1.86, 2.21) while the CPU pool's is seeded from the
+profile.
+
+The rule now counts the frames not read yet, as v0.17.54 did for the aggregate decompress check
+(`HybridSched::ranked_takes_`, one definition for the intake gate, the park predicate and the tick's
+decline streak).  A pipe has no size: there a queue at its producer cap takes.  After the producer is done
+nothing changes.  A device's first window is dropped.  It is the same decision wherever the old rule was
+measured, and it needs no constant.
+
+| 4 CPUs, cold 32 GiB, `-o /dev/null` | v0.18.43 | v0.18.44 |
+|---|---|---|
+| `--adapt` trying 2 streams | 9.47 / 5.95 s | 5.97 / 5.91 |
+| GPU ranked under the pool by injected rates | 11.5-11.6 s, 0 GPU frames | 5.73-5.75, ~1,200 |
+| `--adapt --no-profile`; the default | 5.7-5.9 | 5.7-5.8 |
+
+So two streams measure the same as six there: the stream lever had been timing the starved run.
+
+### GPU decode: a start from the frame count, and a gate that weighs evidence
+
+`--calibrate` reported GPU decompress at 0.36 GiB/s on a card that decodes base64 at 2+.  It was a true
+reading of a decode whose tuner never left its start.  Frames that compress ~5x (calibrate's text half)
+decode in a FLAT ~340 ms a batch at 4, 8 and 16, so the rate is the batch size; and the start was
+input/16 in compressed bytes over the decoded frame size, floor 8, the halving probe came first, and the
+cost gate (a window may read a tenth of what is left) refused every doubling.  `--gpu-only -d`, cached,
+wall seconds including ~0.9 s of startup:
+
+| archive (frames) | auto, v0.18.43 | pinned 8 | 16 | 32 | 64 | 128 | 256 | auto, v0.18.44 |
+|---|---|---|---|---|---|---|---|---|
+| base64 1 GiB (64) | 0.69-0.92 | 0.59 | **0.53** | 0.58 | 0.72 | 0.72 | 0.75 | 0.55 |
+| base64 4 GiB (256) | 1.85-2.0 | 1.70 | 1.35 | **1.21** | 1.30 | 1.65 | | 1.34-1.37 |
+| base64 16 GiB (1024) | 4.75-4.91 | 9.73 | 6.45 | 4.7 | **4.00** | 4.25 | 4.91 | 4.13-4.16 |
+| text 1.4 GiB (88) | 5.16-5.19 | 4.56 | 2.56 | 1.62 | 1.41 | **1.20** | | 3.27-3.28 |
+| text 5.5 GiB (352) | 18.0 | 17.3 | 9.2 | 5.21 | 3.32 | **2.58** | 2.87 | 5.84-5.89 |
+| text 22 GiB (1408) | 33.1-33.5 | | | | 11.4 | 7.24 | **5.75** | 9.43-9.47 |
+
+On base64 the best batch is 2 x sqrt(frames) at all three sizes, which is what a first batch that sets up
+its buffers in proportion to its size, plus a fixed cost per batch, minimises.  The same law gives the
+starts v0.18.41 measured on H100s (36 GiB: 64-128 on two cards, 32-64 on four, 32 on six).  So a decode
+starts at the larger of the byte rule and the largest power of two under 2 x sqrt(frames per device),
+capped at the byte rule's 2 GiB target; frames come from the seek table or from what the reader has
+pushed while CUDA came up.  And the gate now weighs evidence: a halving that cut the rate 1.6x or more
+(or a doubling that raised it as much) admits the next doubling whenever its window fits what is left,
+because a window at a size expected to be that much faster is work done sooner, not an experiment.  That
+is the 22 GiB row's climb from 64 to 128.  The text rows are still 2-3x from their best pinned batch:
+their inputs end before a walk can finish.  Calibrate's row reads 0.56 GiB/s.
+
+### Hybrid decode: behind by enough, and a declined GPU costs nothing
+
+ROADMAP 40.  With every GPU arm cold and the arm order rotated, a cached 49 GiB archive:
+
+| CPUs (CPU pool) | `--cpu-only` | default, v0.18.43 | default, v0.18.44 |
+|---|---|---|---|
+| 12 (10) | 7.49-7.51 | 7.50 (no GPU) | 7.49-7.51 (no GPU) |
+| 10 (8) | 7.85 | 8.56-9.63 (GPU) | 7.91-7.93 (no GPU) |
+| 8 (6) | 9.05-9.62 | 8.96-10.94 (GPU) | 9.32-9.34 (no GPU twice, GPU once) |
+| 6 (4) | 12.0-12.2 | 10.2-11.8 (GPU) | 10.0-11.9 (GPU) |
+| 4 (3) | 16.9-17.1 | 12.2-13.0 (GPU) | 12.2-12.8 (GPU) |
+
+Two causes.  **A declined GPU was not free.**  `--cpu-only` and a hybrid decode run the same six decoders
+at 8 CPUs, yet hybrid with its GPU declined took 9.96-10.26 s against 9.05-9.62: its queue ceiling is the
+CPU pool plus a batch for every GPU stream (~2,070 frames) from the first frame, so the reader was never
+held back (blocked 0% of the time against 90%), its threads ran 19.3 s against 12.1 and the decoders 59.0
+against 53.7.  The ceiling now comes down to the CPU pool's when no GPU is coming.  **And behind is not
+enough.**  A GPU can take no more than the reader's rate less the pool's -- how fast the backlog grows --
+and with it running the pool decoded 2.2 GiB/s less at 8 CPUs and 2.0 less at 6.  The bringup sample now
+engages only when the backlog has grown by three workers' share of what the pool took (3 / pool, at most
+half); a reader that has finished, or a queue at its cap, passes.  At 8 CPUs the measure sits at
+0.35-0.38 against a bar of 0.5; at 4 CPUs 0.56-0.68 -- the thin side, chosen because a wrong skip there
+costs 40% and a wrong start at 8 costs 9%.
+
+### What was not a defect
+
+"The default starts its GPU a second later than a forced start" was the arm order.  Any GPU run that
+follows ~10 s of GPU idle is ~0.9 s slower on this host, default and forced alike (6.5-6.7 s against
+5.6-5.8): CUDA starts as fast, the card runs slow for its first second or so.  Every default arm had
+followed a `--cpu-only` arm.  The 12% loss at 8 CPUs in the first table of this work was that too.
+
+**Independent review (Codex, GPT-6.1-Sol at xhigh, the staged diff): one blocker, two majors, two test
+gaps; all five checked against the code and fixed before the commit.**  (1) Lowering the queue cap could
+leave every consumer asleep: a CPU worker holding out for `--cpu-batch` frames sleeps on a predicate that
+capacity satisfies, the cap came down to below the queue with nobody told, and the reader's next push then
+waits on the cap before it notifies anyone.  `set_max_depth` and `set_max_bytes` now wake every waiter
+under the lock.  Fixed by reasoning; the window was not reproduced (`-T1 --cpu-batch=128` and `=48` with a
+declined GPU finish with the right bytes).  (2) The ranked rule now admits a slower device while input is
+unread, so it can sit in the batch wait until the producer ends and then take the last frames without being
+asked again -- the tail the rule exists to decline.  Both intakes ask again after the wait.  (3) A steep
+doubling was admitted against ALL of what is left by every device at once; it is now a device's share.
+(4) The new staged cell demanded a one-frame queue cap, which a two-CPU quota makes two; it asks for three
+or fewer.  (5) The same cell passed without compress's source size, on the sizeless capacity escape; `-vv`
+now says once when the ranked rule counts unread input, and the cell requires it.
+**A second round, on the repairs alone, found two more.**  The re-ask in (2) could be admitted at the loop
+top and declined after the wait for ever, without a pop or a park, when two streams of a device hold
+different batch sizes (the intake publishes its own); a decline after the wait now parks under that size,
+as the gate does.  And the once-only `-vv` line in (5) could be spent on a decline before the first frame;
+it is the first take that is logged.  A third round, on those two, found nothing at blocker or major.
+Neither hang was reproduced: both are static findings, fixed by reasoning.  Its last note was the cells'
+own: they held the reader a fixed 4.5 s and guessed that a card is up by then.  The stall hook now takes
+`N:MS:gpu` and holds the frame until a GPU stream has registered (a minute at most), and both staged
+`--adapt` cells use it; the new one runs in 3.3 s instead of 6.7.
+
+**Tests.**  +1 default GPU cell (`--adapt`: a GPU ranked under the staged CPU pool takes frames while input
+is unread; the reader is held on frame 0 until the GPU is up, so the old rule declines every intake: 0
+frames in 5 of 5, the new one 5-7).  The `-e` cell for a pool that keeps up gained two arms: a share nothing
+reaches (`GZSTD_DEBUG_GPU_BEHIND_SHARE`) must skip as "nearly keeps up", and a declined GPU must leave the
+queue ceiling at the CPU pool's 32 frames; it found that a short archive is queued whole before the first
+window, where the backlog can only shrink.  v0.18.43's binary fails both cells.  Baselines 573 default,
+919 `-e`, no-GPU deltas 163 and 245.  Both configurations build warning-free.  Suites on the one-GPU
+workstation: `-e` 873 passed, 0 failed, 46 skipped of 919 (7m36s, as expected on this host: -21 GDS
+refused, -25 not exercisable); CPU-only 410 / 0 / 132 of 542 (1m56s, -163 no GPU).
 
 
 ## v0.18.43 — `--gpu-only` starts the number of GPUs this machine's measurements predict is fastest, not one per 8 GiB (two RTX 2080 Ti: a 6 GiB compress 7.5-8.2 -> 4.9-5.0 s, a 4.5 GiB archive 3.3-3.8 -> 2.5-2.7), `--calibrate ARCHIVE` measures the decompress side, `--adapt -d` chooses its count (it started every card, as `--adapt` compress did with nothing measured), and a hybrid decode starts no GPU it cannot feed
