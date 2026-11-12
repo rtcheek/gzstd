@@ -633,8 +633,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=573
-$EXTENSIVE && EXPECTED_TESTS=919
+EXPECTED_TESTS=574
+$EXTENSIVE && EXPECTED_TESTS=920
+# v0.18.46: +1 default GPU cell (a hybrid -d and -t of a named file start two GPUs, not every
+# card; a single- or two-GPU host or a caller's mask skips it as host-unexercisable), so the
+# no-GPU deltas +1 (163 -> 164, 245 -> 246): 573 -> 574, -e 919 -> 920.  DERIVED.
 # v0.18.44: +1 default GPU cell (--adapt: a GPU ranked under the staged CPU pool takes
 # frames while input is unread), in the staged block's no-GPU skip list, so the no-GPU
 # deltas +1 (162 -> 163, 244 -> 245): 572 -> 573, -e 918 -> 919.  DERIVED.
@@ -1009,8 +1012,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=163   # + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=245   # + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=164   # + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=246   # + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7738,6 +7741,63 @@ PYEOF_GM
     skip_host "$gp_t" "fewer than three GPUs"
   else
     skip_host "$gp_t" "a caller's CUDA_VISIBLE_DEVICES, or fewer than 3 GPUs with ${mg_min_mib} MiB free"
+  fi
+
+  # A HYBRID -d OR -t OF A NAMED FILE STARTS TWO GPUs (v0.18.46).  The cards share
+  # only what the reader has beyond the CPU pool, so more of them do not take more
+  # frames, and each past the second only starts, holds VRAM, runs a worker thread
+  # on the pool's CPUs and tears down.  MEASURED, the 8-H100 server,
+  # a cached 72 GiB archive at 4/8/12/16 CPUs: the old default (every card) lost
+  # 15% to two at 12 CPUs and 35% to --cpu-only at 16, and two won at every CPU
+  # count.  The rule is the pipe's above, extended to a named file.  Like it, this
+  # clears the suite's mask (a caller's mask is never escaped) and needs three
+  # cards: two of two is no cap.  GZSTD_DEBUG_GPU_START_AFTER_INPUT keeps a
+  # fixture this small from being declined for a drained queue, so the workers
+  # that DO start are counted.  An explicit --gpu-devices wins, and --adapt, whose
+  # count model is --gpu-only's, takes the cap too.
+  hf_t="a hybrid -d and -t of a named file start two GPUs, not every card"
+  if [[ "${GPU_ALL_DEVICES:-}" == *,*,* && "${GPU_ALL_DEVICES:-}" == "${GPU_HOST_UUIDS:-}" ]] \
+     && (( ${#mg_cards[@]} >= 3 )); then
+    hf_why=""
+    # The count in "2 of N" is the cards gzstd counts as usable, which can be fewer than
+    # the host lists (a card it knows it cannot use), so only that N is not pinned.
+    hf_err() { tr '\r' '\n' < "$TMPDIR/hf.err" | grep -ah 'GPU\] devices\|CUDA sees\|online' | tr '\n' ' '; }
+    "$GZSTD" -q --cpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/hf.zst" 2>/dev/null || hf_why+=" fixture"
+    hf_run() {   # hf_run NAME OUT|- ARGS... : the mask cleared, a private profile cache
+      local name=$1 out=$2; shift 2
+      local o=(); [[ "$out" == - ]] || o=(-o "$out")
+      env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_START_AFTER_INPUT=1 XDG_CACHE_HOME="$TMPDIR/hf-xdg" \
+        timeout --foreground -k 10 120 "$GZSTD" "$@" -vv -k -f "$TMPDIR/hf.zst" "${o[@]}" \
+        2>"$TMPDIR/hf.err" || hf_why+=" $name:rc=$?"
+    }
+    hf_decided() {   # the decision line alone: what the implicit default, whatever its backend, said
+      grep -qaE "\[GPU\] devices: 2 of [0-9]+ for a regular-file hybrid decode" "$TMPDIR/hf.err" \
+        || hf_why+=" $1:[$(hf_err)]"
+    }
+    hf_cap() {   # ...and exactly two workers online, and CUDA shown two cards when it says what it sees
+      hf_decided "$1"
+      grep -qa '\[GPU\] 2 device(s) online' "$TMPDIR/hf.err" || hf_why+=" $1:online:[$(hf_err)]"
+      local seen; seen=$(tr '\r' '\n' < "$TMPDIR/hf.err" | grep -a '\[GPU\] CUDA sees ' | head -1)
+      [[ -z "$seen" || "$(grep -o 'GPU-' <<< "$seen" | wc -l)" == 2 ]] || hf_why+=" $1:sees:[$seen]"
+    }
+    rm -f "$TMPDIR/hf.out"
+    hf_run d "$TMPDIR/hf.out" -d --hybrid; hf_cap d
+    cmp -s "$TMPDIR/hf.out" "$TMPDIR/large.bin" || hf_why+=" d:bytes"
+    hf_run t - -t --hybrid; hf_cap t
+    hf_run adapt "$TMPDIR/hf.out" -d --hybrid --adapt; hf_cap adapt
+    # No --hybrid: the default backend is chosen AFTER this rule runs (opt.hybrid is not set
+    # yet), and on a host where the default is not hybrid there are no workers to count.
+    hf_run implicit "$TMPDIR/hf.out" -d; hf_decided implicit
+    cmp -s "$TMPDIR/hf.out" "$TMPDIR/large.bin" || hf_why+=" implicit:bytes"
+    hf_run explicit "$TMPDIR/hf.out" -d --hybrid --gpu-devices 3
+    { grep -qa '\[GPU\] 3 device(s) online' "$TMPDIR/hf.err" && ! grep -qa '\[GPU\] devices:' "$TMPDIR/hf.err"; } \
+      || hf_why+=" explicit:[$(hf_err)]"
+    rm -rf "$TMPDIR/hf.zst" "$TMPDIR/hf.out" "$TMPDIR/hf.err" "$TMPDIR/hf-xdg"
+    [[ -z "$hf_why" ]] && pass "$hf_t" || fail "$hf_t" "$hf_why"
+  elif [[ "${GPU_ALL_DEVICES:-}" != *,*,* ]]; then
+    skip_host "$hf_t" "fewer than three GPUs"
+  else
+    skip_host "$hf_t" "a caller's CUDA_VISIBLE_DEVICES, or fewer than 3 GPUs with ${mg_min_mib} MiB free"
   fi
 
   # THE ALL-DEVICE RANKING RUNS AFTER CUDA, AND ONLY AT GPU BRINGUP (v0.17.63),

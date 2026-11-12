@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.45  
+**Covers:** v0.9.50 → v0.18.46  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,116 @@
 
 ---
 
+
+## v0.18.46 — a hybrid decode of a named file starts two GPUs, not every card (a cached 72 GiB archive, 8-H100 server: 12 CPUs 7.2 -> 5.8-6.0 s, 16 CPUs 6.3-6.4 -> 4.9-5.4, 8 CPUs 9.6 -> 8.4-8.7, 4 CPUs 11.6-11.9 -> 10.2-10.4), and v0.18.44/45's checks on that server
+
+v0.18.44 and v0.18.45 were measured on a 5090 box and a two-card 2080 Ti box.  This is their check on the
+8-H100 server, where three of the eight cards were busy with other jobs, so every run used the five idle
+ones (two H100 PCIe, three H100 NVL; no 6- or 8-card point).  Inputs cached (residency 100%), every GPU arm
+after a `--cpu-only` decode, arm order shuffled, the process pinned to N cores with `taskset`.  The
+server was shared (load 15-28 during the runs, mostly ours).  Two things were found: one default that
+started every card and lost to starting two, and a tuner start that costs ~5% at one point.  The first is
+fixed here.
+
+### Hybrid decode: the cards past the second only cost
+
+The default of a regular-file hybrid `-d` or `-t` started every card the driver listed (the pipe rule of
+v0.18.40 capped a pipe at two; a named file never ran it unless it was `--gpu-only`).  Hybrid decode of a
+cached 72 GiB archive (4,608 frames of 16 MiB, base64) to /dev/null, wall seconds, two shuffled rounds,
+`--gpu-devices N` against `--cpu-only`:
+
+| CPUs (pool) | `--cpu-only` | 1 card | 2 cards | 3 cards | 5 cards (the old default) |
+|---|---|---|---|---|---|
+| 4 (3) | 21.0 | 12.4 | **10.3-10.5** | 10.4 | 11.6-11.9 |
+| 8 (6) | 10.4 | 8.5-9.3 | **8.4-8.5** | 8.5-9.0 | 9.6 |
+| 12 (10) | 6.3 | 5.9-6.2 | **5.8-6.0** | 6.1-6.4 | 7.2 |
+| 16 (14) | **4.6** | 4.9-6.0 | 4.9-5.3 | 6.0-6.6 | 6.3-6.6 |
+| 24 (22) | 3.3-3.5 | the bringup sample skips every arm (2.8-3.3 s remaining against its 4.0 s guard) |
+
+The cards take what the reader has beyond the CPU pool, and that is set by the reader and the host, not by
+how many cards started: the frames the cards decoded were ~3,800-3,950 of 4,608 at 4 CPUs whatever the
+count, ~2,000-2,350 at 8, and at 12 CPUs 900-1,200 (1 card), 1,300-1,400 (2), 1,550-1,600 (3) and 1,150-1,300
+(5).  Each card past the second adds its context and VRAM reserve, a worker thread that runs on the pool's
+CPUs, and its teardown, and takes nothing the others left.  So the default of five lost 14% to two at 12 CPUs
+and 35% to `--cpu-only` at 16, where two lose 6-15%.
+
+Now a hybrid `-d` or `-t` of named regular files starts at most two cards: the pipe rule, extended, for the
+same reason (one stream through one reader) and with the same escape hatches.  `--gpu-devices N` wins, a
+caller's `CUDA_VISIBLE_DEVICES` is used as given, `--gpu-order=ranked` keeps the whole set, `--cpu-only`
+and `--gpu-only` keep their rules, and the cap needs the cheap pre-CUDA mask (the pipe rule's
+`mask_is_free`), so no run newly pays NVML's start.  `--adapt` takes the cap too: its count model is
+`--gpu-only`'s, and a hybrid decode's cards cannot be counted before they run (a running card's delivered
+rate is what the reader let it take, not what it could).  `--tar`, staged readers, calibration and
+compress are unchanged.  The same machine, the new default (the two idle cards, picked by the ranking),
+three rounds, against `--cpu-only`:
+
+| CPUs | `--cpu-only` | v0.18.45 default | v0.18.46 default |
+|---|---|---|---|
+| 4 | 21.0 | 11.6-11.9 | **10.2-10.4** |
+| 8 | 10.4 | 9.6 | **8.4-8.7** |
+| 12 | 6.4-6.5 | 7.2-7.3 (14% slower than `--cpu-only`) | **5.8-6.0** (6-10% faster) |
+| 16 | 4.6 | 6.3-6.4 (35% slower) | 4.9-5.4 (6-15% slower) |
+| 24 | 3.1-3.6 | skip | skip |
+
+A file the GPU never takes pays nothing measurable for the cap's two-card mask.  Default `-d`, unmasked, v0.18.45 against v0.18.46, shuffled, in ms: a 1 MiB
+archive 7-10 / 8-9 and 64 MiB 47-52 / 48-56 (eight rounds; both are below one GPU batch and decode on the
+CPU), 1 GiB of base64 214-241 / 208-251, and 4 GiB 524-598 / 528-661 on all CPUs and 688-716 / 703-735 on
+eight (four and three rounds; the bringup skips the GPU).
+
+### What this does not fix: 16 CPUs
+
+At 16 CPUs the bringup sample still engages (it estimates 4.3-4.6 s remaining against its 4.0 s guard) and
+the run loses 6-15%.  The sample cannot tell that case from 12 CPUs: a new `-vv` line per window
+(`[GPU] bringup window: ...`) shows the backlog growing by the same ~95 frames in each 150 ms window at 12
+and at 16 CPUs, sustained across both windows and not a startup burst (8 CPUs: +79-93 then +86-90; 12:
++76-140 then +75-131; 16: +93-104 then +87-103), and only the pool's pace and the remaining time differ.
+The cards come online ~2.5-3 s into a 4.6 s run, take 830-960 frames, and their worker threads and teardown
+cost the pool about what they take.  The break-even for two cards here is a remaining time of ~5.5-6 s
+(gain ~ 0.3 x (R - 5.8 s) over R = 4.5, 6.4, 12.5 and 38 s), not the guard's fixed 4.0 s, which comes from
+the tar decode pool and prices a bringup, not what the cards then capture.  No constant goes in from one
+host; the guard wants a derivation from measured quantities (ROADMAP 42).
+
+### The other checks on this server
+
+**Decode tuner start (v0.18.44/45), `--gpu-only -d`, auto against the best pinned batch.**  Base64 passes at
+1, 2, 4 and 5 cards: auto is 0.98-1.06x the best pinned batch (bar 1.15) on archives of 64, 256 and 1,024
+frames, and the best batch tracks ~2.6 x sqrt(frames per card) (64, 64, 32-64, 32 on 16 GiB at 1, 2, 4, 5
+cards), so the law and v0.18.45's nearest-power-of-two rounding hold on an H100.  Never slower than v0.18.42
+except ties.  One point misses: at four cards a 2,050-frame archive (32 GiB) is the case v0.18.45 moved from
+a start of 32 to 64, and auto is 5.21-5.29 s against v0.18.42's 4.89-5.06 (pinned 32 4.74-4.88, pinned 64
+4.82-4.98), so the start costs ~5% there (the tuner then settles at 32 or 64).  Only 1,820-4,095 frames at four
+cards reach it; two cards on the same archive tie (5.08-5.39 against 5.03-5.31).  Text (ratio 5.4) is the
+known gap (ROADMAP 41): auto is 1.2-2.3x the best pinned batch, e.g. a 96-frame archive on one card 6.82-6.99
+s against 3.03 at batch 128: the start is 16, the halving probe to 8 fails, and the run ends before any
+doubling (it needs ~120 frames to propose 32).  It is still 1.5-4x faster than v0.18.42.
+
+**Hybrid bringup (v0.18.44), the same archive, `--cpu-only` / default (the old default of every card).**
+256 CPUs 1.47-1.91 / 1.43-1.77, 64 CPUs 1.95-2.06 / 2.03-2.09 and 32 CPUs (noise) skip and match
+`--cpu-only`; 8 CPUs engages and wins 9% with the old default (10.36-10.40 / 9.45-9.51), 4 CPUs 45%; 16 CPUs
+is the loss above.  The sample's backlog-growth ratio (grew / pool took) was 0.60-0.71 at 16 CPUs against a bar
+of 3/14 = 0.21, 1.7 at 8 and 4.1-4.5 at 4.
+
+**Hybrid compress of a named file** has the same shape (24 GiB, 4 CPUs: `--cpu-only` 9.7 s, two cards 6.1, five
+7.7; 16 CPUs all tie at 2.3 s), and is NOT changed here: the default compress may stage through one card, and
+one file at two CPU counts is thin (ROADMAP 42).
+
+### Tests
+
++1 default GPU cell, "a hybrid -d and -t of a named file start two GPUs, not every card": the mask cleared (it
+needs three cards, as the pipe cell does), `-d`, `-t` and `--adapt` with `--hybrid` and `-d` alone, each
+checking the decision line and, where workers can be counted, exactly two online and CUDA shown two cards, plus
+an explicit `--gpu-devices 3` that must win.  Mutation-tested: on the v0.18.45 binary it fails (`[GPU] 8
+device(s) online`).  573 -> 574 default, -e 919 -> 920.
+
+Suites on the final code (the binaries rebuilt after a comment-only edit are byte-identical to the ones
+tested), on the shared server with other jobs running (load ~16, three cards busy): GPU `-e` **918 passed, 0
+failed, 2 skipped of 920** (28m31s), CPU-only **410 passed, 0 failed, 132 skipped of 542** (2m30s).  The two
+skips are the host-timing cells that skip rather than fail when a `-T1` CPU drains the queue before a GPU
+pops a batch ("trivial skip parks, never retires a GPU": no trivial batch reached a GPU; "decompress GPU yields
+the tail (pipe: producer-done arms it)": no GPU came online).  The suite exports a `CUDA_VISIBLE_DEVICES` mask
+for every cell, which the new rule leaves alone, so only the new cell (which clears it) reaches the change.
+The windowed trace and the cap were checked on the real archive, not by the suite: ROADMAP 42 lists what is
+open.
 
 ## v0.18.45 — a GPU decode on two or more cards starts at the nearest power of two to its frame-count law, not the one below it (two RTX 2080 Ti: 4 GiB of base64 2.12-2.20 -> 1.80-2.06 s, 5.5 GiB of text 7.66-7.71 -> 5.21-5.40, 1.4 GiB of text 4.67 -> 2.62-2.66); and v0.18.44's checks on the 2080 Ti box
 

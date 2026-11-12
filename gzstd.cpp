@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.45";
+static constexpr const char * GZSTD_VERSION = "0.18.46";
 //
 // Architecture overview:
 //
@@ -6114,7 +6114,9 @@ static void print_help_long()
 "     Number of GPUs to use.  0 = auto: all available GPUs, except that\n"
 "     each costs ~0.5 s to start, frames or not (a 64 MiB --gpu-only\n"
 "     compress took 5.5 s on eight GPUs and 1.6 s on one), so a pipe\n"
-"     starts two (one stream: two carry it), and --gpu-only on regular\n"
+"     starts two (one stream: two carry it), a hybrid -d or -t of a named\n"
+"     file two (the cards share what the reader has beyond the CPU pool,\n"
+"     which more cards do not raise), and --gpu-only on regular\n"
 "     files the count this machine's profile predicts is fastest for the\n"
 "     input's size when --calibrate FILE (compress) or --calibrate ARCHIVE\n"
 "     (decompress and -t) has measured every count, else one per 8 GiB of\n"
@@ -11457,6 +11459,19 @@ static bool gpu_bringup_worth_it(const Options & opt,
     // since the first window against the frames the pool took meanwhile.
     const double grew  = capped || !test_growth ? 0.0 : double(b_now) - double(b_first);
     const double took  = capped || !test_growth ? 0.0 : double(p_now - p_first) - grew;
+    // What each window saw (-vv), so the burst a reader makes while it fills its
+    // queue can be told from a surplus that lasts: the backlog and the frames the
+    // reader has queued at the window's end, and the fewest waiting within it.
+    if (test_growth && opt.verbosity >= V_DEBUG) {
+      char w[240];
+      std::snprintf(w, sizeof w,
+        "[GPU] bringup window: ends %.0f ms, queued %zu (+%zu since the first window), backlog %s "
+        "(+%.0f), fewest waiting %zu, pool took %.0f, %.1f%% done\n",
+        t * 1000.0, p_now, p_now - p_first,
+        b_now == SIZE_MAX ? "at its cap" : std::to_string(b_now).c_str(),
+        grew, win_min == SIZE_MAX ? (size_t)0 : win_min, took, p * 100.0);
+      vlog(V_DEBUG, opt, w);
+    }
     const double share = share_hook >= 0.0 ? share_hook
                                            : std::min(0.5, 3.0 / double(behind_frames));
     // A reader that has FINISHED left everything in the queue: the backlog can
@@ -55847,9 +55862,14 @@ static void apply_backend_defaults(Options & opt)
   // a pipe the CPUs keep up with still starts CUDA on the default's hybrid (the
   // owner's v0.18.13 decision; --adapt is the route that starts none).
   //
+  // A HYBRID -d OR -t OF A NAMED FILE TAKES TWO AT MOST (v0.18.46), on the same
+  // grounds: see the branch below.  It never ran the rule before, so it started every
+  // card the driver listed.
+  //
   // UNDER --adapt only a --gpu-only run whose count --adapt did not settle reaches
-  // this (v0.18.43; adapt_counted above), and only its regular-file branch: a
-  // pipe under --adapt is its pipe gate's.
+  // this (v0.18.43; adapt_counted above), and its regular-file branches; a pipe
+  // under --adapt is its pipe gate's.  --adapt's count model is --gpu-only's: a
+  // hybrid decode under --adapt takes the cap too.
   if (!opt.cpu_only && (!opt.adapt || !adapt_counted)
       && !opt.calibrate && opt.gpu_devices == 0 && !opt.gds_only
       && !opt.direct_stage && !opt.gpu_order_ranked
@@ -55872,7 +55892,13 @@ static void apply_backend_defaults(Options & opt)
         if (S_ISDIR(st.st_mode) || S_ISBLK(st.st_mode)) streams = false;
       }
     }
-    const int devices = (streams || (known && opt.gpu_only)) ? gz_precuda_gpu_count() : 0;
+    // A HYBRID DECODE OF A NAMED FILE (v0.18.46): -d and -t, the default backend or
+    // --hybrid.  opt.hybrid is not set yet for the default (the backend is chosen
+    // after this), so the test is "not --gpu-only"; --cpu-only is out above.
+    const bool hybrid_file_decode = known && !opt.gpu_only && !opt.list_mode
+        && (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST);
+    const int devices = (streams || (known && opt.gpu_only) || hybrid_file_decode)
+                        ? gz_precuda_gpu_count() : 0;
     int n = 0;
     std::string why;
     // A count makes the mask code below place a guess, ranked at the first CUDA
@@ -55892,6 +55918,33 @@ static void apply_backend_defaults(Options & opt)
     if (streams && !opt.adapt && devices > 2 && (mask_is_free || opt.gpu_only)) {
       n = 2;
       why = "a pipe (one stream: two carry it, and each costs ~0.5 s to start; "
+            "--gpu-devices sets the count)";
+    } else if (hybrid_file_decode && devices > 2 && mask_is_free) {
+      // TWO CARRY A HYBRID DECODE'S SURPLUS (v0.18.46).  The CPU pool decodes what
+      // it can and a GPU takes only what the reader has beyond the pool, so the
+      // devices' TOTAL intake is set by the reader and the host, not by how many
+      // cards started -- and every card past the second only starts, holds its
+      // VRAM, runs a worker thread on the pool's CPUs, and tears down.
+      // MEASURED, 8-H100 server (five idle cards), a cached 72 GiB archive (4,608
+      // frames) to /dev/null, hybrid, wall seconds, two shuffled rounds, a
+      // --cpu-only decode before every GPU arm:
+      //   CPUs   --cpu-only    1 card      2          3          5 (the old default)
+      //    4       21.0        12.4     10.3-10.5     10.4       11.6-11.9
+      //    8       10.4       8.5-9.3    8.4-8.5     8.5-9.0       9.6
+      //   12       6.3        5.9-6.2    5.8-6.0     6.1-6.4       7.2
+      //   16       4.6        4.9-6.0    4.9-5.3     6.0-6.6      6.3-6.6
+      // The cards' total intake was ~3,800-3,900 frames at 4 CPUs for any count,
+      // ~2,000-2,350 at 8, and at 12 CPUs 900-1,200 (1), 1,300-1,400 (2), 1,550-1,600
+      // (3) and 1,150-1,300 (5).  This is the pipe rule's result below for a named
+      // file (eight cards were never the fastest of those 29 cells either).  The
+      // count only: whether to start any GPU stays the bringup sample's decision
+      // (gpu_bringup_worth_it), and an automatic ceiling is not a claim that two
+      // is best on every host -- --gpu-devices sets the count, --adapt's model
+      // covers --gpu-only, and a hybrid decode's cards cannot be counted before they
+      // run (what a card could take is its own rate, which only a running card has).
+      n = 2;
+      why = "a regular-file hybrid decode (the reader's surplus over the CPU pool is what "
+            "the cards share: two carry it, and each costs ~0.5 s to start; "
             "--gpu-devices sets the count)";
     } else if (known && opt.gpu_only && devices > 1) {
       // GZSTD_DEBUG_GPU_BYTES_PER_DEVICE=N plans N bytes per device, so the suite

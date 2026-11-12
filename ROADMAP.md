@@ -913,10 +913,14 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     10 CPUs went 8.6-9.6 -> 7.9 s and 8 CPUs 9.0-10.9 -> 9.3 (`--cpu-only` 7.85 and 9.05-9.62); 6 and 4
     CPUs still engage and win.  **The 2080 Ti box (v0.18.45 checks): PASS** -- 12 CPUs now skip (G/T
     0.20-0.26 against 0.30) at 8.61-8.65 s against `--cpu-only` 8.46-8.47, where it had engaged and lost
-    7%; 8 CPUs engage (0.94-1.19) and win 17-19%; 6 and 4 win 32-34%.  STILL OWED: the server's table;
-    the bar at 4 CPUs is thin on the 5090 box (0.56-0.68 against 0.5); the 2% a skip still costs at 12
-    CPUs there (24 costs nothing); and a reader held by its own block memory stops the backlog growing,
-    which the test reads as keeping up.
+    7%; 8 CPUs engage (0.94-1.19) and win 17-19%; 6 and 4 win 32-34%.
+    **The 8-H100 server (v0.18.46 checks, five idle cards): the bar engages and wins at 8 and 4 CPUs
+    (9% and 45% with every card, more with two), skips and ties `--cpu-only` at 256, 64 and 32, and
+    still ENGAGES AND LOSES at 16 CPUs** (G/T 0.60-0.71 against 0.21; 4.3-4.6 s remaining against the
+    4.0 s guard): 4.9-5.4 s against 4.6 with two cards, 6.3-6.4 with five (v0.18.46 fixed the count, not
+    this).  See 42.  STILL OWED: the bar at 4 CPUs is thin on the 5090 box (0.56-0.68 against 0.5); the
+    2% a skip still costs at 12 CPUs there (24 costs nothing); and a reader held by its own block memory
+    stops the backlog growing, which the test reads as keeping up.
 
 41. **The GPU decode tuner's halving window costs a short run more than it learns.**  v0.18.45 starts a
     two-card decode at the right batch, but a 4 GiB archive on two RTX 2080 Ti that starts AND settles at
@@ -929,6 +933,36 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     e.g. a shorter probe, or reading the slope from the warm-up batches the start already runs.  A
     "probe: 64 -> 48" after settling was also seen on that text row.  Measure on the server first: its
     cuInit and card count change what a short run is.
+    **Server (v0.18.46 checks, H100):** on base64 the walk costs 0.1-0.3 s (auto 0.98-1.06x the best
+    pinned batch at 1-5 cards), but on text the START and the climb are the loss: auto 1.2-2.3x the best
+    pinned batch (96-frame archive, one card: 6.82-6.99 s against 3.03 at batch 128).  The walk measures
+    16 -> 8 -> 16 before it may propose 32, three batches each after a warm-up, ~120 frames on one
+    stream, and the upward gate budgets five batches at 32 (160 frames) against what is left: a 96-frame
+    run cannot climb, and TUNE_STEEP relaxes a gate, not the measurements it needs.  A second point: at
+    four cards a 2,050-frame archive starts at 64 since v0.18.45 and runs 5.21-5.29 s against 4.89-5.06
+    when it started at 32 (pinned 32 4.74-4.88), ~5%.  The halving probe has no affordability check
+    at all, and TUNE_STEEP lets an unproven doubling cost up to 1 / devices of what is left.
+
+42. **Hybrid decode still engages GPUs at 16 CPUs that cost more than they capture, and hybrid
+    compress starts every card.**  v0.18.46 caps a regular-file hybrid `-d` and `-t` at two cards (the
+    pipe rule, extended): on the 8-H100 server every card past the second only cost (12 CPUs 7.2 ->
+    5.8-6.0 s, 16 CPUs 6.3-6.4 -> 4.9-5.4).  Open: (a) **the 16-CPU loss remains** (4.9-5.4 s against
+    `--cpu-only` 4.6, 6-15%).  The per-window trace (`-vv`, `[GPU] bringup window`) shows 16 CPUs
+    looking exactly like 12 (the backlog grows ~95 frames per 150 ms window in both, sustained across
+    both windows), so a persistence test on the growth cannot separate them; the only signal that does is
+    the remaining time R (4.5 s against 6.3 s), and the guard is a fixed 4.0 s, the tar decode pool's,
+    which prices a bringup and not what the cards capture afterwards.  Measured break-even for two cards
+    there: R ~ 5.5-6 s (gain ~ 0.3 x (R - 5.8 s) over R = 4.5, 6.4, 12.5 and 38 s).  Wants a derivation
+    from quantities the run measures (the cards' time to first intake, their share of the pool's CPUs: a
+    card's worker and its threads cost ~2.3 workers' worth on the 5090 box) rather than a larger
+    constant, and a second host.  (b) **Hybrid compress of a named file** starts every card too: 24 GiB,
+    4 CPUs, `--cpu-only` 9.7 s, two cards 6.1, five 7.7 (16 CPUs all tie at 2.3 s).  Not changed: the
+    default compress may stage through one card (the rule's `!opt.direct_stage` is the user's flag only),
+    and one file at two CPU counts is thin.  Measure the staged default and a cold input first.  (c) A
+    **redirected stdin** (`gzstd -d < f.zst`) is a regular file the rule leaves alone (`in == "-"` keeps
+    `known` false, as v0.18.39 decided) and starts every card.  (d) A positive `--throttle-frames`
+    disables `gpu_joins_later`, so its initial throttle floor still counts the provisional eight cards,
+    and the queue's depth ceiling does for every hybrid decode (bounded, not preallocated).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
