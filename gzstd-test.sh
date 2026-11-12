@@ -633,8 +633,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=574
-$EXTENSIVE && EXPECTED_TESTS=920
+EXPECTED_TESTS=575
+$EXTENSIVE && EXPECTED_TESTS=922
+# v0.18.48: +1 default cell on both builds (a GPU slot's next frame wakes the waiting
+# writer: a self-test, no CUDA) and +1 -e GPU cell (a GPU decode's writer takes each
+# frame as it lands), so the -e no-GPU delta +1 (246 -> 247): 574 -> 575, -e 920 -> 922.
+# The hf cell gains arms (a redirect, the queue's ceiling, hybrid compress), not a count.
+# DERIVED.
 # v0.18.46: +1 default GPU cell (a hybrid -d and -t of a named file start two GPUs, not every
 # card; a single- or two-GPU host or a caller's mask skips it as host-unexercisable), so the
 # no-GPU deltas +1 (163 -> 164, 245 -> 246): 573 -> 574, -e 919 -> 920.  DERIVED.
@@ -1013,7 +1018,7 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
 EXPECTED_NOGPU_DELTA=164   # + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=246   # + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=247   # + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7168,6 +7173,13 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   # is declined reads like --cpu-only: its queue ceiling comes down to the CPU
   # pool's (32 frames under -T 1), or the reader runs unchecked beside the
   # decoders (8 CPUs: 9.96-10.26 s against 9.05-9.62).
+  # THE MOST A GPU COULD SAVE (v0.18.47): a pool that is behind also needs the
+  # time the reader ends before it (s x R + B / U, the bound a GPU cannot beat)
+  # to clear the guard.  GZSTD_DEBUG_GPU_SURPLUS_SHARE sets that bound as a share
+  # of R: 0 isolates the new decline even when the reader has finished or hit its
+  # cap, and 1 in the other arms keeps their old time gate, so each tests its own
+  # condition.  Decisions, output bytes and the lowered queue ceiling are
+  # asserted, never a machine's speed or a CUDA startup duration.
   if $EXTENSIVE; then
     bh_t="a decode starts no GPU while its CPU pool keeps up with the reader"
     bh_why=""
@@ -7179,26 +7191,87 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
         -k -f "$TMPDIR/bh.zst" -o "$TMPDIR/bh.out" 2>"$TMPDIR/bh.err" || bh_why+=" $name:rc=$?"
       cmp -s "$TMPDIR/bh.out" "$TMPDIR/bh.b64" || bh_why+=" $name:bytes"
     }
-    bh_err() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -aE 'bringup sample|skipping GPU|online' | tr '\n' ' '; }
-    bh_run keeps-up GZSTD_DEBUG_GPU_BEHIND_FRAMES=1000000000
+    bh_err() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -aE 'bringup window|bringup sample|skipping GPU|online' | tr '\n' ' '; }
+    bh_run keeps-up GZSTD_DEBUG_GPU_BEHIND_FRAMES=1000000000 GZSTD_DEBUG_GPU_SURPLUS_SHARE=1
     { grep -qa 'bringup sample:.*the CPU pool keeps up with the reader.*-> skip' "$TMPDIR/bh.err" \
         && grep -qa 'the CPU pool keeps up with the reader, so a GPU would wait for frames; skipping GPU bringup' \
              "$TMPDIR/bh.err" \
         && ! grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" keeps-up:[$(bh_err)]"
     bh_ceil() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -ao 'producer depth ceiling: [0-9]* frames' | tail -1 | grep -o '[0-9]*'; }
     [[ "$(bh_ceil)" == 32 ]] || bh_why+=" keeps-up:ceiling-$(bh_ceil)"
-    bh_run nearly GZSTD_DEBUG_GPU_BEHIND_SHARE=1000000000
+    bh_run nearly GZSTD_DEBUG_GPU_BEHIND_SHARE=1000000000 GZSTD_DEBUG_GPU_SURPLUS_SHARE=1
     { grep -qa 'bringup sample:.*the CPU pool nearly keeps up with the reader (the queue grew -\{0,1\}[0-9]* frames while its 1 workers took [0-9]*;.*-> skip' "$TMPDIR/bh.err" \
         && grep -qa 'the CPU pool nearly keeps up with the reader, so a GPU would take less than its own threads cost; skipping GPU bringup' \
              "$TMPDIR/bh.err" \
         && ! grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" nearly:[$(bh_err)]"
     [[ "$(bh_ceil)" == 32 ]] || bh_why+=" nearly:ceiling-$(bh_ceil)"
-    bh_run behind
+    bh_run surplus GZSTD_DEBUG_GPU_SURPLUS_SHARE=0
+    { grep -qa 'bringup window:.*a GPU could save 0.00 s of [0-9.]* (test override)' "$TMPDIR/bh.err" \
+        && grep -qa 'bringup sample:.*the reader ends only 0.00 s before the CPU pool would.*does not clear the guard.*-> skip' \
+             "$TMPDIR/bh.err" \
+        && grep -qa 'the reader ends too little before the CPU pool for a GPU to repay its bringup; skipping GPU bringup' \
+             "$TMPDIR/bh.err" \
+        && ! grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" surplus:[$(bh_err)]"
+    [[ "$(bh_ceil)" == 32 ]] || bh_why+=" surplus:ceiling-$(bh_ceil)"
+    # GZSTD_DEBUG_GPU_START_AFTER_INPUT: the arm asserts the decision and the cards
+    # it starts, and a loaded host's cuInit can outlast this 64-frame fixture on one
+    # CPU ("file already decompressed by CPU during init"), which is no decision.
+    # No bound override: this arm runs the real one (a finished reader's R, or a
+    # measured s beside a one-worker pool -- far above the 0.05 s guard either way).
+    bh_run behind GZSTD_DEBUG_GPU_START_AFTER_INPUT=1
     { grep -qa 'bringup sample:.*the queue held >= [0-9]* frames through the window (the CPU pool: 1).*-> engage' \
-        "$TMPDIR/bh.err" && grep -qa 'device(s) online' "$TMPDIR/bh.err"; } || bh_why+=" behind:[$(bh_err)]"
+        "$TMPDIR/bh.err" && grep -qa 'device(s) online' "$TMPDIR/bh.err" \
+        && grep -qa 'bringup window:.*a GPU could save [0-9.]* s of ' "$TMPDIR/bh.err" \
+        && ! grep -qa 'test override' "$TMPDIR/bh.err"; } || bh_why+=" behind:[$(bh_err)]"
     [[ "$(bh_ceil)" -gt 32 ]] || bh_why+=" behind:ceiling-$(bh_ceil)"
+    # The bound's arithmetic, which no timed run can pin (GZSTD_DEBUG_GPU_BOUND=R,s,B,I,U):
+    # s x R + (B + I) / U, at most R.  The first two differ only in the backlog, which
+    # carries the bound across a 4 s guard; then the clamp to R, no reader rate, no R.
+    for bh_c in "6,0.5,600,10,1000=3.610" "6,0.5,1200,10,1000=4.210" "5,0.9,5000,0,1000=5.000" \
+                "6,0.5,600,10,0=3.000" "0,0.5,600,10,1000=-1.000"; do
+      bh_got=$(GZSTD_DEBUG_GPU_BOUND="${bh_c%=*}" timeout --foreground -k 5 20 "$GZSTD" 2>/dev/null </dev/null | head -c 64 | tr -cd '[:print:]'
+                echo ":${PIPESTATUS[0]}")
+      [[ "$bh_got" == "${bh_c#*=}:0" ]] || bh_why+=" bound(${bh_c%=*})=$bh_got"
+    done
     rm -f "$TMPDIR/bh.b64" "$TMPDIR/bh.zst" "$TMPDIR/bh.out" "$TMPDIR/bh.err"
     [[ -z "$bh_why" ]] && pass "$bh_t" || fail "$bh_t" "$bh_why"
+  fi
+
+  # THE WRITER WAKES FOR THE GPU FRAME IT WAITS ON (v0.18.48).  push_to_slot woke
+  # the writer for CPU frames only; a GPU batch's frames waited for the batch's end.
+  # In a hybrid run the CPU pool's pushes woke it every few ms, until the pool had
+  # finished: then the last batch's frames past the GPU's ~28 recycled buffers each
+  # took a fresh 16 MiB buffer whose pages the copy faulted in (0.3-1.0 s on the
+  # 8-H100 server, against ~0.12 for 128 recycled frames).  --gpu-only has no CPU
+  # pool at all, so every batch held a batch's worth.  Asserted as the stream's
+  # count of host output buffers (-vv): to /dev/null, a writer woken per frame
+  # recycles a few (2 on the 8-H100 server), one woken per batch needs the whole batch
+  # (16 here) -- every time, as nothing else wakes it mid-batch in --gpu-only.  A
+  # correct build can need 16 too if the writer and its write thread stall for ~16
+  # frames' copies (Codex review), so any of three runs passes; the deterministic
+  # check is the slot self-test in the default suite.  A count, never a time.  -e:
+  # 768 MiB, 48 frames.
+  if $EXTENSIVE; then
+    wk_t="a GPU decode's writer takes each frame as it lands, not at the batch's end"
+    wk_why=""
+    { head -c 536870912 /dev/zero; head -c 201326592 /dev/urandom | base64 -w0 | head -c 268435456; } \
+      > "$TMPDIR/wk.bin" 2>/dev/null
+    "$GZSTD" -q --cpu-only -k -f "$TMPDIR/wk.bin" -o "$TMPDIR/wk.zst" 2>/dev/null || wk_why+=" fixture"
+    wk_args=(-d --gpu-only --gpu-devices=1 --gpu-streams=1 --gpu-batch=16 -vv -k -f "$TMPDIR/wk.zst")
+    wk_seen=""
+    for wk_try in 1 2 3; do
+      timeout --foreground -k 10 120 "$GZSTD" "${wk_args[@]}" -o /dev/null 2>"$TMPDIR/wk.err" \
+        || { wk_why+=" rc=$?"; break; }
+      wk_n=$(tr '\r' '\n' < "$TMPDIR/wk.err" | grep -ao '\[GPU0/S0\] output buffers: [0-9]* allocated' | grep -o '[0-9]*' | tail -1)
+      wk_b=$(tr '\r' '\n' < "$TMPDIR/wk.err" | grep -ac 'done batch=16 ')
+      wk_seen+=" ${wk_n:-none}/${wk_b}b"
+      [[ -n "$wk_n" ]] && (( wk_n < 16 && wk_b >= 3 )) && { wk_seen=""; break; }
+    done
+    [[ -z "$wk_seen" ]] || wk_why+=" buffers/batches:$wk_seen"
+    timeout --foreground -k 10 120 "$GZSTD" "${wk_args[@]}" -o "$TMPDIR/wk.out" 2>/dev/null || wk_why+=" file:rc=$?"
+    cmp -s "$TMPDIR/wk.out" "$TMPDIR/wk.bin" || wk_why+=" bytes"
+    rm -f "$TMPDIR/wk.bin" "$TMPDIR/wk.zst" "$TMPDIR/wk.out" "$TMPDIR/wk.err"
+    [[ -z "$wk_why" ]] && pass "$wk_t" || fail "$wk_t" "$wk_why"
   fi
 
   # A PIPE IS HELD TO THE SAME GATE (v0.18.5).  It has no size, so the gate
@@ -7755,7 +7828,7 @@ PYEOF_GM
   # fixture this small from being declined for a drained queue, so the workers
   # that DO start are counted.  An explicit --gpu-devices wins, and --adapt, whose
   # count model is --gpu-only's, takes the cap too.
-  hf_t="a hybrid -d and -t of a named file start two GPUs, not every card"
+  hf_t="a hybrid run of a named or redirected file starts two GPUs, and a decode queues for two"
   if [[ "${GPU_ALL_DEVICES:-}" == *,*,* && "${GPU_ALL_DEVICES:-}" == "${GPU_HOST_UUIDS:-}" ]] \
      && (( ${#mg_cards[@]} >= 3 )); then
     hf_why=""
@@ -7780,8 +7853,12 @@ PYEOF_GM
       local seen; seen=$(tr '\r' '\n' < "$TMPDIR/hf.err" | grep -a '\[GPU\] CUDA sees ' | head -1)
       [[ -z "$seen" || "$(grep -o 'GPU-' <<< "$seen" | wc -l)" == 2 ]] || hf_why+=" $1:sees:[$seen]"
     }
+    hf_ceil() {   # "N D": the queue ceiling an engage set, and the devices it was set for
+      tr '\r' '\n' < "$TMPDIR/hf.err" | grep -ao 'queue ceiling: [0-9]* frames for [0-9]* device(s)' \
+        | tail -1 | grep -o '[0-9]*' | paste -sd' ' -
+    }
     rm -f "$TMPDIR/hf.out"
-    hf_run d "$TMPDIR/hf.out" -d --hybrid; hf_cap d
+    hf_run d "$TMPDIR/hf.out" -d --hybrid; hf_cap d; hf_c2=$(hf_ceil)
     cmp -s "$TMPDIR/hf.out" "$TMPDIR/large.bin" || hf_why+=" d:bytes"
     hf_run t - -t --hybrid; hf_cap t
     hf_run adapt "$TMPDIR/hf.out" -d --hybrid --adapt; hf_cap adapt
@@ -7792,6 +7869,42 @@ PYEOF_GM
     hf_run explicit "$TMPDIR/hf.out" -d --hybrid --gpu-devices 3
     { grep -qa '\[GPU\] 3 device(s) online' "$TMPDIR/hf.err" && ! grep -qa '\[GPU\] devices:' "$TMPDIR/hf.err"; } \
       || hf_why+=" explicit:[$(hf_err)]"
+    # AN ENGAGE QUEUES FOR THE CARDS IT STARTS (v0.18.48): the sample keeps its depth
+    # for eight, and until then so did the rest of the run, so the cap's two and an
+    # explicit three queued for the same eight.  The depth differs by host (streams,
+    # batch ceilings), so the devices it names and the order are asserted.
+    hf_c3=$(hf_ceil)
+    [[ "${hf_c2#* }" == 2 && "${hf_c3#* }" == 3 ]] && (( ${hf_c2% *} < ${hf_c3% *} )) \
+      || hf_why+=" ceiling:[${hf_c2:-none}][${hf_c3:-none}]"
+    # A REDIRECTED STDIN IS A REGULAR FILE TOO (v0.18.48): `gzstd -d < f.zst` took no
+    # cap and started every card, where the named file starts two and a pipe two.
+    rm -f "$TMPDIR/hf.out"
+    env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_START_AFTER_INPUT=1 XDG_CACHE_HOME="$TMPDIR/hf-xdg" \
+      timeout --foreground -k 10 120 "$GZSTD" -d --hybrid -vv -c < "$TMPDIR/hf.zst" > "$TMPDIR/hf.out" \
+      2>"$TMPDIR/hf.err" || hf_why+=" redirect:rc=$?"
+    hf_cap redirect
+    cmp -s "$TMPDIR/hf.out" "$TMPDIR/large.bin" || hf_why+=" redirect:bytes"
+    # A HYBRID COMPRESS OF A NAMED FILE TAKES TWO TOO (v0.18.48): it was the one hybrid
+    # run left without the rule, and every card past two lost time (8 CPUs: 7.3 s on
+    # eight against 4.5 on two and 5.0 for --cpu-only).  The decision and the bytes:
+    # this file is compressed before any card comes up, and the arms above prove the
+    # mask starts exactly two.  --hybrid, the implicit default, and --gpu-devices wins.
+    hf_comp() {   # hf_comp NAME ARGS... : compress large.bin, then a CPU round trip
+      local name=$1; shift
+      env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/hf-xdg" timeout --foreground -k 10 120 \
+        "$GZSTD" "$@" -vv -k -f "$TMPDIR/large.bin" -o "$TMPDIR/hfc.zst" 2>"$TMPDIR/hf.err" \
+        || hf_why+=" $name:rc=$?"
+      "$GZSTD" --cpu-only -d -q -c "$TMPDIR/hfc.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || hf_why+=" $name:bytes"
+    }
+    hf_comp_capped() {
+      grep -qaE "\[GPU\] devices: 2 of [0-9]+ for a regular-file hybrid compress" "$TMPDIR/hf.err" \
+        || hf_why+=" $1:[$(hf_err)]"
+    }
+    hf_comp compress --hybrid; hf_comp_capped compress
+    hf_comp compress-implicit; hf_comp_capped compress-implicit
+    hf_comp compress-explicit --hybrid --gpu-devices 3
+    ! grep -qa '\[GPU\] devices:' "$TMPDIR/hf.err" || hf_why+=" compress-explicit:[$(hf_err)]"
+    rm -f "$TMPDIR/hfc.zst"
     rm -rf "$TMPDIR/hf.zst" "$TMPDIR/hf.out" "$TMPDIR/hf.err" "$TMPDIR/hf-xdg"
     [[ -z "$hf_why" ]] && pass "$hf_t" || fail "$hf_t" "$hf_why"
   elif [[ "${GPU_ALL_DEVICES:-}" != *,*,* ]]; then
@@ -12363,6 +12476,20 @@ else
   skip "a GPU batch published in the writer's blind window still wakes it" "no GPU"
 fi
 fi  # $EXTENSIVE (GPU failure handling: moved to -e in v0.18.32 -- stable, untouched, and slow)
+
+# THE WRITER'S NEXT FRAME WAKES IT (v0.18.48).  A GPU frame published to a slot woke
+# the writer only at its batch's end; in a hybrid run the CPU pool's pushes woke it
+# meanwhile, until the pool had finished -- then a GPU's recycled output buffers
+# stayed queued, and the last batch's frames faulted in fresh 16 MiB ones (0.3-1.0 s
+# on an H100).  GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST publishes the frame a sleeping waiter
+# needs with no batch-completion notify at all, so only the per-frame wake can end the
+# wait.  No CUDA and no device timing: both builds (Codex review's design).
+rs_why=""; rs_rc=0
+rs_got=$(GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST=1 timeout --foreground -k 5 20 "$GZSTD" \
+           </dev/null 2>/dev/null) || rs_rc=$?
+[[ $rs_rc -eq 0 && "$rs_got" == slot-next-frame-woke ]] || rs_why="exit $rs_rc, output [$rs_got]"
+[[ -z "$rs_why" ]] && pass "a GPU slot's next frame wakes the waiting writer" \
+  || fail "a GPU slot's next frame wakes the waiting writer" "$rs_why"
 
 
 # ────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.46";
+static constexpr const char * GZSTD_VERSION = "0.18.48";
 //
 // Architecture overview:
 //
@@ -5576,9 +5576,12 @@ static void print_help_long()
 "the CPU and never touches a GPU.  A decode also needs its CPU pool\n"
 "to be falling behind the reader (frames left waiting): while the\n"
 "pool takes each frame as it arrives, a GPU would only wait for a\n"
-"batch that never forms.  -v says which happened.  So a short job,\n"
-"or one the CPU pool decodes at memory speed, costs no GPU bringup\n"
-"and no VRAM under the default.\n"
+"batch that never forms.  And by enough: a decode cannot end before\n"
+"its reader does, so the thread estimates the most a GPU could save,\n"
+"how long the pool would run on after the last frame is read, and\n"
+"that, not the time left, must clear the startup guard.  -v says\n"
+"which happened.  So a short job, or one the CPU pool decodes at\n"
+"memory speed, costs no GPU bringup and no VRAM under the default.\n"
 "An input of unknown size (a pipe) is held to the one-batch bound as\n"
 "it arrives: CUDA starts once a batch's worth of work has come in, or\n"
 "after a few seconds if it is still coming; a pipe that ends first\n"
@@ -5882,10 +5885,12 @@ static void print_help_long()
 "     CPU workers pop single frames; GPU workers pop greedy batches.\n"
 "     An EMA (exponential moving average)-based scheduler tracks\n"
 "     observed throughput and adapts the CPU/GPU split over time.\n"
-"     It does not force the GPUs on: they start only if the job will\n"
-"     outlast their startup and, on a decode, the CPU pool is falling\n"
-"     behind the reader (see BACKEND SELECTION).  --gpu-only, or\n"
-"     --hybrid with --cpu-share, always starts them.\n"
+"     It does not force the GPUs on: they start only if the job is\n"
+"     estimated to outlast their startup guard and, on a decode, the\n"
+"     CPU pool falls far enough behind the reader that the time it\n"
+"     would run on after the reader ends clears the guard too (see\n"
+"     BACKEND SELECTION).  --gpu-only, or --hybrid with --cpu-share,\n"
+"     always starts them.\n"
 "\n"
 "  --sliding-window\n"
 "     Compress the whole file as a single frame with zstd's built-in\n"
@@ -6114,10 +6119,10 @@ static void print_help_long()
 "     Number of GPUs to use.  0 = auto: all available GPUs, except that\n"
 "     each costs ~0.5 s to start, frames or not (a 64 MiB --gpu-only\n"
 "     compress took 5.5 s on eight GPUs and 1.6 s on one), so a pipe\n"
-"     starts two (one stream: two carry it), a hybrid -d or -t of a named\n"
-"     file two (the cards share what the reader has beyond the CPU pool,\n"
-"     which more cards do not raise), and --gpu-only on regular\n"
-"     files the count this machine's profile predicts is fastest for the\n"
+"     starts two at most (one stream: two carry it), as does a hybrid run\n"
+"     of a named or redirected file -- automatic ceilings, measured on one\n"
+"     server -- and --gpu-only on regular files starts\n"
+"     the count this machine's profile predicts is fastest for the\n"
 "     input's size when --calibrate FILE (compress) or --calibrate ARCHIVE\n"
 "     (decompress and -t) has measured every count, else one per 8 GiB of\n"
 "     input; two at most when most of it is not cached (the drive sets the\n"
@@ -11107,9 +11112,28 @@ static uint64_t adapt_decomp_uncompressed_est(int fd, uint64_t comp_size);
 #endif
 #endif
 
-// How long GPU bringup takes, near enough.  Same guard the -d --tar decode pool
-// already uses to decide whether to engage its GPU streams; kept identical so
-// the two lazy-engagement decisions can't disagree about what cuInit costs.
+// The price of a GPU bringup the sampler weighs a job against: the same four
+// seconds the -d --tar decode pool asks of its own work before it engages GPU
+// streams (a separate check), so the two lazy-engagement decisions agree.  It is
+// a legacy budget, NOT a measured CUDA latency or a host-independent break-even:
+// before CUDA starts, a run knows neither the cards' start-up and teardown nor
+// their rate (on the 8-H100 server, two cards came up 1.3-2.8 s after the
+// decision depending on how busy the CPUs were, and took 0.22-0.25 s each to
+// tear down).  What the sampler CAN measure it compares against this price: the
+// most a GPU could save (see gpu_bringup_worth_it), not merely the time left.
+// WHICH PRICE A RUN USES (v0.18.48, ROADMAP 42a) -- STATE TABLE:
+//   --gpu-only, or --cpu-share               -> no sample, no price (they always start)
+//   a known-size hybrid run, any profile     -> this legacy price
+//   an unknown-size (piped) hybrid, --adapt  -> the backlog gate, no time price
+//   an unknown-size hybrid, no --adapt       -> the work gate; this price as its timeout
+//   GZSTD_DEBUG_GPU_GUARD_SEC                -> the test override, in the sampler
+// NOT the profile's --gpu-only overhead model (gpuc_overhead_s, which --calibrate
+// fills): that is a --gpu-only run's wall time outside its cards' busy span, with no
+// CPU pool losing to the cards' host copies and threads, and its wall clock stops
+// before the kernel tears the contexts down at exit -- 0.15-0.34 s in the H100 runs
+// of ROADMAP 42f (Codex review).  A measured hybrid price needs its own model, fitted
+// on calibrated --cpu-only and hybrid runs side by side; ROADMAP 42 says what it must
+// record.
 static constexpr double GPU_INIT_GUARD_SEC = 4.0;
 // Startup ramp to discard before trusting the pipeline's rate, then the length of
 // each window the rate is measured over.  Windows repeat until the decision is
@@ -11120,6 +11144,19 @@ static constexpr double GPU_SAMPLE_WINDOW_SEC = 0.15;
 // A window whose rate is within this factor of the previous window's means the
 // startup ramp is over, and that rate is the one to extrapolate.
 static constexpr double GPU_SAMPLE_SETTLED = 1.25;
+
+// The most a GPU could save a hybrid decode, in seconds: R - Ru = s x R + (B + I) / U,
+// at most R (derived at gpu_bringup_worth_it).  remaining = R, the pool's time
+// left; share = s; waiting = B and in_flight = I, frames; reader_fps = U.  -1 when
+// there is no remaining-time estimate.  Pure, so the suite can check the arithmetic
+// without a timing (GZSTD_DEBUG_GPU_BOUND=R,s,B,I,U prints it and exits).
+static double gpu_reader_headroom(double remaining, double share, double waiting,
+                                  double in_flight, double reader_fps)
+{
+  if (!(remaining > 0.0)) return -1.0;
+  const double lead = reader_fps > 0.0 ? (waiting + in_flight) / reader_fps : 0.0;
+  return std::min(remaining, share * remaining + lead);
+}
 
 // Is bringing the GPU up still worth it?  Called from the background bringup
 // thread BEFORE the first CUDA call, so a "no" costs nothing at all.
@@ -11174,7 +11211,8 @@ static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 // cut 25.96-26.05 s to 16.95-17.18.  0 = no such test (compress: the mmap reader
 // queues the whole input, so the backlog says nothing there).  `pool_keeps_up`
 // is set when that test is what declined, so the caller can say so: 1 = the pool
-// keeps up, 2 = it is behind, but by less than a GPU costs it (below).
+// keeps up, 2 = it is behind, but by less than a GPU costs it (below),
+// 3 = its estimated surplus work does not clear the bringup guard.
 //
 // `pushed` (v0.18.44, with behind_frames): the frames the reader has queued so
 // far (TaskQueue::total_tasks).  BEHIND IS NOT ENOUGH; BEHIND BY HOW MUCH.  A GPU
@@ -11201,6 +11239,56 @@ static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 // or two of a pool far behind, which the first windows will have seen.  At two workers' share the 8-CPU row engaged on 45 frames against 40.
 // NOT YET MEASURED on a second host (ROADMAP 40): the 2080 Ti box lost 7% at 12
 // CPUs and won 12% at 8 before this test existed.
+//
+// THE MOST A GPU COULD SAVE (v0.18.47).  A hybrid decode cannot end before its
+// reader does, however fast the cards: what a GPU can cut is the time the pool
+// would go on decoding after the last frame was read, R - Ru, with R the pool's
+// remaining time and Ru = unread / U the reader's.  With P and U the frames per
+// second the pool takes and the reader queues, B the frames waiting, I those in
+// flight on the pool's workers and N the unread ones, R = (B + I + N) / P and
+// Ru = N / U, so R - Ru = s x R + (B + I) / U, where s = (U - P) / U = grew /
+// (frames queued) is the share of the reader's output the pool leaves -- every
+// term counted by this sampler, on any host (gpu_reader_headroom), I as the
+// pool's size (a pool behind its reader has a frame on every worker).  It bounds
+// what instant, unlimited cards could save, estimated from steady rates and a
+// representative frame mix (R is bytes, s frames), and the guard prices a
+// bringup, so the sample engages only when the bound clears the guard: the old
+// R > guard is its s -> 1 case (a pool that takes nothing, or a reader with
+// nothing left to read).  (The backlog and in-flight terms: Codex review.)
+// It is not a break-even: the cards' own rate, their host copies, the pool's
+// loss to CUDA's start and their teardown are unknown before CUDA starts, and
+// the guard is still the tree's one price for all of them (see GPU_INIT_GUARD_SEC).
+// MEASURED, 8-H100 server, a cached 72 GiB archive (4,669 frames) to /dev/null at
+// N CPUs, two cards, wall s.  The columns are different runs: --cpu-only every
+// round; v0.18.46 its own runs (two to five a row, none at 10 CPUs); s and the
+// bound the deciding window, ~0.41 s in, of each v0.18.47 run that decided there;
+// v0.18.47 its final build's three rounds.
+//   CPUs  --cpu-only   v0.18.46     s          bound      v0.18.47
+//    4    20.9-21.0   10.5-10.7  0.77-0.89   20-39 s    engage  10.4-11.1
+//    8    10.4-10.5    8.3-8.7   0.61-0.63   7.6-8.5    engage   8.5-8.6
+//   10     7.8-8.0       --      0.47-0.65   4.0-5.8    engage   7.0-7.1; one read 3.99, skip: 7.9
+//   12     6.3-6.7     6.1-6.5   0.53-0.58   3.4-4.1    skip at 3.4-3.9: 6.38-6.39
+//   14     5.3-5.5     5.8-6.2   0.47-0.48   2.7-2.8    skip     5.32-5.39
+//   16     4.6-4.9     5.2-6.0   0.29-0.40   1.7-2.1    skip     4.65-4.86
+// The build before the final one computed the same bound and engaged at the same
+// window (it declined at the budget instead): it engaged all three 10-CPU runs
+// (6.4-7.3) and two at 12, at bounds of 4.03-4.06, which won (5.86 against
+// 6.30-6.33 that round).  So 12 CPUs is where two cards stop paying here, on the
+// guard from both sides -- a guard this host did not choose -- and the 16-CPU
+// decode that v0.18.46's two cards slowed by 12-29% ties --cpu-only.  The numbers
+// above for the 5090 give 2.4 at 8 CPUs ("a tie at best") and 6-6.5 at 6 and 4,
+// which won.  The counts are the growth test's, cumulative from
+// the first window.  A bound that falls short declines at the window an engage
+// would have taken, not at the budget: in steady state it does not drift (both end
+// times are fixed), under that model the early biases -- a reader's startup burst
+// inflating s, a ramping pool inflating R -- only overstate it (a reader that
+// speeds up later is outside it), and sampling on is NOT free.
+// MEASURED, 12 CPUs, a decline forced at the budget (~2.2 s in) took 6.48-7.21 s
+// against 6.31-6.37 for one at 0.25 s (--cpu-only 6.30-6.33): the 2,062-frame
+// queue lets the reader run ahead of the pool all that time.  A cap reached
+// mid-sample keeps the last uncensored bound; capped from the start, or a finished
+// reader, the bound is R, the old test.  Without the growth callback (compress)
+// the test is off.
 static bool gpu_bringup_worth_it(const Options & opt,
                                  const std::function<double()> & progress,
                                  std::mutex & mx, std::condition_variable & cv,
@@ -11376,13 +11464,19 @@ static bool gpu_bringup_worth_it(const Options & opt,
   };
   // The fewest frames waiting at any check of the current window (behind_frames).
   const bool test_behind = behind_frames > 0 && backlog && opt.cpu_share < 0.0;
+  const bool test_growth = test_behind && pushed;
+  bool surplus_capped = false;
   size_t win_min = SIZE_MAX;
   // Wait until `until` seconds in, or until the run ends.  Timed CV wait rather
   // than a bare sleep so a job that finishes mid-sample cuts it short instead of
   // waiting out the window.
   auto hold = [&](double until) {
     while (secs_in() < until) {
-      if (test_behind) win_min = std::min(win_min, backlog());
+      if (test_behind) {
+        const size_t b = backlog();
+        win_min = std::min(win_min, b);
+        if (test_growth && b == SIZE_MAX) surplus_capped = true;
+      }
       if (stop()) return false;
       std::unique_lock<std::mutex> lk(mx);
       cv.wait_for(lk, std::chrono::milliseconds(10), [&] { return stop(); });
@@ -11413,8 +11507,8 @@ static bool gpu_bringup_worth_it(const Options & opt,
   // FALLS, as on an archive whose head is cached and whose tail is not; the single
   // window this replaces had that exposure too.  An engage waits until the rate
   // stops rising (a window within GPU_SAMPLE_SETTLED of the one before), or until
-  // half the guard has passed: a job still running then wants the GPU, and starting
-  // it that much later costs it little.  MEASURED on the same archive and host,
+  // half the guard has passed, when the backlog and surplus tests make the final
+  // decision.  MEASURED on the same archive and host,
   // four runs each: 8 GPUs 27.2-29.8 -> 56.9-62.4 GiB/s (skip at ~0.40 s), one GPU
   // 24.0-39.8 -> 53.0-59.7, and a cold decompress still engages (settled at 706 ms).
   if (!hold(GPU_SAMPLE_WARMUP_SEC)) return say(false, "run ended during warm-up", 0.0, frac());
@@ -11434,10 +11528,23 @@ static bool gpu_bringup_worth_it(const Options & opt,
     const double v = e ? std::strtod(e, &end) : -1.0;
     return e && end != e && v >= 0.0 ? v : -1.0;
   }();
-  const bool test_growth = test_behind && pushed;
+  // Test-only: the bound as a share of R, replacing s, B / U and the cap/EOF
+  // fallback.  0 forces the new decline when the other tests pass and a remaining
+  // time is measurable; 1 restores the old remaining > guard test.  It never
+  // bypasses waiting or enough, and has no effect without test_growth or with guard=0.
+  const double surplus_hook = [] {
+    const char * e = ::getenv("GZSTD_DEBUG_GPU_SURPLUS_SHARE");
+    char * end = nullptr;
+    const double v = e ? std::strtod(e, &end) : -1.0;
+    return e && end != e && *end == '\0' && std::isfinite(v) && v >= 0.0 && v <= 1.0
+         ? v : -1.0;
+  }();
   const size_t b_first = test_growth ? backlog() : 0;
   const size_t p_first = test_growth ? pushed() : 0;
+  const double t_first = secs_in();
+  double uncensored_save = -1.0;   // the bound from the last window no cap censored
   bool capped = test_growth && b_first == SIZE_MAX;
+  surplus_capped = capped;   // discard warm-up observations
   for (;;) {
     win_min = SIZE_MAX;
     if (!hold(t_prev + GPU_SAMPLE_WINDOW_SEC))
@@ -11445,6 +11552,9 @@ static bool gpu_bringup_worth_it(const Options & opt,
     const size_t b_now = test_growth ? backlog() : 0;
     const size_t p_now = test_growth ? pushed() : 0;
     capped = capped || (test_growth && b_now == SIZE_MAX);
+    // Keep the old growth test; the surplus rate also remembers a cap observed
+    // between window ends, when producer backpressure censored the sample.
+    surplus_capped = surplus_capped || capped;
     const double p = frac();
     const double t = secs_in();
     if (p >= 0.98) return say(false, "already done", 0.0, p);
@@ -11459,27 +11569,64 @@ static bool gpu_bringup_worth_it(const Options & opt,
     // since the first window against the frames the pool took meanwhile.
     const double grew  = capped || !test_growth ? 0.0 : double(b_now) - double(b_first);
     const double took  = capped || !test_growth ? 0.0 : double(p_now - p_first) - grew;
+    const bool reader_done = test_growth && no_more && no_more();
+    const double queued = test_growth ? double(p_now - p_first) : 0.0;
+    // No pushes (or no growth) while the reader is live is no observed surplus;
+    // never divide by zero.  Counts are read separately, so clamp snapshot skew.
+    const double surplus = !test_growth ? 1.0
+        : surplus_capped || reader_done ? 1.0
+        : queued > 0.0 ? std::max(0.0, std::min(1.0, grew / queued)) : 0.0;
+    // The most a GPU could save (see above).  A cap censors the reader's rate from
+    // the moment it is reached, not the windows before it, and the bound does not
+    // drift while the rates hold: a cap reached mid-sample keeps the last uncensored
+    // bound (capped from the start, there is none: R, the old test).  A finished
+    // reader has nothing left to read, so Ru = 0 and the bound is R exactly.
+    const double reader_fps = queued > 0.0 && t > t_first ? queued / (t - t_first) : 0.0;
+    const double waiting_frames = b_now == SIZE_MAX ? 0.0 : double(b_now);
+    double could_save = -1.0;
+    if (rate > 0.0) {
+      if (surplus_hook >= 0.0)                could_save = surplus_hook * remaining;
+      else if (!test_growth || reader_done)   could_save = remaining;
+      else if (surplus_capped)                could_save = uncensored_save >= 0.0
+                                                  ? std::min(remaining, uncensored_save) : remaining;
+      else {
+        // In flight: a pool behind its reader has a frame on every worker, and R
+        // counts a frame's bytes only once it is decoded.
+        could_save = gpu_reader_headroom(remaining, surplus, waiting_frames,
+                                         double(behind_frames), reader_fps);
+        // Kept only from a window that measured the reader: one that queued nothing
+        // says 0, and a cap that follows must not inherit it (Codex review).
+        if (reader_fps > 0.0) uncensored_save = could_save;
+      }
+    }
+    // No rate means no remaining-time estimate: preserve the budget fallback.
+    const bool enough_time = !test_growth || rate <= 0.0 || could_save > guard_sec;
     // What each window saw (-vv), so the burst a reader makes while it fills its
     // queue can be told from a surplus that lasts: the backlog and the frames the
     // reader has queued at the window's end, and the fewest waiting within it.
     if (test_growth && opt.verbosity >= V_DEBUG) {
-      char w[240];
+      char w[320];
       std::snprintf(w, sizeof w,
         "[GPU] bringup window: ends %.0f ms, queued %zu (+%zu since the first window), backlog %s "
-        "(+%.0f), fewest waiting %zu, pool took %.0f, %.1f%% done\n",
+        "(+%.0f), fewest waiting %zu, pool took %.0f, %.1f%% done; "
+        "surplus share %.3f, reader %.0f frames/s, a GPU could save %.2f s of %.2f%s\n",
         t * 1000.0, p_now, p_now - p_first,
         b_now == SIZE_MAX ? "at its cap" : std::to_string(b_now).c_str(),
-        grew, win_min == SIZE_MAX ? (size_t)0 : win_min, took, p * 100.0);
+        grew, win_min == SIZE_MAX ? (size_t)0 : win_min, took, p * 100.0,
+        surplus, reader_fps, could_save, remaining,
+        surplus_hook >= 0.0 ? " (test override)"
+          : surplus_capped ? " (reader capped)" : reader_done ? " (reader ended)" : "");
       vlog(V_DEBUG, opt, w);
     }
     const double share = share_hook >= 0.0 ? share_hook
                                            : std::min(0.5, 3.0 / double(behind_frames));
     // A reader that has FINISHED left everything in the queue: the backlog can
     // only shrink, and the remaining-time test above is the whole answer.  (The
-    // hook's share decides alone, so a cell can force either answer.)
+    // hook's share decides this growth test alone, bypassing cap/EOF, so a cell
+    // can force either answer; the time and waiting tests remain independent.)
     const bool grown = grew > 0.0 && grew >= took * share;
     const bool enough = !test_growth
-        || (share_hook >= 0.0 ? grown : capped || grown || (no_more && no_more()));
+        || (share_hook >= 0.0 ? grown : capped || grown || reader_done);
     const bool behind = waiting && enough;
     if (test_behind) {
       int n = std::snprintf(behind_why, sizeof behind_why,
@@ -11494,8 +11641,34 @@ static bool gpu_bringup_worth_it(const Options & opt,
                         grew, took, took * share);
       }
     }
+    // A short bound declines at the window an engage would have (see the derivation
+    // above): sampling on costs the pool, and only adds the windows that cannot move it.
+    auto short_bound = [&] {
+      if (pool_keeps_up) *pool_keeps_up = 3;
+      std::snprintf(behind_why, sizeof behind_why,
+                    "the reader ends only %.2f s before the CPU pool would (surplus share "
+                    "%.3f of %.2f s, %.0f frames waiting): the most a GPU could save "
+                    "does not clear the guard",
+                    could_save, surplus, remaining, waiting_frames);
+      return say(false, behind_why, remaining, p);
+    };
+    // A POOL THAT KEEPS UP SAMPLES ON TO THE BUDGET, WHATEVER ITS BOUND (v0.18.48,
+    // ROADMAP 42e, kept on purpose).  STATE TABLE:
+    //   behind     + settled        -> engage, or short_bound (v0.18.47)
+    //   behind     + at the budget  -> engage, or short_bound
+    //   not behind + before budget  -> keep sampling, even with a short bound
+    //   not behind + at the budget  -> the keeps-up / nearly-keeps-up decline
+    // The bound reads short for a pool that keeps up (s = 0: (B + I) / U, 0.20 s in
+    // every window of a 32 GiB archive read cold at 64 CPUs), and declining at the
+    // settled window was tried.  But a settled POOL does not mean a settled READER:
+    // an archive whose cold head gives way to a cached tail falls behind later in
+    // the budget, which only sampling on can see (Codex review).  And waiting costs
+    // a pool that keeps up nothing measurable -- an empty queue lets nothing run
+    // ahead: 6.44 s against --cpu-only 6.64 in that run.  v0.18.47's 0.15-0.9 s was
+    // the cost of sampling on BEHIND a reader, which it already stopped.
     if (behind && rate > 0.0 && prev_rate > 0.0 && rate <= prev_rate * GPU_SAMPLE_SETTLED)
-      return say(true, (std::string("settled rate") + behind_why).c_str(), remaining, p);
+      return enough_time ? say(true, (std::string("settled rate") + behind_why).c_str(), remaining, p)
+                         : short_bound();
     if (t >= budget) {
       if (!behind) {
         if (pool_keeps_up) *pool_keeps_up = waiting ? 2 : 1;
@@ -11512,6 +11685,7 @@ static bool gpu_bringup_worth_it(const Options & opt,
                         grew, behind_frames, took, took * share);
         return say(false, behind_why, remaining, p);
       }
+      if (!enough_time) return short_bound();
       return (rate > 0.0) ? say(true, (std::string("rate at sampling budget") + behind_why).c_str(),
                                 remaining, p)
                           : say(true, "no measurable progress", -1.0, p);
@@ -16014,9 +16188,25 @@ struct ResultStore {
   // Producer: push a result to a specific slot (low contention  one producer per slot)
   void push_to_slot(int slot_id, size_t seq, FrameBuf frame) {
     if (slot_id >= 0 && slot_id < (int)slots.size()) {
-      std::lock_guard<std::mutex> lk(slots[slot_id]->slot_m);
-      slots[slot_id]->pending.emplace_back(seq, std::move(frame));
-      // GPU path: no per-frame notify. Batch-completion notify handles it.
+      {
+        std::lock_guard<std::mutex> lk(slots[slot_id]->slot_m);
+        slots[slot_id]->pending.emplace_back(seq, std::move(frame));
+      }
+      // GPU path: no notify per frame -- the batch's completion notify covers the
+      // rest -- EXCEPT for the frame the writer is waiting for (v0.18.48).  The
+      // writer drained a GPU slot only when something woke it: in a hybrid run the
+      // CPU pool's pushes did, every few ms, so a GPU's ~28 recycled output buffers
+      // came back as it delivered.  Once the pool had finished, nothing woke it
+      // until the batch ended, the buffers stayed queued, and every frame past the
+      // 28th of the last batch took a fresh 16 MiB buffer whose pages the copy
+      // faulted in.  MEASURED, 8-H100 server, a cached 72 GiB archive, one card,
+      // 4-8 CPUs: the last batch drew 49-113 fresh buffers in 9 of 12 runs and its
+      // D2H took 0.31-0.97 s against ~0.12 for a 128-frame batch of recycled ones,
+      // with the pool idle (ROADMAP 42g).  Woken for its next frame, the writer
+      // writes the batch as it lands.  After slot_m: the writer takes slot_m under
+      // m.  A stale cursor only skips this notify (the batch's still comes), and
+      // notify_slot_batch takes m, so it cannot fall into the writer's scan-to-wait gap.
+      if (seq == next_pub.load(std::memory_order_relaxed)) notify_slot_batch();
     } else {
       // CPU path: shared map, always notify.  A "targeted notify only when
       // seq == next_to_write" optimization was tried in v0.12.16 and removed
@@ -16048,7 +16238,8 @@ struct ResultStore {
   // The writer holds `m` from its scan until cv.wait releases it, so a notifier
   // that takes `m` first cannot run inside the gap: it runs before the scan
   // (which then sees the slot) or after the wait began (which it then wakes).
-  // One uncontended lock per BATCH, not per frame.
+  // One uncontended lock per BATCH -- and, since v0.18.48, per GPU frame that is the
+  // writer's next (push_to_slot).
   void notify_slot_batch() {
     std::lock_guard<std::mutex> lk(m);
     cv.notify_one();
@@ -16066,6 +16257,54 @@ struct ResultStore {
     }
   }
 };
+
+// GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST=1 (v0.18.48; Codex review): push_to_slot's wake for
+// the writer's next frame, without CUDA, a device's timing or a batch's end.  A waiter
+// takes the writer's lock, scans the slots and sleeps on the writer's condition; the
+// frame it waits for is then published to a GPU slot with NO batch-completion notify,
+// so only the per-frame wake can end the wait.  Acquiring m before publishing proves
+// the waiter released it in cv.wait.  Prints "slot-next-frame-woke" and exits 0; a
+// missing wake hangs (the suite's timeout).
+static int gz_slot_notify_selftest()
+{
+  ResultStore rs;
+  rs.init_slots(1);
+  std::mutex ready_m;
+  std::condition_variable ready_cv;
+  bool ready = false;
+  std::thread waiter([&] {
+    std::unique_lock<std::mutex> lk(rs.m);
+    rs.drain_slots_locked();
+    {
+      std::lock_guard<std::mutex> rk(ready_m);
+      ready = true;
+    }
+    ready_cv.notify_one();
+    rs.cv.wait(lk, [&] {
+      rs.drain_slots_locked();
+      return rs.producer_done || rs.data.count(0) != 0;
+    });
+  });
+  {
+    std::unique_lock<std::mutex> rk(ready_m);
+    ready_cv.wait(rk, [&] { return ready; });
+  }
+  { std::lock_guard<std::mutex> lk(rs.m); }
+  try {
+    rs.push_to_slot(0, 0, std::make_shared<FrameVec>());
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lk(rs.m);
+      rs.producer_done = true;
+      rs.cv.notify_one();
+    }
+    waiter.join();
+    throw;
+  }
+  waiter.join();
+  std::puts("slot-next-frame-woke");
+  return 0;
+}
 
 // Writer thread: waits for compressed frames to appear in sequence order,
 // then writes them to the output file.  This keeps the output deterministic
@@ -28279,6 +28518,37 @@ static const GzFloorPre & gz_floor_precuda()
 // every card not known to be below the floor, before any mask.  0 = none listed
 // or unreadable.  For a decision that must come before CUDA starts.
 static int gz_precuda_gpu_count() { return gz_floor_precuda().usable; }
+
+// THE PROVISIONAL DEVICE COUNT (v0.18.48): what a deferred bringup (hybrid, and
+// --gpu-only's overlap) sizes its throttle floor and scheduler by before CUDA can
+// count the devices.  It was max(--gpu-devices, 8) on both sides -- and on decode
+// even when v0.18.46's cap had set --gpu-devices to two and masked the rest (compress
+// trimmed it to --gpu-devices; decode never did), so a two-card decode sized for
+// eight (ROADMAP 42d).  STATE TABLE:
+//   a CUDA_VISIBLE_DEVICES list (the caller's, or the device rule's own)
+//                         -> its entries (CUDA stops at the first it cannot use)
+//   --gpu-devices N       -> no more than N
+//   neither               -> the old guess, max(--gpu-devices, 8)
+// Not the driver's /proc list: that counts physical GPUs, and a mask may name more
+// logical (MIG) devices than there are cards (Codex review).  An upper bound: the
+// bringup fits the real count.  The queue's depth during the sample is NOT sized
+// by this (see decompress_nvcomp's gpu_queue_ceiling).
+static int gz_provisional_gpu_count(const Options & opt)
+{
+  int n = std::max(opt.gpu_devices, 8);
+  if (const char * mask = ::getenv("CUDA_VISIBLE_DEVICES")) {
+    int entries = 0;
+    for (const char * p = mask; ; ) {
+      const char * q = std::strchr(p, ',');
+      if ((q ? (size_t)(q - p) : std::strlen(p)) > 0) ++entries;
+      if (!q) break;
+      p = q + 1;
+    }
+    n = entries;
+  }
+  if (opt.gpu_devices > 0) n = std::min(n, opt.gpu_devices);
+  return n;
+}
 
 static int gz_pre_uuid_floor(const std::string & uuid)
 {
@@ -41736,11 +42006,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     total_hw_devices = device_count;
   } else {
     // Provisional count, used only to SIZE the throttle and scheduler before the
-    // real one is known.  Generous on purpose: the throttle budget is RAM-capped
-    // downstream, so over-estimating costs nothing, and the per-device arrays are
-    // built from the real count inside the bringup below.  Same trick, and the
-    // same justification, as decompress_nvcomp.
-    device_count = std::max(opt.gpu_devices, 8);
+    // real one is known: a mask's or --gpu-devices' bound, else the old guess of
+    // eight (gz_provisional_gpu_count).  The per-device arrays are built from the
+    // real count inside the bringup below, as in decompress_nvcomp.
+    device_count = gz_provisional_gpu_count(opt);
     total_hw_devices = device_count;
   }
 
@@ -46754,6 +47023,14 @@ static void gpu_decomp_worker(
       }
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
+      // How many host output buffers this stream allocated (v0.18.48): the pool
+      // plus its overdrafts.  A writer woken for each frame it waits on keeps this
+      // to a handful; one that drains only at batch ends needs a batch's worth
+      // (see push_to_slot).  -vv, for the suite: a count, never a time.
+      if (opt.verbosity >= V_DEBUG && (!C.out_pool.empty() || C.out_pool_waits))
+        vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id) + "/S" + std::to_string(C.stream_index)
+             + "] output buffers: " + std::to_string(C.out_pool.size() + C.out_pool_waits)
+             + " allocated\n");
       C.free_device();
       size_t freed = C.free_host_pinned();
       if (freed) release_pinned(freed, opt);
@@ -47344,9 +47621,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       }
     }
   } else {
-    // Provisional count for throttle sizing; real detection happens in
-    // the background bringup thread.  Generous (RAM-capped downstream).
-    device_count = std::max(opt.gpu_devices, 8);
+    // Provisional count for throttle and scheduler sizing; real detection happens
+    // in the background bringup thread.  A mask's or --gpu-devices' bound, as
+    // compress always trimmed it (gz_provisional_gpu_count, v0.18.48).
+    device_count = gz_provisional_gpu_count(opt);
     total_hw_devices = device_count;
   }
 
@@ -47443,7 +47721,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   const int decomp_gpu_batch_floor = device_count
       * (int)std::max<size_t>(1, opt.gpu_streams)
       * (int)decomp_per_stream_budget;
-  const int decomp_parallelism = decomp_cpu_threads_est + decomp_gpu_batch_floor;
+  // THE QUEUE A HYBRID DECODE SAMPLES IN IS v0.18.47's (v0.18.48).  The bringup sample
+  // reads the reader's rate and surplus from the backlog's growth, and a cap censors
+  // them (gpu_bringup_worth_it): a queue sized for the two cards a capped run starts
+  // can fill before the first window ends, leaving no measured bound -- and the
+  // fallback is the permissive remaining-time test (Codex review).  So the sample
+  // keeps the old depth, for eight cards, and the queue comes down to the cards the
+  // run will start once it has decided (gpu_queue_ceiling).
+  const int queue_devices = hybrid_overlap ? std::max(opt.gpu_devices, 8) : device_count;
+  const int decomp_parallelism = decomp_cpu_threads_est + queue_devices
+      * (int)std::max<size_t>(1, opt.gpu_streams) * (int)decomp_per_stream_budget;
   // The pool as the memory holds it in either case (see compress_nvcomp).
   bool thr_ram_bound = false;
   FrameThrottle throttle(compute_throttle_budget(
@@ -48072,6 +48359,28 @@ gds_out_declined:
     queue_depth_ceiling = qf;
     if (sched) sched->set_queue_depth_cap(qf);
   };
+  // ...AND ONE THAT ENGAGES QUEUES FOR THE CARDS IT STARTS (v0.18.48, ROADMAP 42d).
+  // The sample's depth is eight cards' batches (see queue_devices), whatever the run
+  // starts.  Kept past the decision, it let the reader run ahead of a two-card run:
+  // a cached 72 GiB archive, 8-H100 server, 4-12 CPUs, 2,051-2,058 frames queued and
+  // 27.5-30.3 GiB peak RSS while the cards came up.  So on an engage the ceiling
+  // drops to the pool plus a full batch for every stream of the cards it will start
+  // -- v0.17.48's one batch per consumer -- first for the provisional count (the
+  // device rule's mask), then for the count the bringup fits.  Only ever lowered.
+  auto gpu_queue_ceiling = [&](int devices, size_t per_stream) {
+    if (!hybrid_overlap || !queue_depth_ceiling || devices <= 0) return;
+    const int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : 1;
+    const size_t qf = (size_t)std::max(THROTTLE_MIN_FRAMES,
+        (decomp_cpu_threads_est + devices * (int)std::max<size_t>(1, opt.gpu_streams)
+                                          * (int)std::max<size_t>(1, per_stream)) * qslack);
+    if (qf >= queue_depth_ceiling) return;
+    queue.set_max_depth(qf);
+    queue.set_max_bytes(gz_queue_bytes_cap(qf * (8 * ONE_MIB)));
+    queue_depth_ceiling = qf;
+    if (sched) sched->set_queue_depth_cap(qf);
+    vlog(V_DEBUG, opt, "[GPU] queue ceiling: " + std::to_string(qf) + " frames for "
+         + std::to_string(devices) + " device(s)\n");
+  };
 
   auto gpu_bringup = [&]() {
     if (defer_detect) {
@@ -48131,11 +48440,15 @@ gds_out_declined:
                : pool_keeps_up == 2
                ? "[GPU] the CPU pool nearly keeps up with the reader, so a GPU would take less "
                  "than its own threads cost; skipping GPU bringup\n"
+               : pool_keeps_up == 3
+               ? "[GPU] the reader ends too little before the CPU pool for a GPU to repay its "
+                 "bringup; skipping GPU bringup\n"
                : "[GPU] CPU pool will finish before GPU init could; skipping GPU bringup\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         cpu_queue_ceiling();
         return;
       }
+      gpu_queue_ceiling(device_count, decomp_per_stream_budget);   // the provisional count
       // Before any CUDA call: one GPU's context and smallest batches must fit
       // (v0.18.30; see compress_nvcomp).
       if (gpu_joins_later) {
@@ -48209,6 +48522,9 @@ gds_out_declined:
         bool gpu_ram_bound = false;
         const int budget = compute_throttle_budget(decomp_frame, cpu + floor, floor, opt, &gpu_ram_bound);
         throttle.grow_to(budget, gpu_ram_bound);
+        gpu_queue_ceiling(device_count, per);                     // the fitted count
+      } else {
+        gpu_queue_ceiling(device_count, decomp_per_stream_budget);
       }
     }
     if (device_count <= 0) return;
@@ -54675,6 +54991,8 @@ int main(int argc, char ** argv)
   } gpu_monitor_guard;
 #endif
   try {
+    // Hidden hook: push_to_slot wakes the writer for its next frame (both builds).
+    if (::getenv("GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST")) return gz_slot_notify_selftest();
 #ifdef HAVE_NVCOMP
     // Hidden hook: verify the --gds-only content-checksum kernel against the CPU
     // hash and exit.  Kept out of parse_args deliberately — it runs before any
@@ -54685,6 +55003,18 @@ int main(int argc, char ** argv)
         die_usage(gz_no_gpu_usage_msg(test_opt));
       checkCuda(cudaSetDevice(gz_floor_postcuda().ids.front()), "XXH GPU selftest: cudaSetDevice");
       return gzstd_xxh_gpu_selftest();
+    }
+    // Hidden hook: the bringup sampler's bound (gpu_reader_headroom) on given
+    // inputs, R,s,B,I,U, printed to stdout, then exit -- its arithmetic, checked
+    // without a run whose rates no host can pin.
+    if (const char * e = ::getenv("GZSTD_DEBUG_GPU_BOUND")) {
+      double v[5] = {0, 0, 0, 0, 0};
+      if (std::sscanf(e, "%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4]) != 5) {
+        std::fprintf(stderr, "gzstd: GZSTD_DEBUG_GPU_BOUND wants R,s,B,I,U\n");
+        return 2;
+      }
+      std::printf("%.3f\n", gpu_reader_headroom(v[0], v[1], v[2], v[3], v[4]));
+      return 0;
     }
 #endif
     {
@@ -55864,7 +56194,8 @@ static void apply_backend_defaults(Options & opt)
   //
   // A HYBRID -d OR -t OF A NAMED FILE TAKES TWO AT MOST (v0.18.46), on the same
   // grounds: see the branch below.  It never ran the rule before, so it started every
-  // card the driver listed.
+  // card the driver listed.  SO DOES A HYBRID COMPRESS OF ONE, AND A REDIRECTED STDIN
+  // COUNTS AS ONE (v0.18.48): the hybrid backend now takes two at most whatever it reads.
   //
   // UNDER --adapt only a --gpu-only run whose count --adapt did not settle reaches
   // this (v0.18.43; adapt_counted above), and its regular-file branches; a pipe
@@ -55885,8 +56216,18 @@ static void apply_backend_defaults(Options & opt)
       if (r != 0) { known = streams = false; break; }
       if (S_ISREG(st.st_mode)) {
         streams = false;
-        if (in == "-") known = false;     // a redirect: left alone, as v0.18.39 did
-        total += (uint64_t)st.st_size;
+        // A REDIRECTED STDIN IS A REGULAR FILE TOO (v0.18.48).  v0.18.39 left it
+        // alone, so gzstd -d < f.zst started every card the driver listed where
+        // gzstd -d f.zst starts two, and the pipe rule two (ROADMAP 42c): the same
+        // bytes under three different counts.  Decode
+        // already treats it as a file (known_input_size, the whole file's size);
+        // the count here is sized from the caller's offset, where the read begins.
+        uint64_t bytes = (uint64_t)st.st_size;
+        if (in == "-") {
+          const off_t at = ::lseek(STDIN_FILENO, 0, SEEK_CUR);
+          if (at > 0) bytes = (uint64_t)at < bytes ? bytes - (uint64_t)at : 0;
+        }
+        total += bytes;
       } else {
         known = false;
         if (S_ISDIR(st.st_mode) || S_ISBLK(st.st_mode)) streams = false;
@@ -55897,7 +56238,12 @@ static void apply_backend_defaults(Options & opt)
     // after this), so the test is "not --gpu-only"; --cpu-only is out above.
     const bool hybrid_file_decode = known && !opt.gpu_only && !opt.list_mode
         && (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST);
-    const int devices = (streams || (known && opt.gpu_only) || hybrid_file_decode)
+    // ...AND A HYBRID COMPRESS OF ONE (v0.18.48): see the branch below.  The staged
+    // default (a small CPU budget) is out above (!opt.direct_stage).
+    const bool hybrid_file_compress = known && !opt.gpu_only && !opt.list_mode
+        && opt.mode == Mode::COMPRESS;
+    const int devices = (streams || (known && opt.gpu_only) || hybrid_file_decode
+                         || hybrid_file_compress)
                         ? gz_precuda_gpu_count() : 0;
     int n = 0;
     std::string why;
@@ -55946,6 +56292,30 @@ static void apply_backend_defaults(Options & opt)
       why = "a regular-file hybrid decode (the reader's surplus over the CPU pool is what "
             "the cards share: two carry it, and each costs ~0.5 s to start; "
             "--gpu-devices sets the count)";
+    } else if (hybrid_file_compress && devices > 2 && mask_is_free) {
+      // A HYBRID COMPRESS OF A NAMED FILE TAKES TWO AT MOST (v0.18.48, ROADMAP 42b) --
+      // the last hybrid run without the rule: a pipe's compress already took two
+      // (v0.18.40), a named file's -d and -t two (v0.18.46), and the same file
+      // named to a compress started every card the driver listed.  The CPU pool
+      // compresses what it can and the cards take the rest through host copies and
+      // worker threads on the same CPUs.  Two extends the existing automatic ceiling;
+      // it is not a capacity bound this run derives, and in these measurements every
+      // card past the second cost more than it added.  MEASURED, 8-H100 server (five idle
+      // cards), a cached 24 GiB base64 file to /dev/null, wall s, two shuffled rounds:
+      //   CPUs  --cpu-only   every card (8)   1 card     2          3          5
+      //    5      9.67        8.50-8.57     6.13-6.25  5.49-5.64  5.87-6.00  7.63-8.01
+      //    6     7.21-7.31    7.93-8.17     5.21-5.35  5.25-5.26  5.90-6.03  6.86-7.00
+      //    8     5.03-5.04    7.31-7.37     4.47-4.54  4.53-4.58  5.27-5.48  5.88-5.91
+      // (12 and 16 CPUs finish before the guard: every arm declines.)  Read cold at
+      // 8 CPUs, every card 6.87-7.03 s and two 5.27-5.28 against --cpu-only 4.92-4.93
+      // (the drive set the rate; see ROADMAP 42b).  Like the decode branch, a ceiling,
+      // not a claim that two is best on every host: --gpu-devices sets the count, and
+      // whether to start any stays the bringup sample's.  Codex review dissented (no
+      // measured hybrid model on another host); the maintainer's pipe and decode rules
+      // already take two for the same reason.
+      n = 2;
+      why = "a regular-file hybrid compress (the automatic two-card ceiling: each "
+            "costs ~0.5 s to start; --gpu-devices sets the count)";
     } else if (known && opt.gpu_only && devices > 1) {
       // GZSTD_DEBUG_GPU_BYTES_PER_DEVICE=N plans N bytes per device, so the suite
       // reaches the cold cap (more than two devices) with small files.  Set, it
@@ -55981,14 +56351,17 @@ static void apply_backend_defaults(Options & opt)
         if (opt.cold_read) {
           cold = true;
         } else {
-          double out = 0.0;   // bytes outside the page cache
+          double out = 0.0;     // bytes outside the page cache
+          double whole = 0.0;   // ...of these files, whole: a redirect's residency is its file's
           for (const std::string & in : opt.inputs) {
             struct stat st {};
-            if (::stat(in.c_str(), &st) != 0) continue;
-            const double r = adapt_path_residency(in);
+            const bool redirect = in == "-";   // adapt_path_residency("") probes fd 0
+            if ((redirect ? ::fstat(STDIN_FILENO, &st) : ::stat(in.c_str(), &st)) != 0) continue;
+            whole += double(st.st_size);
+            const double r = adapt_path_residency(redirect ? std::string() : in);
             if (r >= 0.0) out += double(st.st_size) * (1.0 - r);   // unknown counts as cached
           }
-          cold = out >= 0.5 * double(total);
+          cold = out >= 0.5 * whole;
         }
         if (cold) n = 2;
       }

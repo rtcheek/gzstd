@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.46  
+**Covers:** v0.9.50 → v0.18.48  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,213 @@
 
 ---
 
+
+## v0.18.48 — a hybrid compress of a named file starts two GPUs, not every card, and a redirected stdin counts as a file; a GPU decode's writer takes each frame as it lands; a hybrid decode that engages queues for the cards it starts (8-H100 server, a cached 24 GiB file: the default compress at 5-8 CPUs 7.1-8.7 -> 4.7-5.7 s; a 72 GiB archive at 4-8 CPUs: 27-30 -> 12-13 GiB peak RSS; --gpu-only -d of a 32 GiB archive 5.1-5.4 -> 4.3-4.7 s)
+
+ROADMAP 42's list, worked through: four fixes (b, c, d, g), two measured and closed (e, f), and the guard itself
+(a) and a cold compress the CPU pool keeps up with left open.  Designed and reviewed with Codex (gpt-6.1-sol, max); where I kept a change over its dissent it says so.
+
+### A hybrid compress of a named file takes two cards (42b)
+
+The device rule capped a pipe's runs at two cards (v0.18.40, compress included) and a named file's hybrid `-d`
+and `-t` at two (v0.18.46); the same file named to a compress started every card the driver listed.  It now
+takes two at most too.  A cached 24 GiB base64 file to /dev/null, wall s, two shuffled rounds (8 is every card,
+three of them busy with other users; 1-5 are --hybrid --gpu-devices N, the least busy first):
+
+| CPUs | `--cpu-only` | every card (8) | 1 | 2 | 3 | 5 |
+|---|---|---|---|---|---|---|
+| 5 | 9.67 | 8.50-8.57 | 6.13-6.25 | **5.49-5.64** | 5.87-6.00 | 7.63-8.01 |
+| 6 | 7.21-7.31 | 7.93-8.17 | 5.21-5.35 | **5.25-5.26** | 5.90-6.03 | 6.86-7.00 |
+| 8 | 5.03-5.04 | 7.31-7.37 | 4.47-4.54 | **4.53-4.58** | 5.27-5.48 | 5.88-5.91 |
+
+At 12 and 16 CPUs every arm finishes inside the guard and declines.  Every card past the second costs time, and
+eight lost to `--cpu-only` at 6 and 8 CPUs.  The release itself, v0.18.47 against v0.18.48 on the default:
+5 CPUs 8.46-8.73 -> 5.54-5.68 s, 6 CPUs 7.88-8.74 -> 5.18-5.22, 8 CPUs 7.14-7.30 -> 4.65-4.69 (`--cpu-only`
+4.80-4.85).  A ceiling, not a claim that two is best everywhere: `--gpu-devices` sets the count, and whether to
+start any stays the bringup sample's.  Codex dissented -- no measured hybrid model on another host says two --
+and I kept it: the pipe and decode rules already take two for the same reason, and the old default lost here.
+
+Measured with it and left open (ROADMAP 42b, 43): read cold at 8 CPUs, `--cpu-only` runs at the drive's ~5 GB/s
+(4.92-4.93 s) and two cards still start, take one frame and cost 7% (5.27-5.28; every card 6.87-7.03).
+Compress's sample has no reader-end bound -- an mmap reader queues the whole input at once -- and no single
+signal shows a GPU cannot help (cold at 4 CPUs two cards won 25%).  And at 4 CPUs, where the default stages
+through one card, hybrid on two now beats it: cached 6.03-6.11 s against 6.94-7.28, cold 7.02-7.09 against
+7.32-8.18.  The staging threshold was measured against a hybrid that started every card; logged, not moved.
+
+### A redirected stdin is a regular file (42c)
+
+`gzstd -d < f.zst` started every card -- eight here -- where `gzstd -d f.zst` starts two and `cat f.zst |` two:
+the rule marked standard input unknown even when it was a regular file.  It counts as one now, sized from the
+caller's offset, and its cold check weighs the whole file's residency against the whole file.  Codex first
+dissented (a ceiling the redirect had not been under), then withdrew it in review: it found no redirect-specific
+reason, and the same bytes should not get three counts.
+
+### The writer takes a GPU frame as it lands (42g)
+
+In 3 of 20 engaged runs v0.18.47's last GPU batch spent 0.7-1.1 s in D2H against a 0.05-0.2 s median, with the
+CPU pool already done.  Timed by part (the buffer, the copy, the hand-off), those batches copied into FRESH
+16 MiB output buffers -- 49-116 of their 128 -- whose pages faulted in at ~2 GB/s, where recycled ones copy at
+~16.  A GPU stream recycles ~28 buffers as the writer hands them back, and push_to_slot never woke the writer for
+a GPU frame ("batch-completion notify handles it"): in a hybrid run the CPU pool's pushes woke it every few ms,
+until the pool had finished.  It is now woken for the frame it is waiting on: after the slot's mutex is
+released, one lock and notify when the pushed frame is the writer's next.  One card, 4-8 CPUs, four rounds:
+the last batch drew no fresh buffer in any fixed run (D2H 93-136 ms) and 87-116 in 3 of 8 unfixed ones
+(0.76-1.0 s, those runs 1.0-1.2 s slower).  `--gpu-only` has no CPU pool, so its writer only ever woke at batch
+ends: a 32 GiB archive on two cards 5.08-5.37 -> 4.27-4.72 s.  `--gpu-only` compress 24 GiB unchanged
+(6.85-7.15 / 6.94-7.19).  Bytes identical on hybrid, `--gpu-only`, a redirect, multi-file and piped decodes,
+and GPU and hybrid compress round trips.
+
+### A hybrid decode that engages queues for the cards it starts (42d)
+
+Before CUDA can count the devices, a deferred bringup sized its throttle floor, scheduler and queue by
+max(--gpu-devices, 8) -- on decode even after v0.18.46's cap had set --gpu-devices to two (compress trimmed
+it; decode never did).  So a two-card decode queued 2,051-2,062 frames, and the reader ran that far ahead while
+the cards came up.  Now:
+- the provisional count is a mask's entries (the caller's, or the device rule's own) or --gpu-devices, else
+  the old guess.  Not the driver's /proc list, which counts physical GPUs where a mask may name MIG devices
+  (Codex review; my first cut used it).
+- the bringup SAMPLE keeps v0.18.47's depth.  My first cut sized it for two cards, and Codex showed the cost:
+  a queue that fills before the first window ends censors every reader-rate observation, and the bound falls
+  back to the permissive remaining-time test.
+- once the sample engages, the queue drops to the pool plus a full batch for every stream of the cards it will
+  start -- for the provisional count, then the fitted one (-vv: `[GPU] queue ceiling: N frames for D device(s)`).
+
+A cached 72 GiB archive, two cards, two shuffled rounds: 4 CPUs 10.25-10.32 -> 10.18-10.21 s at 27.0-27.3 ->
+11.8-11.9 GiB peak RSS; 8 CPUs 8.47-8.49 -> 8.45-8.52 at 29.1-29.6 -> 13.0-13.3 GiB; 12 and 16 CPUs decline in
+both, as before.  A positive `--throttle-frames` keeps its shape.
+
+### Measured and closed: the keeps-up declines (42e) and the exit (42f)
+
+ROADMAP 42e said the keeps-up and nearly-keeps-up declines cost what v0.18.47's early decline saved; that was
+measured on a pool BEHIND its reader.  A pool that keeps up -- a 32 GiB archive read cold at 64 CPUs, the drive
+setting the rate -- showed s 0.000 and a bound of 0.20 s in every window from 255 to 2,224 ms, and sampling on
+had no measurable penalty there: 6.44 s against `--cpu-only` 6.64 (an empty queue lets nothing run ahead).  Declining it at the
+settled window was built and reverted: a settled pool is not a settled reader, and an archive whose cold head
+gives way to a cached tail falls behind later in the budget (Codex review).  The state table is in the sampler.
+
+The 0.15-0.34 s an engaged run spends exiting is not CUDA's atexit (1-2 ms, under strace) but the kernel tearing
+the contexts down after `exit_group`, against 0.02 s for `--cpu-only`.  A CUDA test program with two contexts:
+left to the kernel 0.36 s; cudaDeviceReset on each in turn 0.34-0.39 s plus 0.16-0.20 still at exit; on each
+from its own thread 0.26-0.33 plus 0.17-0.23.  The driver serializes it, and an explicit reset costs more than
+the kernel's own, so it stays a part of a started card's price.
+
+### Still open: the guard's price (42a)
+
+The 4.0 s guard is still the legacy price of a bringup.  The obvious per-machine number is wrong for it: the
+profile's `--gpu-only` overhead (gpuc_overhead_s, from --calibrate) has no CPU pool losing to the cards, and its
+clock stops before the kernel's teardown (Codex review).  A measured price needs a hybrid model fitted on
+interleaved `--cpu-only` and hybrid calibration runs; ROADMAP 42a lists what it must record.  The guard's comment
+now carries the state table.
+
+### Tests
+
+- +1 default cell on both builds: **a GPU slot's next frame wakes the waiting writer**
+  (`GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST`, Codex's design): a waiter asleep on the writer's condition, the frame it
+  needs published to a GPU slot with no batch-completion notify, so only the per-frame wake ends the wait.  No
+  CUDA, no timing.  Passes on both builds; without the wake it hangs to the timeout (exit 124).
+- +1 -e GPU cell: **a GPU decode's writer takes each frame as it lands**: `--gpu-only`, one stream, batches of
+  16, 48 frames to /dev/null, and the stream's buffer count (a new -vv line) below the batch.  Fixed: 2; without
+  the wake: 16 in every run.  Any of three runs may pass, as a writer stalled for ~16 frames' copies would need
+  16 too (Codex review, which would have kept the count diagnostic only).
+- the hf cell (now "a hybrid run of a named or redirected file starts two GPUs, and a decode queues for two")
+  gains a redirect arm, the queue ceiling an engage sets (two cards' below three's, each naming its count), and
+  hybrid compress arms (--hybrid and the implicit default capped, --gpu-devices 3 not).  Run by hand: passes on
+  v0.18.48; v0.18.47 fails the ceiling, the redirect (8 devices online) and both compress arms.
+- Counts: 574 -> 575, -e 920 -> 922, the -e no-GPU delta 246 -> 247.
+
+
+## v0.18.47 — a hybrid decode starts its GPUs only when the most they could save clears the bringup guard: the time the CPU pool would run on after the reader ends, estimated from what the sample counts, not the time left (a cached 72 GiB archive, 8-H100 server: 16 CPUs 5.2-6.0 -> 4.65-4.86 s against --cpu-only 4.65-4.71, 14 CPUs 5.8-6.2 -> 5.32-5.39, 4-8 CPUs still engage and win; 10 and 12 sit near the guard)
+
+v0.18.46 left one loss open (ROADMAP 42a): at 14-16 CPUs the bringup sample still started two cards, and the run
+lost to `--cpu-only` (4-12% at 14 CPUs and 12-29% at 16 in this release's same-round runs; v0.18.46's own runs
+measured 6-15% at 16).  The sample asked only whether the time left outlasted the guard (4.0 s), and at 16
+CPUs it estimated 4.5 s.  The overnight analysis said nothing the sample measured could tell 16 CPUs from 12; that
+was wrong, and this release fixes the loss with a test that needs no new constant.  The maintainer's rule for it:
+a default must come from what the run measures, never from a number fitted on one host.
+
+### What a GPU can save
+
+A hybrid decode cannot end before its reader does, however fast the cards are.  So the most a GPU could save is
+the time the CPU pool would go on decoding after the last frame is read: R - Ru, with R the pool's remaining
+time and Ru = unread / U the reader's.  With P and U the frames per second the pool takes and the reader queues,
+B the frames waiting, I those in flight and N those unread, R = (B + I + N) / P and Ru = N / U, so
+
+    R - Ru = s x R + (B + I) / U,   s = (U - P) / U = growth / frames queued
+
+every term of which the sample already counts on any host, with I taken as the pool's size (a pool behind its reader
+has a frame on every worker), assuming steady rates and a representative frame mix.  No new constant enters.  It
+bounds what instant, unlimited cards could save;
+the guard prices a bringup; the sample now engages only when the bound clears it.  The old `R > guard` is its
+s -> 1 case (a pool that takes nothing, or a reader with nothing left).  It is not a break-even: the cards' own
+rate, their host copies, the pool's loss to CUDA's start and their teardown cannot be read before CUDA starts, and
+the 4.0 s guard is still the tree's one price for all of them (its comment now says so).  The bound stays put while
+the rates hold (both end times are fixed), so it does not matter which settled window reads it.  Codex (gpt-6.1-sol,
+max) derived the backlog and in-flight terms from a first draft that had only s x R.
+
+| CPUs | `--cpu-only` | v0.18.46 (two cards) | s | bound | v0.18.47 |
+|---|---|---|---|---|---|
+| 4 | 20.9-21.0 | 10.5-10.7 | 0.77-0.89 | 20-39 s | engage, **10.4-11.1** |
+| 8 | 10.4-10.5 | 8.3-8.7 | 0.61-0.63 | 7.6-8.5 | engage, **8.5-8.6** |
+| 10 | 7.8-8.0 | -- | 0.47-0.65 | 4.0-5.8 | engage, **7.0-7.1**; one run read 3.99 and skipped: 7.9 |
+| 12 | 6.3-6.7 | 6.1-6.5 | 0.53-0.58 | 3.4-4.1 | skip at 3.4-3.9: 6.38-6.39 |
+| 14 | 5.3-5.5 | 5.8-6.2 | 0.47-0.48 | 2.7-2.8 | skip, **5.32-5.39** |
+| 16 | 4.6-4.9 | 5.2-6.0 | 0.29-0.40 | 1.7-2.1 | skip, **4.65-4.86** (`--cpu-only` 4.65-4.71 that round) |
+| 20 | 3.7-4.6 | skip | 0.38-0.39 | 1.7-1.9 | skip (the time left was already short) |
+
+Wall seconds, to /dev/null, the process pinned to N cores, a `--cpu-only` decode before every arm, on a shared host
+(load 9-33; the 20-CPU `--cpu-only` arm drifted with it).  The columns are different runs: `--cpu-only` is every
+round; v0.18.46 its own runs (two to five a row, none at 10 CPUs); s and the bound are the deciding window, ~0.41 s
+in, of each v0.18.47 run that decided there; v0.18.47 is the final build's three rounds.  The build before it
+computed the same bound and engaged at the same window (it declined at the budget instead): it engaged all three
+10-CPU runs (6.4-7.3 s) and two at 12, at bounds of 4.03-4.06 s, which won 7% (5.86 against 6.30-6.33 that round).
+So 12 CPUs is where two cards stop paying here, on the guard from both sides, and 10 CPUs mostly clears it: one of
+the final build's three runs read 3.99 and declined, a tie with `--cpu-only` that gave up a 10% win.  The 5090
+numbers in the code give 2.4 s at 8 CPUs, where its GPU tied "at best", and 6-6.5 s at 6 and 4, where it won 10-40%.
+
+Three details:
+- **A cap is censoring, not evidence.**  The first build took a queue that reached its byte cap as s = 1 (the reader
+  can no longer be measured), and at 12 CPUs that turned a bound held at 3.3-3.7 s for eleven windows into R = 4.7
+  s, and the run engaged at 1.93 s.  A cap reached mid-sample now keeps the last bound from a window that measured
+  the reader.  Capped from the start, or a finished reader (Ru = 0), the bound is R.
+- **A short bound declines at once.**  Codex advised sampling on to the budget (2.1 s) before declining on this test
+  alone.  Measured at 12 CPUs, a decline at the budget took 6.48-7.21 s against 6.31-6.37 for one at 0.25 s
+  (`--cpu-only` 6.30-6.33): the 2,062-frame queue lets the reader run ahead of the pool all that time.  The decline
+  now comes at the window an engage would have taken (~0.41 s here).  Under the bound's steady-rate model the early
+  biases (a reader's startup burst in s, a ramping pool in R) only overstate it; a reader that speeds up later is
+  outside that model.
+- **The bound is checked without timing.**  `GZSTD_DEBUG_GPU_BOUND=R,s,B,I,U` prints it and exits, beside
+  `GZSTD_DEBUG_XXH_SELFTEST`; `GZSTD_DEBUG_GPU_SURPLUS_SHARE=X` sets it to X x R (0 forces the decline, 1 the old test).
+
+`-vv` adds the share, the reader's rate and the bound to every `[GPU] bringup window` line, and -v says
+"the reader ends too little before the CPU pool for a GPU to repay its bringup; skipping GPU bringup".
+
+### Measured and not adopted: a shallow queue while the cards come up
+
+While two cards start (1.3-2.8 s after the decision), the pool decodes 10.3-12.1 GiB/s against ~16 for
+`--cpu-only`.  A prototype held the queue at the pool's ceiling from the decision until the cards were spawned:
+8 CPUs 8.74-10.91 s against 8.28-8.59, 12 CPUs 5.99-6.58 against 6.27-6.53, 16 CPUs 5.45-5.48 against 5.26-5.64
+(one card the same).  No gain: the loss is CUDA's start on the pool's CPUs, not the read-ahead.  Also seen and
+logged (ROADMAP 42): after the last byte, the process takes 0.22-0.25 s per card to exit against 0.06 s for
+`--cpu-only`, and in 3 of 20 engaged runs the last batch's D2H took 0.7-1.1 s against a 0.05-0.2 s median, after
+the pool had finished.
+
+### Tests
+
+No new cell; the `-e` cell "a decode starts no GPU while its CPU pool keeps up with the reader" gains:
+- a `surplus` arm (`GZSTD_DEBUG_GPU_SURPLUS_SHARE=0`) that must skip with the new reason, lower the queue ceiling
+  to the pool's and decode the bytes;
+- five arithmetic cases through `GZSTD_DEBUG_GPU_BOUND`, two of which differ only in the backlog and fall on either
+  side of 4 s, each checked for its output and exit status (stdin closed and a timeout: an old binary ignores the
+  hook, reads stdin and hung the first mutation run);
+- the `behind` arm runs the real bound (no override) and gains `GZSTD_DEBUG_GPU_START_AFTER_INPUT=1`: on the loaded
+  host it failed on v0.18.46 too, because cuInit outlasted its 64-frame fixture on one CPU ("file already
+  decompressed by CPU during init").  The keeps-up and nearly arms pin the bound to R so each tests its own condition.
+Extracted and run by hand: passes on v0.18.47 every time; on v0.18.46 it fails at the surplus arm, the behind arm
+and all five bounds.  Counts unchanged.  Codex reviewed four rounds (design at max, three reviews at xhigh):
+no blocker; its findings (the backlog and in-flight terms, an untested formula, a saved bound of zero from a
+window that measured no reader, an unchecked exit status, help and notes that stated the estimate as a
+guarantee and mixed runs in one table) are all in.  Left untested, with its agreement: a reader that stalls and
+then caps inside the 2.1 s sample, the one sequence the zero-bound fix covers, which no hook can stage.
 
 ## v0.18.46 — a hybrid decode of a named file starts two GPUs, not every card (a cached 72 GiB archive, 8-H100 server: 12 CPUs 7.2 -> 5.8-6.0 s, 16 CPUs 6.3-6.4 -> 4.9-5.4, 8 CPUs 9.6 -> 8.4-8.7, 4 CPUs 11.6-11.9 -> 10.2-10.4), and v0.18.44/45's checks on that server
 

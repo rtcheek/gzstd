@@ -943,26 +943,61 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     when it started at 32 (pinned 32 4.74-4.88), ~5%.  The halving probe has no affordability check
     at all, and TUNE_STEEP lets an unproven doubling cost up to 1 / devices of what is left.
 
-42. **Hybrid decode still engages GPUs at 16 CPUs that cost more than they capture, and hybrid
-    compress starts every card.**  v0.18.46 caps a regular-file hybrid `-d` and `-t` at two cards (the
-    pipe rule, extended): on the 8-H100 server every card past the second only cost (12 CPUs 7.2 ->
-    5.8-6.0 s, 16 CPUs 6.3-6.4 -> 4.9-5.4).  Open: (a) **the 16-CPU loss remains** (4.9-5.4 s against
-    `--cpu-only` 4.6, 6-15%).  The per-window trace (`-vv`, `[GPU] bringup window`) shows 16 CPUs
-    looking exactly like 12 (the backlog grows ~95 frames per 150 ms window in both, sustained across
-    both windows), so a persistence test on the growth cannot separate them; the only signal that does is
-    the remaining time R (4.5 s against 6.3 s), and the guard is a fixed 4.0 s, the tar decode pool's,
-    which prices a bringup and not what the cards capture afterwards.  Measured break-even for two cards
-    there: R ~ 5.5-6 s (gain ~ 0.3 x (R - 5.8 s) over R = 4.5, 6.4, 12.5 and 38 s).  Wants a derivation
-    from quantities the run measures (the cards' time to first intake, their share of the pool's CPUs: a
-    card's worker and its threads cost ~2.3 workers' worth on the 5090 box) rather than a larger
-    constant, and a second host.  (b) **Hybrid compress of a named file** starts every card too: 24 GiB,
-    4 CPUs, `--cpu-only` 9.7 s, two cards 6.1, five 7.7 (16 CPUs all tie at 2.3 s).  Not changed: the
-    default compress may stage through one card (the rule's `!opt.direct_stage` is the user's flag only),
-    and one file at two CPU counts is thin.  Measure the staged default and a cold input first.  (c) A
-    **redirected stdin** (`gzstd -d < f.zst`) is a regular file the rule leaves alone (`in == "-"` keeps
-    `known` false, as v0.18.39 decided) and starts every card.  (d) A positive `--throttle-frames`
-    disables `gpu_joins_later`, so its initial throttle floor still counts the provisional eight cards,
-    and the queue's depth ceiling does for every hybrid decode (bounded, not preallocated).
+42. **Hybrid runs and their GPUs: what is left after v0.18.46-48.**  v0.18.46 capped a regular-file hybrid
+    `-d` and `-t` at two cards (the pipe rule, extended); v0.18.47 engages only when the most a GPU could
+    save clears the guard; v0.18.48 closed the rest of this item's list except (a) and (b)'s cold compress.
+    (a) **OPEN: the guard itself** is the legacy 4.0 s, the one price for CUDA's start, the pool's loss to
+    the cards' host copies and threads, and the teardown (0.15-0.34 s in the H100 runs of (f)),
+    none of which a run can read before CUDA starts; 12 CPUs sits on it here (bounds of 4.03-4.06 s engaged
+    and won 7%, 3.4-3.9 declined and tied).  NOT the profile's `--gpu-only` overhead model (gpuc_overhead_s):
+    no CPU pool loses anything in it, and its wall clock stops before the kernel's teardown (Codex review,
+    v0.18.48).  A measured hybrid price needs its own model.  What it must record (Codex's design): at the
+    sample's decision R, the bound, U, s, the backlog, the pool's size and the sample's length; the first
+    usable stream's registration (not the "online" line); the CPU pool's completed bytes before and during
+    the bringup and each card's delivered bytes; the last CPU frame, the last GPU delivery and the last
+    committed output; and, from --calibrate's parent, the whole process through `waitpid`.  Keyed by
+    direction, CPU allowance, device set, frame geometry, reader path and source/sink class, in its own
+    namespace and epoch.  Fitted against observed `--cpu-only` minus hybrid times from INTERLEAVED
+    calibration runs, validated across the boundary, never extrapolated; a default reads a matching
+    validated model and otherwise keeps 4.0 s; exploration stays opt-in.  The -d --tar decode pool needs
+    its own matched price.  A second host should check v0.18.47's break-even meanwhile (the 5090's
+    code-comment numbers agree: 2.4 s tied, 6-6.5 won).
+    (b) ~~**hybrid compress of a named file started every card**~~ **FIXED v0.18.48**: it takes two at most,
+    as a pipe's compress (v0.18.40) and a named file's decode (v0.18.46) already did (8 CPUs, a cached
+    24 GiB file: every card 7.31-7.37 s, two 4.53-4.58, `--cpu-only` 5.03-5.04).  Codex dissented: no
+    measured hybrid model on another host says two.  STILL OPEN there: **a cold compress whose CPU pool
+    keeps up with the drive** still starts its cards -- 8 CPUs, the same file cold: `--cpu-only`
+    4.92-4.93 s (the drive's ~5 GB/s), two cards 5.27-5.28, and they took ONE frame.  Compress's sample has
+    no reader-end bound (an mmap reader queues everything at once), and none of the candidate signals -- the
+    workers' CPU busy share, `/proc/self/io` against the work rate, the start's mincore residency -- shows
+    on its own that a GPU cannot help (Codex review); 4 CPUs cold, two cards won 25%.
+    (c) ~~**a redirected stdin started every card**~~ **FIXED v0.18.48**: `gzstd -d < f.zst` is a regular file,
+    sized from the caller's offset, and takes the named file's rule.
+    (d) ~~**the provisional eight**~~ **FIXED v0.18.48**: a deferred bringup sizes its throttle floor and
+    scheduler by a mask's or --gpu-devices' bound (not /proc: a mask may name MIG devices), and a hybrid
+    decode that engages lowers its queue to the cards it starts.  The sample keeps v0.18.47's depth: a
+    queue sized for two can fill before the first window and censor every reader-rate observation (Codex
+    review).  A cached 72 GiB archive, two cards, 4-8 CPUs: peak RSS 27.0-29.6 GiB -> 11.8-13.3 at the
+    same wall time, and the sample's decisions at 4-16 CPUs unchanged.  A positive `--throttle-frames` keeps its shape.
+    (e) ~~**the keeps-up declines sample to the budget**~~ **CLOSED v0.18.48, measured, kept**: sampling on
+    showed no measurable penalty for a pool that keeps up (a 32 GiB archive cold at 64 CPUs: 6.44 s against `--cpu-only`
+    6.64; s 0.000 and a bound of 0.20 s in every window), and declining at the settled window misses a pool
+    that falls behind later in the budget (a cold head and a cached tail; Codex review).
+    (f) ~~**the exit after an engaged run**~~ **CLOSED v0.18.48, measured**: CUDA's atexit costs 1-2 ms; the
+    0.15 s (one card) to 0.34 s (two) is the kernel's teardown after `exit_group`.  Explicit resets measured
+    worse (two cards: 0.34-0.39 s serial or 0.26-0.33 parallel, plus 0.16-0.23 still at exit, against 0.36
+    left to the kernel).  It is part of (a)'s price.
+    (g) ~~**the last GPU batch's D2H**~~ **FIXED v0.18.48**: fresh output buffers faulted in because nothing
+    woke the writer for a GPU frame once the CPU pool had finished; push_to_slot now wakes it for the frame
+    it waits on.  --gpu-only decode, whose writer had only batch ends to wake it, gained 12-20%.
+
+43. **The staged compress default against hybrid on two cards.**  AUTO_STAGE_MAX_CPUS_COMPRESS (4) was
+    measured against a hybrid that started every card.  With v0.18.48's two, hybrid beats the staged
+    default at 4 CPUs on the 8-H100 server, a 24 GiB file: cached 6.03-6.11 s against 6.94-7.28, cold
+    7.02-7.09 against 7.32-8.18 (`--cpu-only` 9.3-9.7).  The staged path reads O_DIRECT, so a cached input
+    forgoes the page cache.  Its comment already says its constants are one host's and `--adapt`'s
+    budget prior measures the crossover; re-measure on a one-card host (the case staging was built for)
+    before moving the default.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
