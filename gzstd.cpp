@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.48";
+static constexpr const char * GZSTD_VERSION = "0.18.49";
 //
 // Architecture overview:
 //
@@ -6121,11 +6121,11 @@ static void print_help_long()
 "     compress took 5.5 s on eight GPUs and 1.6 s on one), so a pipe\n"
 "     starts two at most (one stream: two carry it), as does a hybrid run\n"
 "     of a named or redirected file -- automatic ceilings, measured on one\n"
-"     server -- and --gpu-only on regular files starts\n"
-"     the count this machine's profile predicts is fastest for the\n"
-"     input's size when --calibrate FILE (compress) or --calibrate ARCHIVE\n"
-"     (decompress and -t) has measured every count, else one per 8 GiB of\n"
-"     input; two at most when most of it is not cached (the drive sets the\n"
+"     server -- and --gpu-only on regular files starts the count this\n"
+"     machine's profile predicts is fastest for the input's size when\n"
+"     --calibrate FILE (compress) or --calibrate ARCHIVE (decompress and\n"
+"     -t) has measured every count, else one per 8 GiB of input; two at\n"
+"     most when most of it is not cached (the drive sets the\n"
 "     rate).  --no-profile keeps to one per 8 GiB.  --gpu-order=ranked\n"
 "     keeps them all, a caller's CUDA_VISIBLE_DEVICES is used as given, and\n"
 "     --adapt decides for itself: a single-file --gpu-only compress, -d or\n"
@@ -11199,7 +11199,7 @@ static double gpu_reader_headroom(double remaining, double share, double waiting
 //
 // `behind_frames` (v0.18.43, decompress): a known-size run engages only once a
 // whole sample window has kept at least this many frames waiting -- the CPU
-// pool's worker count -- i.e. once the CPUs are falling behind the reader.  A
+// pool's worker count -- i.e. once the CPUs are falling behind a live reader.  A
 // pool that keeps up leaves a GPU nothing to take: its intake waits for a full
 // batch (wait_for_batch_or_cap), and with the queue floor released for a bounded
 // producer the CPUs pop every frame as it lands.  MEASURED, 2x RTX 2080 Ti, 24
@@ -11208,8 +11208,11 @@ static double gpu_reader_headroom(double remaining, double share, double waiting
 // cards, and they decoded ZERO frames -- 8.11-8.20 s against --cpu-only's
 // 7.93-7.94, the bringup alone.  The backlog there never passed 8 frames; at 4
 // CPUs it was 181 and climbing, the GPUs took 81-83% of the frames and two cards
-// cut 25.96-26.05 s to 16.95-17.18.  0 = no such test (compress: the mmap reader
-// queues the whole input, so the backlog says nothing there).  `pool_keeps_up`
+// cut 25.96-26.05 s to 16.95-17.18.  0 = no such test.  Compress passes it too
+// since v0.18.49, without `pushed`: the waiting test alone (see compress_nvcomp's
+// bringup).  Once a compress reader has finished, any queued work instead uses
+// the time test: fewer waiting frames than workers can still cost a CPU wave.
+// `pool_keeps_up`
 // is set when that test is what declined, so the caller can say so: 1 = the pool
 // keeps up, 2 = it is behind, but by less than a GPU costs it (below),
 // 3 = its estimated surplus work does not clear the bringup guard.
@@ -11289,6 +11292,13 @@ static double gpu_reader_headroom(double remaining, double share, double waiting
 // mid-sample keeps the last uncensored bound; capped from the start, or a finished
 // reader, the bound is R, the old test.  Without the growth callback (compress)
 // the test is off.
+// A synthetic sampler can advance this clock at each hold instead of waiting
+// on wall time.  Production calls leave it null; self-tests and call-site tests
+// supply their own progress/backlog/end-of-input signals.
+struct GpuSamplerTestClock {
+  double seconds = 0.0;
+};
+
 static bool gpu_bringup_worth_it(const Options & opt,
                                  const std::function<double()> & progress,
                                  std::mutex & mx, std::condition_variable & cv,
@@ -11297,7 +11307,8 @@ static bool gpu_bringup_worth_it(const Options & opt,
                                  const std::function<bool()> & no_more = {},
                                  const std::function<size_t()> & backlog = {},
                                  size_t behind_frames = 0, int * pool_keeps_up = nullptr,
-                                 const std::function<size_t()> & pushed = {})
+                                 const std::function<size_t()> & pushed = {},
+                                 GpuSamplerTestClock * test_clock = nullptr)
 {
   if (opt.gpu_only) return true;
   // GZSTD_DEBUG_GPU_GUARD_SEC overrides the guard; 0 disables the check so the
@@ -11444,10 +11455,30 @@ static bool gpu_bringup_worth_it(const Options & opt,
       cv.wait_for(lk, std::chrono::milliseconds(10), [&] { return stop(); });
     }
   }
+  // Call-site tests use a live reader with either no backlog or one pool's
+  // worth, and a ten-second job on a virtual clock.  Keep callback presence
+  // and behind_frames real, so omitting compress's waiting-test arguments is
+  // still detected.  A real fixture need not outrun a loaded host's sampler,
+  // remain cached, or avoid a capacity marker to exercise either decision.
+  GpuSamplerTestClock signal_clock;
+  const char * signal = ::getenv("GZSTD_DEBUG_GPU_SAMPLER_SIGNAL");
+  const int test_signal = signal && std::strcmp(signal, "empty") == 0 ? 1
+                        : signal && std::strcmp(signal, "waiting") == 0 ? 2 : 0;
+  if (test_signal) test_clock = &signal_clock;
+  auto secs_in = [&] {
+    return test_clock ? test_clock->seconds : std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+  };
+  auto frac = [&] {
+    return test_signal ? std::min(0.5, secs_in() / 10.0) : progress();
+  };
+  auto stopped = [&] { return !test_signal && stop(); };
+  auto queued_backlog = [&] {
+    return test_signal ? (test_signal == 2 ? behind_frames : size_t(0)) : backlog();
+  };
   auto say = [&](bool engage, const char * why, double remaining, double p) {
     if (opt.verbosity >= V_DEBUG) {
-      const double el = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - t_start).count();
+      const double el = secs_in();
       char b[480];
       std::snprintf(b, sizeof b,
         "[GPU] bringup sample: %.0f%% done at %.0f ms, %s -> %.2f s remaining "
@@ -11458,32 +11489,42 @@ static bool gpu_bringup_worth_it(const Options & opt,
     }
     return engage;
   };
-  auto secs_in = [&] {
-    return std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t_start).count();
-  };
-  // The fewest frames waiting at any check of the current window (behind_frames).
+  // The fewest frames waiting at any check of the current window (behind_frames),
+  // and how many checks it took.  A full queue reads SIZE_MAX and counts as the
+  // most frames waiting there can be, not as no reading (v0.18.49): a window spent
+  // entirely at the queue's cap is a pool as far behind its reader as the queue
+  // can show.  Until then such a window failed the waiting test ("keeps up"), which
+  // a hybrid decode met only late in a sample (its byte cap at 12 CPUs, 1.9 s in).
+  // Compress's pooled reader has a depth cap too; mmap views have no queue cap.
   const bool test_behind = behind_frames > 0 && backlog && opt.cpu_share < 0.0;
   const bool test_growth = test_behind && pushed;
   bool surplus_capped = false;
   size_t win_min = SIZE_MAX;
+  size_t win_checks = 0;
+  auto check_backlog = [&] {
+    if (!test_behind) return;
+    const size_t b = queued_backlog();
+    win_min = std::min(win_min, b);
+    ++win_checks;
+    if (test_growth && b == SIZE_MAX) surplus_capped = true;
+  };
   // Wait until `until` seconds in, or until the run ends.  Timed CV wait rather
   // than a bare sleep so a job that finishes mid-sample cuts it short instead of
   // waiting out the window.
   auto hold = [&](double until) {
-    while (secs_in() < until) {
-      if (test_behind) {
-        const size_t b = backlog();
-        win_min = std::min(win_min, b);
-        if (test_growth && b == SIZE_MAX) surplus_capped = true;
-      }
-      if (stop()) return false;
-      std::unique_lock<std::mutex> lk(mx);
-      cv.wait_for(lk, std::chrono::milliseconds(10), [&] { return stop(); });
+    if (test_clock) {
+      check_backlog();
+      test_clock->seconds = std::max(test_clock->seconds, until);
+      return !stopped();
     }
-    return !stop();
+    while (secs_in() < until) {
+      check_backlog();
+      if (stopped()) return false;
+      std::unique_lock<std::mutex> lk(mx);
+      cv.wait_for(lk, std::chrono::milliseconds(10), [&] { return stopped(); });
+    }
+    return !stopped();
   };
-  auto frac = [&] { return progress(); };
 
   // Let the pipeline reach steady state before believing it.  Extrapolating
   // from cumulative bytes-since-zero folds in the startup ramp and badly
@@ -11539,7 +11580,7 @@ static bool gpu_bringup_worth_it(const Options & opt,
     return e && end != e && *end == '\0' && std::isfinite(v) && v >= 0.0 && v <= 1.0
          ? v : -1.0;
   }();
-  const size_t b_first = test_growth ? backlog() : 0;
+  const size_t b_first = test_growth ? queued_backlog() : 0;
   const size_t p_first = test_growth ? pushed() : 0;
   const double t_first = secs_in();
   double uncensored_save = -1.0;   // the bound from the last window no cap censored
@@ -11547,9 +11588,10 @@ static bool gpu_bringup_worth_it(const Options & opt,
   surplus_capped = capped;   // discard warm-up observations
   for (;;) {
     win_min = SIZE_MAX;
+    win_checks = 0;
     if (!hold(t_prev + GPU_SAMPLE_WINDOW_SEC))
       return say(false, "run ended during sample", 0.0, frac());
-    const size_t b_now = test_growth ? backlog() : 0;
+    const size_t b_now = test_growth ? queued_backlog() : 0;
     const size_t p_now = test_growth ? pushed() : 0;
     capped = capped || (test_growth && b_now == SIZE_MAX);
     // Keep the old growth test; the surplus rate also remembers a cap observed
@@ -11564,12 +11606,20 @@ static bool gpu_bringup_worth_it(const Options & opt,
     // Is the CPU pool behind the reader?  Asked of every window, never latched:
     // a pool that falls behind later (a slower stretch of the archive) still
     // engages within the budget.
-    const bool waiting = !test_behind || (win_min != SIZE_MAX && win_min >= behind_frames);
+    // Compress's waiting test diagnoses a LIVE reader.  Once that reader ends,
+    // even fewer queued frames than workers can cost another full CPU wave:
+    // eight slow frames on six workers leave two waiting, not an idle GPU.
+    // Restore the remaining-time test for that finite tail.  Decode keeps its
+    // existing waiting/growth/bound policy (test_growth).
+    const bool reader_done = test_behind && no_more && !test_signal && no_more();
+    const size_t finished_backlog = !test_growth && reader_done ? queued_backlog() : 0;
+    const bool waiting = !test_behind
+        || (!test_growth && reader_done ? finished_backlog > 0
+                                       : win_checks > 0 && win_min >= behind_frames);
     // ...and by enough to pay for a GPU (see `pushed`): the backlog's growth
     // since the first window against the frames the pool took meanwhile.
     const double grew  = capped || !test_growth ? 0.0 : double(b_now) - double(b_first);
     const double took  = capped || !test_growth ? 0.0 : double(p_now - p_first) - grew;
-    const bool reader_done = test_growth && no_more && no_more();
     const double queued = test_growth ? double(p_now - p_first) : 0.0;
     // No pushes (or no growth) while the reader is live is no observed surplus;
     // never divide by zero.  Counts are read separately, so clamp snapshot skew.
@@ -11604,17 +11654,22 @@ static bool gpu_bringup_worth_it(const Options & opt,
     // What each window saw (-vv), so the burst a reader makes while it fills its
     // queue can be told from a surplus that lasts: the backlog and the frames the
     // reader has queued at the window's end, and the fewest waiting within it.
+    // "a full queue" for a window whose every check saw the cap (see win_checks).
+    char fewest[32];
+    if (win_min == SIZE_MAX) std::snprintf(fewest, sizeof fewest, win_checks ? "a full queue" : "0");
+    else std::snprintf(fewest, sizeof fewest, "%zu", win_min);
     if (test_growth && opt.verbosity >= V_DEBUG) {
       char w[320];
       std::snprintf(w, sizeof w,
         "[GPU] bringup window: ends %.0f ms, queued %zu (+%zu since the first window), backlog %s "
-        "(+%.0f), fewest waiting %zu, pool took %.0f, %.1f%% done; "
+        "(+%.0f), fewest waiting %s, pool took %.0f, %.1f%% done; "
         "surplus share %.3f, reader %.0f frames/s, a GPU could save %.2f s of %.2f%s\n",
         t * 1000.0, p_now, p_now - p_first,
         b_now == SIZE_MAX ? "at its cap" : std::to_string(b_now).c_str(),
-        grew, win_min == SIZE_MAX ? (size_t)0 : win_min, took, p * 100.0,
+        grew, fewest, took, p * 100.0,
         surplus, reader_fps, could_save, remaining,
-        surplus_hook >= 0.0 ? " (test override)"
+        test_signal ? " (test signal: synthetic progress, backlog and clock)"
+          : surplus_hook >= 0.0 ? " (test override)"
           : surplus_capped ? " (reader capped)" : reader_done ? " (reader ended)" : "");
       vlog(V_DEBUG, opt, w);
     }
@@ -11629,9 +11684,16 @@ static bool gpu_bringup_worth_it(const Options & opt,
         || (share_hook >= 0.0 ? grown : capped || grown || reader_done);
     const bool behind = waiting && enough;
     if (test_behind) {
-      int n = std::snprintf(behind_why, sizeof behind_why,
-                    "; the queue held >= %zu frames through the window (the CPU pool: %zu)",
-                    win_min == SIZE_MAX ? (size_t)0 : win_min, behind_frames);
+      int n = !test_growth && reader_done && finished_backlog > 0
+          ? std::snprintf(behind_why, sizeof behind_why,
+                          "; the reader has finished; frames remain queued for the CPU pool")
+          : win_min == SIZE_MAX && win_checks
+          ? std::snprintf(behind_why, sizeof behind_why,
+                          "; the queue stayed full through the window (the CPU pool: %zu)",
+                          behind_frames)
+          : std::snprintf(behind_why, sizeof behind_why,
+                          "; the queue held >= %zu frames through the window (the CPU pool: %zu)",
+                          win_min == SIZE_MAX ? (size_t)0 : win_min, behind_frames);
       if (test_growth && n > 0 && (size_t)n < sizeof behind_why) {
         if (capped)
           std::snprintf(behind_why + n, sizeof behind_why - (size_t)n, " and reached its cap");
@@ -11694,6 +11756,66 @@ static bool gpu_bringup_worth_it(const Options & opt,
     p_prev = p;
     t_prev = t;
   }
+}
+
+// GZSTD_DEBUG_GPU_SAMPLER_SELFTEST=1 (v0.18.49): the bringup sample on synthetic
+// signals -- a ten-second job and a queue FULL at every check (backlog SIZE_MAX), a
+// pool of four, no growth test -- so the waiting test's reading of a full queue is
+// checked without a device or wall-clock timing.  Also checks a finished reader
+// with two slow frames left behind six workers.  Prints both verdicts;
+// before v0.18.49 the sample read every check as no reading and declined as keeping
+// up ("full-queue-declines 1").  Needs a guard above 0 (the suite exports 0, which
+// engages before any test): use GZSTD_DEBUG_GPU_GUARD_SEC=0.5.
+static int gz_sampler_full_queue_selftest()
+{
+  Options o;
+  o.verbosity = 0;
+  std::mutex mx;
+  std::condition_variable cv;
+  GpuSamplerTestClock clock;
+  auto progress = [&] { return std::min(0.5, clock.seconds / 10.0); };
+  int keeps = 0;
+  const bool engage = gpu_bringup_worth_it(o, progress, mx, cv,
+                                           [] { return false; }, {}, {},
+                                           [] { return SIZE_MAX; }, 4, &keeps, {}, &clock);
+  std::printf("%s %d; ", engage ? "full-queue-engages" : "full-queue-declines", keeps);
+  clock.seconds = 0.0;
+  keeps = 0;
+  const bool tail = gpu_bringup_worth_it(o, progress, mx, cv,
+                                         [] { return false; }, {}, [] { return true; },
+                                         [] { return size_t(2); }, 6, &keeps, {}, &clock);
+  std::printf("%s %d\n", tail ? "eof-backlog-engages" : "eof-backlog-declines", keeps);
+  return 0;
+}
+
+// The frames the bringup sample's behind test holds the queue to (behind_frames):
+// the CPU pool's worker count.  GZSTD_DEBUG_GPU_BEHIND_FRAMES=N tests N frames
+// instead (0 = no test).  A capacity marker still passes any positive threshold;
+// GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=empty forces the keeps-up arm independently of
+// capacity and EOF.  Test hooks only.  Decode and, since v0.18.49, compress.
+static size_t gpu_behind_frames(int cpu_threads)
+{
+  if (const char * e = ::getenv("GZSTD_DEBUG_GPU_BEHIND_FRAMES")) {
+    char * end = nullptr;
+    const unsigned long long v = std::strtoull(e, &end, 10);
+    if (end != e && *end == '\0') return (size_t)v;
+  }
+  return (size_t)std::max(0, cpu_threads);
+}
+
+// What -v says when the bringup sample declined, by its pool_keeps_up code.
+static const char * gpu_decline_message(int pool_keeps_up)
+{
+  return pool_keeps_up == 1
+       ? "[GPU] the CPU pool keeps up with the reader, so a GPU would wait for frames; "
+         "skipping GPU bringup\n"
+       : pool_keeps_up == 2
+       ? "[GPU] the CPU pool nearly keeps up with the reader, so a GPU would take less "
+         "than its own threads cost; skipping GPU bringup\n"
+       : pool_keeps_up == 3
+       ? "[GPU] the reader ends too little before the CPU pool for a GPU to repay its "
+         "bringup; skipping GPU bringup\n"
+       : "[GPU] CPU pool will finish before GPU init could; skipping GPU bringup\n";
 }
 
 #endif  // HAVE_NVCOMP  (GPU engagement helpers)
@@ -42515,6 +42637,41 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // would cut every sample short and skip the GPU unconditionally.
       // A pipe has no total (comp_progress -1): the work that has arrived is
       // what the reader has read, and the input has ended when it says so.
+      // A COMPRESS ENGAGES ONLY BEHIND A CPU POOL WITH FRAMES WAITING (v0.18.49,
+      // ROADMAP 42b) -- decode's waiting test (v0.18.43), and only that.  It was
+      // decode's alone: "the mmap reader queues the whole input, so the backlog says
+      // nothing".  An mmap reader queues views of every frame at once, cached OR
+      // cold; it does not materialize their bytes.  The cold-input probe normally
+      // chooses pread readers (here three, O_DIRECT), and when the CPU pool keeps
+      // up with them nothing waits and a GPU's
+      // batch never forms.  MEASURED, 8-H100 server, a 24 GiB base64 file read cold,
+      // two cards: at 8 and 16 CPUs every window had 0 frames waiting (--cpu-only
+      // 4.92-5.01 s, the drive's ~5.2 GB/s; hybrid 5.04-5.41 s, the cards took 0-1
+      // frames).  NOT decode's growth share or its bound: they price a decoded frame,
+      // and a compressed one saves the pool more.  At 6 CPUs cold the queue grew
+      // (s ~0.2, a bound of 1.3-1.5 s, under the guard), and two cards still won
+      // (6.12-6.32 against 6.98-7.01).  What compress's price is belongs to the
+      // guard's open question (ROADMAP 42a); a pool that keeps up has none to ask.
+      // No `pushed` callback: without it the sampler runs the waiting test alone.
+      // STATE TABLE (the reader path, not cache residency alone):
+      //   fixed-share / gpu-only / staged -> synchronous bringup; no sampler
+      //   known size, live pooled reader -> waiting test + old time test; this
+      //       includes buffered/--direct-read, a regular-file stdin redirect,
+      //       block devices, --no-mmap and the pre-6.4 mmap gate
+      //   known --tar layout / fallback block reader -> same live-reader tests;
+      //       queued frames contain bytes the producer has already read
+      //   mmap, warm OR cold -> views can queue without disk I/O; after producer
+      //       completion the old time test decides while queued work remains
+      //   finished reader, queued work -> time test even below a pool's worth;
+      //       eight slow frames on six workers can leave a second wave of two
+      //   finished reader, empty queue -> no GPU work left to take
+      //   unknown-size pipe -> existing work gate, or --adapt's backlog gate
+      // Cold mmap remains possible (--mmap, --cold, rotational/unknown input,
+      // below the read-probe floor, or a failed residency probe).  Its full view
+      // queue cannot diagnose storage starvation; that limitation is unchanged.
+      // A full byte/depth cap proves consumer backpressure, which can also come
+      // from the writer's throttle.  It does not prove that a GPU will be faster.
+      int pool_keeps_up = 0;
       if (!gpu_bringup_worth_it(opt, comp_progress, bringup_mx, bringup_cv,
                                 [&] { return comp_progress() >= 0.98; },
                                 [&]() -> double {
@@ -42524,11 +42681,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                   std::lock_guard<std::mutex> lk(results.m);
                                   return results.producer_done;
                                 },
-                                [&] { return queue.backlog_frames(); })) {
+                                [&] { return queue.backlog_frames(); },
+                                gpu_behind_frames(cpu_threads), &pool_keeps_up)) {
         // --adapt's pipe gate has said why already ("[ADAPT] pipe: ...").
         if (!opt.adapt || comp_progress() >= 0.0)
-          vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
-                               "skipping GPU bringup\n");
+          vlog(V_VERBOSE, opt, gpu_decline_message(pool_keeps_up));
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
       }
@@ -48420,30 +48577,11 @@ gds_out_declined:
                                 [&] { return queue.backlog_frames(); },
                                 // Engage only behind a pool that falls behind (see
                                 // gpu_bringup_worth_it): no pool, no test.
-                                // GZSTD_DEBUG_GPU_BEHIND_FRAMES=N tests N frames
-                                // instead (0 = no test), so the suite can make the
-                                // pool "keep up" on a fixture: test hook only.
-                                [&]() -> size_t {
-                                  if (const char * e = ::getenv("GZSTD_DEBUG_GPU_BEHIND_FRAMES")) {
-                                    char * end = nullptr;
-                                    const unsigned long long v = std::strtoull(e, &end, 10);
-                                    if (end != e && *end == '\0') return (size_t)v;
-                                  }
-                                  return (size_t)std::max(0, cpu_threads);
-                                }(), &pool_keeps_up,
+                                gpu_behind_frames(cpu_threads), &pool_keeps_up,
                                 [&] { return queue.total_tasks(); })) {
         // --adapt's pipe gate has said why already ("[ADAPT] pipe: ...").
         if (!opt.adapt || decomp_progress() >= 0.0)
-          vlog(V_VERBOSE, opt, pool_keeps_up == 1
-               ? "[GPU] the CPU pool keeps up with the reader, so a GPU would wait for frames; "
-                 "skipping GPU bringup\n"
-               : pool_keeps_up == 2
-               ? "[GPU] the CPU pool nearly keeps up with the reader, so a GPU would take less "
-                 "than its own threads cost; skipping GPU bringup\n"
-               : pool_keeps_up == 3
-               ? "[GPU] the reader ends too little before the CPU pool for a GPU to repay its "
-                 "bringup; skipping GPU bringup\n"
-               : "[GPU] CPU pool will finish before GPU init could; skipping GPU bringup\n");
+          vlog(V_VERBOSE, opt, gpu_decline_message(pool_keeps_up));
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         cpu_queue_ceiling();
         return;
@@ -55007,6 +55145,7 @@ int main(int argc, char ** argv)
     // Hidden hook: the bringup sampler's bound (gpu_reader_headroom) on given
     // inputs, R,s,B,I,U, printed to stdout, then exit -- its arithmetic, checked
     // without a run whose rates no host can pin.
+    if (::getenv("GZSTD_DEBUG_GPU_SAMPLER_SELFTEST")) return gz_sampler_full_queue_selftest();
     if (const char * e = ::getenv("GZSTD_DEBUG_GPU_BOUND")) {
       double v[5] = {0, 0, 0, 0, 0};
       if (std::sscanf(e, "%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4]) != 5) {
@@ -56219,15 +56358,11 @@ static void apply_backend_defaults(Options & opt)
         // A REDIRECTED STDIN IS A REGULAR FILE TOO (v0.18.48).  v0.18.39 left it
         // alone, so gzstd -d < f.zst started every card the driver listed where
         // gzstd -d f.zst starts two, and the pipe rule two (ROADMAP 42c): the same
-        // bytes under three different counts.  Decode
-        // already treats it as a file (known_input_size, the whole file's size);
-        // the count here is sized from the caller's offset, where the read begins.
-        uint64_t bytes = (uint64_t)st.st_size;
-        if (in == "-") {
-          const off_t at = ::lseek(STDIN_FILENO, 0, SEEK_CUR);
-          if (at > 0) bytes = (uint64_t)at < bytes ? bytes - (uint64_t)at : 0;
-        }
-        total += bytes;
+        // bytes under three different counts.  Sized as the whole file, as decode's
+        // known_input_size sizes it: a seekable stdin not at its start is refused
+        // before anything is read (v0.17.69), so a run that proceeds reads all of it.
+        // (v0.18.48 subtracted the caller's offset here, for a run that never happens.)
+        total += (uint64_t)st.st_size;
       } else {
         known = false;
         if (S_ISDIR(st.st_mode) || S_ISBLK(st.st_mode)) streams = false;
@@ -56351,17 +56486,15 @@ static void apply_backend_defaults(Options & opt)
         if (opt.cold_read) {
           cold = true;
         } else {
-          double out = 0.0;     // bytes outside the page cache
-          double whole = 0.0;   // ...of these files, whole: a redirect's residency is its file's
+          double out = 0.0;   // bytes outside the page cache
           for (const std::string & in : opt.inputs) {
             struct stat st {};
             const bool redirect = in == "-";   // adapt_path_residency("") probes fd 0
             if ((redirect ? ::fstat(STDIN_FILENO, &st) : ::stat(in.c_str(), &st)) != 0) continue;
-            whole += double(st.st_size);
             const double r = adapt_path_residency(redirect ? std::string() : in);
             if (r >= 0.0) out += double(st.st_size) * (1.0 - r);   // unknown counts as cached
           }
-          cold = out >= 0.5 * whole;
+          cold = out >= 0.5 * double(total);
         }
         if (cold) n = 2;
       }

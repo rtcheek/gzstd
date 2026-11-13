@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.48  
+**Covers:** v0.9.50 → v0.18.49  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,84 @@
 
 ---
 
+
+## v0.18.49 — a hybrid compress starts no GPU while its CPU pool keeps up with the reader, and the bringup sample counts a full queue as frames waiting (8-H100 server, a 24 GiB file read cold at 8-16 CPUs: 5.24-5.45 -> 4.91-5.04 s, --cpu-only's time; cached, and cold at 6 CPUs where the cards win, unchanged)
+
+The loose ends of v0.18.48's ROADMAP 42 work: one fix (42b's cold compress), one sampler defect found on the way,
+one measurement left as it stands (43), and a correction to v0.18.48's redirect sizing.
+
+### A compress whose CPU pool keeps up with its reader declines (42b)
+
+v0.18.48 left this open: a cold compress whose pool already keeps up with the drive still started two cards.
+In these measured runs a cold input was read through pread readers (three, O_DIRECT, "reader saturated"), and at 8-16 CPUs every sample
+window had 0 frames waiting -- the pool took each frame as it arrived, and a GPU's batch never formed: the cards
+took 0-1 frames and cost 7-8%.  The bringup sample's waiting test (v0.18.43) asks exactly that, and was decode's
+alone ("the mmap reader queues the whole input").  Compress now asks it too -- and only it.  Decode's growth share
+(v0.18.44) and bound (v0.18.47) price a DECODED frame; a compressed frame saves the pool far more, and at 6 CPUs
+cold, where the queue grew (s ~0.20, a bound of 1.3-1.5 s, under the guard), two cards still won 10-12%.  The
+test diagnoses a LIVE reader: once the reader has finished, frames still queued keep the old time-left test, as
+fewer of them than the pool has workers can still cost another CPU wave (eight slow frames on six workers; Codex
+review).  An mmap reader -- a cached input's -- queues every frame at once and finishes, so the time-left test
+decides as before.  The state table, by reader path, is in compress_nvcomp's bringup.  A cached 24 GiB base64
+file and the same file cold, two rounds, wall s:
+
+| CPUs | input | `--cpu-only` | v0.18.48 | v0.18.49 |
+|---|---|---|---|---|
+| 5 | cached | 9.42-9.44 | 5.64-5.87 | 5.77-5.85 (engages) |
+| 8 | cached | 4.82-4.90 | 4.73-5.05 | 4.77-5.04 (engages) |
+| 6 | cold | 7.04-7.06 | 6.06-6.17 | 6.05 (engages) |
+| 8 | cold | 4.90-4.93 | 5.24-5.25 | **4.91-4.92** (declines) |
+| 12 | cold | 4.98-5.05 | 5.34-5.36 | **4.98-5.04** (declines) |
+| 16 | cold | 5.02-5.06 | 5.38-5.45 | **4.99-5.00** (declines) |
+
+The cold declines come from the time-left test about a second in: "not behind" kept them sampling past the window
+that used to engage them.
+
+### A full queue counts as frames waiting
+
+The waiting test kept the fewest frames seen per window, and a check that found the queue at its cap read "no
+number" (SIZE_MAX) -- so a window spent entirely at the cap failed the test, and a pool as far behind as the queue
+can show was classed as keeping up.  Decode met it only late in a sample (the byte cap at 12 CPUs, 1.9 s in); the
+cold compress reader at 4-5 CPUs fills its 1,134-frame ceiling.  A full queue now counts as waiting when the
+window took a check; -vv says "a full queue", and the behind reason "the queue stayed full through the window".
+
+### Measured and left: the staged compress default (43)
+
+v0.18.48 found hybrid on two cards beating the staged 4-CPU default.  The full grid, 24 GiB, wall s, two rounds:
+
+| CPUs | input | `--cpu-only` | staged (default) | hybrid, 1 card | hybrid, 2 |
+|---|---|---|---|---|---|
+| 2 | cold | 36.2-36.3 | **7.69-7.88** | 11.05-12.43 | 10.47-11.28 |
+| 2 | cached | 28.0-28.2 | **7.59** | 8.31-8.42 | 7.74-8.29 |
+| 3 | cold | 13.9 | **7.47-7.48** | 8.49-9.33 | 8.62-9.31 |
+| 3 | cached | 14.0 | 7.33-7.34 | 7.19-7.21 | **6.59-6.82** |
+| 4 | cold | 9.42-9.51 | 7.34-7.39 | 7.28-7.51 | 7.81-8.09 |
+| 4 | cached | 9.30-9.43 | 7.28-7.30 | **6.07-6.36** | 6.17-6.18 |
+
+Staging wins at 2 CPUs either way and cold at 3; the better of one or two cards wins cached at 3-4 (the staged path
+reads O_DIRECT and forgoes the page cache); cold at 4, one card ties staging and two lose to it.  No default changes: a CPU threshold moved to fit this grid
+would be fitted to this server, and "a cached input does not stage" would lose at 2 CPUs.  The staging rule
+already hands the crossover to `--adapt`'s budget prior, which measures the staged and hybrid arms per machine.
+
+### A correction to v0.18.48: a redirected stdin's size
+
+v0.18.48 sized a regular-file stdin from the caller's offset.  A seekable stdin not at its start is refused
+before anything is read (v0.17.69: its readers work in absolute offsets), so a run that proceeds reads the whole
+file; the subtraction is gone and the cold check weighs the whole file again.
+
+### Tests
+
+The -e cell "a decode starts no GPU while its CPU pool keeps up with the reader" becomes "a decode or compress
+...".  New test hook GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=empty|waiting replaces the sampler's progress, backlog and end
+signals with synthetic ones on a virtual clock -- a live reader with nothing or a pool's worth waiting, a
+ten-second job -- while the caller's pool size and callbacks stay real, so no fixture's speed, residency or cap
+decides an arm (Codex review: a full queue now passes any GZSTD_DEBUG_GPU_BEHIND_FRAMES, and a preempted window
+could take no check).  The decode keeps-up arm moves to it; a compress with an empty queue must decline with the
+reason and start no card; a compress with a pool's worth waiting must engage on the waiting reason with no growth
+lines.  GZSTD_DEBUG_GPU_SAMPLER_SELFTEST runs the sampler itself on the virtual clock: a queue full at every check
+must engage, and a finished reader's two frames behind six workers must engage.  Run by hand: passes on v0.18.49;
+v0.18.48 fails (it engages regardless); a build with the old full-queue reading prints "full-queue-declines 1",
+one without the finished-reader rule "eof-backlog-declines 1".  Counts unchanged.
 
 ## v0.18.48 — a hybrid compress of a named file starts two GPUs, not every card, and a redirected stdin counts as a file; a GPU decode's writer takes each frame as it lands; a hybrid decode that engages queues for the cards it starts (8-H100 server, a cached 24 GiB file: the default compress at 5-8 CPUs 7.1-8.7 -> 4.7-5.7 s; a 72 GiB archive at 4-8 CPUs: 27-30 -> 12-13 GiB peak RSS; --gpu-only -d of a 32 GiB archive 5.1-5.4 -> 4.3-4.7 s)
 

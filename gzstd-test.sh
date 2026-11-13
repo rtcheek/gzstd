@@ -7181,7 +7181,7 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   # condition.  Decisions, output bytes and the lowered queue ceiling are
   # asserted, never a machine's speed or a CUDA startup duration.
   if $EXTENSIVE; then
-    bh_t="a decode starts no GPU while its CPU pool keeps up with the reader"
+    bh_t="a decode or compress starts no GPU while its CPU pool keeps up with the reader"
     bh_why=""
     head -c 805306368 /dev/urandom 2>/dev/null | base64 -w0 2>/dev/null | head -c 1073741824 > "$TMPDIR/bh.b64"
     "$GZSTD" -q --cpu-only -k -f "$TMPDIR/bh.b64" -o "$TMPDIR/bh.zst" 2>/dev/null || bh_why+=" fixture"
@@ -7192,7 +7192,9 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
       cmp -s "$TMPDIR/bh.out" "$TMPDIR/bh.b64" || bh_why+=" $name:bytes"
     }
     bh_err() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -aE 'bringup window|bringup sample|skipping GPU|online' | tr '\n' ' '; }
-    bh_run keeps-up GZSTD_DEBUG_GPU_BEHIND_FRAMES=1000000000 GZSTD_DEBUG_GPU_SURPLUS_SHARE=1
+    # An empty synthetic queue cannot turn into SIZE_MAX at a real queue's cap.
+    # Its virtual clock also keeps a delayed sampler from missing this decision.
+    bh_run keeps-up GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=empty GZSTD_DEBUG_GPU_SURPLUS_SHARE=1
     { grep -qa 'bringup sample:.*the CPU pool keeps up with the reader.*-> skip' "$TMPDIR/bh.err" \
         && grep -qa 'the CPU pool keeps up with the reader, so a GPU would wait for frames; skipping GPU bringup' \
              "$TMPDIR/bh.err" \
@@ -7219,11 +7221,44 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
     # No bound override: this arm runs the real one (a finished reader's R, or a
     # measured s beside a one-worker pool -- far above the 0.05 s guard either way).
     bh_run behind GZSTD_DEBUG_GPU_START_AFTER_INPUT=1
-    { grep -qa 'bringup sample:.*the queue held >= [0-9]* frames through the window (the CPU pool: 1).*-> engage' \
+    # Either reason: a queue held at its (RAM-sized) byte cap through the window says
+    # "stayed full" since v0.18.49 (Codex review).
+    { grep -qaE 'bringup sample:.*the queue (held >= [0-9]* frames|stayed full) through the window \(the CPU pool: 1\).*-> engage' \
         "$TMPDIR/bh.err" && grep -qa 'device(s) online' "$TMPDIR/bh.err" \
         && grep -qa 'bringup window:.*a GPU could save [0-9.]* s of ' "$TMPDIR/bh.err" \
         && ! grep -qa 'test override' "$TMPDIR/bh.err"; } || bh_why+=" behind:[$(bh_err)]"
     [[ "$(bh_ceil)" -gt 32 ]] || bh_why+=" behind:ceiling-$(bh_ceil)"
+    # A COMPRESS ASKS THE WAITING TEST TOO (v0.18.49).  A cold input's pread readers can
+    # leave a pool that keeps up with nothing waiting (8-16 CPUs on the 8-H100 server:
+    # two cards took 0-1 frames and cost 7-8%).  Synthetic live-reader signals and
+    # a virtual clock make the decisions independent of the fixture's speed, cache
+    # residency and caps; the real caller still supplies its one-worker threshold.
+    # No growth or bound test for compress: the decision lines say only that.
+    bh_comp() {   # bh_comp NAME ENV... -> $TMPDIR/bh.err, then a CPU round trip
+      local name=$1; shift
+      env GZSTD_DEBUG_GPU_GUARD_SEC=0.05 "$@" timeout --foreground -k 10 120 "$GZSTD" --hybrid -T 1 -vv \
+        -k -f "$TMPDIR/bh.b64" -o "$TMPDIR/bhc.zst" 2>"$TMPDIR/bh.err" || bh_why+=" $name:rc=$?"
+      "$GZSTD" --cpu-only -d -q -c "$TMPDIR/bhc.zst" 2>/dev/null | cmp -s - "$TMPDIR/bh.b64" \
+        || bh_why+=" $name:bytes"
+    }
+    bh_comp comp-keeps-up GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=empty
+    { grep -qa 'bringup sample:.*the CPU pool keeps up with the reader.*-> skip' "$TMPDIR/bh.err" \
+        && grep -qa 'the CPU pool keeps up with the reader, so a GPU would wait for frames; skipping GPU bringup' \
+             "$TMPDIR/bh.err" \
+        && ! grep -qaE '[0-9]+ device workers? online' "$TMPDIR/bh.err"; } || bh_why+=" comp-keeps-up:[$(bh_err)]"
+    bh_comp comp-behind GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting
+    { grep -qa 'bringup sample:.*the queue held >= [0-9]* frames through the window (the CPU pool: 1).*-> engage' \
+        "$TMPDIR/bh.err" && ! grep -qa 'bringup window' "$TMPDIR/bh.err"; } || bh_why+=" comp-behind:[$(bh_err)]"
+    rm -f "$TMPDIR/bhc.zst"
+    # A FULL QUEUE IS FRAMES WAITING (v0.18.49): the waiting test read a check that saw
+    # the queue at its cap as no reading, so a window spent at the cap "kept up".  The
+    # sampler on synthetic signals (a queue full at every check, a ten-second job) must
+    # engage; the old reading declines it.  A finished reader's two waiting frames
+    # behind six workers must also engage (a second CPU wave is still work).
+    # No device or wall-clock timing.
+    bh_got=$(GZSTD_DEBUG_GPU_GUARD_SEC=0.5 GZSTD_DEBUG_GPU_SAMPLER_SELFTEST=1 timeout --foreground -k 5 20 \
+               "$GZSTD" 2>/dev/null </dev/null | head -c 64 | tr -cd '[:print:]'; echo ":${PIPESTATUS[0]}")
+    [[ "$bh_got" == "full-queue-engages 0; eof-backlog-engages 0:0" ]] || bh_why+=" sampler=$bh_got"
     # The bound's arithmetic, which no timed run can pin (GZSTD_DEBUG_GPU_BOUND=R,s,B,I,U):
     # s x R + (B + I) / U, at most R.  The first two differ only in the backlog, which
     # carries the bound across a 4 s guard; then the clamp to R, no reader rate, no R.

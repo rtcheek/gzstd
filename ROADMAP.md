@@ -945,7 +945,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
 
 42. **Hybrid runs and their GPUs: what is left after v0.18.46-48.**  v0.18.46 capped a regular-file hybrid
     `-d` and `-t` at two cards (the pipe rule, extended); v0.18.47 engages only when the most a GPU could
-    save clears the guard; v0.18.48 closed the rest of this item's list except (a) and (b)'s cold compress.
+    save clears the guard; v0.18.48-49 closed the rest of this item's list except (a) and (b)'s cold mmap.
     (a) **OPEN: the guard itself** is the legacy 4.0 s, the one price for CUDA's start, the pool's loss to
     the cards' host copies and threads, and the teardown (0.15-0.34 s in the H100 runs of (f)),
     none of which a run can read before CUDA starts; 12 CPUs sits on it here (bounds of 4.03-4.06 s engaged
@@ -965,14 +965,17 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     (b) ~~**hybrid compress of a named file started every card**~~ **FIXED v0.18.48**: it takes two at most,
     as a pipe's compress (v0.18.40) and a named file's decode (v0.18.46) already did (8 CPUs, a cached
     24 GiB file: every card 7.31-7.37 s, two 4.53-4.58, `--cpu-only` 5.03-5.04).  Codex dissented: no
-    measured hybrid model on another host says two.  STILL OPEN there: **a cold compress whose CPU pool
-    keeps up with the drive** still starts its cards -- 8 CPUs, the same file cold: `--cpu-only`
-    4.92-4.93 s (the drive's ~5 GB/s), two cards 5.27-5.28, and they took ONE frame.  Compress's sample has
-    no reader-end bound (an mmap reader queues everything at once), and none of the candidate signals -- the
-    workers' CPU busy share, `/proc/self/io` against the work rate, the start's mincore residency -- shows
-    on its own that a GPU cannot help (Codex review); 4 CPUs cold, two cards won 25%.
+    measured hybrid model on another host says two.  ~~**A cold compress whose CPU pool keeps up with the
+    drive**~~ **FIXED v0.18.49**: compress asks decode's waiting test of its live reader (a cold input's pread
+    readers left 0 frames waiting at 8-16 CPUs, and two cards took 0-1 frames); 24 GiB cold at 8-16 CPUs
+    5.24-5.45 -> 4.91-5.04 s, `--cpu-only`'s time.  Not decode's growth share or bound: at 6 CPUs cold the
+    queue grew (s ~0.2, a bound of 1.3-1.5 s) and two cards still won 10-12%, so what a compressed frame is
+    worth to the pool is (a)'s question.  The workers' CPU busy share was measured and is no signal (0.80
+    cached and cold at 8 CPUs).  Still open: a COLD input read by mmap (--mmap, --cold, below the read-probe
+    floor) queues views of every frame at once, so its backlog cannot show the drive starving the pool.
     (c) ~~**a redirected stdin started every card**~~ **FIXED v0.18.48**: `gzstd -d < f.zst` is a regular file,
-    sized from the caller's offset, and takes the named file's rule.
+    sized as the whole file (v0.18.49; a seekable stdin not at its start is refused), and takes the named
+    file's rule.
     (d) ~~**the provisional eight**~~ **FIXED v0.18.48**: a deferred bringup sizes its throttle floor and
     scheduler by a mask's or --gpu-devices' bound (not /proc: a mask may name MIG devices), and a hybrid
     decode that engages lowers its queue to the cards it starts.  The sample keeps v0.18.47's depth: a
@@ -991,13 +994,15 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     woke the writer for a GPU frame once the CPU pool had finished; push_to_slot now wakes it for the frame
     it waits on.  --gpu-only decode, whose writer had only batch ends to wake it, gained 12-20%.
 
-43. **The staged compress default against hybrid on two cards.**  AUTO_STAGE_MAX_CPUS_COMPRESS (4) was
-    measured against a hybrid that started every card.  With v0.18.48's two, hybrid beats the staged
-    default at 4 CPUs on the 8-H100 server, a 24 GiB file: cached 6.03-6.11 s against 6.94-7.28, cold
-    7.02-7.09 against 7.32-8.18 (`--cpu-only` 9.3-9.7).  The staged path reads O_DIRECT, so a cached input
-    forgoes the page cache.  Its comment already says its constants are one host's and `--adapt`'s
-    budget prior measures the crossover; re-measure on a one-card host (the case staging was built for)
-    before moving the default.
+43. **The staged compress default against hybrid on two cards: MEASURED v0.18.49, default kept.**
+    AUTO_STAGE_MAX_CPUS_COMPRESS (4) was measured against a hybrid that started every card.  The grid with
+    one or two cards, 24 GiB on the 8-H100 server: staging wins at 2 CPUs cached and cold (7.6-7.9 s against
+    7.7-12.4) and cold at 3 (7.5 against 8.5-9.3); the better of one or two cards wins cached at 3-4 CPUs
+    (6.1-6.8 against 7.3, 7-17%: the staged path reads O_DIRECT and forgoes the page cache); cold at 4, one
+    card ties staging (7.28-7.51 against 7.34-7.39) and two lose (7.81-8.09).  Neither residency alone (it
+    loses at 2 CPUs) nor a moved CPU threshold (fitted to this server) is a general rule, and the staging
+    rule already hands the crossover to `--adapt`'s budget prior, which measures both arms per machine
+    (Codex agreed).  Open only for a sensed rule; a one-card host is the case staging was built for.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
