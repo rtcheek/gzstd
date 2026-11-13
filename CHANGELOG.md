@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.49  
+**Covers:** v0.9.50 → v0.18.50  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,44 @@
 
 ---
 
+
+## v0.18.50 — the pre-tag review's repairs: --adapt no longer cuts a caller's CUDA_VISIBLE_DEVICES down to a card this build cannot use, and two suite cells no longer fail a correct build
+
+The pre-tag review of v0.18.43-49 (Codex, gpt-6.1-sol at max, with the blocker bar stated first) returned NOT SAFE
+on three suspected blockers, one in the code and two in the suite.  All three are repaired; the code one was
+reproduced before it was fixed.
+
+**--adapt -d and -t truncated a mixed caller mask to an unusable card (v0.18.43).**  The --adapt device-count
+model counts USABLE cards, but the count it chooses is applied as --gpu-devices, which keeps the first N entries
+of the RAW CUDA_VISIBLE_DEVICES.  On a host mixing cards below this build's capability floor with newer ones,
+`CUDA_VISIBLE_DEVICES=old,new gzstd --adapt --gpu-only -d` with a model that chose one card kept only the old one
+and refused: exit 2, though the new card was there.  v0.18.42 never chose a decode count.  The decode chooser now
+leaves such a mask intact -- whenever the driver's list shows a card below the floor, or one it cannot classify --
+for the capability filter after CUDA starts, and says why (-v: "CUDA_VISIBLE_DEVICES may include GPUs below this
+build's capability floor; leaving it intact").  REPRODUCED: the new arm of the --adapt count cell exits 2 on
+v0.18.49 and passes here (GZSTD_DEBUG_GPU_CC marks the mask's first card 6.1; one card online, bytes identical).
+
+**The hf cell's queue ceiling could fail a host short of RAM.**  It compared the ceilings an engage set after the
+memory fit, and the fit divides one RAM budget among the cards, so three can queue less than two.  It now compares
+the PROVISIONAL ceilings (set before the fit), and a host whose RAM cut a requested card count is a host skip with
+the decisions and bytes still checked.
+
+**The -e buffer-count cell could fail a correct build.**  A writer descheduled for a batch needs the batch's
+buffers whatever wakes it, and three retries cannot rule that out on a busy host.  The count's upper bound is no
+longer asserted (the cell is "a batched GPU decode reports its output buffers and preserves bytes"); the default suite's
+slot self-test checks the wake deterministically.
+
+The review found nothing else under the bar (it traced the writer's lock order, the queue's notifications and
+lifetimes, the sampler's decisions, the device overrides, stdin and pipes, several inputs, --tar, and the debug
+hooks unset), and its second round on the repairs returned SAFE TO TAG.  Should-fix left: the mask repair is
+conservative where the build cannot classify a card (a floor above 7.5 has no PCI rule, or a container hides the
+PCI attributes), so an opt-in --adapt --gpu-only decode there keeps the full mask, as v0.18.42 always did; and the
+hf cell's RAM skip does not check the reduced worker count.  Alongside it, the release checklist's real-data round trips on HEAD: 21 of 21 byte-identical --
+two 13 GB files, a 16 GiB compressible file and a 100,000-file tree, through the default, --hybrid -T 1 (GPUs
+engaged), --gpu-only, several inputs, a redirect, a pipe, cold reads, -t and --tar -c/-d.  And v0.18.42 against
+HEAD on common default runs (12 GiB, two to six rounds): no default slower; 4-CPU decode 5.27-5.62 -> 3.39-3.51 s.
+Logged, not changed (ROADMAP 44): a hybrid --tar compress at 8 CPUs loses to --cpu-only with two cards or eight,
+as v0.18.42 did.
 
 ## v0.18.49 — a hybrid compress starts no GPU while its CPU pool keeps up with the reader, and the bringup sample counts a full queue as frames waiting (8-H100 server, a 24 GiB file read cold at 8-16 CPUs: 5.24-5.45 -> 4.91-5.04 s, --cpu-only's time; cached, and cold at 6 CPUs where the cards win, unchanged)
 

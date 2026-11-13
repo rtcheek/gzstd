@@ -1004,6 +1004,13 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     rule already hands the crossover to `--adapt`'s budget prior, which measures both arms per machine
     (Codex agreed).  Open only for a sensed rule; a one-card host is the case staging was built for.
 
+44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  Found in v0.18.50's
+    pre-tag round trips: the device rule leaves --tar alone (`!opt.tar_mode`), so every card starts, but the count
+    is not the sole cause -- two cards improve on eight and still lose.  Two 13 GB base64 files as one --tar archive, 8 CPUs, cached, wall s, two rounds: `--cpu-only`
+    5.89-6.07, two cards 7.86-8.57, every card (8) 8.57-9.44, the cards taking ~480-500 of ~1,600 frames; v0.18.42
+    the same (8.70-9.28).  A plain hybrid compress of a 24 GiB base64 file at 8 CPUs wins (4.5-4.6 against
+    5.0 s), so the --tar producer or sink is the first suspect (a hypothesis, not measured).  Then decide whether --tar takes the device rule's two-card ceiling.
+
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
 Found by Codex while reviewing v0.17.84, reproduced in v0.17.85 with a stall hook

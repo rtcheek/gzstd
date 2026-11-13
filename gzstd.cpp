@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.49";
+static constexpr const char * GZSTD_VERSION = "0.18.50";
 //
 // Architecture overview:
 //
@@ -56240,9 +56240,21 @@ static void apply_backend_defaults(Options & opt)
       const AdaptPriors pr = adapt_load_priors();
       const int di = decode ? 1 : 0;
       const GpucChoice ch = gpuc_choose(devices, size_gib, pr.dir[di], pr.dir[di].runs);
+      // A valid caller mask can mix cards below and above this build's floor.
+      // The model counts USABLE cards, but --gpu-devices below truncates the RAW
+      // mask: choosing one can retain only an old first card and hide a usable
+      // later one, turning a valid -d/-t into exit 2 (new with v0.18.43's chooser).
+      // Leave that decode mask intact for the post-CUDA capability filter.  An
+      // uncertain PCI classification cannot prove a prefix safe either.  The
+      // choice hook supplies a synthetic inventory, not the host's capabilities.
+      const bool keep_decode_mask = decode && ch.n > 0 && ch.n < devices
+          && !choice_hook && ::getenv("CUDA_VISIBLE_DEVICES")
+          && (gz_floor_precuda().some_old || gz_floor_precuda().uncertain);
       if (ch.unmeasured) {
         why = std::string("no ") + (decode ? "decompress" : "compress")
             + " count measured yet, and the input is too small to explore one: the default's rule decides";
+      } else if (keep_decode_mask) {
+        why = "CUDA_VISIBLE_DEVICES may include GPUs below this build's capability floor; leaving it intact";
       } else {
         if (ch.n > 0 && ch.n < devices) opt.gpu_devices = ch.n;
         chose = true;
