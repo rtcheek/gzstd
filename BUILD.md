@@ -259,6 +259,19 @@ fails at start-up with ``version `GLIBCXX_3.4.xx' not found``.  So run the binar
 build, and check `readelf -d build-cpu/gzstd | grep RUNPATH` names the env you meant.  Even an
 existing build directory takes the RPATH from the shell that reconfigures it.
 
+**A build uses the compilers its directory was configured with**, whatever env is active when you
+run `cmake --build`.  A conda env that ships compilers (`gcc_linux-64`, `gxx_linux-64`,
+`binutils`, `cuda-nvcc`) puts its own `ld` first on PATH when activated and sets
+`NVCC_PREPEND_FLAGS=-ccbin=<its c++>`, and both are read again at every build step.  So the link
+passes `-B<directory of CMAKE_LINKER>/`, and every nvcc call replays the `NVCC_PREPEND_FLAGS` of
+the directory's FIRST configure (cached as `GZSTD_NVCC_PREPEND_FLAGS`, empty = unset; change it
+with `-DGZSTD_NVCC_PREPEND_FLAGS=...`).  Before this (v0.18.50 and earlier checkouts) a
+system-configured directory built in such a shell failed both ways: `undefined reference to
+__libc_*@GLIBC_PRIVATE` at the link (the env's `ld` with its own sysroot) and `cuda_runtime.h: No
+such file` from nvcc (the env's c++ as its host compiler).  To build with the env's compilers
+instead, configure a NEW directory with the env active; it records the env's toolchain and builds
+the same from any shell.
+
 ## Conda Environment Example
 
 ```bash

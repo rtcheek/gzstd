@@ -237,6 +237,27 @@ if(HAVE_NVCOMP)
   else()
     set(GZSTD_CUDA_ARCH_USER_SET FALSE)
   endif()
+  # Record NVCC_PREPEND_FLAGS as the tree's FIRST configure saw it -- the
+  # environment CUDA detection below runs in -- for the gzstd target to replay
+  # on every CUDA compile (the linker pin by add_executable explains why).
+  # Recorded once: CMake re-runs configure by itself during a build after a
+  # CMakeLists.txt edit, in the BUILD shell's environment, which must not
+  # become the record.  A tree whose CUDA detection already ran (configured
+  # before this record existed) gets "unset" -- the environment now is not the
+  # one it was configured in.  To change it: -DGZSTD_NVCC_PREPEND_FLAGS=...
+  if(NOT DEFINED CACHE{GZSTD_NVCC_PREPEND_FLAGS})
+    if(EXISTS "${CMAKE_BINARY_DIR}/CMakeFiles/${CMAKE_VERSION}/CMakeCUDACompiler.cmake")
+      set(_gz_prepend "")
+      if(NOT "$ENV{NVCC_PREPEND_FLAGS}" STREQUAL "")
+        message(STATUS "gzstd: ignoring NVCC_PREPEND_FLAGS from this shell for an already-configured "
+                       "tree; set -DGZSTD_NVCC_PREPEND_FLAGS=... to keep it")
+      endif()
+    else()
+      set(_gz_prepend "$ENV{NVCC_PREPEND_FLAGS}")
+    endif()
+    set(GZSTD_NVCC_PREPEND_FLAGS "${_gz_prepend}" CACHE STRING
+        "NVCC_PREPEND_FLAGS for every CUDA compile (default: the first configure's environment; empty = unset)")
+  endif()
   enable_language(CUDA)
   if(NOT GZSTD_CUDA_ARCH_USER_SET)
     set(GZSTD_CUDA_ARCH_SEED "${CMAKE_CUDA_ARCHITECTURES}" CACHE INTERNAL
@@ -267,12 +288,57 @@ endif()
 add_executable(gzstd gzstd.cpp)
 target_compile_features(gzstd PRIVATE cxx_std_17)
 
+# A build uses the tools its tree was CONFIGURED with.  Two of them are looked
+# up again from the environment on every build step, so a shell that differs
+# from the configuring one -- typically a conda env with its own compilers
+# activated after `cmake -B build` -- silently swaps them:
+#   - the linker: GCC and Clang resolve `ld` on PATH at each link
+#     (`c++ -print-prog-name=ld` prints a bare "ld"), so the system c++ linked
+#     with conda's ld against conda's old sysroot and failed on
+#     `__libc_*@GLIBC_PRIVATE`;
+#   - nvcc's host compiler: nvcc reads NVCC_PREPEND_FLAGS on each call, and
+#     conda's cuda-nvcc hook puts `-ccbin=<conda c++>` there, so the system
+#     nvcc compiled with conda's c++ and failed on `cuda_runtime.h: No such file`.
+# Point the compiler driver at the directory of the linker CMake found
+# (-B<dir>/: GCC and Clang look there for `ld` before PATH; GCC has no
+# --ld-path, that is Clang's), unless the user picked a linker (-fuse-ld /
+# CMAKE_LINKER_TYPE) or it is not a GNU-style ld.  Probed, so a compiler that
+# rejects it keeps the old behaviour.  A tree configured INSIDE the conda env
+# records conda's own ld, so that tree stays consistent too.  MEASURED, py3
+# active, the system c++: `-print-prog-name=ld` is "ld" without it and
+# /usr/bin/x86_64-linux-gnu-ld with -B/usr/bin/.
+include(CheckLinkerFlag)
+get_filename_component(_gz_ld_name "${CMAKE_LINKER}" NAME)
+get_filename_component(_gz_ld_dir "${CMAKE_LINKER}" DIRECTORY)
+if(CMAKE_LINKER AND IS_ABSOLUTE "${CMAKE_LINKER}" AND EXISTS "${CMAKE_LINKER}"
+   AND _gz_ld_name MATCHES "^(.*-)?ld$"
+   AND NOT DEFINED CMAKE_LINKER_TYPE
+   AND NOT "${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_CXX_FLAGS}" MATCHES "-fuse-ld")
+  check_linker_flag(CXX "-B${_gz_ld_dir}/" GZSTD_HAVE_LINKER_DIR)
+  if(GZSTD_HAVE_LINKER_DIR)
+    target_link_options(gzstd PRIVATE "-B${_gz_ld_dir}/")
+  endif()
+endif()
+
 # Include/defines
 if(HAVE_NVCOMP)
   target_compile_definitions(gzstd PRIVATE HAVE_NVCOMP)
   target_include_directories(gzstd PRIVATE ${NVCOMP_INCLUDE_DIR})
   # The GPU-verify byte-compare kernel (nvcc-compiled).
   target_sources(gzstd PRIVATE gpuverify.cu)
+
+  # nvcc's half of "the tools the tree was configured with" (see the linker pin
+  # above, and where GZSTD_NVCC_PREPEND_FLAGS is recorded): replay it on every
+  # CUDA compile -- unset if empty -- so a flag set on purpose at configure
+  # still applies and one a later shell injects does not.  An explicit -ccbin
+  # would also win, but nvcc warns "incompatible redefinition" on every compile.
+  if(GZSTD_NVCC_PREPEND_FLAGS STREQUAL "")
+    set(_gz_nvcc_env "--unset=NVCC_PREPEND_FLAGS")
+  else()
+    set(_gz_nvcc_env "NVCC_PREPEND_FLAGS=${GZSTD_NVCC_PREPEND_FLAGS}")
+  endif()
+  set_property(TARGET gzstd PROPERTY CUDA_COMPILER_LAUNCHER
+               "${CMAKE_COMMAND}" -E env "${_gz_nvcc_env}" ${CMAKE_CUDA_COMPILER_LAUNCHER})
 
   # Goal: the GPU-verify kernel must run on every GPU nvCOMP itself supports,
   # not just the boxes we test on.  Embed native SASS (-real) for the cards

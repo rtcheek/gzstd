@@ -9,6 +9,39 @@
 ---
 
 
+## Build only, after v0.18.50 (no version change, 2026-11-13) — a build uses the compilers its directory was configured with: an activated conda env with its own compilers no longer breaks the link or nvcc
+
+On the 5090 workstation, a build directory configured from a plain shell failed to build with the conda env that
+holds nvCOMP and zstd ACTIVE: the CPU-only link with `undefined reference to __libc_dlclose@GLIBC_PRIVATE` (from
+the env's sysroot libpthread), and the GPU build with `cuda_runtime.h: No such file or directory` from
+gpuverify.cu.  The other hosts never saw it because only that env ships compilers (gcc/gxx/binutils_linux-64 and
+cuda-nvcc, via cuda-toolkit, which conda's triton depends on); their envs carry no activation hooks for a
+toolchain.  The recorded workaround was to build with the env deactivated.
+
+CMake records the compiler, linker and nvcc it chose, and activation cannot change those -- but two lookups
+happen again at every build step: GCC resolves `ld` on PATH at each link (`c++ -print-prog-name=ld` prints a
+bare "ld"), and nvcc reads NVCC_PREPEND_FLAGS on each call, where conda's cuda-nvcc hook puts
+`-ccbin=<conda c++>`.  So the system c++ linked with conda's ld, and the system nvcc compiled with conda's c++.
+
+Now the link passes `-B<directory of CMAKE_LINKER>/` (GCC has no `--ld-path`; that is Clang's), probed, and
+skipped when the user chose a linker with -fuse-ld or CMAKE_LINKER_TYPE.  Every CUDA compile runs under
+`cmake -E env`, replaying the NVCC_PREPEND_FLAGS of the directory's first configure (cached as
+GZSTD_NVCC_PREPEND_FLAGS; empty = unset), ahead of any user launcher.  It is recorded once because CMake
+re-runs configure by itself, in the BUILD shell, after a CMakeLists.txt edit; a directory whose CUDA detection
+already ran gets "unset" and says so.  An explicit -ccbin would also have won, but nvcc then warns
+"incompatible redefinition" on every compile.
+
+MEASURED (the 5090 workstation, CMake 3.28, system gcc 13.3 and nvcc 12.8, conda env with gcc 14.3 and
+binutils 2.44), both build types each time, all warning-free, 1 GiB base64 round trips byte-identical:
+the existing directories (re-configured by the build) with the env active and inactive; a new directory
+configured inactive and built active; one configured with a deliberate NVCC_PREPEND_FLAGS (replayed, conda's
+dropped); one configured INSIDE the env (records conda's c++, ld, nvcc and -ccbin) built active, and the same
+built inactive.  NOT run: the
+suites (a build-only change), and the static portable build (BUILD_STATIC, the release CI).
+
+---
+
+
 ## v0.18.50 — the pre-tag review's repairs: --adapt no longer cuts a caller's CUDA_VISIBLE_DEVICES down to a card this build cannot use, and two suite cells no longer fail a correct build
 
 The pre-tag review of v0.18.43-49 (Codex, gpt-6.1-sol at max, with the blocker bar stated first) returned NOT SAFE
