@@ -1004,7 +1004,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     rule already hands the crossover to `--adapt`'s budget prior, which measures both arms per machine
     (Codex agreed).  Open only for a sensed rule; a one-card host is the case staging was built for.
 
-44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  Found in v0.18.50's
+44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  MOSTLY FIXED v0.18.51
+    (three defects, below); the engaged 8-CPU loss that is left belongs to 42a.  Found in v0.18.50's
     pre-tag round trips: the device rule leaves --tar alone (`!opt.tar_mode`), so every card starts, but the count
     is not the sole cause -- two cards improve on eight and still lose.  Two 13 GB base64 files as one --tar archive, 8 CPUs, cached, wall s, two rounds: `--cpu-only`
     5.89-6.07, two cards 7.86-8.57, every card (8) 8.57-9.44, the cards taking ~480-500 of ~1,600 frames; v0.18.42
@@ -1021,6 +1022,27 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     a declined --tar compress pays for the background CUDA bringup that a plain one does not.  The extra memory is
     anonymous (VmPin 0), grows through the run, +9 threads.  Mechanism NOT found -- the next step is to find what in the
     --tar producer or sink grows while CUDA is initializing, not to change the device rule.
+    **v0.18.51, 8-H100 server (four of the eight cards another user's), MECHANISM FOUND -- three defects, all fixed:**
+    (1) The compress input queue's byte cap counted the PROVISIONAL card count's streams at the tuner's 256-frame
+    ceiling from the first frame (two cards: 4,120 half-frame slots, 32 GiB).  A reader that copies into owned frames
+    -- the --tar assembler always, --no-mmap's and the cold pread readers, a pipe -- filled it beside a CPU pool whose
+    GPUs the sample then declined; an mmap reader queues zero-byte views, so a plain file never showed it.  The empty
+    mask above is a provisional count of 0, which is why that control tied.  A 12 GiB file as an archive, 8 CPUs,
+    declining: 2.88-3.42 s and 4.6-6.3 GiB against --cpu-only's 2.56-2.60 and 0.7-0.8; now 2.56-2.58 and 0.76.  The
+    cap starts at compress_cpu_mt's and grows with the throttle when a GPU joins (v0.18.30's rule for the throttle,
+    v0.18.44's for decode's queue).  (2) The --tar assembler, bounded by that cap, never declared itself a bounded
+    producer, so the AUTO queue floor locked the CPU pool out once the cards came online (cpu_taken=0 at a floor of
+    256); it now declares the cap before any GPU registers.  (3) --tar took no device rule; a hybrid --tar compress now
+    takes the two-card ceiling (no size needed), and no longer ranks the cards on the main thread at startup (~80 ms
+    on every run, GPU or not): that list was for the -d/-t decode pool.  Two 12 GiB files, cached, x3: 6 CPUs
+    --cpu-only 6.99-7.01, v0.18.51 6.25-6.31 (wins), v0.18.42 9.10-9.47; 8 CPUs 5.06-5.07 / 5.27-5.70 / 8.29-8.65;
+    12-24 CPUs declined, at --cpu-only's time and memory.
+    **Left, for 42a: the engaged run at 8 CPUs still loses 4-12%.**  Not the queue: an engaged queue of 70, 134, 268
+    or 2,060 frames gave 5.4-6.1 s and 10-12 s of kernel time each, against --cpu-only's 4 s.  The same plain file
+    through --no-mmap's reader loses the same way (5.65-5.68 against 5.08) where the mmap reader wins (4.46-4.70): the
+    GPU path's host copies beside a reader that copies cost more CPU than 8 CPUs have spare (each card's stream ran
+    1.2-1.5 GiB/s), and the 4.0 s guard (the sample engaged at 4.7 s remaining) does not price that.  A measured
+    hybrid price (42a) should be keyed by reader path -- copying or mmap -- as well as the CPU allowance.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

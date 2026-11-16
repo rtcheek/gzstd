@@ -7250,6 +7250,52 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
     { grep -qa 'bringup sample:.*the queue held >= [0-9]* frames through the window (the CPU pool: 1).*-> engage' \
         "$TMPDIR/bh.err" && ! grep -qa 'bringup window' "$TMPDIR/bh.err"; } || bh_why+=" comp-behind:[$(bh_err)]"
     rm -f "$TMPDIR/bhc.zst"
+    # A --tar ARCHIVE QUEUES FOR ITS CPU POOL UNTIL A GPU JOINS, AND ITS ASSEMBLER SAYS IT
+    # IS BOUNDED (v0.18.51, ROADMAP 44).  The assembler reads members into owned frames,
+    # and the queue's byte cap counted every provisional card's 256-frame batches from
+    # the first frame (32 GiB on two), so its readers buffered the input beside a pool
+    # whose GPUs the sample then declined: 8 CPUs, a 12 GiB file, 2.88-3.42 s and 4.6-6.3
+    # GiB against --cpu-only's 2.56-2.60 s and 0.7-0.8.  Here one worker cannot keep up with
+    # three readers, so the old cap held most of this 1 GiB input; the pool's holds 256
+    # MiB.  Peak RSS, not time: 942-974 MiB on v0.18.50, 542-558 since (8-H100 server);
+    # the bound sits between.  And an engaged run declares the cap as its producer's
+    # depth ceiling (the deferred bringup when it grows it, a fixed share up front), or
+    # the AUTO queue floor locks the pool out (cpu_taken=0 at a floor of 256).
+    mkdir -p "$TMPDIR/bht" && cp "$TMPDIR/bh.b64" "$TMPDIR/bht/bh.b64"
+    bh_tar() {   # bh_tar NAME ENV... [-- ARGS...] -> $TMPDIR/bh.err, $TMPDIR/bh.rss, then a CPU round trip
+      local name=$1; shift
+      local envs=() args=()
+      while (( $# )) && [[ "$1" != -- ]]; do envs+=("$1"); shift; done
+      [[ "${1:-}" == -- ]] && { shift; args=("$@"); }
+      local tw=(); [[ -x /usr/bin/time ]] && tw=(/usr/bin/time -f %M -o "$TMPDIR/bh.rss")
+      env GZSTD_DEBUG_GPU_GUARD_SEC=0.05 "${envs[@]}" timeout --foreground -k 10 120 \
+        "${tw[@]}" "$GZSTD" --hybrid -T 1 "${args[@]}" -vv -f \
+        --tar -C "$TMPDIR/bht" -o "$TMPDIR/bht.tzst" bh.b64 2>"$TMPDIR/bh.err" || bh_why+=" $name:rc=$?"
+      "$GZSTD" --cpu-only -d -q -c "$TMPDIR/bht.tzst" 2>/dev/null | tar -xOf - bh.b64 2>/dev/null \
+        | cmp -s - "$TMPDIR/bh.b64" || bh_why+=" $name:bytes"
+    }
+    bh_ceiling_said() {
+      grep -qaE 'producer depth ceiling: [0-9]+ frames; auto queue floor released' "$TMPDIR/bh.err"
+    }
+    bh_tar tar-keeps-up GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=empty
+    { grep -qa 'skipping GPU bringup' "$TMPDIR/bh.err" \
+        && ! grep -qaE '[0-9]+ device workers? online' "$TMPDIR/bh.err"; } || bh_why+=" tar-keeps-up:[$(bh_err)]"
+    if [[ -x /usr/bin/time ]]; then   # the RSS half needs GNU time; the decisions do not
+      bh_rss=$(tail -1 "$TMPDIR/bh.rss" 2>/dev/null)
+      [[ "$bh_rss" =~ ^[0-9]+$ ]] && (( bh_rss < 786432 )) \
+        || bh_why+=" tar-keeps-up:peak-${bh_rss:-?}KiB(want<768MiB)"
+    fi
+    # The ceiling is declared after cuInit, and only if the pool has not finished the
+    # input by then (the bringup's drained check, a correct decline).  One worker on
+    # this server had 54 of the 64 frames done when the card came up; a 50 ms delay
+    # per CPU permit (GZSTD_DEBUG_ACQUIRE_DELAY_US; the GPU intake takes no delay)
+    # left it ~13, so a slow or loaded host's cuInit cannot win the race.
+    bh_tar tar-behind GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting GZSTD_DEBUG_ACQUIRE_DELAY_US=50000
+    { grep -qaE '[0-9]+ device workers? online' "$TMPDIR/bh.err" && bh_ceiling_said; } \
+      || bh_why+=" tar-behind:[$(bh_err)]"
+    bh_tar tar-fixed -- --cpu-share 0.5
+    bh_ceiling_said || bh_why+=" tar-fixed:no-ceiling"
+    rm -rf "$TMPDIR/bht" "$TMPDIR/bht.tzst" "$TMPDIR/bh.rss"
     # A FULL QUEUE IS FRAMES WAITING (v0.18.49): the waiting test read a check that saw
     # the queue at its cap as no reading, so a window spent at the cap "kept up".  The
     # sampler on synthetic signals (a queue full at every check, a ten-second job) must
@@ -7978,6 +8024,36 @@ PYEOF_GM_MASK
     hf_comp compress-explicit --hybrid --gpu-devices 3
     ! grep -qa '\[GPU\] devices:' "$TMPDIR/hf.err" || hf_why+=" compress-explicit:[$(hf_err)]"
     rm -f "$TMPDIR/hfc.zst"
+    # A HYBRID --tar COMPRESS TAKES TWO TOO (v0.18.51, ROADMAP 44), though a tree has no
+    # size before its walk: every card started, and two cards beat eight (8 CPUs, two
+    # 12 GiB files: 7.86-8.57 s against 8.57-9.44).  And it ranks them at its first CUDA
+    # call, as a plain compress does, never on the main thread at startup: that cost
+    # every hybrid --tar compress ~80 ms whether or not a GPU started.  The suite's
+    # guard of 0 engages the cards, so the bringup thread ranks; the main thread at
+    # startup must not, here or under an explicit --gpu-devices (which places a mask
+    # too).  --gpu-devices wins, and --tar --gpu-only (sized by its input) keeps every card.
+    mkdir -p "$TMPDIR/hf-tar" && cp "$TMPDIR/large.bin" "$TMPDIR/hf-tar/large.bin"
+    hf_tarc() {   # hf_tarc NAME ARGS... : archive hf-tar/large.bin, then a CPU round trip
+      local name=$1; shift
+      env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/hf-xdg" timeout --foreground -k 10 120 \
+        "$GZSTD" "$@" -vv -f --tar -C "$TMPDIR/hf-tar" -o "$TMPDIR/hfc.tzst" large.bin \
+        2>"$TMPDIR/hf.err" || hf_why+=" $name:rc=$?"
+      "$GZSTD" --cpu-only -d -q -c "$TMPDIR/hfc.tzst" 2>/dev/null | tar -xOf - large.bin 2>/dev/null \
+        | cmp -s - "$TMPDIR/large.bin" || hf_why+=" $name:bytes"
+      ! grep -qa 'ranking the cards before CUDA starts (main thread' "$TMPDIR/hf.err" \
+        || hf_why+=" $name:ranked-at-startup"
+    }
+    hf_tar_capped() {
+      grep -qaE "\[GPU\] devices: 2 of [0-9]+ for a --tar hybrid compress" "$TMPDIR/hf.err" \
+        || hf_why+=" $1:[$(hf_err)]"
+    }
+    hf_tarc tar --hybrid; hf_tar_capped tar
+    hf_tarc tar-implicit; hf_tar_capped tar-implicit
+    hf_tarc tar-explicit --hybrid --gpu-devices 3
+    ! grep -qa '\[GPU\] devices:' "$TMPDIR/hf.err" || hf_why+=" tar-explicit:[$(hf_err)]"
+    hf_tarc tar-gpu-only --gpu-only
+    ! grep -qa '\[GPU\] devices:' "$TMPDIR/hf.err" || hf_why+=" tar-gpu-only:[$(hf_err)]"
+    rm -rf "$TMPDIR/hfc.tzst" "$TMPDIR/hf-tar"
     rm -rf "$TMPDIR/hf.zst" "$TMPDIR/hf.out" "$TMPDIR/hf.err" "$TMPDIR/hf-xdg"
     if [[ -n "$hf_why" ]]; then
       fail "$hf_t" "$hf_why"

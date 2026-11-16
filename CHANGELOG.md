@@ -1,12 +1,101 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.50  
+**Covers:** v0.9.50 → v0.18.51  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.51 — a hybrid --tar compress whose GPUs are declined reads like --cpu-only, an engaged one no longer locks its CPU pool out, and it starts two cards, not every one (ROADMAP 44; 8-H100 server, cached: a 12 GiB file at 8 CPUs, declined, 2.88-3.42 -> 2.56-2.58 s and 4.6-6.3 -> 0.76 GiB peak RSS; two 12 GiB files at 6 CPUs 9.10-9.47 -> 6.25-6.31 s, at 8 CPUs 8.29-8.65 -> 5.27-5.70)
+
+Three defects, each measured before it was changed, all found chasing ROADMAP 44 (a hybrid --tar compress at 8
+CPUs lost to --cpu-only on any card count, and the Gen3 workstation's declined 24-CPU run was 11-12% slower at
+three times the memory).  One cause was not --tar at all: the same 24 GiB as a plain file engaged on two cards at 8
+CPUs wins through the mmap reader (4.46-4.70 s against --cpu-only's 5.08) and loses through --no-mmap's pooled
+reader (5.65-5.68 s, 12.5-12.7 GiB peak RSS, 10.5 s of kernel time against 6.0).  A reader that copies into owned frames
+is what --tar always has.
+
+**The compress input queue counted GPUs that were not there.**  Its byte cap is 4 x (CPU pool + GPU batch floor)
+half-frames, and the floor was the PROVISIONAL card count's streams at the tuner's 256-frame ceiling from the first
+frame: two cards made 4,120 slots, 32 GiB.  A reader that copies filled it while the bringup sample decided, and
+kept doing so after it declined the GPUs, so the run faulted in gigabytes it never needed.  v0.18.30 gave the
+throttle exactly this rule (start at the CPU pool's budget, grow when a GPU joins) and v0.18.44 gave it to decode's
+queue; compress's queue never got it.  It now starts at compress_cpu_mt's cap and grows beside the throttle, in the
+bringup, before the first GPU worker exists.  The sample still sees a reader that outruns the pool: a full queue
+counts as frames waiting (v0.18.49).  MEASURED, 8 CPUs, one cached 12 GiB file as a --tar archive, the sample
+declining at ~255 ms, three rounds:
+
+| arm | v0.18.50 | v0.18.51 |
+|---|---|---|
+| --cpu-only | 2.56-2.60 s, 0.71-0.77 GiB | 2.60-2.61 s, 0.76-0.79 GiB |
+| default (eight cards listed) | 2.88-3.42 s, 4.6-6.3 GiB | 2.56-2.58 s, 0.76 GiB |
+| a one-card mask | 2.88-3.10 s, 4.4-5.4 GiB | 2.56-2.59 s, 0.74-0.77 GiB |
+| an empty mask (CUDA_VISIBLE_DEVICES=) | 2.56-2.62 s, 0.76-0.81 GiB | 2.59-2.61 s, 0.74-0.78 GiB |
+
+The last row was the Gen3 workstation's control: an empty mask is a provisional count of zero, so its cap never
+counted a GPU.  An mmap reader queues zero-byte views, which is why a plain file never showed this.
+
+**A --tar archive's assembler never said it was a bounded producer.**  The hybrid scheduler's AUTO queue floor
+reserves frames for the cards' next batches, which an mmap reader that queues the whole input can always hold.
+A producer whose depth is bounded must declare it (HybridSched::set_queue_depth_cap), which releases the AUTO floor
+-- the pooled reader and the staging pool do, and v0.13.66 measured why: otherwise a reader slower than the cards'
+appetite never builds the depth and the CPU pool is locked out.  The --tar assembler, bounded by the queue's byte
+cap, never declared.  Two cards at 8 CPUs: the first tick after they came online read cpu_taken=0 at a floor of
+256.  It declares the cap (in frames) before any GPU registers: up front for a bringup that is already final, in
+the bringup when it grows the cap.  -v: "[HYBRID] producer depth ceiling: N frames; auto queue floor released".
+The staged paths keep declaring their staging depth.
+
+**A hybrid --tar compress started every card, and ranked them on the main thread at startup.**  The device rule's
+hybrid ceiling of two (v0.18.40 pipes, v0.18.46 decode, v0.18.48 named files) excluded --tar because a tree has no
+size before its walk, but the hybrid ceiling needs none, and two cards beat eight here as for a plain file (two
+12 GiB files, 8 CPUs: every card 8.57-9.44 s, two 7.86-8.57 on v0.18.50).  The rule reads opt.tar_sources' run,
+not opt.inputs, which holds stdin there.  --tar --gpu-only, whose count is sized by the input, and -d/-t --tar,
+which decode through their own pool, still start every card.  With a mask now placed, a second cost showed: --tar
+was on the list of modes whose cards are ranked on the main thread before any work, as if their first CUDA call
+were immediate.  That is true of the -d/-t decode pool, not of an archive's compress, whose first CUDA call is
+compress_nvcomp's bringup (gz_cuda_usable_count ranks there, as for any compress) and whose assembler calls CUDA
+only under --gds-only.  Ranking at startup cost every hybrid --tar compress ~80 ms whether or not a GPU started (24
+CPUs, declining: 2.04-2.31 s ranked at startup, 1.88-1.98 with the rule skipped, 1.80-1.97 on v0.18.50).
+
+MEASURED together, two cached 12 GiB files as one archive to /dev/null, three shuffled rounds, an idle-breaker
+before every arm.  Four of the eight cards were another user's throughout, so v0.18.42's every-card arm ran on
+busy cards as well (the quiet-server ROADMAP 44 numbers had the same shape):
+
+| CPUs | --cpu-only | v0.18.51 (two cards by the rule) | v0.18.42 (every card) |
+|---|---|---|---|
+| 6 | 6.99-7.01 s | 6.25-6.31 s, 6.5-6.9 GiB | 9.10-9.47 s, 12.0-15.5 GiB |
+| 8 | 5.06-5.07 | 5.27-5.70, 5.7-7.8 GiB | 8.29-8.65, 8.2-9.7 GiB |
+| 12 | 3.05-3.24 | 3.09-3.12 (declined) | 3.14-3.75 (declined, 3.0-4.3 GiB) |
+| 16 | 2.62-2.92 | 2.43-2.93 (declined) | v0.18.50: 2.43-3.13 |
+| 24 | 1.95-2.14 | 1.98-2.42 (declined) | v0.18.50: 2.00-2.46 |
+
+(16 and 24 CPUs: six rounds against v0.18.50 under a load average of 15-26 from other users.)  A piped compress,
+whose reader also owns its bytes, is unchanged: 24 GiB through cat at 8 CPUs, v0.18.51 11.76-13.85 s against
+v0.18.50 12.70-14.26 (one 20.8 s v0.18.51 run was the pipe: its reader waited on cat 93% of the run and was never
+blocked by the queue).
+
+**Still open (ROADMAP 44 -> 42a):** at 8 CPUs the engaged two-card run loses 4-12% to --cpu-only.  It is not the
+queue: an engaged queue of 70, 134, 268 or the default 2,060 frames left the run at 5.4-6.1 s and 10-12 s of
+kernel time either way, against --cpu-only's 4.  It is the host side of the GPU path beside a reader that copies
+-- the cards' streams ran 1.2-1.5 GiB/s each on 8 CPUs -- a cost the 4.0 s guard does not price, which is 42a's
+open question.  At 6 CPUs the same engage wins 10%.
+
+**Suite.**  The bringup-sample cell (-e) gains --tar arms: a declined archive's peak RSS under one worker (942-974
+MiB on v0.18.50, 542-558 here; the bound is 768 MiB), and the producer-ceiling line for an engaged archive in both
+the deferred and the fixed-share (--cpu-share) bringup.  The two-card cell (three or more GPUs) gains --tar arms:
+the rule's decision for --hybrid and the default, --gpu-devices winning, --tar --gpu-only left alone, and no
+ranking on the main thread at startup.  v0.18.50 fails every new arm, each for its own reason.
+
+**Review.**  Codex (gpt-6.1-sol, xhigh, the blocker bar stated first): SAFE TO COMMIT, no blocker in the code -- it
+traced the cap's growth against every GPU spawn, the producers' and intakes' waits, the lazy ranking against every
+--tar compress path's first CUDA call, and the CPU-only build's conditionals.  Two should-fix items in the suite,
+both adopted: the engaged arm could lose a race to cuInit on a slow host (one worker had done 54 of the 64 frames
+when the card came up here, and a pool that finishes first is a correct decline, before the ceiling is declared),
+so it now delays each CPU permit 50 ms (GZSTD_DEBUG_ACQUIRE_DELAY_US; ~13 frames by then); and the arms ran under
+/usr/bin/time unguarded, so without GNU time they now run bare and skip only the RSS half.
 
 
 ## Build only, after v0.18.50 (no version change, 2026-11-13) — a build uses the compilers its directory was configured with: an activated conda env with its own compilers no longer breaks the link or nvcc

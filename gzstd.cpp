@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.50";
+static constexpr const char * GZSTD_VERSION = "0.18.51";
 //
 // Architecture overview:
 //
@@ -42348,16 +42348,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       * (int)std::max<size_t>(1, opt.gpu_streams)
       * (int)per_stream_budget;
   const int comp_parallelism = cpu_threads_est + comp_gpu_batch_floor;
-  // Byte-cap the input queue (compress-side ROADMAP 7.8 analogue): a pipe/stdin
-  // producer that outruns the consumers reads frames into heap, so bound the
-  // queued owned bytes.  No-op for the common mmap path (zero-copy views,
-  // data.size()==0); bounds only fread.  Bytes only — no frame cap, so mmap can
-  // run ahead freely.  Tunable via --throttle-factor.
-  if (opt.throttle_frames != 0) {
-    int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
-    size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, comp_parallelism * qslack);
-    queue.set_max_bytes(gz_queue_bytes_cap(qfloor * (host_chunk / 2)));
-  }
   // THE THROTTLE A GPU JOINS (v0.18.30).  The budget used to count the GPU batch
   // floor of the provisional device count from the start, so while the GPUs were
   // still being considered (and on the many runs whose bringup then skips them)
@@ -42369,6 +42359,32 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // sees the whole floor.  A user's --throttle-frames keeps its old shape.
   // The CPU pool counts as the memory holds it (cpu_threads_fit, above).
   const bool gpu_joins_later = defer_detect && opt.throttle_frames < 0;
+  // Byte-cap the input queue (compress-side ROADMAP 7.8 analogue): a producer that
+  // outruns the consumers reads frames into heap, so bound the queued owned bytes.
+  // No-op for the mmap path (zero-copy views, data.size()==0); it bounds the readers
+  // that copy -- a pipe, the pooled and O_DIRECT readers, --no-mmap, and every
+  // --tar archive's assembler.  Bytes only -- no frame cap, so mmap can run ahead
+  // freely.  ~half a frame per slot; tunable via --throttle-factor.
+  // THE QUEUE A GPU JOINS, TOO (v0.18.51, ROADMAP 44) -- the throttle's rule above,
+  // which the queue never got.  Its cap counted the provisional GPU batch floor from
+  // the first frame (two cards' streams at the tuner's 256-frame ceiling: 4,120 slots,
+  // 32 GiB), so a reader that copies filled it beside a CPU pool whose GPUs were still
+  // being considered -- and kept doing so after the sample declined them.  MEASURED,
+  // 8-H100 server, 8 CPUs, a cached 12 GiB file as a --tar archive, the sample
+  // declining at ~254 ms: --cpu-only 2.56-2.60 s at 0.71-0.77 GiB peak RSS; the
+  // default 2.88-3.42 s at 4.6-6.3 GiB, 1.7-2.9 s more kernel time faulting that
+  // memory in; the default with CUDA_VISIBLE_DEVICES= (a provisional count of 0)
+  // 2.56-2.62 s at 0.76-0.81.  The Gen3 workstation's 24-CPU --tar loss (11-12%, 3x
+  // the memory) was this.  So a deferred bringup starts at compress_cpu_mt's cap,
+  // and the bringup grows it with the throttle.  The sample still sees a backlog: a
+  // full queue counts as frames waiting (backlog_frames' capacity marker).
+  const int comp_qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+  auto comp_queue_bytes = [&](int parallelism) {
+    return gz_queue_bytes_cap((size_t)std::max(THROTTLE_MIN_FRAMES, parallelism * comp_qslack)
+                              * (host_chunk / 2));
+  };
+  if (opt.throttle_frames != 0)
+    queue.set_max_bytes(comp_queue_bytes(gpu_joins_later ? cpu_threads_fit : comp_parallelism));
   // The pool as the memory holds it in either case (v0.18.31): counted at its
   // full 96 a synchronous bringup's RAM-bound throttle took the 32-frame floor
   // with 7 frames' room, and --cpu-share=0.5 decode under 512 MB lived by timing.
@@ -42524,6 +42540,26 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_DEBUG, opt, os.str() + "\n");
     }
   }
+  // A --TAR ARCHIVE'S ASSEMBLER IS A BOUNDED PRODUCER, AND MUST SAY SO (v0.18.51,
+  // ROADMAP 44) -- as the pooled reader and the staging pool do (see
+  // HybridSched::set_queue_depth_cap).  It reads every member into an owned frame at
+  // the rate of its readers, so the queue's byte cap is its depth ceiling, and the
+  // scheduler's AUTO queue floor, sized for an mmap that queues the whole input,
+  // locked the CPU pool out whenever the cards' appetite outran the readers.
+  // MEASURED, 8-H100 server, 8 CPUs, two cached 12 GiB files as one archive, two
+  // cards: the first tick after they came online read cpu_taken=0 at a floor of
+  // 256, and the run took 5.27-5.46 s against --cpu-only's 5.06-5.09.  Declared
+  // before any GPU registers: here when the cap is already final, and in the
+  // bringup, before it spawns a worker, when it grows the cap.  The staged paths
+  // declare their own staging depth (pin_dstage_host_pool); --gds-only has no pool.
+  auto tar_declare_ceiling = [&](size_t queue_bytes) {
+    if (!opt.tar_mode || !sched || opt.direct_stage || opt.gds_only || queue_bytes == 0)
+      return;
+    sched->set_queue_depth_cap(std::max<size_t>(1, queue_bytes
+                                                   / std::min(host_chunk, GPU_SUBCHUNK_MAX)));
+  };
+  if (!gpu_joins_later && opt.throttle_frames != 0)
+    tar_declare_ceiling(comp_queue_bytes(comp_parallelism));
 
   // (No CPU "rescue" pool: a GPU fault aborts the whole compress pass and the
   // driver rebuilds CPU-only from the original input — there is nothing to
@@ -42739,6 +42775,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         if (device_count <= 0) { g_adapt_gpu_declined.store(true, std::memory_order_relaxed); return; }
         const int floor = device_count * (int)std::max<size_t>(1, opt.gpu_streams) * (int)per;
         throttle.grow_to(compute_throttle_budget(host_chunk, cpu_threads_fit + floor, floor, opt));
+        // ...and the queue they take their batches from (see comp_queue_bytes).
+        queue.set_max_bytes(comp_queue_bytes(cpu_threads_est + floor));
+        tar_declare_ceiling(comp_queue_bytes(cpu_threads_est + floor));
       }
     }
     if (device_count <= 0) return;
@@ -56352,15 +56391,29 @@ static void apply_backend_defaults(Options & opt)
   // this (v0.18.43; adapt_counted above), and its regular-file branches; a pipe
   // under --adapt is its pipe gate's.  --adapt's count model is --gpu-only's: a
   // hybrid decode under --adapt takes the cap too.
+  //
+  // A HYBRID --tar COMPRESS TAKES TWO AT MOST TOO (v0.18.51, ROADMAP 44).  --tar was
+  // left out because a tree has no size before its walk, but the hybrid compress
+  // ceiling needs none.  MEASURED, 8-H100 server, two cached 12 GiB files as one
+  // archive, 8 CPUs, to /dev/null: every card 8.57-9.44 s and two 7.86-8.57 (v0.18.50,
+  // ROADMAP 44); with v0.18.51's queue repairs, one card 5.15-5.62, two 5.18-5.39,
+  // four 5.93-5.99 (four of the eight were another user's).  --tar --gpu-only sizes
+  // its count by the input, which a tree cannot give here, and -d/-t --tar decode
+  // through their own pool (ROADMAP 42a): both still start every card.
+  const bool tar_hybrid_compress = opt.tar_mode && opt.mode == Mode::COMPRESS
+                                   && !opt.gpu_only && !opt.list_mode;
   if (!opt.cpu_only && (!opt.adapt || !adapt_counted)
       && !opt.calibrate && opt.gpu_devices == 0 && !opt.gds_only
       && !opt.direct_stage && !opt.gpu_order_ranked
-      && !opt.tar_mode && !opt.inputs.empty() && !::getenv("CUDA_VISIBLE_DEVICES")
+      && (!opt.tar_mode || tar_hybrid_compress)
+      && (!opt.inputs.empty() || tar_hybrid_compress) && !::getenv("CUDA_VISIBLE_DEVICES")
       && (opt.mode == Mode::COMPRESS || opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST)) {
     uint64_t total = 0;
-    bool known = true;      // every input a named regular file: its size plans the count
-    bool streams = true;    // every input a pipe, FIFO, socket or terminal: no size at all
-    for (const std::string & in : opt.inputs) {
+    // A --tar compress reads opt.tar_sources, not opt.inputs (which holds stdin there),
+    // and its ceiling needs no size: neither a known file nor a stream.
+    bool known = !tar_hybrid_compress;    // every input a named regular file: its size plans the count
+    bool streams = !tar_hybrid_compress;  // every input a pipe, FIFO, socket or terminal: no size at all
+    if (!tar_hybrid_compress) for (const std::string & in : opt.inputs) {
       struct stat st {};
       // stat, never open: a named FIFO must not be opened just to be classified.
       const int r = in == "-" ? ::fstat(STDIN_FILENO, &st) : ::stat(in.c_str(), &st);
@@ -56387,8 +56440,8 @@ static void apply_backend_defaults(Options & opt)
         && (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST);
     // ...AND A HYBRID COMPRESS OF ONE (v0.18.48): see the branch below.  The staged
     // default (a small CPU budget) is out above (!opt.direct_stage).
-    const bool hybrid_file_compress = known && !opt.gpu_only && !opt.list_mode
-        && opt.mode == Mode::COMPRESS;
+    const bool hybrid_file_compress = (known || tar_hybrid_compress) && !opt.gpu_only
+        && !opt.list_mode && opt.mode == Mode::COMPRESS;
     const int devices = (streams || (known && opt.gpu_only) || hybrid_file_decode
                          || hybrid_file_compress)
                         ? gz_precuda_gpu_count() : 0;
@@ -56461,7 +56514,8 @@ static void apply_backend_defaults(Options & opt)
       // measured hybrid model on another host); the maintainer's pipe and decode rules
       // already take two for the same reason.
       n = 2;
-      why = "a regular-file hybrid compress (the automatic two-card ceiling: each "
+      why = std::string(opt.tar_mode ? "a --tar" : "a regular-file")
+          + " hybrid compress (the automatic two-card ceiling: each "
             "costs ~0.5 s to start; --gpu-devices sets the count)";
     } else if (known && opt.gpu_only && devices > 1) {
       // GZSTD_DEBUG_GPU_BYTES_PER_DEVICE=N plans N bytes per device, so the suite
@@ -56640,7 +56694,17 @@ static void apply_backend_defaults(Options & opt)
 #else
       if (!opt.calibrate) g_gpu_monitor.start();
 #endif
-      if ((opt.gds_only || opt.direct_stage || opt.tar_mode)
+      // A --tar COMPRESS IS NOT ONE OF THEM (v0.18.51): --tar was listed for its
+      // decode pool (-d/-t), which starts CUDA at once; an archive's compress
+      // reaches CUDA through compress_nvcomp's bringup like any compress
+      // (gz_cuda_usable_count ranks there), and its assembler calls CUDA only
+      // under --gds-only.  Since v0.18.51 its device rule places a mask, and
+      // ranking it here cost every hybrid --tar compress ~80 ms on this thread
+      // whether or not a GPU started.  MEASURED, 8-H100 server, two cached 12 GiB
+      // files, 24 CPUs, the sample declining: 2.04-2.31 s ranked here against
+      // 1.88-1.98 with the rule skipped (--gpu-devices=8) and 1.80-1.97 on v0.18.50.
+      if ((opt.gds_only || opt.direct_stage
+           || (opt.tar_mode && opt.mode != Mode::COMPRESS))
           && !gz_floor_precuda().all_old)
         finalize_gpu_mask(opt, "main thread, immediate GPU mode");
     } else {
