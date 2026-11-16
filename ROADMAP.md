@@ -1010,6 +1010,17 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     5.89-6.07, two cards 7.86-8.57, every card (8) 8.57-9.44, the cards taking ~480-500 of ~1,600 frames; v0.18.42
     the same (8.70-9.28).  A plain hybrid compress of a 24 GiB base64 file at 8 CPUs wins (4.5-4.6 against
     5.0 s), so the --tar producer or sink is the first suspect (a hypothesis, not measured).  Then decide whether --tar takes the device rule's two-card ceiling.
+    **The Gen3 workstation (two 2080 Ti, 24 CPUs), 2026-11-13, v0.18.50, the same two files, cached, to /dev/null, x3:**
+    at 8 CPUs the hybrid engages (2 workers online) and TIES `--cpu-only` (8.49-8.81 against 8.83-8.85; v0.18.42
+    8.50-8.94) -- this host's CPU path is slower, so the loss does not reproduce.  At 24 CPUs the bringup sample
+    DECLINES ("CPU pool will finish before GPU init could") and the run is still 11-12% slower: 4.73-4.78 against
+    4.21-4.27, peak RSS 5.8-6.7 GiB against 2.1-2.2 (v0.18.42 4.49-4.73, the same shape).  Two controls narrow it:
+    the SAME default --tar run with `CUDA_VISIBLE_DEVICES=` (hybrid path, same sample, same decline, the -vv logs
+    identical but for timings) ties `--cpu-only` (4.22-4.25) at its RSS; and a PLAIN compress of a cached 32 GiB file
+    at 24 CPUs, declined at the same point (~405 ms, 3.2-3.8 s remaining), ties too (4.19-4.22 against 4.19-4.26).  So
+    a declined --tar compress pays for the background CUDA bringup that a plain one does not.  The extra memory is
+    anonymous (VmPin 0), grows through the run, +9 threads.  Mechanism NOT found -- the next step is to find what in the
+    --tar producer or sink grows while CUDA is initializing, not to change the device rule.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
