@@ -1004,7 +1004,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     rule already hands the crossover to `--adapt`'s budget prior, which measures both arms per machine
     (Codex agreed).  Open only for a sensed rule; a one-card host is the case staging was built for.
 
-44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  MOSTLY FIXED v0.18.51, the rest v0.18.52
+44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  MOSTLY FIXED v0.18.51-53; two cards through --no-mmap at 8 CPUs left (42a)
     (three defects, below); the engaged 8-CPU loss that is left belongs to 42a.  Found in v0.18.50's
     pre-tag round trips: the device rule leaves --tar alone (`!opt.tar_mode`), so every card starts, but the count
     is not the sole cause -- two cards improve on eight and still lose.  Two 13 GB base64 files as one --tar archive, 8 CPUs, cached, wall s, two rounds: `--cpu-only`
@@ -1052,13 +1052,21 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     drain whose buffers no longer double: --tar 1.10M faults, 3.8 GiB (6.5 on v0.18.51).  The pooled reader (--no-mmap,
     a cold input) also stopped reading ahead into a GPU window that was never opened.  **Left:** (1) DONE, the wall clock on
     a near-quiet server (CHANGELOG v0.18.52): engaged --tar is within 1% of --cpu-only, 4.94-5.01 s against 4.91-4.94
-    (v0.18.51 5.13-5.27); engaged --no-mmap still trails it, 5.17-5.25 against 5.04-5.13 (v0.18.51 5.34-5.62); (2) the ENGAGED pooled reader
-    keeps v0.18.51's window, each card's streams at the tuner's 256-frame ceiling (1,126 buffers at 8 CPUs), and it
-    still faults: under that load 5.92-5.94 s, 2.9M faults, 10.7 GiB at 1,126 against 5.23-5.34, 1.72M, 5.7 GiB at a
-    134-buffer window (--cpu-only 5.69-5.77).  A smaller window must follow the tuner's live batch, not cut it off,
-    and be measured cold, where the pool's depth keeps reads in flight; the copying readers' byte cap has the same
-    ceiling-sized floor; (3) huge pages for FrameMem only behind a test that predicts compaction stalls (none known:
-    free 2 MiB blocks did not).
+    (v0.18.51 5.13-5.27); engaged --no-mmap still trails it, 5.17-5.25 against 5.04-5.13 (v0.18.51 5.34-5.62); (2) MEASURED,
+    NOT A LEVER (v0.18.53): the ENGAGED pooled reader's window.  The v0.18.52 numbers for a 134-buffer window were
+    taken under another user's 256-CPU job; on a quiet server the readers touched ~353 of the 1,126 buffers, and
+    held to 300-640 they touched 300-358 with no wall difference outside the noise -- at 8 CPUs they never get that
+    far ahead; (3) huge pages for FrameMem only behind a test that predicts compaction stalls (none known: free 2 MiB
+    blocks did not).
+    **v0.18.53: why --no-mmap still trailed** (CHANGELOG v0.18.53): ahead by its own clock (4.92 s against 5.17), it
+    lost it after the last frame, to serial work -- the pooled reader's buffers freed in one munmap (0.58-0.60 s
+    against --cpu-only's 0.34-0.38), FrameMem's cache (~0.2 s) and CUDA's teardown (~0.3 s) at exit.  Freeing does
+    not parallelize (~0.09 s a GiB on one node, any thread count), so a reclaimer thread now frees while the workers
+    finish: --no-mmap --cpu-only 5.12 -> 4.85 s, two cards 5.33 -> 5.07.  **Left (42a): two cards through --no-mmap
+    at 8 CPUs, 4.5% behind**, the cards taking a quarter of the frames from ~2.9 s of a 5 s run and paying CUDA's
+    start, ~1M first-touch faults and its exit.  The guard cannot price it from what it measures today: --no-mmap
+    engaged wins 18% at 6 CPUs (sampled 6.2-7.4 s remaining) and loses 4.5% at 8 (4.2-5.8 s), and mmap wins 10% at
+    8 (4.16-4.52 s), so neither a uniform nor a copying-reader increase is safe without a measured hybrid price.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

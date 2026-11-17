@@ -633,8 +633,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=576
-$EXTENSIVE && EXPECTED_TESTS=923
+EXPECTED_TESTS=577
+$EXTENSIVE && EXPECTED_TESTS=924
+# v0.18.53: +1 default cell on both builds (memory goes back while the workers finish:
+# --cpu-only, no CUDA), so 576 -> 577, -e 923 -> 924, the no-GPU deltas unchanged.  The
+# FrameMem self-test gains the drain's and the pool's rules, not a count.  DERIVED.
 # v0.18.52: +1 default cell on both builds (FrameMem's rules: a self-test, no CUDA),
 # so 575 -> 576, -e 922 -> 923, the no-GPU deltas unchanged.  The bringup-sample cell
 # gains --no-mmap arms (the pooled reader's lead), not a count.  DERIVED.
@@ -12705,8 +12708,12 @@ rs_got=$(GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST=1 timeout --foreground -k 5 20 "$GZSTD
 # touches: reuse, best fit within half again, across threads, same-size page reuse
 # under a limit, the cache's byte cap, a foreign pointer freed, everything mapped
 # within the live high-water plus the slack, zeroed bytes in a dirty recycled block,
-# and (GZSTD_DEBUG_FRAMEMEM_THP=1) 2 MiB alignment.  No CUDA, no timing, no page
-# faulted: both builds.
+# and (GZSTD_DEBUG_FRAMEMEM_THP=1) 2 MiB alignment.  v0.18.53 adds the drain's rules
+# (past the cache it began with, a release goes back to the kernel; within it, caches;
+# off again, caches) and the pooled reader's (at the last read, the free buffers a
+# reader touched go back and read zero, untouched ones stay, a buffer released after
+# it goes back as it comes, every buffer ends on the free list).  No CUDA, no timing,
+# three pages faulted: both builds.
 fm_why=""
 for fm_env in "" GZSTD_DEBUG_FRAMEMEM_THP=1; do
   fm_rc=0
@@ -12716,6 +12723,46 @@ for fm_env in "" GZSTD_DEBUG_FRAMEMEM_THP=1; do
 done
 [[ -z "$fm_why" ]] && pass "frame-sized buffers are recycled within the live high-water" \
   || fail "frame-sized buffers are recycled within the live high-water" "$fm_why"
+
+# MEMORY GOES BACK WHILE THE WORKERS FINISH (v0.18.53).  Freeing what a run touched
+# costs the kernel ~0.09 s a GiB however many threads free it, and it all came after
+# the last frame: the pooled reader's buffers in one munmap by its destructor, ahead
+# of the last output write (0.34-0.60 s of a ~5 s --no-mmap compress at 8 CPUs), and
+# FrameMem's cache by the kernel at exit.  Now the reader's buffers go to MemReclaimer
+# as the workers release them after the last read, and FrameMem's blocks after the
+# last frame is taken, on the last input only.  -vv's [RECLAIM] line counts what was
+# handed back (fixed once the workers join); GZSTD_DEBUG_RECLAIM=0 hands back nothing;
+# of two inputs, the first keeps its frame blocks for a later pass and the last
+# drains.  Every output round-trips.  --cpu-only, no CUDA: both builds.
+rc_why=""
+head -c 25165824 /dev/urandom 2>/dev/null | base64 -w0 2>/dev/null | head -c 33554432 > "$TMPDIR/rc.b64"
+for rc_arm in on off; do
+  rc_env=X=1; [[ $rc_arm == off ]] && rc_env=GZSTD_DEBUG_RECLAIM=0
+  rm -f "$TMPDIR/rc.zst"
+  env $rc_env timeout --foreground -k 5 60 "$GZSTD" -vv --cpu-only --no-mmap -T 2 --chunk-size 1 \
+    -k -f "$TMPDIR/rc.b64" -o "$TMPDIR/rc.zst" 2>"$TMPDIR/rc.err" || rc_why+=" $rc_arm:rc=$?"
+  "$GZSTD" -d -q -c "$TMPDIR/rc.zst" 2>/dev/null | cmp -s - "$TMPDIR/rc.b64" || rc_why+=" $rc_arm:bytes"
+  if [[ $rc_arm == on ]]; then
+    grep -qE '^\[RECLAIM\] back to the kernel while the workers finished: [1-9][0-9]* read buffers? after the last read \([0-9]+ done so far\), [0-9.]+ GiB of frame blocks after the last frame was taken' \
+      "$TMPDIR/rc.err" || rc_why+=" on:[$(grep -m1 '^\[RECLAIM\]' "$TMPDIR/rc.err")]"
+  else
+    grep -q '^\[RECLAIM\]' "$TMPDIR/rc.err" && rc_why+=" off:handed-back"
+  fi
+done
+cp "$TMPDIR/rc.b64" "$TMPDIR/rc2.b64"
+rm -f "$TMPDIR/rc.b64.zst" "$TMPDIR/rc2.b64.zst"
+timeout --foreground -k 5 60 "$GZSTD" -vv --cpu-only --no-mmap -T 2 --chunk-size 1 -k -f \
+  "$TMPDIR/rc.b64" "$TMPDIR/rc2.b64" 2>"$TMPDIR/rc.err" || rc_why+=" two:rc=$?"
+rc_lines=$(grep '^\[RECLAIM\]' "$TMPDIR/rc.err")
+[[ $(grep -c 'frame blocks kept for a later pass' <<<"$rc_lines") == 1 \
+   && $(grep -c 'GiB of frame blocks after the last frame' <<<"$rc_lines") == 1 \
+   && $(head -n 1 <<<"$rc_lines") == *'kept for a later pass'* ]] || rc_why+=" two:[$rc_lines]"
+for rc_f in rc rc2; do
+  "$GZSTD" -d -q -c "$TMPDIR/$rc_f.b64.zst" 2>/dev/null | cmp -s - "$TMPDIR/$rc_f.b64" || rc_why+=" two:$rc_f-bytes"
+done
+rm -f "$TMPDIR"/rc.b64 "$TMPDIR"/rc2.b64 "$TMPDIR"/rc.zst "$TMPDIR"/rc.b64.zst "$TMPDIR"/rc2.b64.zst "$TMPDIR/rc.err"
+[[ -z "$rc_why" ]] && pass "memory goes back to the kernel while the workers finish" \
+  || fail "memory goes back to the kernel while the workers finish" "$rc_why"
 
 
 # ────────────────────────────────────────────────────────────

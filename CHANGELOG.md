@@ -1,12 +1,96 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.52  
+**Covers:** v0.9.50 → v0.18.53  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.53 — memory goes back to the kernel while the workers finish, not after the last frame (ROADMAP 44; 8-H100 server, 8 CPUs, a cached 24 GiB file through --no-mmap: --cpu-only 5.12 -> 4.85 s, two cards 5.33 -> 5.07; read cold at 6 CPUs, two cards 5.88 -> 5.75; at 256 CPUs a --cpu-only compress's exit 0.63-0.76 -> 0.17 s)
+
+Asked why the engaged two-card --no-mmap compress at 8 CPUs still trailed --cpu-only by 3% after v0.18.52.  It
+was ahead by gzstd's own clock, 4.92 s against 5.17, and lost it after the last frame, to work that ran on one
+thread at a time:
+
+| after the last frame (8 CPUs, quiet server) | two cards | --cpu-only |
+|---|---|---|
+| the pooled reader's buffers, one munmap by its destructor, ahead of the last output write | 0.58-0.60 s | 0.34-0.38 s |
+| the exit: FrameMem's cached blocks (v0.18.52) | ~0.2 s | ~0 |
+| the exit: CUDA's teardown | ~0.3 s | 0 |
+
+**Freeing memory does not parallelize, so it has to move earlier.**  MEASURED, 9 GiB touched on one NUMA node,
+then freed by 1, 2, 4 or 8 threads: munmap 0.81-0.85 s, MADV_DONTNEED 0.74-0.82 -- about 0.09 s a GiB however
+many threads.  Once the readers have read the last chunk their CPUs are idle while the workers finish the queue
+(0.66 s at 8 CPUs), and that is where the freeing now goes.
+
+**MemReclaimer**: one leaked, detached thread that unmaps or MADV_DONTNEEDs what it is handed, then calls back.
+**DirectReadPool::set_eof**, called by the producer before it closes the queue: every buffer a reader touched goes
+to the reclaimer, the free ones at once and the rest as the workers release them, and returns to the free list
+untouched (an acquire after it still works).  The destructor waits for the jobs, and their callback notifies under
+the pool's lock, so nothing touches a destroyed pool.  **FrameMem::set_draining**, from a new TaskQueue hook when
+the last task is taken (not at the last read: an mmap reader finishes at once, and every frame after it would
+have mapped afresh -- 263 blocks in a two-card mmap run of the first build): blocks released from then on go
+back to the kernel, beyond what the cache held then, on the process's LAST input only (a -r run's next file would
+map afresh what a drain returned), never under --calibrate.  A drained block stays an ordinary cached block until
+its job runs, and the job unmaps it only if it is still cached, so an allocation meanwhile takes it back; one being
+unmapped counts as mapped, and an allocation that would pass the bound waits for that munmap.  Past 256 MiB queued,
+the releasing thread unmaps its block itself, as glibc would: at 256 CPUs the ~250 workers release 7 GiB of pools within milliseconds and
+one reclaimer left 6.6 GiB for the exit (0.63-0.74 s, against 0.39-0.40 with FrameMem off); their own threads
+free on both nodes.  -vv: "[RECLAIM] back to the kernel while the workers finished: ...".
+GZSTD_DEBUG_RECLAIM=0 hands nothing back: the A/B control, and v0.18.52's behaviour.
+
+MEASURED, 8 CPUs, two idle cards, cached, to /dev/null, default verbosity, the two arms shuffled together, five
+rounds (s, median):
+
+| arm | GZSTD_DEBUG_RECLAIM=0 | v0.18.53 |
+|---|---|---|
+| --no-mmap, --cpu-only | 5.06-5.15 (5.12) | 4.78-4.88 (4.85) |
+| --no-mmap, two cards | 5.27-5.37 (5.33) | 4.97-5.20 (5.07) |
+| plain (mmap), two cards | 4.37-4.58 (4.40) | 4.22-4.45 (4.35) |
+| --tar, two cards | 4.91-5.09 (5.05) | 4.89-5.12 (4.98) |
+| plain and --tar, --cpu-only | 4.79-4.81, 4.90-4.95 | 4.80-4.82, 4.90-4.94 |
+
+Read cold (evicted before every run), 8 CPUs: 4.86-4.92 s either way (the drive is the limit; the pool touched
+about a dozen buffers).  6 CPUs, where two cards engage: 5.88 -> 5.75 (--cpu-only 6.64-6.70).  256 CPUs, five
+rounds: the wall clock is unchanged within noise on every reader; the exit teardown of a --cpu-only compress fell
+0.63-0.76 -> 0.17 s through mmap (FrameMem off: 0.35-0.37), 0.40-0.45 -> 0.11 through --tar, 0.30-0.32 -> 0.02-0.05
+through --no-mmap -- the freeing moved into the workers' last milliseconds, it did not disappear.
+
+**Still behind: two cards through --no-mmap at 8 CPUs, by 4.5% (5.07 s against 4.85).**  The cards take frames
+only from ~2.9 s of a 5 s run (the sample decides at 0.4 s; CUDA's start and the contexts take the rest), take
+about a quarter of them, and cost ~1M more first-touch faults and ~0.3 s of the driver's teardown at exit.
+Nothing in the driver's teardown is worth moving: MEASURED with a bare CUDA program, two contexts holding 16 GiB
+each, exit 0.56 s; cudaDeviceReset on each first 0.21 s and the exit then 0.36; in parallel threads 0.75 s.
+
+**MEASURED AND NOT SHIPPED.**
+- *The engaged read window following the tuner* (ROADMAP 44's open item).  With the whole 1,126-buffer window the
+  readers touched ~353 buffers; held to 300-640 they touched 300-358, and the wall clock did not move outside
+  the noise (the cards took 0-432 frames a run).  At 8 CPUs the readers never get that far ahead of the workers.
+- *The bringup guard pricing the exit for a reader that copies* (ROADMAP 42a).  --no-mmap, two cards against
+  --cpu-only: 6 CPUs 5.50-5.70 against 6.80-6.85 (sampled 6.2-7.4 s remaining, -18%), 8 CPUs 4.97-5.20 against
+  4.78-4.88 (4.2-5.8 s, +4.5%), 12 CPUs both decline.  A price that declines the 8-CPU band risks the 18% win just
+  past it, and plain mmap at 8 CPUs engages at 4.16-4.52 s remaining and wins 10%, so no uniform increase either.
+- *Draining decode.*  FrameMem adds nothing to a decompress's exit (0.03-0.05 s at 8 CPUs, 0.43-0.51 at 256, on
+  or off).
+- *Every cached block at the last frame*, not only those released after it: no difference measured.
+
+**Review.**  Codex (gpt-6.1-sol, xhigh), two rounds.  Round 1 NOT SAFE: the first drain took a block out of the
+cache for the reclaimer's queue, so an allocation before the job ran mapped a second block beside it (2S against
+the 1.125S bound, reachable at -T 2 with two frames) -- now a drained block stays cached until its job runs and is
+unmapped only if still cached, an unmap in progress counts as mapped, and an allocation that would pass the bound
+waits for it (the self-test's drain-reuse rule holds the reclaimer to pin that order); the pool self-test's
+definition lacked its _WIN32 guard.  Round 2 SAFE TO COMMIT, no findings; it checked a stale job meeting a block
+remapped at the same address, the allocation's wait for deadlock and missed wakeups, and the same-size scan.
+
+**Suite.**  The FrameMem self-test gains the drain's rules and the pooled reader's (three pages faulted); a new
+default cell on both builds runs a --no-mmap --cpu-only compress and checks -vv's [RECLAIM] line, its absence
+under GZSTD_DEBUG_RECLAIM=0, and two inputs (the first keeps its blocks, the last drains), all round-tripping.
+Eight mutants fail the self-test (five of them in the drain's rules, one modelling the review's blocker below) and
+four the cell, each for its own reason.  576 -> 577 default, 923 -> 924 -e.  Run on this tree after the review:
+-e 923 passed, 0 failed, 1 skipped (host could not exercise it), CPU-only 413 passed, 0 failed.
 
 
 ## v0.18.52 — frame-sized buffers are recycled instead of faulted in afresh, and a --no-mmap or cold-input compress no longer reads ahead into a GPU window that never opens (ROADMAP 44's remainder; 8-H100 server, 8 CPUs, two cards, two cached 12 GiB files as one --tar archive: 5.13-5.27 -> 4.94-5.01 s, --cpu-only's 4.91-4.94; 2.0M -> 1.1M page faults, 6.5 -> 3.8 GiB peak RSS, 11.9 -> 9.9 s of kernel time; a declined --no-mmap compress of 1 GiB at one worker 909-920 -> 289-301 MiB)

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.52";
+static constexpr const char * GZSTD_VERSION = "0.18.53";
 //
 // Architecture overview:
 //
@@ -14222,8 +14222,113 @@ static void gz_input_retire_stop() { g_input_retirer.stop(); }
 
  Leaked on purpose: die() exits with threads still running, and a frame freed
  after a static destructor ran would touch a destroyed registry. */
+
+/*---- MemReclaimer (v0.18.53): memory back to the kernel while the run works ----
+ Freeing memory a run has touched costs the kernel about 0.09 s a GiB, and more
+ threads do not make it faster: MEASURED on the 8-H100 server, 9 GiB touched, then
+ freed by 1, 2, 4 or 8 threads, munmap 0.81-0.85 s, MADV_DONTNEED 0.74-0.82.  What a
+ run still holds when its last frame is done is therefore freed serially AFTER it:
+ the pooled reader's buffers by its destructor, before the last output is written
+ (0.58-0.60 s for an engaged two-card --no-mmap compress at 8 CPUs of a cached 24 GiB
+ file, 0.34-0.38 s for --cpu-only), and FrameMem's cached blocks by the kernel at
+ exit (0.2-0.25 s more at exit for a hybrid run than with glibc).  That serial tail
+ is where the two-card --no-mmap compress lost to --cpu-only: ahead by gzstd's own
+ clock (4.92 s against 5.17), behind on the wall (5.17-5.25 against 5.04-5.13).
+ Once the last read is done the readers' CPUs are idle while the workers finish the
+ queue, so this thread returns memory then -- the pooled reader's buffers as each
+ comes back (DirectReadPool::set_eof), FrameMem's blocks the last input will not
+ use again (FrameMem::set_draining) -- and less is left for the end to free.
+ One thread, because the kernel serializes the work anyway.  Leaked and detached,
+ like FrameMem: a job still queued at exit is freed by the exit, as it was before.
+ GZSTD_DEBUG_RECLAIM=0 turns it off (no job is queued): the A/B control. */
+class MemReclaimer {
+public:
+  static MemReclaimer & get() { static MemReclaimer * p = new MemReclaimer(); return *p; }
+  bool enabled() const { return enabled_; }
+  // Unmap [p, p + len) (unmap) or MADV_DONTNEED it, then call done() on the
+  // reclaimer's thread, outside its lock.  false: nothing was queued (disabled, no
+  // thread, no memory) and done() will not run -- the caller keeps the memory as it
+  // would have without the reclaimer.
+  bool submit(void * p, size_t len, bool unmap, std::function<void()> done) noexcept {
+    if (!p || !len) return false;
+    return push(p, len, unmap, std::move(done));
+  }
+  // Run fn on the reclaimer's thread, outside its lock (FrameMem's drain: the job
+  // decides under FrameMem's lock whether there is still anything to unmap).  false:
+  // not queued, as for submit.
+  bool submit_call(std::function<void()> fn) noexcept {
+    return fn ? push(nullptr, 0, false, std::move(fn)) : false;
+  }
+  // Bytes returned to the kernel so far (the -vv lines), and a wait until the
+  // queue is empty and no job is running (the self-test).
+  uint64_t bytes_done() const { return bytes_done_.load(std::memory_order_relaxed); }
+  void quiesce() {
+    std::unique_lock<std::mutex> lk(m_);
+    idle_cv_.wait(lk, [this] { return q_.empty() && !busy_; });
+  }
+
+private:
+  bool push(void * p, size_t len, bool unmap, std::function<void()> done) noexcept {
+#ifdef __linux__
+    if (!enabled_) return false;
+    try {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!started_) {
+        started_ = true;               // one attempt: a thread that cannot start stays off
+        std::thread([this] { run(); }).detach();
+        running_ = true;
+      }
+      if (!running_) return false;
+      q_.push_back(Job{p, len, unmap, std::move(done)});
+    } catch (...) {
+      return false;
+    }
+    cv_.notify_one();
+    return true;
+#else
+    (void)p; (void)len; (void)unmap; (void)done;
+    return false;
+#endif
+  }
+  MemReclaimer() {
+    const char * e = std::getenv("GZSTD_DEBUG_RECLAIM");
+    enabled_ = !(e && *e == '0');
+  }
+  struct Job { void * p; size_t len; bool unmap; std::function<void()> done; };
+  void run() {
+#ifdef __linux__
+    std::unique_lock<std::mutex> lk(m_);
+    for (;;) {
+      cv_.wait(lk, [this] { return !q_.empty(); });
+      Job j = std::move(q_.front());
+      q_.pop_front();
+      busy_ = true;
+      lk.unlock();
+      if (j.p) {                       // a call-only job (submit_call) has none
+        if (j.unmap) (void)::munmap(j.p, j.len);
+        else         (void)::madvise(j.p, j.len, MADV_DONTNEED);
+        bytes_done_.fetch_add(j.len, std::memory_order_relaxed);
+      }
+      if (j.done) j.done();
+      j = Job{};                       // drop the callback before taking the lock
+      lk.lock();
+      busy_ = false;
+      if (q_.empty()) idle_cv_.notify_all();
+    }
+#endif
+  }
+  std::mutex m_;
+  std::condition_variable cv_, idle_cv_;
+  std::deque<Job> q_;
+  bool started_ = false, running_ = false, busy_ = false, enabled_ = true;
+  std::atomic<uint64_t> bytes_done_{0};
+};
+
 static constexpr size_t FRAMEMEM_MIN   = size_t(2) << 20;
 static constexpr size_t FRAMEMEM_GRAIN = size_t(2) << 20;
+// Draining (set_draining): blocks queued to the reclaimer past this, the releasing
+// thread unmaps itself -- ~23 ms of the reclaimer's work at ~11 GiB/s.
+static constexpr size_t FRAMEMEM_DRAIN_BACKLOG = size_t(256) << 20;
 class FrameMem {
 public:
   static FrameMem & get() { static FrameMem * p = new FrameMem(); return *p; }
@@ -14232,13 +14337,14 @@ public:
   void * alloc(size_t n) {
     size_t want;
     {
-      std::lock_guard<std::mutex> lk(m_);
+      std::unique_lock<std::mutex> lk(m_);
       // Under a known limit, the page and not the grain: a block another frame
       // filled to its rounded size would keep that tail resident beyond the capacity
       // the queue charges this one (Codex review).  The decoder's size classes and a
       // compress run's fixed frames still recur exactly.  Huge pages need the grain.
       const size_t g = exact_ && !thp_ ? size_t(4096) : FRAMEMEM_GRAIN;
       want = (n + g - 1) / g * g;
+      for (;;) {
       // Best fit, and not wastefully large: a 4 MiB request must not take a 16 MiB
       // input frame's block when the next 16 MiB frame would then map.  Sharing
       // across sizes matters: a --tar run's GPU output frames (14 MiB blocks) reuse
@@ -14262,9 +14368,20 @@ public:
       // let a concurrent fresh block map past the bound (Codex review).  Rare --
       // only when a size appears that nothing cached can serve.
       const size_t cap = mapped_cap(std::max(peak_, live_ + want));
-      while (cached_ > 0 && live_ + cached_ + want > cap) evict_smallest_locked();
+      while (cached_ > 0 && live_ + cached_ + unmapping_ + want > cap) evict_smallest_locked();
+      // A drained block being unmapped outside the lock (unmap_if_cached) is still
+      // mapped: wait for its munmap rather than map past the bound, then look in the
+      // cache again -- a release may have refilled it meanwhile (v0.18.53, Codex
+      // review).  Milliseconds: it is never waiting on a queue, only on a munmap.
+      if (unmapping_ > 0 && live_ + cached_ + unmapping_ + want > cap) {
+        unmapped_cv_.wait(lk);
+        continue;
+      }
+      break;
+      }
       live_ += want;   // reserved now: a concurrent alloc sees it
       if (live_ > peak_) peak_ = live_;
+      if (draining_) ++drain_fresh_;
     }
     void * p = map_fresh(want);
     if (!p) {
@@ -14284,6 +14401,8 @@ public:
 
   void release(void * p) noexcept {
     if (!p) return;
+    size_t drain = 0;
+    bool sync = false;
     {
       std::lock_guard<std::mutex> lk(m_);
       auto it = size_of_.find(p);
@@ -14292,16 +14411,84 @@ public:
         live_ -= s;
         // Within the cache's byte cap (set_cache_cap), smallest cached first out.
         while (cached_ > 0 && cached_ + s > cache_cap_) evict_smallest_locked();
+        bool cached = false;
         if (cached_ + s <= cache_cap_) {
-          try { free_.emplace(s, p); cached_ += s; return; }
+          try { free_.emplace(s, p); cached_ += s; cached = true; }
           catch (...) {}                      // no node for the cache: unmap it instead
         }
-        size_of_.erase(it);
-        ::munmap(p, s);
-        return;
+        if (!cached) {
+          size_of_.erase(it);
+          ::munmap(p, s);
+          return;
+        }
+        // Draining (set_draining): past what was cached when the last frame was
+        // taken, the block is also queued to go back to the kernel -- IF it is still
+        // cached when the job runs (unmap_if_cached).  It stays an ordinary cached
+        // block until then, so an allocation that wants it takes it back and the job
+        // finds nothing to do, and the bound counts it like any other (Codex review:
+        // a block taken out of the cache for the queue let the next allocation map a
+        // second one beside it).
+        if (!(draining_ && cached_ > drain_keep_)) return;
+        // ...on this thread instead once the reclaimer is behind, as glibc would have.
+        // A full-width run's ~250 workers release 7 GiB of pools within milliseconds
+        // as they finish; one reclaimer frees one node's pages at a time, while the
+        // releasing threads free their own, on both nodes.  MEASURED, 256 CPUs,
+        // --cpu-only, a cached 24 GiB file: all queued, 6.6 GiB was still waiting at
+        // the run's end and the exit took 0.63-0.74 s, against 0.39-0.40 with
+        // FrameMem off.
+        sync = queued_ + unmapping_ >= FRAMEMEM_DRAIN_BACKLOG;
+        if (!sync) queued_ += s;
+        drain = s;
       }
     }
-    std::free(p);
+    if (!drain) { std::free(p); return; }     // not FrameMem's: malloc's
+    if (sync) { unmap_if_cached(p, drain, false); return; }
+    if (!MemReclaimer::get().submit_call([p, drain] { FrameMem::get().unmap_if_cached(p, drain, true); })) {
+      std::lock_guard<std::mutex> lk(m_);     // not queued: it stays cached, as before
+      queued_ -= drain;
+    }
+  }
+
+  // A drained block, if it is still cached: out of the cache and the registry under
+  // the lock, counted as mapped (unmapping_) until its munmap returns, outside the
+  // lock.  Gone or handed out again since it was queued: nothing to do (a block
+  // mapped since at the same address and cached at the same size is surplus too).
+  void unmap_if_cached(void * p, size_t s, bool queued) noexcept {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (queued) queued_ -= s;
+      auto r = free_.equal_range(s);
+      auto it = r.first;
+      while (it != r.second && it->second != p) ++it;
+      if (it == r.second) return;
+      free_.erase(it);
+      cached_ -= s;
+      size_of_.erase(p);
+      unmapping_ += s;
+    }
+    ::munmap(p, s);
+    std::lock_guard<std::mutex> lk(m_);
+    unmapping_ -= s;
+    drained_ += s;
+    unmapped_cv_.notify_all();
+  }
+
+  // THE LAST FRAME OF THE LAST INPUT HAS BEEN TAKEN (v0.18.53, gz_last_pop).  No
+  // frame starts after it, and the ones in flight have their buffers -- pooled (the
+  // CPU workers' and GPU streams' out_pool) or cached before now: blocks released
+  // from here on -- the pools as their workers finish, frames the writer drops -- are
+  // surplus, and cached they would only be freed by the kernel at exit, serially,
+  // after the last frame (MemReclaimer).  So the cache keeps what it holds now and no
+  // more, and the rest goes back to the kernel on the reclaimer's thread while the
+  // workers finish (on the releasing thread past FRAMEMEM_DRAIN_BACKLOG).  Not at the
+  // last read: an mmap reader finishes at once, and every frame after it would map
+  // afresh.  Only for the LAST input: a -r run's next file maps afresh whatever a
+  // drain returns.  set_draining(false) at each run's start.
+  void set_draining(bool on) {
+    std::lock_guard<std::mutex> lk(m_);
+    draining_ = on && MemReclaimer::get().enabled();
+    drain_keep_ = cached_;
+    if (on) { drain_at_cached_ = cached_; drain_at_live_ = live_; drained_ = 0; drain_fresh_ = 0; }
   }
 
   // The most the cache may hold, whatever the high-water (v0.18.52, Codex review).
@@ -14327,10 +14514,16 @@ public:
     return hw + std::min<size_t>(size_t(256) << 20, hw / 8);
   }
   // For the self-test (GZSTD_DEBUG_FRAMEMEM_SELFTEST): what is mapped, and the bound.
-  struct Stats { size_t live, cached, peak, maps, fresh; bool thp; };
+  // drain_*: at set_draining(true), and since -- bytes drained blocks queued and
+  // being unmapped, unmapped, fresh blocks mapped while draining -- for the -vv line
+  // and the self-test.
+  struct Stats { size_t live, cached, peak, maps, fresh; bool thp;
+                 size_t queued, unmapping, drained, drain_at_cached, drain_at_live, drain_fresh;
+                 bool draining; };
   Stats stats() {
     std::lock_guard<std::mutex> lk(m_);
-    return { live_, cached_, peak_, size_of_.size(), fresh_, thp_ };
+    return { live_, cached_, peak_, size_of_.size(), fresh_, thp_,
+             queued_, unmapping_, drained_, drain_at_cached_, drain_at_live_, drain_fresh_, draining_ };
   }
 
 private:
@@ -14385,6 +14578,13 @@ private:
   size_t cache_cap_ = SIZE_MAX;                   // set_cache_cap
   bool exact_ = false;                            // set_cache_cap: same-size reuse, pages
   bool enabled_ = false, thp_ = false;
+  // set_draining: on, and what the cache held then; drained blocks queued to the
+  // reclaimer (still cached), those being unmapped outside the lock (still mapped:
+  // alloc waits on unmapped_cv_ rather than map past the bound), and the -vv figures.
+  bool draining_ = false;
+  size_t drain_keep_ = 0, queued_ = 0, unmapping_ = 0;
+  size_t drained_ = 0, drain_at_cached_ = 0, drain_at_live_ = 0, drain_fresh_ = 0;
+  std::condition_variable unmapped_cv_;
 };
 
 // The allocator frame buffers take: FrameMem at FRAMEMEM_MIN and above, the C++
@@ -14425,6 +14625,9 @@ using HostBytes = std::vector<char, frame_allocator<char>>;
 // everything mapped stays within the live high-water plus the slack; a value-
 // initialised HostBytes reads zero in a dirty recycled block; huge-page mode maps
 // on 2 MiB boundaries.  Prints "framemem ok" or the rules that failed.
+#ifndef _WIN32
+static void gz_reclaim_pool_selftest(std::string & bad);   // after DirectReadPool
+#endif
 static int gz_framemem_selftest()
 {
   FrameMem & fm = FrameMem::get();
@@ -14517,6 +14720,66 @@ static int gz_framemem_selftest()
     for (size_t i = 0; i < h.size(); i += 4096)
       if (h[i] != 0) { bad += " dirty"; break; }
   }
+  // Draining (v0.18.53): past what was cached when it began, a released block goes
+  // back to the kernel (a job on the reclaimer's thread) unless it is handed out again
+  // first; within it, the cache keeps it; off again, everything caches.
+  if (MemReclaimer::get().enabled()) {
+    MemReclaimer & rc = MemReclaimer::get();
+    void * k = fm.alloc(6 * MiB);
+    void * g = fm.alloc(10 * MiB);
+    fm.release(k);
+    fm.set_draining(true);
+    const auto s0 = fm.stats();
+    fm.release(g);
+    rc.quiesce();
+    const auto s1 = fm.stats();
+    // g's block may be a cached larger one (best fit): its size is what live lost.
+    if (s1.cached != s0.cached || s1.maps + 1 != s0.maps || s1.drained < 10 * MiB
+        || s1.drained != s0.live - s1.live || s1.queued != 0 || s1.unmapping != 0)
+      bad += " drain";
+    void * k2 = fm.alloc(6 * MiB);
+    const size_t maps2 = fm.stats().maps;
+    fm.release(k2);
+    rc.quiesce();
+    if (fm.stats().cached != s1.cached || fm.stats().maps != maps2) bad += " drain-keep";
+    // Released while the reclaimer is busy, then asked for again before its job runs:
+    // handed back out, not mapped a second time beside it, and the job then leaves
+    // it alone (Codex review).  The reclaimer is held by a job that waits on a flag.
+    {
+      std::atomic<bool> held{false}, go{false};
+      if (rc.submit_call([&] {
+            held.store(true);
+            while (!go.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          })) {
+        while (!held.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        void * h = fm.alloc(20 * MiB);
+        fm.release(h);                         // cached, and its job queued behind ours
+        const auto s2 = fm.stats();
+        void * h2 = fm.alloc(20 * MiB);
+        const auto s3 = fm.stats();
+        go.store(true);
+        rc.quiesce();
+        const auto s4 = fm.stats();
+        if (h2 != h || s3.fresh != s2.fresh || s2.queued == 0 || s4.maps != s3.maps
+            || s4.queued != 0)
+          bad += " drain-reuse";
+        fm.release(h2);                        // and released again: this time it goes
+        rc.quiesce();
+        if (fm.stats().maps + 1 != s4.maps) bad += " drain-reuse-release";
+      } else {
+        bad += " drain-hold";
+      }
+    }
+    fm.set_draining(false);
+    void * g2 = fm.alloc(20 * MiB);   // no cached block serves it: past any keep
+    const size_t maps3 = fm.stats().maps;
+    fm.release(g2);
+    rc.quiesce();
+    if (fm.stats().maps != maps3) bad += " drain-off";
+  }
+#ifndef _WIN32
+  gz_reclaim_pool_selftest(bad);
+#endif
   if (bad.empty()) std::printf("framemem ok\n");
   else std::printf("framemem FAIL:%s\n", bad.c_str());
   return 0;
@@ -15499,13 +15762,66 @@ public:
   // Preserve its fresh state so the next pass excludes its first touch too.
   void release(int slot, bool unused_fresh = false) {
     if (slot < 0) return;
+    bool reclaim_it = false;
     {
       std::lock_guard<std::mutex> lk(m_);
       if (unused_fresh) used_[(size_t)slot] = 0;
-      free_.push_back(slot);
       if (held_ > 0) --held_;
+      if (eof_ && used_[(size_t)slot]) {      // after the last read: see set_eof
+        used_[(size_t)slot] = 0;
+        ++reclaiming_;
+        ++handed_;
+        reclaim_it = true;
+      } else {
+        free_.push_back(slot);
+      }
     }
-    cv_.notify_one();
+    if (reclaim_it) reclaim(slot);
+    else cv_.notify_one();
+  }
+  // THE LAST READ IS DONE (v0.18.53): the producer calls this before it closes the
+  // queue, when no reader will acquire a buffer again.  Every buffer a reader has
+  // touched goes back to the kernel on MemReclaimer's thread -- the free ones now,
+  // the rest as the workers release them -- while the workers finish the queue,
+  // instead of in one munmap by the destructor after the last frame, ahead of the
+  // last output write.  MEASURED, 8-H100 server, 8 CPUs, a cached 24 GiB file through
+  // --no-mmap, five interleaved rounds against GZSTD_DEBUG_RECLAIM=0: --cpu-only
+  // 5.06-5.15 s -> 4.78-4.88 (230 buffers), two cards 5.27-5.37 -> 4.97-5.20 (~350),
+  // the destructor waiting 0.0 ms; read cold at 6 CPUs, two cards 5.88 -> 5.75.
+  // A reclaimed buffer returns to the free list after the advice, untouched again
+  // (used_ cleared), so an acquire after this still works: it faults afresh.
+  void set_eof() noexcept {
+    std::vector<int> touched;
+    try { touched.reserve(bufs_.size()); } catch (...) { return; }
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (eof_ || !base_ || !MemReclaimer::get().enabled()) return;
+      eof_ = true;
+      size_t k = 0;
+      for (int s : free_) {
+        if (used_[(size_t)s]) { touched.push_back(s); used_[(size_t)s] = 0; }
+        else free_[k++] = s;
+      }
+      free_.resize(k);
+      reclaiming_ += touched.size();
+      handed_ += touched.size();
+    }
+    for (int s : touched) reclaim(s);
+  }
+  // Buffers handed to the reclaimer since the last read (fixed once the workers
+  // have joined), those it has returned to the kernel so far (the -vv line), and the
+  // free list's length (the self-test).
+  size_t handed() {
+    std::lock_guard<std::mutex> lk(m_);
+    return handed_;
+  }
+  size_t reclaimed() {
+    std::lock_guard<std::mutex> lk(m_);
+    return reclaimed_;
+  }
+  size_t free_slots() {
+    std::lock_guard<std::mutex> lk(m_);
+    return free_.size();
   }
   // Abort escape (GPU-fault shutdown): pool-as-backpressure means the reader
   // is very likely parked in acquire() at fault time — with the workers gone,
@@ -15516,8 +15832,32 @@ public:
     cv_.notify_all();
   }
   char * buf(int slot) { return bufs_[(size_t)slot]; }
-  ~DirectReadPool() { if (base_) free(base_); }
+  // Waits for every buffer queued to the reclaimer: its job writes this pool's
+  // free list when the advice is done.
+  ~DirectReadPool() {
+    if (base_) {
+      std::unique_lock<std::mutex> lk(m_);
+      cv_.wait(lk, [this] { return reclaiming_ == 0; });
+    }
+    if (base_) free(base_);
+  }
 private:
+  // Slot s, counted in reclaiming_ and in no list, to the reclaimer; back on the
+  // free list when it is done -- or now, unreclaimed, when it cannot be queued.
+  void reclaim(int s) noexcept {
+    if (MemReclaimer::get().submit(bufs_[(size_t)s], stride_, false, [this, s] { reclaimed(s, true); }))
+      return;
+    reclaimed(s, false);
+  }
+  // Notifies UNDER the lock: once reclaiming_ reaches 0 the destructor may run,
+  // and nothing here may touch the pool after the lock is released.
+  void reclaimed(int s, bool advised) noexcept {
+    std::lock_guard<std::mutex> lk(m_);
+    free_.push_back(s);                       // capacity reserved in init: no allocation
+    --reclaiming_;
+    if (advised) ++reclaimed_;
+    cv_.notify_all();
+  }
   void *              base_ = nullptr;   // single backing region (2 MiB-aligned, THP-advised)
   size_t              stride_ = 0;       // per-buffer stride (2 MiB-aligned)
   std::vector<char *> bufs_;
@@ -15529,6 +15869,10 @@ private:
   size_t              limit_ = 0;      // slots that may be held at once (set_limit)
   size_t              held_ = 0;       // slots acquired and not yet released
   bool                done_ = false;   // abort: acquire() returns -1
+  bool                eof_ = false;    // set_eof: touched slots go to the reclaimer
+  size_t              reclaiming_ = 0; // slots queued to it, in no list until done
+  size_t              reclaimed_ = 0;  // slots it has advised away (the -vv line)
+  size_t              handed_ = 0;     // slots queued to it since set_eof (the -vv line)
 };
 
 // Set while a zero-copy --direct-read run is active (the producer sets it just
@@ -15538,6 +15882,72 @@ private:
 // joins complete, destroyed after).
 static std::atomic<DirectReadPool *> g_direct_read_pool{nullptr};
 #endif
+
+// GZSTD_DEBUG_FRAMEMEM_SELFTEST's pool rules (v0.18.53), on six 2 MiB buffers:
+// at the last read the free buffers a reader touched go back to the kernel and read
+// zero again, never-acquired ones are left alone, a buffer released after it goes
+// back as it comes, and every buffer ends on the free list.
+#ifndef _WIN32
+static void gz_reclaim_pool_selftest(std::string & bad) {
+  if (!MemReclaimer::get().enabled()) return;
+  DirectReadPool pool;
+  if (!pool.init(size_t(2) << 20, 6, /*want_thp=*/false, /*prefault_plain=*/false)) {
+    bad += " pool-init";
+    return;
+  }
+  const int a = pool.acquire(), b = pool.acquire(), c = pool.acquire();
+  pool.buf(a)[0] = 1; pool.buf(b)[0] = 1; pool.buf(c)[0] = 1;
+  pool.release(a);
+  pool.set_eof();
+  MemReclaimer::get().quiesce();
+  if (pool.reclaimed() != 1 || pool.buf(a)[0] != 0) bad += " pool-eof";
+  pool.release(b);
+  MemReclaimer::get().quiesce();
+  if (pool.reclaimed() != 2 || pool.buf(b)[0] != 0) bad += " pool-release";
+  pool.release(c);
+  MemReclaimer::get().quiesce();
+  if (pool.reclaimed() != 3 || pool.free_slots() != 6) bad += " pool-free";
+}
+#endif
+
+// END OF A COMPRESS RUN (v0.18.53).  gz_last_read: the producer's last read is
+// done, just before it closes the queue -- the pooled reader's buffers go back to
+// the kernel as the workers release them (DirectReadPool::set_eof).  gz_last_pop:
+// the last task has been taken (TaskQueue::on_last_pop) -- on the process's last
+// input, FrameMem's blocks released from then on do (set_draining).  Not at the
+// last read: an mmap reader finishes at once, and every frame after it would map
+// afresh.  --calibrate times pass after pass in one process and keeps the cache.
+static std::atomic<bool> g_last_input{true};   // gzstd_main's loop: the last input
+#ifndef _WIN32
+static void gz_last_read(DirectReadPool * pool) { if (pool) pool->set_eof(); }
+#endif
+static void gz_last_pop(const Options & opt) {
+  FrameMem::get().set_draining(g_last_input.load(std::memory_order_relaxed) && !opt.calibrate);
+}
+// -vv, at a compress run's end: what went back to the kernel while its workers
+// finished.  `handed`: the pooled reader's buffers queued after its last read, all
+// of them once the workers have joined; `done`: those already returned.
+static void gz_log_reclaim(const Options & opt, size_t handed, size_t done) {
+  if (opt.verbosity < V_DEBUG) return;
+  const FrameMem::Stats st = FrameMem::get().stats();
+  if (!st.draining && !handed) return;
+  constexpr double G = 1073741824.0;
+  char b[480];
+  int n = std::snprintf(b, sizeof b,
+    "[RECLAIM] back to the kernel while the workers finished: %zu read buffer%s after the last "
+    "read (%zu done so far)", handed, handed == 1 ? "" : "s", done);
+  if (n > 0 && (size_t)n < sizeof b) {
+    if (st.draining)
+      std::snprintf(b + n, sizeof b - (size_t)n,
+        ", %.2f GiB of frame blocks after the last frame was taken (%.2f GiB live and %.2f "
+        "cached then; %.2f GiB still queued; %zu block%s mapped since)\n",
+        st.drained / G, st.drain_at_live / G, st.drain_at_cached / G, (st.queued + st.unmapping) / G,
+        st.drain_fresh, st.drain_fresh == 1 ? "" : "s");
+    else
+      std::snprintf(b + n, sizeof b - (size_t)n, "; frame blocks kept for a later pass\n");
+  }
+  vlog(V_DEBUG, opt, b);
+}
 
 static void gz_direct_read_release(int slot) {
 #ifndef _WIN32
@@ -15866,10 +16276,18 @@ public:
   // call is the wake).  The early return made a multi-GPU abort wait for the
   // scheduler's 0.5 s tick instead.  Reverted: the cost avoided was one lock
   // and three notifications ONCE PER RUN, and it bought an abort delay.
+  // Run f once, under the queue's lock, when the producer is done and the last
+  // task has been taken (or at set_done, if none is left by then): no new frame
+  // starts after it.  f must not touch the queue.  Set before any worker starts.
+  // (v0.18.53: FrameMem::set_draining.)  A GPU batch requeued after it is still
+  // compressed; the hook does not fire again.
+  void on_last_pop(std::function<void()> f) { on_last_pop_ = std::move(f); }
+
   void set_done()
   {
     std::unique_lock<std::mutex> lk(m_);
     done_ = true;
+    if (q_.empty()) fire_last_pop_locked();
     cv_.notify_all();
     cpu_cv_.notify_all();
     space_cv_.notify_all();  // wake a producer blocked on a full bounded queue
@@ -16129,12 +16547,21 @@ private:
     // can wake a GPU parked in wait_for_gpu_yield().  Free integer check
     // when nothing is parked (the common case).
     if (gpu_yield_waiters_ > 0) cv_.notify_all();
+    if (done_ && q_.empty()) fire_last_pop_locked();
     return t;
+  }
+  // The on_last_pop hook, once: the producer is done and nothing is queued.
+  void fire_last_pop_locked() {
+    if (last_pop_fired_ || !on_last_pop_) return;
+    last_pop_fired_ = true;
+    on_last_pop_();
   }
 
   void notify_throttle_(size_t head);   // defined after FrameThrottle
 
   mutable std::mutex      m_;        // mutable: front_seq_at_most() is a const probe
+  std::function<void()>   on_last_pop_;            // on_last_pop
+  bool                    last_pop_fired_ = false;
   std::condition_variable cv_;
   std::condition_variable cpu_cv_;   // dedicated CV for CPU workers (avoids spurious wakes from GPU pops)
   std::atomic<bool> cpu_wake_all_{false};  // waiters with different take predicates need a broadcast
@@ -36377,6 +36804,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
+  FrameMem::get().set_draining(false);   // until this run's last read (gz_last_read)
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
 
@@ -36631,6 +37059,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   if (progress_loop_needed(opt, total_in))
     progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
+  queue.on_last_pop([&opt] { gz_last_pop(opt); });   // v0.18.53
   // Byte-cap the input queue: a pipe/stdin producer that outruns the workers
   // (fread reads frames into heap) must not buffer the whole input in RAM — the
   // compress-side analogue of the ROADMAP 7.8 decompress cap.  Bytes only (no
@@ -37052,6 +37481,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   if (g_debug_throw_reader)
     throw std::runtime_error("simulated reader fault (GZSTD_DEBUG_THROW_READER)");
 
+#ifndef _WIN32
+  gz_last_read(&dr_pool);
+#endif
   // Signal workers that no more input is coming
   queue.set_done();
   {
@@ -37102,6 +37534,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   gz_wake_periodic_loops();
   if (progress_thr.joinable()) progress_thr.join();
   log_throttle_stats(throttle, opt, "compress-cpu");
+#ifndef _WIN32
+  gz_log_reclaim(opt, dr_pool.handed(), dr_pool.reclaimed());
+#else
+  gz_log_reclaim(opt, 0, 0);
+#endif
 
   if (g_perf) {
     g_perf->print_summary("CPU-ONLY COMPRESS");
@@ -42353,6 +42790,7 @@ static void dstage_read_plain(TaskQueue & queue, GdsStagePool & pool, int fd,
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   g_compress_pass_stats = CompressPassStats{};
+  FrameMem::get().set_draining(false);   // until this run's last read (gz_last_read)
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
   gds_preflight_or_die(opt, in);
@@ -42657,6 +43095,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // ---- Shared state for all workers ----
   TaskQueue   queue;
+  queue.on_last_pop([&opt] { gz_last_pop(opt); });   // v0.18.53
   ResultStore results;
   std::atomic<size_t> seq_counter{0};
   std::atomic<bool>   any_gpu_failed{false};
@@ -43952,6 +44391,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
   }
 
+#ifndef _WIN32
+  gz_last_read(&nv_pool);
+#endif
   // Signal workers that all input has been read
   queue.set_done();
   perf_mark(PerfCounters::HM_PRODUCER_DONE);
@@ -44277,6 +44719,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "compress-hybrid" :
                      opt.gpu_only ? "compress-gpu" : "compress-nvcomp");
+#ifndef _WIN32
+  gz_log_reclaim(opt, nv_pool.handed(), nv_pool.reclaimed());
+#else
+  gz_log_reclaim(opt, 0, 0);
+#endif
 
   // --stats-json: what this pass did.  Every worker has joined, so the sink is
   // complete; a worker that never finished exported nothing and is absent.
@@ -53288,6 +53735,7 @@ static int gzstd_main(int argc, char ** argv)
   for (size_t file_idx = 0; file_idx < opt.inputs.size(); ++file_idx) {
   // --- Per-file setup ---
   opt.input = opt.inputs[file_idx];
+  g_last_input.store(file_idx + 1 == opt.inputs.size(), std::memory_order_relaxed);   // FrameMem drains
   gz_mem_new_input();   // this input's budgets read the memory afresh, once
   if (opt.keep_going) g_damage.reset();   // damage is reported per input file
 
