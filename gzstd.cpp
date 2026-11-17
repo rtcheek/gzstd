@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.51";
+static constexpr const char * GZSTD_VERSION = "0.18.52";
 //
 // Architecture overview:
 //
@@ -14182,9 +14182,349 @@ static inline void gz_input_retire(const char * p, size_t len) {
 }
 static void gz_input_retire_stop() { g_input_retirer.stop(); }
 
+/*---- Frame-sized host buffers: FrameMem (v0.18.52, ROADMAP 44 / 42a) ----------
+ A FRAME IS ALLOCATED ON ONE THREAD AND FREED ON ANOTHER: a reader fills a
+ Task's bytes and a worker releases them, a GPU drain or a CPU worker fills an
+ output buffer and the writer drops it.  glibc serves a block that size from
+ the ALLOCATING thread's arena, whose heaps are 64 MiB mappings, and unmaps a
+ heap the moment it empties.  The 256 MiB M_TRIM_THRESHOLD set in main() keeps
+ only the MAIN heap's top resident; a thread arena's heap is deleted outright.
+ The next frame then lands in a fresh mapping, faulted in 4 KiB at a time, on
+ whichever thread touches it first.  A hybrid run frees out of order on more
+ threads and churns harder.
+
+ MEASURED (8-H100 server, 8 CPUs, two cards, two cached 12 GiB base64 files as
+ one --tar archive, to /dev/null): the default unmapped 161 such heaps against
+ --cpu-only's 83, faulted 2.0M pages against 0.65M, spent 11.5 s in the kernel
+ against 6.7, and lost, 5.36-5.40 s against 4.95.  Every thread paid: the
+ assembler's 865k faults against 420k, the CPU workers' 600k against 210k and
+ 9% more user time a frame, the GPU drain's 575k.  MALLOC_ARENA_MAX=1, which
+ leaves no thread heap to delete, gave 5.12-5.16 on its own.
+
+ So a block of FRAMEMEM_MIN or more comes from here: mapped in FRAMEMEM_GRAIN
+ multiples (a frame's compressed size varies frame to frame; a grain lets the
+ next one reuse the block -- under a known limit, pages and same-size reuse
+ only, see set_cache_cap), handed out best-fit from the blocks freed, and
+ unmapped only to keep everything mapped within an eighth (256 MiB at most) of
+ the run's high-water of live blocks (mapped_cap) -- memory the run has already
+ faulted in once, so its peak RSS stays within that of the live set.  The registry
+ holds every mapping, so a release needs no size and a pointer it does not know
+ (malloc's, when a mapping failed) goes back to free().
+
+ PLAIN PAGES.  Huge pages measured far better with memory free (the same
+ archive 4.61-4.64 s, 9k faults, against --cpu-only's 4.79-4.84), but this
+ server has twice measured huge pages faulted lazily stalling on direct
+ compaction when memory is mostly page cache -- 11.9-14.3 s against 5.0-5.2 on
+ plain pages, free 2 MiB blocks no predictor (see DirectReadPool::init) -- and a
+ recycler's fresh blocks are exactly such faults.  GZSTD_DEBUG_FRAMEMEM_THP=1
+ asks for them (2 MiB-aligned, MADV_HUGEPAGE), the A/B control;
+ GZSTD_DEBUG_FRAMEMEM=0 hands every block back to the C++ allocator.
+
+ Leaked on purpose: die() exits with threads still running, and a frame freed
+ after a static destructor ran would touch a destroyed registry. */
+static constexpr size_t FRAMEMEM_MIN   = size_t(2) << 20;
+static constexpr size_t FRAMEMEM_GRAIN = size_t(2) << 20;
+class FrameMem {
+public:
+  static FrameMem & get() { static FrameMem * p = new FrameMem(); return *p; }
+  bool enabled() const { return enabled_; }
+
+  void * alloc(size_t n) {
+    size_t want;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      // Under a known limit, the page and not the grain: a block another frame
+      // filled to its rounded size would keep that tail resident beyond the capacity
+      // the queue charges this one (Codex review).  The decoder's size classes and a
+      // compress run's fixed frames still recur exactly.  Huge pages need the grain.
+      const size_t g = exact_ && !thp_ ? size_t(4096) : FRAMEMEM_GRAIN;
+      want = (n + g - 1) / g * g;
+      // Best fit, and not wastefully large: a 4 MiB request must not take a 16 MiB
+      // input frame's block when the next 16 MiB frame would then map.  Sharing
+      // across sizes matters: a --tar run's GPU output frames (14 MiB blocks) reuse
+      // its freed 16 MiB input frames' blocks, and same-size-only reuse faulted
+      // 1.78-1.96M pages against best fit's 1.47-1.52M (8 CPUs, two cards).  Under a
+      // known limit, the block's own size only (set_cache_cap).
+      auto it = free_.lower_bound(want);
+      if (it != free_.end() && it->first <= (exact_ ? want : want + want / 2)) {
+        void * p = it->second;
+        const size_t s = it->first;
+        free_.erase(it);
+        cached_ -= s;
+        live_ += s;
+        if (live_ > peak_) peak_ = live_;
+        return p;
+      }
+      // A fresh block.  Keep everything mapped within the live high-water (this
+      // block's included) plus the slack, unmapping cached blocks smallest first:
+      // a small one cannot serve the larger requests that could not use it.
+      // Unmapped UNDER THE LOCK: a victim dropped from the count but still mapped
+      // let a concurrent fresh block map past the bound (Codex review).  Rare --
+      // only when a size appears that nothing cached can serve.
+      const size_t cap = mapped_cap(std::max(peak_, live_ + want));
+      while (cached_ > 0 && live_ + cached_ + want > cap) evict_smallest_locked();
+      live_ += want;   // reserved now: a concurrent alloc sees it
+      if (live_ > peak_) peak_ = live_;
+    }
+    void * p = map_fresh(want);
+    if (!p) {
+      { std::lock_guard<std::mutex> lk(m_); live_ -= want; }
+      // The mapping failed (vm.max_map_count, RLIMIT_AS): the C allocator then,
+      // which the release below recognises by its absence from the registry.
+      void * q = std::malloc(n);
+      if (!q) throw std::bad_alloc();
+      return q;
+    }
+    std::lock_guard<std::mutex> lk(m_);
+    ++fresh_;
+    try { size_of_.emplace(p, want); }
+    catch (...) { live_ -= want; ::munmap(p, want); throw; }
+    return p;
+  }
+
+  void release(void * p) noexcept {
+    if (!p) return;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      auto it = size_of_.find(p);
+      if (it != size_of_.end()) {
+        const size_t s = it->second;
+        live_ -= s;
+        // Within the cache's byte cap (set_cache_cap), smallest cached first out.
+        while (cached_ > 0 && cached_ + s > cache_cap_) evict_smallest_locked();
+        if (cached_ + s <= cache_cap_) {
+          try { free_.emplace(s, p); cached_ += s; return; }
+          catch (...) {}                      // no node for the cache: unmap it instead
+        }
+        size_of_.erase(it);
+        ::munmap(p, s);
+        return;
+      }
+    }
+    std::free(p);
+  }
+
+  // The most the cache may hold, whatever the high-water (v0.18.52, Codex review).
+  // A cached block serves only FrameMem, never libzstd's window or a malloc, which a
+  // freed glibc chunk could have served; under a container's limit, or --memlimit,
+  // that difference is what a run has to spare.  gzstd_main sets an eighth of the
+  // memory available at startup (a container's headroom included); unset, no cap.
+  // Under a known limit (exact_reuse) a request takes only a block of its own size,
+  // rounded to the page and not the grain: a larger block, or one another frame
+  // filled to its grain, would keep a tail resident beyond the capacity the queue
+  // charges (Task::queued_host_bytes; Codex review).
+  void set_cache_cap(size_t bytes, bool exact_reuse) {
+    std::lock_guard<std::mutex> lk(m_);
+    cache_cap_ = bytes;
+    exact_ = exact_reuse;
+    while (cached_ > cache_cap_) evict_smallest_locked();
+  }
+  // What may be mapped, live and cached, given the live high-water: an eighth more,
+  // at most 256 MiB -- room for a new size beside cached ones, and no more than that
+  // past what the run itself held at once (a process under a memory limit lives at
+  // its high-water; a fixed 256 MiB would be twice a 128 MB limit).
+  static size_t mapped_cap(size_t hw) {
+    return hw + std::min<size_t>(size_t(256) << 20, hw / 8);
+  }
+  // For the self-test (GZSTD_DEBUG_FRAMEMEM_SELFTEST): what is mapped, and the bound.
+  struct Stats { size_t live, cached, peak, maps, fresh; bool thp; };
+  Stats stats() {
+    std::lock_guard<std::mutex> lk(m_);
+    return { live_, cached_, peak_, size_of_.size(), fresh_, thp_ };
+  }
+
+private:
+  FrameMem() {
+#ifdef __linux__
+    const char * e = std::getenv("GZSTD_DEBUG_FRAMEMEM");
+    enabled_ = !(e && *e == '0');
+    const char * t = std::getenv("GZSTD_DEBUG_FRAMEMEM_THP");
+    thp_ = t && *t == '1';
+#endif
+  }
+  void evict_smallest_locked() {
+    auto v = free_.begin();
+    cached_ -= v->first;
+    size_of_.erase(v->second);
+    ::munmap(v->second, v->first);
+    free_.erase(v);
+  }
+  void * map_fresh(size_t want) {
+#ifdef __linux__
+    if (!thp_) {
+      void * p = ::mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (p == MAP_FAILED) return nullptr;
+#ifdef MADV_NOHUGEPAGE
+      // Plain means plain under a system THP=always too, as DirectReadPool does.
+      (void)::madvise(p, want, MADV_NOHUGEPAGE);
+#endif
+      return p;
+    }
+    // 2 MiB-aligned so every grain can be a huge page: map a grain more, trim.
+    const size_t span = want + FRAMEMEM_GRAIN;
+    void * r = ::mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (r == MAP_FAILED) return nullptr;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(r);
+    const uintptr_t b = (a + FRAMEMEM_GRAIN - 1) & ~(uintptr_t)(FRAMEMEM_GRAIN - 1);
+    if (b > a) ::munmap(r, b - a);
+    if (a + span > b + want) ::munmap(reinterpret_cast<void *>(b + want), a + span - (b + want));
+#ifdef MADV_HUGEPAGE
+    (void)::madvise(reinterpret_cast<void *>(b), want, MADV_HUGEPAGE);
+#endif
+    return reinterpret_cast<void *>(b);
+#else
+    (void)want;
+    return nullptr;
+#endif
+  }
+  std::mutex m_;
+  std::multimap<size_t, void *> free_;            // cached blocks by mapped size
+  std::unordered_map<void *, size_t> size_of_;    // every mapping, live or cached
+  size_t live_ = 0, cached_ = 0, peak_ = 0;
+  size_t fresh_ = 0;                              // blocks ever mapped (the self-test)
+  size_t cache_cap_ = SIZE_MAX;                   // set_cache_cap
+  bool exact_ = false;                            // set_cache_cap: same-size reuse, pages
+  bool enabled_ = false, thp_ = false;
+};
+
+// The allocator frame buffers take: FrameMem at FRAMEMEM_MIN and above, the C++
+// allocator below it.  allocate and deallocate see the same n, so they agree on
+// which side owns a block; enabled() is fixed for the process.
+template <typename T>
+struct frame_allocator {
+  using value_type = T;
+  using is_always_equal = std::true_type;
+  using propagate_on_container_move_assignment = std::true_type;
+  frame_allocator() noexcept = default;
+  template <typename U> frame_allocator(const frame_allocator<U> &) noexcept {}
+  T * allocate(size_t n) {
+    if (n <= SIZE_MAX / sizeof(T) && n * sizeof(T) >= FRAMEMEM_MIN && FrameMem::get().enabled())
+      return static_cast<T *>(FrameMem::get().alloc(n * sizeof(T)));
+    return std::allocator<T>().allocate(n);
+  }
+  void deallocate(T * p, size_t n) noexcept {
+    if (n * sizeof(T) >= FRAMEMEM_MIN && FrameMem::get().enabled()) {
+      FrameMem::get().release(p);
+      return;
+    }
+    std::allocator<T>().deallocate(p, n);
+  }
+};
+template <typename T, typename U>
+bool operator==(const frame_allocator<T> &, const frame_allocator<U> &) noexcept { return true; }
+template <typename T, typename U>
+bool operator!=(const frame_allocator<T> &, const frame_allocator<U> &) noexcept { return false; }
+// A Task's owned bytes: value-initialised like the std::vector<char> it replaces.
+using HostBytes = std::vector<char, frame_allocator<char>>;
+
+// GZSTD_DEBUG_FRAMEMEM_SELFTEST=1 (v0.18.52): FrameMem's rules on blocks it never
+// touches (no page is faulted, so it costs nothing and needs no device): a freed
+// block serves the next request of its grain, best fit and never more than half
+// again its size, across threads; under a limit only its own page-rounded size; the
+// cache keeps to its byte cap; a pointer it never mapped goes back to free();
+// everything mapped stays within the live high-water plus the slack; a value-
+// initialised HostBytes reads zero in a dirty recycled block; huge-page mode maps
+// on 2 MiB boundaries.  Prints "framemem ok" or the rules that failed.
+static int gz_framemem_selftest()
+{
+  FrameMem & fm = FrameMem::get();
+  if (!fm.enabled()) { std::printf("framemem disabled\n"); return 0; }
+  std::string bad;
+  const size_t MiB = size_t(1) << 20;
+  const bool thp = fm.stats().thp;
+  auto aligned = [&](void * p) {
+    return !thp || (reinterpret_cast<uintptr_t>(p) & (FRAMEMEM_GRAIN - 1)) == 0;
+  };
+  // A 128 MiB high-water first, so the small cases below stay inside mapped_cap and
+  // nothing is evicted under them (best fit leaves this block alone: too large).
+  fm.release(fm.alloc(128 * MiB));
+  // Reuse: 5 MiB maps a 6 MiB block; a 6 MiB request then takes the same one.
+  void * a = fm.alloc(5 * MiB);
+  if (!aligned(a)) bad += " align";
+  fm.release(a);
+  const size_t fresh0 = fm.stats().fresh;   // not the address: the kernel may hand back
+  void * b = fm.alloc(6 * MiB);             // an unmapped block's range for a new one
+  if (b != a || fm.stats().fresh != fresh0) bad += " reuse";
+  // Best fit within half again: a 2 MiB request may not take the cached 6 MiB block...
+  fm.release(b);
+  void * c = fm.alloc(2 * MiB);
+  if (c == b) bad += " fit-too-large";
+  fm.release(c);
+  // ...a 4 MiB one may, and takes it over the 2 MiB block that cannot serve it.
+  const size_t fresh2 = fm.stats().fresh;
+  void * d = fm.alloc(4 * MiB);
+  if (d != b || fm.stats().fresh != fresh2) bad += " fit-best";
+  fm.release(d);
+  // Across threads: allocated on one, released on another, reused on a third.
+  void * e = nullptr;
+  std::thread([&] { e = fm.alloc(8 * MiB); }).join();
+  std::thread([&] { fm.release(e); }).join();
+  const size_t fresh1 = fm.stats().fresh;
+  void * f = fm.alloc(8 * MiB);
+  if (f != e || fm.stats().fresh != fresh1) bad += " cross-thread";
+  fm.release(f);
+  // A pointer FrameMem never mapped (the fallback after a failed mapping) is freed.
+  const auto before = fm.stats();
+  fm.release(std::malloc(4 * MiB));
+  const auto after = fm.stats();
+  if (after.cached != before.cached || after.maps != before.maps) bad += " foreign";
+  // The bound: 320 MiB of 8 MiB blocks freed, then 14 MiB blocks they cannot serve.
+  std::vector<void *> v;
+  for (int i = 0; i < 40; ++i) v.push_back(fm.alloc(8 * MiB));
+  for (void * p : v) fm.release(p);
+  v.clear();
+  for (int i = 0; i < 60; ++i) {
+    v.push_back(fm.alloc(14 * MiB));
+    const auto st = fm.stats();
+    if (st.live + st.cached > FrameMem::mapped_cap(st.peak)) { bad += " bound@" + std::to_string(i); break; }
+  }
+  if (fm.stats().cached >= 320 * MiB) bad += " no-eviction";
+  for (void * p : v) fm.release(p);
+  // Under a limit, a request takes no larger block, not even one of its grain: a
+  // 2.1 MiB one maps fresh beside a cached 3.9 MiB block (plain pages; huge pages
+  // keep the grain).  The same size is still reused.
+  {
+    fm.set_cache_cap(SIZE_MAX, true);
+    void * x = fm.alloc(3900 * 1024);
+    fm.release(x);
+    const size_t fresh3 = fm.stats().fresh;
+    void * y = fm.alloc(thp ? 4 * MiB + 1 : 2100 * 1024);
+    if (y == x || fm.stats().fresh == fresh3) bad += " exact";
+    fm.release(y);
+    const size_t fresh4 = fm.stats().fresh;
+    void * z = fm.alloc(3900 * 1024);
+    if (z != x || fm.stats().fresh != fresh4) bad += " exact-reuse";
+    fm.release(z);
+    fm.set_cache_cap(SIZE_MAX, false);
+  }
+  // The cache's byte cap: lowering it unmaps down to it, and a release past it unmaps.
+  fm.set_cache_cap(40 * MiB, false);
+  if (fm.stats().cached > 40 * MiB) bad += " cache-cap";
+  {
+    std::vector<void *> w;
+    for (int i = 0; i < 8; ++i) w.push_back(fm.alloc(8 * MiB));
+    for (void * p : w) fm.release(p);
+  }
+  if (fm.stats().cached > 40 * MiB) bad += " cache-cap-release";
+  fm.set_cache_cap(SIZE_MAX, false);
+  // Value-initialised bytes read zero in a recycled, dirty block.
+  {
+    HostBytes h(3 * MiB);
+    std::memset(h.data(), 0x5a, h.size());
+  }
+  {
+    HostBytes h(3 * MiB);
+    for (size_t i = 0; i < h.size(); i += 4096)
+      if (h[i] != 0) { bad += " dirty"; break; }
+  }
+  if (bad.empty()) std::printf("framemem ok\n");
+  else std::printf("framemem FAIL:%s\n", bad.c_str());
+  return 0;
+}
+
 struct Task {
   size_t seq = 0;
-  std::vector<char> data;
+  HostBytes data;
   // The queue charges `data`'s CAPACITY, not its size (v0.18.38).  Set by the decode
   // reader under a memory limit, where a copy is reserved in a size class (up to an
   // eighth more than the frame) and a carry is handed over with up to a sixteenth
@@ -14244,7 +14584,7 @@ struct Task {
     else if (direct_buf >= 0) { gz_direct_read_release(direct_buf); direct_buf = -1; view_ptr = nullptr; view_len = 0; }
     else if (block)      { block.reset(); view_ptr = nullptr; view_len = 0; }
     else if (view_ptr)   { gz_input_retire(view_ptr, view_len); view_ptr = nullptr; view_len = 0; }
-    else                 { std::vector<char>().swap(data); }
+    else                 { HostBytes().swap(data); }
   }
 };
 
@@ -15123,7 +15463,23 @@ public:
     // THP engages, and the plain memset stops at 4 GiB.  A fresh slot just means
     // no reader has had it yet; touching a slot that is already mapped is cheap.
     used_.assign(n_bufs, 0);
+    limit_ = n_bufs;
+    held_ = 0;
     return true;
+  }
+  // A ceiling on the slots held at once, below the pool's size (v0.18.52).  The
+  // free list is LIFO, so a ceiling also bounds the slots ever TOUCHED: a pool sized
+  // for a GPU window that never opens faults in only the CPU pool's lead.  Safe to
+  // move mid-run, either way: acquire() rechecks under the lock, and a lowered
+  // ceiling only stops new acquisitions until releases bring the count under it.
+  // The caller moves the queue's depth cap with it (wait_for_batch_or_cap's
+  // capacity escape, see the compress producer).  0 restores the whole pool.
+  void set_limit(size_t n) {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      limit_ = (n == 0 || n > bufs_.size()) ? bufs_.size() : n;
+    }
+    cv_.notify_all();
   }
   // Blocks until a buffer is free; returns its slot index, or -1 after
   // set_done() (abort: the reader must stop, no buffer is coming back).
@@ -15131,9 +15487,10 @@ public:
   // read probe faults such a buffer in outside its timed read (ReadWindow).
   int acquire(bool * fresh = nullptr) {
     std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [&]{ return done_ || !free_.empty(); });
+    cv_.wait(lk, [&]{ return done_ || (!free_.empty() && held_ < limit_); });
     if (done_) return -1;
     int s = free_.back(); free_.pop_back();
+    ++held_;
     if (fresh) *fresh = !used_[(size_t)s];
     used_[(size_t)s] = 1;
     return s;
@@ -15146,6 +15503,7 @@ public:
       std::lock_guard<std::mutex> lk(m_);
       if (unused_fresh) used_[(size_t)slot] = 0;
       free_.push_back(slot);
+      if (held_ > 0) --held_;
     }
     cv_.notify_one();
   }
@@ -15168,6 +15526,8 @@ private:
   std::mutex          m_;
   std::condition_variable cv_;
   size_t              buf_size_ = 0;
+  size_t              limit_ = 0;      // slots that may be held at once (set_limit)
+  size_t              held_ = 0;       // slots acquired and not yet released
   bool                done_ = false;   // abort: acquire() returns -1
 };
 
@@ -15809,9 +16169,10 @@ private:
 // before the buffer is read (ZSTD / cudaMemcpy / assign / memcpy) and no writer
 // reads past size() — DirectWriter copies exactly size() bytes into its own
 // aligned buffer, so a buffer's [size(),capacity()) tail never reaches disk.
+// v0.18.52: its blocks come from FrameMem (above Task), like a Task's bytes.
 template <typename T>
-struct default_init_allocator : std::allocator<T> {
-  using base = std::allocator<T>;
+struct default_init_allocator : frame_allocator<T> {
+  using base = frame_allocator<T>;
   using base::base;
   template <typename U> struct rebind { using other = default_init_allocator<U>; };
   template <typename U>
@@ -22020,7 +22381,7 @@ static void cpu_decomp_worker(
       if (const uint64_t ram = get_available_ram_bytes(); ram && t.src_len > ram / 8)
         die_io(gz_stage_name(*opt)
                + ": compressed frame exceeds the host memory budget for CPU rescue");
-      std::vector<char> host;
+      HostBytes host;
       try { host.resize(t.src_len); }
       catch (const std::bad_alloc &) {
         die_io(gz_stage_name(*opt) + ": cannot allocate the CPU rescue frame");
@@ -23172,7 +23533,7 @@ static size_t stream_frames_to_queue_mt(
   // "out_off .. out_off + decomp_size" for each unrecoverable region — and this
   // reader is chosen for ANY seekable input over 128 MiB, --keep-going included.
   uint64_t out_off_acc = 0;
-  std::vector<char> carry;            // straddling-frame bytes from prior block(s)
+  HostBytes carry;                    // straddling-frame bytes from prior block(s)
   uint64_t carry_origin = 0;          // absolute file offset of carry[0] (for the fallback offset)
   // THE CARRY AT ITS FRAME'S SIZE (v0.18.38, carry_exact only).  Once a carried
   // frame's header is in hand, its compress bound -- the most a frame of that
@@ -23207,7 +23568,7 @@ static size_t stream_frames_to_queue_mt(
         // carry too roomy to hand over (Codex review).  The bytes so far (a split
         // header, under 18) move with it; `h` is not used after this.
         if (carry.capacity() < res || carry.capacity() - res > res / 16) {
-          std::vector<char> fresh;
+          HostBytes fresh;
           fresh.reserve(res);
           fresh.assign(carry.begin(), carry.end());
           carry.swap(fresh);
@@ -23244,7 +23605,7 @@ static size_t stream_frames_to_queue_mt(
   // and a 2 GiB decode of compressible data died under 128 MB.  Rounded up to an
   // eighth of their power of two (at most 12.5% more), one archive's copies share
   // one size and reuse each other's chunks exactly.
-  auto copy_frame = [&](std::vector<char> & dst, const char * src, size_t n) {
+  auto copy_frame = [&](HostBytes & dst, const char * src, size_t n) {
     if (carry_exact && n > ONE_MIB) {
       const size_t step = (size_t{1} << (63 - __builtin_clzll((unsigned long long)n))) / 8;
       dst.reserve((n + step - 1) / step * step);
@@ -23257,7 +23618,7 @@ static size_t stream_frames_to_queue_mt(
   // buffer, which already holds the frame), or neither (copy the frame out).
   auto emit = [&](const char * p, size_t fc,
                   const std::shared_ptr<BlockBuf> * view_of,
-                  std::vector<char> * take_from) -> bool {
+                  HostBytes * take_from) -> bool {
     gz_enforce_window_limit(p, fc);
     unsigned long long dz = ZSTD_getFrameContentSize(p, fc);
     if (dz == ZSTD_CONTENTSIZE_UNKNOWN || dz == ZSTD_CONTENTSIZE_ERROR) {
@@ -39574,7 +39935,16 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
       // Size ONCE for frame + checksum trailer, so stamping the checksum below
       // cannot reallocate.  FrameVec's allocator default-inits, so this is a size
       // change only — no zero-fill of the region the copy is about to overwrite.
+      // A POOLED BUFFER GROWS BY AN EIGHTH, NOT DOUBLE (v0.18.52).  Sized to its
+      // first frame, the next slightly larger one made the vector double it: 12.06
+      // MiB base64 frames became 24 MiB buffers, 70 fresh mappings in one hybrid run,
+      // each pushing FrameMem past its bound and evicting the CPU workers' blocks.
+      // Not the largest frame either: 18 MiB output blocks outgrew a --tar run's
+      // 16 MiB input frames, which then took them (1.85-1.89M faults against 1.47-
+      // 1.52M), where 14 MiB ones reuse the inputs' blocks instead.
       if (tr) t_a = now_ns();
+      if (h_out->capacity() < csz + 4)
+        h_out->reserve(std::min(C.max_out_chunk + 4, (csz + 4) + (csz + 4) / 8));
       h_out->resize(csz + 4);
       if (tr) { ns_size += now_ns() - t_a; t_a = now_ns(); }
       if (C.h2d_pinned_base) {
@@ -42560,6 +42930,44 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   };
   if (!gpu_joins_later && opt.throttle_frames != 0)
     tar_declare_ceiling(comp_queue_bytes(comp_parallelism));
+  // THE READ POOL A GPU JOINS (v0.18.52) -- the queue's rule above, for the reader
+  // whose frames the queue counts as zero bytes.  The pooled reader (--no-mmap, a
+  // cold or partly cached input) queues views into one DirectReadPool sized for the
+  // GPU window from the first frame: the CPU pool, 32 per reader, and 1,024 for the
+  // cards' batches -- 1,126 16 MiB buffers at 8 CPUs, 17.6 GiB.  Its readers ran
+  // that far ahead whether or not a GPU ever came, faulting in every buffer they
+  // touched.  MEASURED, 8-H100 server, 8 CPUs, a cached 24 GiB file, --no-mmap:
+  // --cpu-only 5.05-5.18 s at 4.0 GiB peak RSS, the default engaged on two cards
+  // 5.44-5.61 at 11.5-12.0 GiB and 2.9M page faults.  So a deferred bringup holds
+  // the pool to compress_cpu_mt's lead (its CPU pool, 128, 32 per reader) and the
+  // bringup opens the window, before any GPU worker exists; a decline leaves it
+  // shut.  The pool may be built before or after the bringup decides, hence the
+  // lock.  The queue's depth cap moves with the lead, so wait_for_batch_or_cap's
+  // capacity escape still fires for a batch larger than the lead.
+  struct PoolLead {
+    std::mutex m;
+    DirectReadPool * pool = nullptr;   // set once the producer has built it
+    size_t window = 0;                 // the pool's size, the GPU window included
+    size_t cpu = 0;                    // compress_cpu_mt's lead
+    bool open = false;                 // the GPU window is open
+  } pool_lead;
+  pool_lead.open = !gpu_joins_later;
+  auto pool_lead_apply_locked = [&] {
+    const size_t lead = pool_lead.open ? pool_lead.window
+                                       : std::min(pool_lead.window, pool_lead.cpu);
+    queue.set_max_depth(lead);         // the queue first: a reader the larger lead
+    pool_lead.pool->set_limit(lead);   // releases must find room to push
+    return lead;
+  };
+  auto pool_lead_open = [&] {
+    std::lock_guard<std::mutex> lk(pool_lead.m);
+    if (pool_lead.open) return;
+    pool_lead.open = true;
+    if (!pool_lead.pool) return;
+    const size_t lead = pool_lead_apply_locked();
+    vlog(V_DEBUG, opt, "[POOLED-READ] the GPU window opens: " + std::to_string(lead)
+         + " of " + std::to_string(pool_lead.window) + " buffers\n");
+  };
 
   // (No CPU "rescue" pool: a GPU fault aborts the whole compress pass and the
   // driver rebuilds CPU-only from the original input — there is nothing to
@@ -42778,6 +43186,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         // ...and the queue they take their batches from (see comp_queue_bytes).
         queue.set_max_bytes(comp_queue_bytes(cpu_threads_est + floor));
         tar_declare_ceiling(comp_queue_bytes(cpu_threads_est + floor));
+        pool_lead_open();   // ...and the pooled reader's lead (see PoolLead)
       }
     }
     if (device_count <= 0) return;
@@ -43419,13 +43828,25 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // in gpu-only mode no CPU pop can break the standoff).  push() can
       // never actually block on this cap: queued view tasks each hold a
       // pool slot, so acquire() gates the producer strictly earlier.
-      queue.set_max_depth(pool_n);
+      // v0.18.52: the cap is the pool's LEAD, which a deferred bringup holds to
+      // the CPU pool's until a GPU joins (PoolLead, above); the invariant holds
+      // for the lead as it did for the size.
+      size_t lead;
+      {
+        std::lock_guard<std::mutex> lk(pool_lead.m);
+        pool_lead.pool = &nv_pool;
+        pool_lead.window = pool_n;
+        pool_lead.cpu = (size_t)cpu_threads + 128 + 32 * (size_t)n_readers;
+        lead = pool_lead_apply_locked();
+      }
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt,
              std::string(want_direct_read
                            ? "[DIRECT-READ] O_DIRECT input (page cache bypassed)"
                            : "[POOLED-READ] buffered input (page cache + readahead)")
-             + ", zero-copy pool " + std::to_string(pool_n) + " buffers\n");
+             + ", zero-copy pool " + std::to_string(pool_n) + " buffers"
+             + (lead < pool_n ? ", " + std::to_string(lead) + " until a GPU joins" : std::string())
+             + "\n");
       auto nv_emit = [&](const char * buf, size_t n, size_t idx, int slot) {
         Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
         queue.push(std::move(t));
@@ -52549,6 +52970,20 @@ static int gzstd_main(int argc, char ** argv)
     }
   }
   g_mem_limit_bytes.store(decode_limit, std::memory_order_relaxed);
+  // FrameMem's cache within an eighth of what this run may use (set_cache_cap):
+  // the memory available now, a container's headroom included, and -M/--memlimit;
+  // under either limit, same-size reuse only.  Read directly, not through
+  // get_available_ram_bytes, whose per-input reading this must not take before the
+  // dictionaries, --calibrate's corpus or a --tar listing exist (Codex review).
+  {
+    const GzMemHeadroom cg = gz_cgroup_mem_headroom();
+    const uint64_t host = gz_host_mem_available();
+    uint64_t room = cg.file.empty() ? host : host ? std::min(host, cg.headroom) : cg.headroom;
+    if (opt.mem_limit_bytes) room = room ? std::min(room, opt.mem_limit_bytes) : opt.mem_limit_bytes;
+    const bool limited = !cg.file.empty() || opt.mem_limit_bytes != 0;
+    if (room || limited)
+      FrameMem::get().set_cache_cap((size_t)std::min<uint64_t>(room / 8, SIZE_MAX), limited);
+  }
   // --long on compression: the per-frame compressor reads it (see g_long_wlog).
   // Not under --calibrate, which measures the levels as they are.
   if (opt.mode == Mode::COMPRESS && !opt.calibrate) {
@@ -55170,6 +55605,7 @@ int main(int argc, char ** argv)
   try {
     // Hidden hook: push_to_slot wakes the writer for its next frame (both builds).
     if (::getenv("GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST")) return gz_slot_notify_selftest();
+    if (::getenv("GZSTD_DEBUG_FRAMEMEM_SELFTEST")) return gz_framemem_selftest();
 #ifdef HAVE_NVCOMP
     // Hidden hook: verify the --gds-only content-checksum kernel against the CPU
     // hash and exit.  Kept out of parse_args deliberately — it runs before any

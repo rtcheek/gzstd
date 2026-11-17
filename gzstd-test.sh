@@ -633,8 +633,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=575
-$EXTENSIVE && EXPECTED_TESTS=922
+EXPECTED_TESTS=576
+$EXTENSIVE && EXPECTED_TESTS=923
+# v0.18.52: +1 default cell on both builds (FrameMem's rules: a self-test, no CUDA),
+# so 575 -> 576, -e 922 -> 923, the no-GPU deltas unchanged.  The bringup-sample cell
+# gains --no-mmap arms (the pooled reader's lead), not a count.  DERIVED.
 # v0.18.48: +1 default cell on both builds (a GPU slot's next frame wakes the waiting
 # writer: a self-test, no CUDA) and +1 -e GPU cell (batched GPU decode buffer reporting
 # and bytes), so the -e no-GPU delta +1 (246 -> 247): 574 -> 575, -e 920 -> 922.
@@ -7296,6 +7299,54 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
     bh_tar tar-fixed -- --cpu-share 0.5
     bh_ceiling_said || bh_why+=" tar-fixed:no-ceiling"
     rm -rf "$TMPDIR/bht" "$TMPDIR/bht.tzst" "$TMPDIR/bh.rss"
+    # THE POOLED READER WAITS FOR ITS GPU TOO (v0.18.52).  --no-mmap (and a cold input)
+    # queues views into one buffer pool, which the queue's byte cap does not count, sized
+    # for the GPU window from the first frame; its readers ran that far ahead whether or
+    # not a GPU came (8 CPUs, a cached 24 GiB file, engaged: 11.5-12.0 GiB peak RSS against
+    # --cpu-only's 4.0).  A deferred bringup now holds the pool to the CPU pool's lead and
+    # opens the window when a GPU joins.  1 MiB chunks give this 1 GiB fixture a 1,025-
+    # buffer pool against a one-worker lead of 225.  Peak RSS declined: 909-920 MiB on
+    # v0.18.51, 289-301 since (8-H100 server); the bound sits between.
+    bh_pool() {   # bh_pool NAME ENV... -> $TMPDIR/bh.err, $TMPDIR/bh.rss, then a CPU round trip
+      local name=$1; shift
+      local tw=(); [[ -x /usr/bin/time ]] && tw=(/usr/bin/time -f %M -o "$TMPDIR/bh.rss")
+      env GZSTD_DEBUG_GPU_GUARD_SEC=0.05 "$@" timeout --foreground -k 10 120 \
+        "${tw[@]}" "$GZSTD" --hybrid -T 1 --chunk-size 1 --no-mmap -vv \
+        -k -f "$TMPDIR/bh.b64" -o "$TMPDIR/bhc.zst" 2>"$TMPDIR/bh.err" || bh_why+=" $name:rc=$?"
+      "$GZSTD" --cpu-only -d -q -c "$TMPDIR/bhc.zst" 2>/dev/null | cmp -s - "$TMPDIR/bh.b64" \
+        || bh_why+=" $name:bytes"
+    }
+    bh_pool_said() { tr '\r' '\n' < "$TMPDIR/bh.err" | grep -aoE 'zero-copy pool [0-9]+ buffers[^\\]*|GPU window opens[^\\]*' | tr '\n' ' '; }
+    # A host short of RAM sizes the pool below the lead itself (a quarter of what is
+    # available; 512 MiB free makes 128 buffers): no lead to name, and the pool's own
+    # size then bounds the readers (Codex review).  225 = one worker + 128 + 32 x 3 readers.
+    bh_pool_ok() {
+      grep -qaE 'zero-copy pool [0-9]+ buffers, [0-9]+ until a GPU joins' "$TMPDIR/bh.err" && return 0
+      local n; n=$(grep -aoE 'zero-copy pool [0-9]+ buffers' "$TMPDIR/bh.err" | head -1 | grep -oE '[0-9]+')
+      [[ -n "$n" ]] && (( n <= 225 ))
+    }
+    bh_pool pool-keeps-up GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=empty
+    { bh_pool_ok && grep -qa 'skipping GPU bringup' "$TMPDIR/bh.err" \
+        && ! grep -qa 'GPU window opens' "$TMPDIR/bh.err" \
+        && ! grep -qaE '[0-9]+ device workers? online' "$TMPDIR/bh.err"; } \
+      || bh_why+=" pool-keeps-up:[$(bh_err) $(bh_pool_said)]"
+    # The RSS half on a 6.4+ kernel only: an older one prefaults the pool's first 4 GiB
+    # on purpose (DirectReadPool::init: faults during reads contend on mmap_lock there),
+    # about 2 GiB of this fixture's 2 MiB slots, whatever the lead (Codex review).
+    bh_kv=$(uname -r | awk -F. '{ printf "%d", $1 * 1000 + $2 }')
+    if [[ -x /usr/bin/time ]] && (( bh_kv >= 6004 )); then
+      bh_rss=$(tail -1 "$TMPDIR/bh.rss" 2>/dev/null)
+      [[ "$bh_rss" =~ ^[0-9]+$ ]] && (( bh_rss < 614400 )) \
+        || bh_why+=" pool-keeps-up:peak-${bh_rss:-?}KiB(want<600MiB)"
+    fi
+    # Engaged, the window opens to the whole pool -- after the pool was built (the
+    # line), or before it (the pool line then names no lead).
+    bh_pool pool-behind GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting GZSTD_DEBUG_ACQUIRE_DELAY_US=50000
+    { grep -qaE '[0-9]+ device workers? online' "$TMPDIR/bh.err" \
+        && { grep -qaE 'GPU window opens: ([0-9]+) of \1 buffers' "$TMPDIR/bh.err" \
+             || ! grep -qa 'until a GPU joins' "$TMPDIR/bh.err"; }; } \
+      || bh_why+=" pool-behind:[$(bh_err) $(bh_pool_said)]"
+    rm -f "$TMPDIR/bhc.zst" "$TMPDIR/bh.rss"
     # A FULL QUEUE IS FRAMES WAITING (v0.18.49): the waiting test read a check that saw
     # the queue at its cap as no reading, so a window spent at the cap "kept up".  The
     # sampler on synthetic signals (a queue full at every check, a ten-second job) must
@@ -12645,6 +12696,26 @@ rs_got=$(GZSTD_DEBUG_SLOT_NOTIFY_SELFTEST=1 timeout --foreground -k 5 20 "$GZSTD
 [[ $rs_rc -eq 0 && "$rs_got" == slot-next-frame-woke ]] || rs_why="exit $rs_rc, output [$rs_got]"
 [[ -z "$rs_why" ]] && pass "a GPU slot's next frame wakes the waiting writer" \
   || fail "a GPU slot's next frame wakes the waiting writer" "$rs_why"
+
+# FRAME-SIZED BUFFERS ARE RECYCLED, NOT RETURNED (v0.18.52).  glibc deleted a thread
+# arena's 64 MiB heap the moment it emptied, so a frame allocated on one thread and
+# freed on another landed in fresh memory, faulted in 4 KiB at a time: an engaged
+# two-card --tar compress at 8 CPUs faulted 2.0M pages against --cpu-only's 0.65M and
+# lost 8%.  GZSTD_DEBUG_FRAMEMEM_SELFTEST checks FrameMem's rules on blocks it never
+# touches: reuse, best fit within half again, across threads, same-size page reuse
+# under a limit, the cache's byte cap, a foreign pointer freed, everything mapped
+# within the live high-water plus the slack, zeroed bytes in a dirty recycled block,
+# and (GZSTD_DEBUG_FRAMEMEM_THP=1) 2 MiB alignment.  No CUDA, no timing, no page
+# faulted: both builds.
+fm_why=""
+for fm_env in "" GZSTD_DEBUG_FRAMEMEM_THP=1; do
+  fm_rc=0
+  fm_got=$(env $fm_env GZSTD_DEBUG_FRAMEMEM_SELFTEST=1 timeout --foreground -k 5 20 "$GZSTD" \
+             </dev/null 2>/dev/null) || fm_rc=$?
+  [[ $fm_rc -eq 0 && "$fm_got" == "framemem ok" ]] || fm_why+=" [${fm_env:-plain}: exit $fm_rc, output $fm_got]"
+done
+[[ -z "$fm_why" ]] && pass "frame-sized buffers are recycled within the live high-water" \
+  || fail "frame-sized buffers are recycled within the live high-water" "$fm_why"
 
 
 # ────────────────────────────────────────────────────────────

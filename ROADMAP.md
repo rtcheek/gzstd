@@ -1004,7 +1004,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     rule already hands the crossover to `--adapt`'s budget prior, which measures both arms per machine
     (Codex agreed).  Open only for a sensed rule; a one-card host is the case staging was built for.
 
-44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  MOSTLY FIXED v0.18.51
+44. **A hybrid --tar compress loses to --cpu-only at 8 CPUs, on both card counts tried.**  MOSTLY FIXED v0.18.51, the rest v0.18.52
     (three defects, below); the engaged 8-CPU loss that is left belongs to 42a.  Found in v0.18.50's
     pre-tag round trips: the device rule leaves --tar alone (`!opt.tar_mode`), so every card starts, but the count
     is not the sole cause -- two cards improve on eight and still lose.  Two 13 GB base64 files as one --tar archive, 8 CPUs, cached, wall s, two rounds: `--cpu-only`
@@ -1043,6 +1043,22 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     GPU path's host copies beside a reader that copies cost more CPU than 8 CPUs have spare (each card's stream ran
     1.2-1.5 GiB/s), and the 4.0 s guard (the sample engaged at 4.7 s remaining) does not price that.  A measured
     hybrid price (42a) should be keyed by reader path -- copying or mmap -- as well as the CPU allowance.
+    **v0.18.52: that explanation was wrong -- it was page faults** (CHANGELOG v0.18.52).  glibc deleted each thread
+    arena's 64 MiB heap as it emptied, so frames freed on another thread were faulted in afresh: --tar engaged 2.0M
+    faults and 11.5 s of kernel time against --cpu-only's 0.65M and 6.7.  MALLOC_ARENA_MAX=1 with glibc's huge pages
+    turned the loss into a win on every reader path (--tar 4.61-4.64 s against 4.79-4.84; mmap 3.83-3.92 against
+    4.80-4.84), which is why the queue depth above changed nothing: every frame was fresh at any depth.  Fixed with a
+    recycler (FrameMem, plain pages: huge pages stall on compaction here when memory is mostly page cache) and a GPU
+    drain whose buffers no longer double: --tar 1.10M faults, 3.8 GiB (6.5 on v0.18.51).  The pooled reader (--no-mmap,
+    a cold input) also stopped reading ahead into a GPU window that was never opened.  **Left:** (1) DONE, the wall clock on
+    a near-quiet server (CHANGELOG v0.18.52): engaged --tar is within 1% of --cpu-only, 4.94-5.01 s against 4.91-4.94
+    (v0.18.51 5.13-5.27); engaged --no-mmap still trails it, 5.17-5.25 against 5.04-5.13 (v0.18.51 5.34-5.62); (2) the ENGAGED pooled reader
+    keeps v0.18.51's window, each card's streams at the tuner's 256-frame ceiling (1,126 buffers at 8 CPUs), and it
+    still faults: under that load 5.92-5.94 s, 2.9M faults, 10.7 GiB at 1,126 against 5.23-5.34, 1.72M, 5.7 GiB at a
+    134-buffer window (--cpu-only 5.69-5.77).  A smaller window must follow the tuner's live batch, not cut it off,
+    and be measured cold, where the pool's depth keeps reads in flight; the copying readers' byte cap has the same
+    ceiling-sized floor; (3) huge pages for FrameMem only behind a test that predicts compaction stalls (none known:
+    free 2 MiB blocks did not).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

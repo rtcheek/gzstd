@@ -1,12 +1,131 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.51  
+**Covers:** v0.9.50 → v0.18.52  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.52 — frame-sized buffers are recycled instead of faulted in afresh, and a --no-mmap or cold-input compress no longer reads ahead into a GPU window that never opens (ROADMAP 44's remainder; 8-H100 server, 8 CPUs, two cards, two cached 12 GiB files as one --tar archive: 5.13-5.27 -> 4.94-5.01 s, --cpu-only's 4.91-4.94; 2.0M -> 1.1M page faults, 6.5 -> 3.8 GiB peak RSS, 11.9 -> 9.9 s of kernel time; a declined --no-mmap compress of 1 GiB at one worker 909-920 -> 289-301 MiB)
+
+v0.18.51 left the engaged two-card --tar compress at 8 CPUs 4-12% behind --cpu-only and blamed the GPU path's
+host copies beside a reader that copies.  That was wrong.  The cost is page faults, and every thread pays them.
+
+**glibc returned the frames' memory to the kernel between frames.**  A frame is allocated on one thread and freed on
+another: a reader fills a Task's bytes and a worker releases them; a GPU drain or a CPU worker fills an output
+buffer and the writer drops it.  glibc serves a 16 MiB block from the ALLOCATING thread's arena, whose heaps are
+64 MiB mappings, and deletes a heap the moment it empties.  main()'s M_TRIM_THRESHOLD (256 MiB) keeps only the main
+heap's top resident; a thread arena's heap is unmapped whatever it says.  The next frame then lands in a fresh
+mapping, faulted in 4 KiB at a time by whichever thread touches it first.  A hybrid run frees out of order on more
+threads and churns harder.  MEASURED, 8 CPUs, two cards (cards 1 and 4, idle), two cached 12 GiB base64 files, to
+/dev/null, before another user's job filled the server:
+
+| arm | wall | kernel | page faults | note |
+|---|---|---|---|---|
+| --tar, --cpu-only | 4.95 s | 6.7 s | 0.65M | |
+| --tar, two cards | 5.36-5.40 | 11.5 | 2.0M | strace: 161 64 MiB heaps unmapped (--cpu-only 83) |
+| --tar, two cards, MALLOC_ARENA_MAX=1 | 5.12-5.16 | 10.0-10.3 | 1.1-1.3M | no thread heap to delete |
+| --tar, two cards, one arena + glibc.malloc.hugetlb=1 | 4.61-4.64 | 8.3-8.4 | 9k | --cpu-only so: 4.79-4.84 |
+| plain file (mmap), two cards / one arena + huge pages | 4.44-4.64 / 3.83-3.92 | | 1.43M / 0.41M | --cpu-only 4.80-4.84 |
+
+Per thread (the --tar hybrid): the three assembler threads faulted 865k pages against --cpu-only's 420k, the six CPU
+workers 600k against 210k and spent 9% more user time a frame, the GPU drain threads 575k.
+
+**FrameMem.**  A block of 2 MiB or more now comes from a process-wide recycler: mapped in 2 MiB grains (a frame's
+compressed size varies by bytes; a grain keeps one class), handed out best-fit and never more than half again its
+size, kept when freed, and unmapped only to hold everything mapped within an eighth (at most 256 MiB) of the run's
+high-water of live blocks.  Its cache holds at most an eighth of the memory available at startup (a container's
+headroom included) and of -M/--memlimit; under either limit a block serves only its own size, rounded to the page,
+so no filled tail stays resident beyond what the queue charges.  Every output frame (FrameVec) and every copied
+input frame (Task's bytes) takes it.  A pointer it never mapped (malloc's, after a failed mapping) goes back to
+free().
+
+PLAIN PAGES.  Huge pages measured far better with memory free (the table's third row), but this server has twice
+measured lazily faulted huge pages stalling on direct compaction where memory is mostly page cache (11.9-14.3 s
+against 5.0-5.2 on plain pages; DirectReadPool's comment), free 2 MiB blocks no predictor -- and a recycler's fresh
+blocks are exactly such faults.  GZSTD_DEBUG_FRAMEMEM_THP=1 asks for them, the A/B control; GZSTD_DEBUG_FRAMEMEM=0
+turns FrameMem off.
+
+**The GPU drain's output buffers doubled.**  Its pooled buffers were sized to their first frame (12.06 MiB for
+base64), and the first slightly larger frame made the vector double one to 24 MiB: 70 fresh 26 MiB mappings in a
+plain hybrid run, each pushing FrameMem past its bound and evicting the CPU workers' blocks, so the plain path
+faulted MORE than v0.18.51 until this changed.  A buffer too small now grows by an eighth, capped at nvCOMP's largest
+compressed frame.  Not straight to that largest frame: 18 MiB output blocks out-sized a --tar run's 16 MiB input
+frames, which then took them (1.85-1.89M faults); 14 MiB ones reuse the inputs' blocks instead.
+
+MEASURED, the same machine and files, 8 CPUs, two cards, three shuffled rounds -- while another user's job held
+every one of the 256 CPUs at ~90%, so page faults, kernel time and peak RSS are the evidence here, not wall time
+(each arm's own CPUs were contended):
+
+| arm | page faults | kernel | peak RSS |
+|---|---|---|---|
+| --tar, v0.18.51 | 1.97-2.01M | 11.9 s | 6.5-6.6 GiB |
+| --tar, FrameMem without the drain fix | 1.41-1.46M | 10.7 | 4.3-4.4 |
+| --tar, v0.18.52 | 1.10-1.12M | 9.9-10.0 | 3.8-3.9 |
+| --tar, --cpu-only, v0.18.52 | 0.34-0.35M | 5.8-6.0 | 0.7 |
+| plain (mmap), v0.18.51 | 1.45-1.53M | 6.2-6.4 | 4.8-5.3 |
+| plain (mmap), FrameMem without the drain fix | 1.58-1.63M | 6.3-6.6 | 4.7-4.9 |
+| plain (mmap), v0.18.52 | 1.30-1.34M | 5.8-5.9 | 4.7-4.9 |
+
+**A pooled reader read ahead into a GPU window that never opened.**  --no-mmap, and the default reader for a cold
+or partly cached input, queue VIEWS into one DirectReadPool, which the queue's byte cap counts as zero bytes.  The
+pool is sized for the GPU window from the first frame -- the CPU pool, 32 per reader and 1,024 for the cards'
+batches, 1,126 16 MiB buffers at 8 CPUs, 17.6 GiB -- and its readers ran that far ahead whether or not a GPU ever
+came.  v0.18.51 fixed exactly this for the byte cap of readers that copy, not for this pool.  A deferred bringup now
+holds the pool, and the queue's depth cap with it, to compress_cpu_mt's lead (its CPU pool, 128, 32 per reader),
+and the bringup opens the window before any GPU worker exists; a decline leaves it shut.
+DirectReadPool::set_limit bounds the slots held at once, and its LIFO free list makes that the slots ever touched.
+-vv: "zero-copy pool N buffers, M until a GPU joins", "[POOLED-READ] the GPU window opens".  MEASURED, a 1 GiB file,
+1 MiB chunks, one worker, the sample declining: peak RSS 909-920 MiB on v0.18.51, 289-301 here.
+
+**Still open (ROADMAP 42a):** an ENGAGED --no-mmap run keeps the whole window, which is v0.18.51's rule for the byte
+cap too (each card's streams at the tuner's 256-frame ceiling), and it still faults: under the same load, the two
+cached files through --no-mmap on two cards took 5.92-5.94 s, 2.9M faults and 10.6-10.8 GiB with the window at
+1,126 buffers, 5.40-5.66 s at 268, 5.23-5.34 s, 1.72M and 5.7 GiB at 134, against --cpu-only's 5.69-5.77.  A
+smaller window must follow the tuner's live batch rather than cut it off, and the pool is the default reader of a
+cold input, where its depth keeps reads in flight: measured cold, not here.
+
+**Wall clock, measured the next morning on a near-quiet server.**  The same files, 8 CPUs (idle), two idle cards
+(2 and 4; other users' jobs held four others), default verbosity, v0.18.51 and v0.18.52 shuffled together, three
+rounds (five for --no-mmap --cpu-only):
+
+| arm | v0.18.51 | v0.18.52 | page faults | peak RSS |
+|---|---|---|---|---|
+| --tar, --cpu-only | 4.89-4.93 s | 4.91-4.94 s | 0.64-0.70M -> 0.34-0.35M | 0.8 -> 0.7 GiB |
+| --tar, two cards | 5.13-5.27 | 4.94-5.01 | 1.88-2.11M -> 0.99-1.06M | 4.6-5.1 -> 3.4-3.6 |
+| plain (mmap), --cpu-only | 4.80-4.83 | 4.80-4.81 | 0.51M | 0.3 |
+| plain (mmap), two cards | 4.43-4.55 | 4.26-4.36 | 1.43-1.48M -> 1.27-1.29M | 5.0-5.2 -> 4.6-4.9 |
+| --no-mmap, --cpu-only | 5.04-5.13 | 5.04-5.13 | 1.20-1.30M | 3.8 |
+| --no-mmap, two cards | 5.34-5.62 | 5.17-5.25 | 2.64-3.18M -> 2.35-2.44M | 10.1-12.3 -> 9.0-9.2 |
+
+The engaged --tar compress is now within 1% of --cpu-only (means 4.98 and 4.93 s), where v0.18.51 lost 4-8%; the
+mmap one gains 4%; --no-mmap gains 4% and still trails --cpu-only by about 3% (42a above).  One v0.18.52 plain two-card run declined (4.83 s, --cpu-only's
+time; not in the table): over every -vv run this morning the sample estimated 4.16-4.52 s remaining on v0.18.52
+and 4.16-4.50 on v0.18.51, against the 4.0 s guard, so this input sits at the guard's edge on either build.
+Decompression (-vv): 3.45-3.56 s against 3.49-3.61.  At -vv, plain --cpu-only ran 1.2% slower on v0.18.52, inside
+libzstd (median 18.50 ms a frame against 18.26), with GZSTD_DEBUG_FRAMEMEM=0 too, and tied at default verbosity:
+where the workers' buffers land, not work this release adds.
+
+**Review.**  Codex (gpt-6.1-sol, xhigh), five rounds.  Round 1 NOT SAFE: a victim evicted from the count before its
+munmap let a concurrent mapping pass the bound (now unmapped under the lock); the cache, which only FrameMem can
+reuse, could cost a run under a memory limit what glibc would have reused for libzstd's window (the cache cap);
+the self-test's reuse check passed on the kernel's address reuse (it counts mappings now); the RSS bound failed on
+a pre-6.4 kernel, which prefaults the pool on purpose (gated).  Round 2 SAFE TO COMMIT, three adopted: the cap's
+memory reading no longer primes the per-input budget cache, same-size reuse under a limit, MADV_NOHUGEPAGE on
+plain blocks.  Round 3 SAFE, one adopted: page and not grain classes under a limit.  Round 4 SAFE, one adopted: the
+declined --no-mmap arm accepts a pool RAM already sized below the lead.  Round 5, on the drain change: SAFE TO
+COMMIT, no findings.
+
+**Suite.**  A default cell on both builds runs GZSTD_DEBUG_FRAMEMEM_SELFTEST, plain and with huge pages: reuse,
+best fit, across threads, same-size page reuse under a limit, the cache cap, a foreign pointer, the mapped bound, a
+zeroed HostBytes in a dirty block, 2 MiB alignment -- no page faulted, no CUDA.  Four mutants (no caching, unlimited
+best fit, no eviction, a release past the cache cap) each fail it.  The bringup-sample cell (-e) gains --no-mmap
+arms: declined, the lead and no window, peak RSS under 600 MiB on a 6.4+ kernel (v0.18.51 fails both); engaged, the
+window opens to the whole pool.  575 -> 576 default, 922 -> 923 -e.  Run once on the staged tree (under the same
+256-CPU load): -e 922 passed, 0 failed, 1 skipped (host could not exercise it); CPU-only 412 passed, 0 failed.
 
 
 ## v0.18.51 — a hybrid --tar compress whose GPUs are declined reads like --cpu-only, an engaged one no longer locks its CPU pool out, and it starts two cards, not every one (ROADMAP 44; 8-H100 server, cached: a 12 GiB file at 8 CPUs, declined, 2.88-3.42 -> 2.56-2.58 s and 4.6-6.3 -> 0.76 GiB peak RSS; two 12 GiB files at 6 CPUs 9.10-9.47 -> 6.25-6.31 s, at 8 CPUs 8.29-8.65 -> 5.27-5.70)
