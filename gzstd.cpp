@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.55";
+static constexpr const char * GZSTD_VERSION = "0.18.56";
 //
 // Architecture overview:
 //
@@ -30868,6 +30868,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
          + std::to_string(nchunks) + " chunks\n");
 
   std::atomic<size_t> next_chunk{0};
+  std::atomic<size_t> unfilled_chunks{0};   // read without a zero fill (assemble_chunk)
 
   // Reorder buffer: readers deposit completed chunks here; a pusher drains them
   // to the queue in strict order.  Readers may only CLAIM a chunk once it is
@@ -31133,8 +31134,13 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     uint64_t a = (uint64_t)ci * chunk_size;
     uint64_t b = std::min(total, a + chunk_size);
     size_t clen = (size_t)(b - a);
+    // First entry whose data/padding could reach into this chunk (entry_end > a):
+    // the walk below starts here, and an unfilled block is judged by it.
+    const auto first = std::upper_bound(lay.entries.begin(), lay.entries.end(), a,
+                         [](uint64_t v, const TarEntry & e) { return v < e.entry_end; });
     Task t; t.seq = ci;
     char * outp = nullptr;
+    bool unfilled = false;        // outp is an uninitialised block (below)
 #ifdef HAVE_NVCOMP
     int    slot = staged_slot;
     GdsStagePool * stage = g_gds_stage_pool.load(std::memory_order_acquire);
@@ -31189,8 +31195,53 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     } else
 #endif
     {
-      t.data.assign(clen, 0);
-      outp = t.data.data();
+      // A CHUNK OF ONE MEMBER'S DATA IS READ INTO AN UNFILLED BLOCK (v0.18.56).
+      // Every chunk used to start as a zero-filled vector, for three things that
+      // need zeros: tar's padding and end blocks, a sparse member's holes, and a
+      // short read's tail (GNU parity).  A chunk that lies wholly inside one
+      // non-sparse member's data has neither padding nor holes -- its reads cover
+      // every byte -- so the fill was a 16 MiB write the reads then overwrote:
+      // without it a 24 GiB run's user time went 30.1 -> 28.3 s, ~1.1 s of it the
+      // readers' and the rest the workers' (most likely the fill's writes evicting
+      // their compression state from the L3 they share; inferred).  MEASURED,
+      // the same binary against the fill (GZSTD_DEBUG_TAR_FILL=1), one member of
+      // 24 GiB, cached, 8 CPUs: --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51;
+      // 16 CPUs 2.33 -> 2.25; 97 GiB 19.33 -> 19.01 and, two cards, 14.66 ->
+      // 13.66, the cards taking 2-3% more of the frames.  Such a chunk is
+      // held as a view of its own recycled block (FrameVec, uninitialised), the
+      // way the pipe reader's blocks have been since v0.18.11; read_seg zeroes a
+      // short read's tail itself.  Every other chunk keeps the zero-filled vector:
+      // the walk below writes only what it reads.
+      //   GZSTD_DEBUG_TAR_FILL=1       fill every chunk (the A/B control)
+      //   GZSTD_DEBUG_TAR_FILL=poison  fill an unfilled chunk with 0xA5 instead, so a
+      //                                byte its reads miss shows up in the archive
+      //   GZSTD_DEBUG_TAR_READ_GATE    FIFO: the first unfilled chunk waits there before
+      //                                its reads (gz_fifo_gate; the suite shrinks a
+      //                                member under an open descriptor at it)
+      static const char * const fill_env = ::getenv("GZSTD_DEBUG_TAR_FILL");
+      static const bool fill_all = fill_env && std::strcmp(fill_env, "1") == 0;
+      static const bool fill_poison = fill_env && std::strcmp(fill_env, "poison") == 0;
+      if (!fill_all && first != lay.entries.end() && first->size > 0 && first->sparse_map.empty()
+          && first->hdr_off + first->hdr_len <= a && first->data_off <= a
+          && first->data_off + first->size >= b) {
+        auto blk = std::make_shared<FrameVec>();
+        blk->resize(clen);
+        outp = blk->data();
+        if (fill_poison) std::memset(outp, 0xA5, clen);
+        t.view_ptr = outp;
+        t.view_len = clen;
+        t.block    = std::move(blk);
+        unfilled   = true;
+        unfilled_chunks.fetch_add(1, std::memory_order_relaxed);
+#ifndef _WIN32
+        static const bool gate_set = ::getenv("GZSTD_DEBUG_TAR_READ_GATE") != nullptr;
+        static std::atomic<bool> gated{false};
+        if (gate_set && !gated.exchange(true)) gz_fifo_gate("GZSTD_DEBUG_TAR_READ_GATE");
+#endif
+      } else {
+        t.data.assign(clen, 0);
+        outp = t.data.data();
+      }
     }
     // One frame, two possible destinations: host bytes go through here so the
     // assembly logic below stays identical in both.
@@ -31205,9 +31256,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
 #endif
       std::memcpy(outp + (voff - a), src, len);
     };
-    // First entry whose data/padding could reach into this chunk (entry_end > a).
-    auto it = std::upper_bound(lay.entries.begin(), lay.entries.end(), a,
-                [](uint64_t v, const TarEntry & e) { return v < e.entry_end; });
+    auto it = first;
     std::vector<char> hdrbuf;
     for (; it != lay.entries.end() && it->hdr_off < b; ++it) {
       const TarEntry & e = *it;
@@ -31224,7 +31273,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         // e.size == 0 means the data-region block below never runs at all.
         if (e.size == 0 && e.src_id_ok) select_src(e, sc);
       }
-      // Data region (file bytes); padding stays zero.  For a sparse entry the
+      // Data region (file bytes); padding stays zero (a chunk with padding is
+      // always zero-filled: assemble_chunk's unfilled block is one member's data
+      // only).  For a sparse entry the
       // data region holds the concatenated data segments, so a virtual (stored)
       // offset maps to a file offset via the segment map; non-sparse is linear.
       if (e.size > 0) {
@@ -31241,7 +31292,8 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
           // entry THIS record describes.
           select_src(e, sc);
           // Read `len` bytes from file offset `foff` into the chunk at virtual
-          // offset `voff`.  On short read the remainder stays zero (GNU parity).
+          // offset `voff`.  On short read the remainder is zero (GNU parity): from
+          // the fill, or, in an unfilled block, from the memset after the reads.
           auto read_seg = [&](off_t foff, uint64_t voff, size_t len) {
             size_t done = 0;
             if (sc.fd >= 0) {
@@ -31466,6 +31518,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                 if (m) m->reader_io_ns.fetch_add(io_dt, std::memory_order_relaxed);
               }
             }
+            // An unfilled block has no zeros to fall back on: the bytes a short
+            // read (or a member that would not open) left are zeroed here.
+            if (unfilled && done < len) std::memset(outp + (voff - a) + done, 0, len - done);
             if (done < len) {
               g_tar_had_errors.store(true, std::memory_order_relaxed);
               if (sc.fd < 0 && !sc.err_reported) {
@@ -31717,6 +31772,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   rd_ctl_t.stop();
   if (rd_super_t.joinable()) rd_super_t.join();
   if (rd_wd.joinable()) rd_wd.join();
+  if (opt.verbosity >= V_DEBUG)
+    vlog(V_DEBUG, opt, "[TAR] " + std::to_string(unfilled_chunks.load()) + " of "
+         + std::to_string(nchunks) + " chunks read without a zero fill (one member's data)\n");
   if (rd_ad_t) {
     if (m) m->reader_threads.store(rd_ctl_t.want(), std::memory_order_relaxed);
     g_adapt_rd_settled.store(rd_ctl_t.want(), std::memory_order_relaxed);

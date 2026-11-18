@@ -1,12 +1,85 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.55  
+**Covers:** v0.9.50 → v0.18.56  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.56 — a --tar chunk of one member's data is read into an unfilled block, not zero-filled first and then overwritten (ROADMAP 42a; 8-H100 server, idle cards, cached, one 24 GiB member at 8 CPUs: --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51; 97 GiB 19.33 -> 19.01 and, two cards, 14.66 -> 13.66)
+
+**First, what the 24 GiB --tar "gap" was.**  v0.18.55 left an engaged --tar compress at 24 GiB tying --cpu-only
+where --no-mmap and mmap won 5% and 11%.  Most of that was the fixture: its two files cost more to read out of the
+page cache than plain.b64 does.  One thread reading 12 GiB with dd, kernel time from CPU 0 (the runs' socket) and
+CPU 64 (the other):
+
+| file | its cached pages (numa_maps, first 2 GiB) | CPU 0 | CPU 64 |
+|---|---|---|---|
+| plain.b64 | node 0 | 0.93 s | 1.27 |
+| d/a.b64 | node 1 | 2.03 | 1.36 |
+| d/b.b64 | node 0 | 1.63 | 2.55 |
+
+So half the tree is on the far socket from CPUs 0-7, and even read locally both files cost 1.5-1.8x what
+plain.b64 does; why is not measured (the page cache's folio sizes are the likely difference).  An engaged --tar is
+the shape whose readers the cards wait on.  A --tar of a hard link of plain.b64 -- the same cached pages, as the
+97 GiB --tar fixture already was -- engaged in 4.62-4.79 s (12 runs) against --cpu-only's 4.92-5.02: the 5%
+--no-mmap wins.
+
+**Then a cost the fixture had hidden.**  The tar assembler built every chunk in a zero-filled vector
+(`t.data.assign(clen, 0)`) and then preaded the member's bytes over it.  The zeros are needed for tar's padding and
+end blocks, a sparse member's holes and a short read's tail (GNU parity), but a chunk that lies wholly inside one
+non-sparse member's data has none of them: the fill was a 16 MiB write the reads overwrote.  Removing it took the
+run's user time from 30.1 to 28.3 s (the same binary against the fill, below).  Per thread, before (24 GiB,
+--cpu-only, 8 CPUs): the three tar readers spent 1.13 s of user time the pooled readers do not spend, and the six
+workers 0.89 s more than --no-mmap's on the same bytes (shifted by the tar headers).  That the workers' share is the
+fill's writes evicting their compression state from the 32 MiB L3 the eight CPUs share is an inference, not
+measured.
+
+**Such a chunk is now read into an uninitialised block** (FrameVec, from FrameMem like every frame buffer), held
+by its Task as a view with shared ownership -- the compress pipe reader's form since v0.18.11, so every consumer
+(CPU workers, the cards, the queue's byte cap, release) already takes it.  read_seg zeroes a short read's tail
+itself, or the whole segment when the member would not open.  Every other chunk -- a header, padding, the end
+blocks, a sparse member, several members -- keeps the zero-filled vector; so do the staged (--direct-stage,
+--gds-only) paths.  -vv: "[TAR] N of M chunks read without a zero fill (one member's data)".
+GZSTD_DEBUG_TAR_FILL=1 fills every chunk (the A/B control); =poison fills an unfilled block with 0xA5 first, so a
+byte its reads miss reaches the archive.  GZSTD_DEBUG_TAR_READ_GATE (FIFO) holds the first unfilled chunk before
+its reads.
+
+MEASURED, the same binary against GZSTD_DEBUG_TAR_FILL=1, idle cards, cached, to /dev/null, shuffled, medians:
+
+| shape | zero-filled | v0.18.56 |
+|---|---|---|
+| one 24 GiB member, 8 CPUs, --cpu-only (5 rounds) | 4.89-4.98 s, usr 30.1 | 4.78-4.83, usr 28.3 |
+| the same, two cards | 4.69-4.95 (median 4.72) | 4.45-4.71 (4.51) |
+| 97 GiB, 8 CPUs, --cpu-only (4 rounds) | 19.31-19.48 | 18.93-19.04 |
+| the same, two cards | 14.60-14.85, peak RSS 6.0 GiB | 13.31-13.81, 7.5 |
+| 24 GiB, 16 CPUs, --cpu-only (4 rounds) | 2.31-2.42 | 2.23-2.28 |
+| the same, default (the cards decline at 16) | 2.33-2.37 | 2.24 |
+| the two-file tree on the far socket, 8 CPUs, --cpu-only / two cards (3 rounds) | 4.90 / 4.97 | 4.76 / 4.76 |
+
+The 97 GiB hybrid gains more than --cpu-only does (1.0 s against 0.3; user time 86.4 -> 76.4 s against 119.4 ->
+113.4), and why is only partly measured.  Two -vv runs a side (attribution only): the cards took 3,746-3,801 of
+~6,226 frames against the fill's 3,667-3,670, and the fill's runs had the only supply-limited tuning window and
+1-frame batch (one of each, in one run); the throttle's peak was the same (266-285 against 278-339 frames).  On the
+far-socket tree a v0.18.55 -vv run had left a card idle 0.8 s after such a batch -- readers that fall behind starve
+the cards -- but at 97 GiB that accounts for 2-3% more frames on the cards, not the whole second.  Whole-file
+checks on the 24 GiB member: --cpu-only byte-identical to the fill, and the default and --gpu-only (two cards)
+archives extract to plain.b64 through GNU tar.
+
+**Tests.**  A new cell in Native tar archiving: (a) a tree whose 1 MiB chunks mix headers, padding, small members,
+members spanning chunks and a sparse file archives byte-identically under poison and under the fill, plain and
+--sparse, with some -- not all -- chunks read unfilled; (b) a member shrunk to 1.5 MiB at the gate under its open
+descriptor (one reader) keeps its recorded size, extracts as its first 1.5 MiB then zeros, warns "file changed as
+we read it" and exits 1; (c) with a GPU, a poisoned --gpu-only run round-trips.  A build without the tail zeroing
+fails (b); one that takes a chunk running past its member's data as unfilled fails (a).  579 tests (-e 926); the
+no-GPU delta is unchanged.  Suites: default 578/0/1, CPU-only 414/0/133.  Codex (sandboxed, the 42a session): no default-run
+defect; it caught that the cell's GPU arm could pass after a CPU fallback -- it now requires frames delivered by
+a GPU stream, and fails with every bringup forced to fail -- that each chunk searched the entries twice (once
+now), and that an unfilled chunk touched the gate's atomic with no gate set (only when it is set now).  Its review
+of this entry separated measured from inferred.
 
 
 ## v0.18.55 — an engaged hybrid's pooled reader reads ahead only as far as its cards take, not into a flat 1,024-buffer GPU window (ROADMAP 42a; 8-H100 server, idle cards, cached, --no-mmap: 24 GiB at 8 CPUs 4.85-4.89 -> 4.67-4.70 s, now ahead of --cpu-only's 4.8-4.9; 97 GiB 13.77-13.84 -> 13.48-13.49, peak RSS 11-14 -> 7.3-8.6 GiB; 16 CPUs 8.38 -> 8.21)

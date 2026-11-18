@@ -633,8 +633,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=578
-$EXTENSIVE && EXPECTED_TESTS=925
+EXPECTED_TESTS=579
+$EXTENSIVE && EXPECTED_TESTS=926
+# v0.18.56: +1 cell in Native tar archiving (a chunk of one member's data is read
+# without a zero fill), run with or without a GPU: 578 -> 579, -e 925 -> 926, no-GPU
+# delta unchanged (the CPU-only run 413 -> 414).
 # v0.18.54: +1 GPU cell (compress pays the tuner's cost gate), skipped without a GPU, so
 # 577 -> 578, -e 924 -> 925, and the no-GPU delta grows by one (the CPU-only run still 413).
 # v0.18.53: +1 default cell on both builds (memory goes back while the workers finish:
@@ -18394,6 +18397,70 @@ else
   else
     fail "parallel readers (--read-threads 4) round-trip" "tree mismatch"
   fi
+
+  # 9b. A CHUNK OF ONE MEMBER'S DATA IS READ WITHOUT A ZERO FILL (v0.18.56).  It
+  #     goes into an uninitialised recycled block; every other chunk keeps the fill.
+  #     GZSTD_DEBUG_TAR_FILL=poison fills that block with 0xA5 first, so a byte its
+  #     reads miss reaches the archive instead of hiding in a fresh zero page.
+  #     (a) A tree whose 1 MiB chunks mix headers, padding, small members, members
+  #     spanning chunks and a sparse one archives byte-identically to the fill (=1),
+  #     plain and --sparse, with some chunks -- not all -- read unfilled (-vv).
+  #     (b) A member shrunk under its open descriptor at the first unfilled chunk
+  #     (GZSTD_DEBUG_TAR_READ_GATE, one reader) keeps its recorded size, its tail
+  #     reads as zeros (GNU parity) and the run exits 1.  (c) With a GPU, the cards
+  #     take poisoned unfilled chunks and the archive round-trips.  Mutants: no tail
+  #     zeroing fails (b); a chunk past its member's data end taken as unfilled
+  #     fails (a).
+  uf="$TMPDIR/tarfill"; rm -rf "$uf"; mkdir -p "$uf/m/s" "$uf/g" "$uf/x" "$uf/y"; uf_why=""
+  cat "$TARSRC/b/rand.bin" "$TARSRC/b/rand.bin" > "$uf/m/r6.bin"
+  for i in 1 2 3 4 5 6 7 8 9; do head -c $((i * 70001)) "$TARSRC/b/rand.bin" > "$uf/m/s/f$i"; done
+  echo short > "$uf/m/s/t.txt"
+  truncate -s 3M "$uf/m/sp.bin"; head -c 300000 "$TARSRC/b/rand.bin" | dd of="$uf/m/sp.bin" bs=4096 seek=400 conv=notrunc status=none
+  for uf_f in "" --sparse; do
+    GZSTD_DEBUG_TAR_FILL=1 "$GZSTD" --cpu-only -q -f --chunk-size 1 $uf_f -o "$uf/f.tzst" --tar -C "$uf" m 2>/dev/null
+    rc=0; GZSTD_DEBUG_TAR_FILL=poison "$GZSTD" --cpu-only -vv -f --chunk-size 1 $uf_f -o "$uf/p.tzst" \
+      --tar -C "$uf" m 2>"$uf/p.err" >/dev/null || rc=$?
+    [[ $rc -eq 0 ]] || uf_why+=" [${uf_f:-plain}: exit $rc]"
+    cmp -s "$uf/f.tzst" "$uf/p.tzst" || uf_why+=" [${uf_f:-plain}: unfilled chunks changed the archive]"
+    uf_n=$(grep -ao '\[TAR\] [0-9]* of [0-9]* chunks read without a zero fill' "$uf/p.err" | awk '{print $2, $4}')
+    read -r uf_u uf_t <<< "$uf_n"
+    [[ -n "$uf_u" && "$uf_u" -gt 0 && "$uf_u" -lt "$uf_t" ]] \
+      || uf_why+=" [${uf_f:-plain}: unfilled chunks '${uf_n:-no -vv line}', want some of all]"
+  done
+  # (b) 6 MB member, one reader: chunk 0 holds the headers and opens it, chunk 1 is
+  # the first unfilled one; at the gate the file drops to 1.5 MiB.
+  cp "$uf/m/r6.bin" "$uf/g/v"; uf_sz=$(stat -c %s "$uf/g/v")
+  { head -c 1572864 "$uf/g/v"; head -c $((uf_sz - 1572864)) /dev/zero; } > "$uf/want"
+  mkfifo "$uf/gate"
+  GZSTD_DEBUG_TAR_FILL=poison GZSTD_DEBUG_TAR_READ_GATE="$uf/gate" timeout --foreground -k 10 120 \
+    "$GZSTD" --cpu-only -f --chunk-size 1 --read-threads 1 -o "$uf/s.tzst" --tar -C "$uf" g \
+    >/dev/null 2>"$uf/s.err" &
+  uf_pid=$!; uf_gated=0
+  timeout 60 sh -c 'exec 9>"$1/gate" || exit 1; truncate -s 1572864 "$1/g/v" || exit 1
+                    printf go >&9; exec 9>&-' sh "$uf" && uf_gated=1
+  wait "$uf_pid" 2>/dev/null; uf_rc=$?
+  ( cd "$uf/x" && "$GZSTD" --cpu-only -q -d --tar "$uf/s.tzst" >/dev/null 2>&1 )
+  if [[ $uf_gated != 1 ]]; then uf_why+=" [the run never reached GZSTD_DEBUG_TAR_READ_GATE]"
+  else
+    [[ $uf_rc -eq 1 ]] || uf_why+=" [shrunk member: exit $uf_rc, want 1]"
+    grep -aq 'file changed as we read it' "$uf/s.err" || uf_why+=" [shrunk member: no 'file changed' warning]"
+    cmp -s "$uf/x/g/v" "$uf/want" || uf_why+=" [shrunk member: not its first 1.5 MiB then zeros]"
+  fi
+  # (c) the cards' path.  A card that cannot start falls back to the CPU and would
+  # round-trip too, so the arm also requires frames delivered by a GPU stream (-vv's
+  # per-stream totals; Codex review).
+  if has_gpu 2>/dev/null; then
+    rc=0; GZSTD_DEBUG_TAR_FILL=poison "$GZSTD" --gpu-only --gpu-devices 1 -vv -f --chunk-size 1 \
+      -o "$uf/gp.tzst" --tar -C "$uf" m >/dev/null 2>"$uf/gp.err" || rc=$?
+    uf_g=$(grep -ao '\] total batches=[0-9]* chunks=[0-9]*' "$uf/gp.err" | awk -F'chunks=' '{s += $2} END {print s + 0}')
+    [[ $rc -eq 0 ]] || uf_why+=" [--gpu-only: exit $rc]"
+    [[ $uf_g -gt 0 ]] || uf_why+=" [--gpu-only: no frame reached a GPU stream, so the arm proves nothing]"
+    ( cd "$uf/y" && "$GZSTD" --cpu-only -q -d --tar "$uf/gp.tzst" >/dev/null 2>&1 )
+    diff -r "$uf/m" "$uf/y/m" >/dev/null 2>&1 || uf_why+=" [--gpu-only: poisoned unfilled chunks did not round-trip]"
+  fi
+  [[ -z "$uf_why" ]] && pass "a chunk of one member's data is read without a zero fill, and a short read's tail is still zero" \
+    || fail "a chunk of one member's data is read without a zero fill" "$uf_why"
+  rm -rf "$uf"
 
   # 10. Empty source list is a usage error.
   rc=0; "$GZSTD" -q -f -o "$ARC" --tar 2>/dev/null || rc=$?

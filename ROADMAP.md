@@ -1078,6 +1078,13 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     13.77 -> 13.49).  An engaged hybrid now opens its workers and readers plus a batch per stream and one more;
     --gpu-only keeps the whole pool (held to a hybrid's lead, two cards lost 42%).  Not done: a window that follows the
     tuner's live proposals (sized here from the start; a run whose cards grow to 128 is the case to measure).
+    **v0.18.56: the --tar tie at 24 GiB was mostly the fixture, then the zero fill** (CHANGELOG v0.18.56): the two-file
+    tree's files cost 1.5-2.2x plain.b64's kernel time to read from CPU 0 (one of them cached on the other socket; why
+    the local one costs more is not measured); on a hard link of plain.b64 engaged --tar wins ~5% like --no-mmap.
+    Then every tar chunk was zero-filled before its preads overwrote it (user time 30.1 -> 28.3 s per 24 GiB without
+    it, the same binary); a chunk of one member's data is now read into an unfilled block: 24 GiB at 8 CPUs
+    --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51; 97 GiB two cards 14.66 -> 13.66.  Compare reader paths on one
+    inode (a hard link), not on two fixtures.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
