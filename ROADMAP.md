@@ -1073,6 +1073,11 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     gate for a size never run (15.11 -> 14.11 s; --tar 16.03 -> 14.97).  Still open: the frames held scale with the
     whole frame rate times the batch latency, which the tuner does not price -- a long enough input still pays one
     trial -- and FrameMem's plain pages (huge pages need a compaction-stall predictor; none known).
+    **v0.18.55: Left (2) above reversed, measured** (CHANGELOG v0.18.55): with the tuner steady, the engaged pooled
+    reader's flat 1,024-buffer GPU window cost 2-4% (24 GiB at 8 CPUs 4.85 -> 4.70 s, now ahead of --cpu-only; 97 GiB
+    13.77 -> 13.49).  An engaged hybrid now opens its workers and readers plus a batch per stream and one more;
+    --gpu-only keeps the whole pool (held to a hybrid's lead, two cards lost 42%).  Not done: a window that follows the
+    tuner's live proposals (sized here from the start; a run whose cards grow to 128 is the case to measure).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

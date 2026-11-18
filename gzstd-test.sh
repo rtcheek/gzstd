@@ -7344,13 +7344,32 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
       [[ "$bh_rss" =~ ^[0-9]+$ ]] && (( bh_rss < 614400 )) \
         || bh_why+=" pool-keeps-up:peak-${bh_rss:-?}KiB(want<600MiB)"
     fi
-    # Engaged, the window opens to the whole pool -- after the pool was built (the
-    # line), or before it (the pool line then names no lead).
+    # Engaged, a hybrid opens what its cards take, not the whole pool (v0.18.55): its
+    # worker and readers (1 + 32 x 3), plus a 64-frame start (this fixture's sixteenth)
+    # for every stream and one more -- 289 on one card, 417 on two, of 1,025 -- and
+    # never less than the CPU lead (225).  The line is logged whether the pool was
+    # built before the bringup opened it or after.  The whole pool (v0.18.52-54's
+    # window, GZSTD_DEBUG_POOL_LEAD=full) fails it.
     bh_pool pool-behind GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting GZSTD_DEBUG_ACQUIRE_DELAY_US=50000
+    bh_open=$(grep -aoE 'GPU window opens: [0-9]+ of [0-9]+ buffers' "$TMPDIR/bh.err" | tail -1 | grep -oE '[0-9]+' | tr '\n' ' ')
+    read -r bh_lead bh_pool_n <<< "$bh_open"
+    # A host short of RAM caps the pool itself (a quarter of what is available): at or
+    # under the two-card budget the lead is the pool, rightly, and only the bounds are
+    # checked -- the shrink is not exercisable there (Codex review).
     { grep -qaE '[0-9]+ device workers? online' "$TMPDIR/bh.err" \
-        && { grep -qaE 'GPU window opens: ([0-9]+) of \1 buffers' "$TMPDIR/bh.err" \
-             || ! grep -qa 'until a GPU joins' "$TMPDIR/bh.err"; }; } \
+        && [[ "$bh_lead" =~ ^[0-9]+$ && "$bh_pool_n" =~ ^[0-9]+$ ]] \
+        && (( bh_lead >= (bh_pool_n < 225 ? bh_pool_n : 225) && bh_lead <= bh_pool_n )) \
+        && (( bh_pool_n <= 417 || bh_lead < bh_pool_n )); } \
       || bh_why+=" pool-behind:[$(bh_err) $(bh_pool_said)]"
+    # --gpu-only keeps the whole pool: its cards are the only consumer, and held to
+    # a hybrid's lead two cards ran 11.68 -> 16.55 s (97 GiB, 16 MiB frames).
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --gpu-only --chunk-size 1 --no-mmap -vv -k -f "$TMPDIR/bh.b64" -o "$TMPDIR/bhc.zst" \
+      2>"$TMPDIR/bh.err" || bh_why+=" pool-gpu-only:rc=$?"
+    "$GZSTD" --cpu-only -d -q -c "$TMPDIR/bhc.zst" 2>/dev/null | cmp -s - "$TMPDIR/bh.b64" \
+      || bh_why+=" pool-gpu-only:bytes"
+    grep -qaE 'GPU window opens: ([0-9]+) of \1 buffers' "$TMPDIR/bh.err" \
+      || bh_why+=" pool-gpu-only:[$(bh_pool_said)]"
     rm -f "$TMPDIR/bhc.zst" "$TMPDIR/bh.rss"
     # A FULL QUEUE IS FRAMES WAITING (v0.18.49): the waiting test read a check that saw
     # the queue at its cap as no reading, so a window spent at the cap "kept up".  The

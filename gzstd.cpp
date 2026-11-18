@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.54";
+static constexpr const char * GZSTD_VERSION = "0.18.55";
 //
 // Architecture overview:
 //
@@ -43384,20 +43384,47 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // the pool to compress_cpu_mt's lead (its CPU pool, 128, 32 per reader) and the
   // bringup opens the window, before any GPU worker exists; a decline leaves it
   // shut.  The pool may be built before or after the bringup decides, hence the
-  // lock.  The queue's depth cap moves with the lead, so wait_for_batch_or_cap's
-  // capacity escape still fires for a batch larger than the lead.
+  // lock.
+  //
+  // AN ENGAGED HYBRID OPENS ONLY WHAT ITS CARDS TAKE (v0.18.55), not the flat
+  // 1,024: its CPU workers and readers (cpu_threads + 32 per reader) plus a batch
+  // for every stream and one more being gathered, at the largest batch any device
+  // starts at (a profile's start can exceed compress_tune_start), and never less
+  // than the CPU lead.  Two cards x two streams at 32: 262 of 1,126.  The 1,024
+  // dates from v0.13.x, when a GPU batch held its inputs until delivery for rescue
+  // on the server's eight cards; both hybrid and GPU-only now release them right
+  // after H2D, before the kernel launches (gpu_worker), so only an upload holds
+  // pooled slots, and every buffer the readers ran ahead into was faulted in for
+  // nothing.  MEASURED, 8-H100 server, idle cards, cached, --no-mmap, the whole
+  // window (GZSTD_DEBUG_POOL_LEAD=full, the A/B control) against this: 97 GiB at
+  // 8 CPUs 13.77 -> 13.49 s (peak RSS 11-14 -> 7.3-7.8 GiB), 24 GiB at 8 CPUs 4.85
+  // -> 4.70 (--cpu-only 4.8-4.9), 97 GiB at 16 CPUs 8.38 -> 8.21, four cards at 16
+  // CPUs 9.34 -> 9.14; cold at 6 CPUs unchanged.  One -vv run held to the CPU lead
+  // put MORE frames on the cards (3,870 against 3,420-3,584) with no supply-limited
+  // window.  GPU-ONLY KEEPS THE WHOLE POOL: there the cards are the only consumer,
+  // and held to the same lead two cards ran 11.68 -> 16.55 s and one card's 1 MiB
+  // frames 5.02 -> 6.50.  A bigger batch than the lead holds stays live: the
+  // queue's capacity escape counts QUEUED frames, and an upload's slots come back
+  // whatever intake or the writer is doing.  The queue and scheduler ceilings move
+  // with the lead (an explicit queue floor sized from 1,126 could otherwise reserve
+  // the whole reachable queue for the cards).
   struct PoolLead {
     std::mutex m;
     DirectReadPool * pool = nullptr;   // set once the producer has built it
     size_t window = 0;                 // the pool's size, the GPU window included
     size_t cpu = 0;                    // compress_cpu_mt's lead
+    size_t base = 0;                   // CPU workers plus reader lead
+    size_t gpu = 0;                    // initial stream batches plus one gathering; 0 = full window
     bool open = false;                 // the GPU window is open
   } pool_lead;
   pool_lead.open = !gpu_joins_later;
   auto pool_lead_apply_locked = [&] {
-    const size_t lead = pool_lead.open ? pool_lead.window
-                                       : std::min(pool_lead.window, pool_lead.cpu);
+    const size_t lead = !pool_lead.open ? std::min(pool_lead.window, pool_lead.cpu)
+                      : pool_lead.gpu ? std::min(pool_lead.window,
+                          std::max(pool_lead.cpu, pool_lead.base + pool_lead.gpu))
+                      : pool_lead.window;
     queue.set_max_depth(lead);         // the queue first: a reader the larger lead
+    if (sched) sched->set_queue_depth_cap(lead);
     pool_lead.pool->set_limit(lead);   // releases must find room to push
     return lead;
   };
@@ -43649,7 +43676,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         // ...and the queue they take their batches from (see comp_queue_bytes).
         queue.set_max_bytes(comp_queue_bytes(cpu_threads_est + floor));
         tar_declare_ceiling(comp_queue_bytes(cpu_threads_est + floor));
-        pool_lead_open();   // ...and the pooled reader's lead (see PoolLead)
       }
     }
     if (device_count <= 0) return;
@@ -43690,6 +43716,21 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     tune_init_devices(tunes.get(), gpu_count, gpu_ids, tune_run, opt,
                       compress_tune_start, tune_frame_bytes, throttle.max_permits(),
                       compress_start_by_device);
+    if (gpu_joins_later) {
+      // Priors are resolved now, and no GPU worker has started.  Use the largest
+      // initial proposal conservatively for every requested stream; bringup may
+      // subsequently lower either the stream count or its allocated batch.
+      const char * lead_env = ::getenv("GZSTD_DEBUG_POOL_LEAD");   // =full: the A/B control
+      if (!opt.gpu_only && cpu_threads > 0
+          && !(lead_env && std::strcmp(lead_env, "full") == 0)) {
+        size_t batch = std::max<size_t>(1, compress_tune_start);
+        for (int i = 0; i < gpu_count; ++i)
+          batch = std::max(batch, tunes[i].batch_size.load(std::memory_order_relaxed));
+        std::lock_guard<std::mutex> lk(pool_lead.m);
+        pool_lead.gpu = ((size_t)gpu_count * std::max<size_t>(1, opt.gpu_streams) + 1) * batch;
+      }
+      pool_lead_open();
+    }
     fatal_msgs.assign((size_t)gpu_count, std::string());
     // Per-GPU result slots (reduces lock contention).  init_slots resizes
     // ResultStore::slots, which the writer iterates in drain_slots_locked under
@@ -44223,11 +44264,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // buffer per Task, so the single-owner slot release works unchanged (the
   // host-chunk/subchunk split was an fread-efficiency artifact; pooled
   // preads don't need it, and seq == chunk idx stays dense).  Slots are
-  // recycled on the batch-success, partial-rescue, and rescue-worker paths
-  // (v0.13.65) and by CPU workers as before.  GPU batches hold slots from
-  // pop to delivery, so the pool is sized far larger than the cpu-only
-  // reader's — clamped to a quarter of available RAM (the FrameThrottle
-  // bounds total in-flight output; this bounds in-flight input).
+  // recycled by CPU workers after compression and by GPU workers after H2D.
+  // The historical GPU window dates from retaining inputs until delivery for
+  // rescue; compress now releases them before launch and restarts on a fault.
+  // PoolLead limits the opened hybrid lead; the allocation is still clamped
+  // to a quarter of available RAM (the FrameThrottle bounds total in-flight
+  // output; this bounds in-flight input).
   // Preadable (named regular/block file OR a seekable stdin redirect)?  fstat
   // decides; pipes (tar -I gzstd) fall through to fread below.
   uint64_t dr_sz = 0;
@@ -44280,35 +44322,37 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                       /*prefault_plain=*/!kernel_has_per_vma_locks());
     if (pool_ok) {
       g_direct_read_pool = &nv_pool;
-      // Declare the depth ceiling: the queue can never hold more than
-      // pool_n frames, so the GPU queue floor must clamp below it or the
-      // CPU pool gets locked out (see update_queue_floor).
-      if (sched) sched->set_queue_depth_cap(pool_n);
-      // Mirror the ceiling on the queue itself so wait_for_batch_or_cap's
-      // capacity escape fires: a stream waiting for a batch larger than
-      // pool_n would otherwise wait forever (the reader is parked in
-      // acquire() at exactly that point — its designed backpressure — and
-      // in gpu-only mode no CPU pop can break the standoff).  push() can
-      // never actually block on this cap: queued view tasks each hold a
-      // pool slot, so acquire() gates the producer strictly earlier.
-      // v0.18.52: the cap is the pool's LEAD, which a deferred bringup holds to
-      // the CPU pool's until a GPU joins (PoolLead, above); the invariant holds
-      // for the lead as it did for the size.
+      // Mirror the effective lead on the queue: if all lead slots are queued,
+      // wait_for_batch_or_cap can take a short batch instead of waiting for a
+      // larger one.  Essential in GPU-only mode, which has no CPU consumer.
+      // Uploads can temporarily hold slots outside the queue; their release
+      // after H2D does not depend on getting another batch or on ordered output.
+      // Each queued view holds a pool slot, so acquire() bounds the producer
+      // before push() can block on this cap.
       size_t lead;
+      bool gpu_window_open;
       {
         std::lock_guard<std::mutex> lk(pool_lead.m);
         pool_lead.pool = &nv_pool;
         pool_lead.window = pool_n;
         pool_lead.cpu = (size_t)cpu_threads + 128 + 32 * (size_t)n_readers;
+        pool_lead.base = (size_t)cpu_threads + 32 * (size_t)n_readers;
         lead = pool_lead_apply_locked();
+        gpu_window_open = pool_lead.open;
       }
+      // Bringup may have opened the window before this pool existed.  Report
+      // that case too, using the same values as the late-open path.
+      if (gpu_window_open)
+        vlog(V_DEBUG, opt, "[POOLED-READ] the GPU window opens: " + std::to_string(lead)
+             + " of " + std::to_string(pool_n) + " buffers\n");
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt,
              std::string(want_direct_read
                            ? "[DIRECT-READ] O_DIRECT input (page cache bypassed)"
                            : "[POOLED-READ] buffered input (page cache + readahead)")
              + ", zero-copy pool " + std::to_string(pool_n) + " buffers"
-             + (lead < pool_n ? ", " + std::to_string(lead) + " until a GPU joins" : std::string())
+             + (lead < pool_n ? ", " + std::to_string(lead)
+                  + (gpu_window_open ? " with GPU window open" : " until a GPU joins") : std::string())
              + "\n");
       auto nv_emit = [&](const char * buf, size_t n, size_t idx, int slot) {
         Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;

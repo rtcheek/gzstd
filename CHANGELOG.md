@@ -1,12 +1,68 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.54  
+**Covers:** v0.9.50 → v0.18.55  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.55 — an engaged hybrid's pooled reader reads ahead only as far as its cards take, not into a flat 1,024-buffer GPU window (ROADMAP 42a; 8-H100 server, idle cards, cached, --no-mmap: 24 GiB at 8 CPUs 4.85-4.89 -> 4.67-4.70 s, now ahead of --cpu-only's 4.8-4.9; 97 GiB 13.77-13.84 -> 13.48-13.49, peak RSS 11-14 -> 7.3-8.6 GiB; 16 CPUs 8.38 -> 8.21)
+
+With v0.18.54's batches steady, the pooled reader's ENGAGED window -- called inconclusive on shared cards in 42a's
+notes, and "not a lever" for 24 GiB in ROADMAP 44 -- measured cleanly.  A --no-mmap (or cold) hybrid compress reads
+into one DirectReadPool, and when the cards came up its readers were let run ahead to the whole pool: the CPU
+workers, 32 per reader and a flat 1,024 "for the cards' batches", 1,126 16 MiB buffers at 8 CPUs.  The 1,024 dates
+from v0.13.x, when a GPU batch held its inputs until delivery for rescue, on the server's eight cards; both the
+hybrid and --gpu-only now release them right after the host-to-device copy, before the kernel launches.  Every
+buffer the readers ran into was faulted in for nothing.  Held lower with a temporary knob (cached, 8 CPUs, two idle
+cards, five rounds, medians):
+
+| window | 97 GiB | 24 GiB |
+|---|---|---|
+| 1,126 (the whole pool) | 13.89 s | 4.89 |
+| 320 | 13.65 | |
+| 256 | 13.58 | 4.81 |
+| 230 (the CPU pool's own lead) | 13.53 | 4.70 |
+
+One -vv run held to 230 put MORE frames on the cards (3,870 against 3,420-3,584) with no supply-limited tuning
+window.  The same flat cap starved --gpu-only, where the cards are the only consumer: two cards 11.68 -> 16.55 s
+(97 GiB), one card's 1 MiB frames 5.02 -> 6.50.
+
+**An engaged hybrid now opens its CPU workers and readers plus a batch for every stream and one more being gathered,
+at the largest batch any device starts at, never below the CPU lead and never above the pool.**  Two cards x two
+streams at 32: 262 of 1,126.  The start is read after the devices' tuners are built, so a --adapt profile's start
+(which can exceed the default) sizes it; the window opens there, after device selection, so a bringup that fails
+before it leaves the readers at the CPU lead.  A 1 MiB-frame hybrid on two cards (a 256 start) still opens the whole
+pool; --gpu-only always does.  The queue's and the scheduler's depth ceilings follow the lead, not the pool's size:
+an explicit queue floor clamped below 1,126 could otherwise reserve the whole reachable queue for the cards.  A
+stream whose batch is larger than what the lead leaves stays live -- the queue's capacity escape counts queued
+frames, and an upload's slots come back whatever intake or the writer is doing (Codex).  -vv: "[POOLED-READ] the
+GPU window opens: 262 of 1126 buffers", logged too when the pool is built after the bringup opened it.
+GZSTD_DEBUG_POOL_LEAD=full opens the whole pool: the A/B control, and v0.18.54's behaviour.
+
+MEASURED, the same binary against GZSTD_DEBUG_POOL_LEAD=full, idle cards, cached, to /dev/null, shuffled, medians
+(the 16-CPU, four-card and cold rows on the first build of the rule, which sized from the default start only and
+so opened the same lead for each shape: 262 at 8 CPUs, 270 at 16 on two cards, 398 on four, 260 at 6):
+
+| shape | whole pool | v0.18.55 |
+|---|---|---|
+| 97 GiB --no-mmap, 8 CPUs (5 + 4 rounds) | 13.77 / 13.84 s, RSS 10-14 GiB | 13.49 / 13.48, RSS 7.3-8.6 |
+| 24 GiB --no-mmap, 8 CPUs | 4.85 / 4.89 | 4.70 / 4.67 |
+| 97 GiB --no-mmap, 16 CPUs, two cards (4 rounds) | 8.38 | 8.21 |
+| the same, four cards (--gpu-devices 4) | 9.34 | 9.14 |
+| cold, 6 CPUs, 24 GiB: default reader / --no-mmap | 5.69 / 6.77 | 5.66 / 6.75 |
+
+**Tests.**  The pooled reader's engaged arm (v0.18.52, an -e cell) asserted the whole pool; it now asserts a lead
+at least the CPU lead (225) and below the pool (289 of 1,025 on one card, 417 on two) -- where RAM caps the pool at
+or under 417 the lead is the pool and only the bounds are checked (Codex review) -- and a new arm in the same cell
+asserts that --gpu-only still opens the whole pool and round-trips.  The A/B control fails the first and passes the
+second.  No count change.  Suites on v0.18.54 + this: default 577/0/1, CPU-only 413/0/133, -e 924/0/1.  Codex
+(sandboxed, same session as v0.18.54): proposed computing the lead after the tuners are built and moving the
+scheduler ceiling with it (both adopted); review found no default-run defect, a cell assertion that rejected a
+RAM-capped pool and one wrong number in this entry, both fixed.
 
 
 ## v0.18.54 — a compress's GPU batch tuner pays the cost gate for a size it has never run, as decompress has since v0.18.41 (ROADMAP 42a; 8-H100 server, 8 CPUs, a cached 97 GiB file, two cards another job also used: --no-mmap 15.11 -> 14.11 s, --tar 16.03 -> 14.97, peak RSS up to 25 GiB -> up to 18; idle cards: mmap 12.39 -> 11.18, --gpu-only on two cards 14.99 -> 12.54)
