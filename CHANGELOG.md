@@ -1,12 +1,77 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.53  
+**Covers:** v0.9.50 → v0.18.54  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.54 — a compress's GPU batch tuner pays the cost gate for a size it has never run, as decompress has since v0.18.41 (ROADMAP 42a; 8-H100 server, 8 CPUs, a cached 97 GiB file, two cards another job also used: --no-mmap 15.11 -> 14.11 s, --tar 16.03 -> 14.97, peak RSS up to 25 GiB -> up to 18; idle cards: mmap 12.39 -> 11.18, --gpu-only on two cards 14.99 -> 12.54)
+
+Asked whether the other job on the cards had skewed v0.18.53's 42a measurements.  It had not, the way 42a's notes
+claimed: over 100 engaged runs, compared within each arm, wall time tracked page faults (r = +0.87) and not the
+load on the cards gzstd ran on (r = -0.17).  The same command swung between ~13.9 and ~15.5 s, touching 14 to 26
+GiB.  Eight -vv runs, 97 GiB through --no-mmap at 8 CPUs, split cleanly on one thing, the largest GPU batch:
+
+| runs | wall | largest batch | its latency | frames held (throttle peak) | peak RSS | page faults | frames on the cards |
+|---|---|---|---|---|---|---|---|
+| 4 | 13.93-14.20 s | 32-64 | 0.6-1.0 s | 302-563 | 14-18 GiB | 4.4-5.3M | 3,469-3,506 |
+| 4 | 15.09-15.82 | 128 (2 GiB) | 2.0-2.2 | 859-1,156 | 23-26 | 6.7-8.2M | 3,172-3,373 |
+
+**The in-order writer holds every frame finished behind a GPU batch's first frame**, so the frames held at the
+peak are about the run's whole frame rate (~440 a second here) times the longest batch's latency, and every byte
+of that peak is faulted in once (FrameMem recycles it afterwards).  The 128-frame batches were also slower on the
+shared cards (0.9-1.9 GiB/s a stream against 1.5-2.2 at 64), so the cards did less of the work as well.
+Pinned, same session: --gpu-batch 32 13.71-14.06 s, 64 14.27-14.60, auto 15.04-15.72.
+
+**Why the tuner went there.**  It doubles while the device's rate falls by no more than 2%, so a flat curve walks
+up to the allocation, and nothing it measures sees the host memory a batch holds.  v0.18.41 gave the walk a cost
+gate: a doubling into a size the device has not run in this run may cost at most a tenth of the input left (its
+window is four batches rounded up to a whole sweep of the streams, plus a warm-up batch per stream), or a device's
+share of it after a step that scaled the rate 1.6 times or more.  It applied to decompress only, because a compress's tuner recorded no input size.  Now it
+records one (the file's size, or the --tar archive's), and a pipe (size unknown) explores as before.  At 16 MiB
+frames on two cards with two streams each, a window at 64 costs 6 GiB and needs 60 left; at 128, 12 and 120.
+-v: "[AUTO-TUNE] GPUn a window at 64 would read ~6144 MiB of ~48557 MiB left; not exploring it".  The start is
+unchanged: 32 for 16 MiB frames is compress's measured best on one H100 (512 MiB a batch).
+
+It is not a price on host memory, and a long enough input still pays for one trial at a bigger size; the gate's
+shape (a one-time cost against what is left) is the right one for that too.  Codex proposed requiring a doubling
+to GAIN 2% in a hybrid instead of being allowed to lose 2%; measured on idle cards it changed nothing (14.34 s
+against 14.15 without it), the device rate varies more than 2% between windows here, and with the gate in place
+no shape was found where it adds anything, so it was dropped (Codex agreed).
+
+MEASURED, cached, to /dev/null, default verbosity, the same binary with the gate switched off by a temporary
+hook as the control, arms shuffled, medians (range):
+
+| shape | gate off (v0.18.53) | v0.18.54 |
+|---|---|---|
+| shared cards, 8 CPUs, 97 GiB --no-mmap (4 rounds) | 15.11 s (14.05-15.61), RSS 16-25 GiB | 14.11 (13.84-14.71), RSS 14-18 |
+| shared cards, 8 CPUs, 97 GiB mmap | 12.59 (11.94-13.10) | 12.29 (12.14-12.45) |
+| shared cards, 8 CPUs, 97 GiB --tar | 16.03 (14.96-16.10) | 14.97 (14.85-15.15) |
+| shared cards, 16 CPUs, 97 GiB --no-mmap / mmap | 8.98 / 8.38 | 8.54 / 7.95 |
+| shared cards, 8 CPUs, 24 GiB --no-mmap / mmap / --tar (5 rounds) | 4.91 / 4.31 / 4.97 | 4.81 / 4.32 / 4.96 |
+| idle cards, 8 CPUs, 97 GiB --no-mmap (8 rounds) | 14.12 (13.93-15.22) | 14.05 (13.93-15.60) |
+| idle cards, 8 CPUs, 97 GiB mmap | 12.39 (11.04-13.87) | 11.18 (11.01-11.37) |
+| idle cards, 8 CPUs, 97 GiB --tar | 15.30 (14.86-16.46) | 15.27 (14.97-15.41) |
+| idle cards, --gpu-only, two cards, 97 GiB (3 rounds) | 14.99 (14.67-17.63) | 12.54 (12.02-13.72) |
+| idle cards, --gpu-only, one card, 97 GiB | 13.88 (13.52-14.74) | 13.77 (13.21-23.12) |
+
+--cpu-only takes 19.1-19.6 s at 8 CPUs on this file and 8.5-8.7 at 16, so at 16 CPUs the hybrid now wins where
+it tied.  "Shared cards": another user's job on all eight, the ranking picking the two least busy (0-45%
+utilization); "idle": that job had left six cards.  One card under --gpu-only has a separate slow mode in both arms
+(4 of 12 runs at 23-25 s); not this change, and open.
+
+**Tests.**  A new cell (one device, one stream, 1 MiB frames, a synthetic peak at 512, a decision per batch,
+an H100-sized L2 so the start is 128 on any card): with the gate lifted the tuner climbs to its 256 allocation;
+with it nearly shut it must log the refusal for 256 and never measure 256 (not "settle at 128": a run with fewer
+stale batches reaches the settled state's +25% probe and 160 scores better on the synthetic curve -- Codex
+review); the same bytes through a pipe climb from 8 with no refusal.  Run against the build without the input
+size, the second arm fails (no refusal, measured up to 256).  578 default cells (-e 925); CPU-only 413/0/133.
+Codex (sandboxed, three turns): proposed the premium above, then agreed to drop it; review found no defect in
+the change and one flaky assertion in the new cell, fixed as described.
 
 
 ## v0.18.53 — memory goes back to the kernel while the workers finish, not after the last frame (ROADMAP 44; 8-H100 server, 8 CPUs, a cached 24 GiB file through --no-mmap: --cpu-only 5.12 -> 4.85 s, two cards 5.33 -> 5.07; read cold at 6 CPUs, two cards 5.88 -> 5.75; at 256 CPUs a --cpu-only compress's exit 0.63-0.76 -> 0.17 s)

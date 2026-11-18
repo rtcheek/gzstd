@@ -1067,6 +1067,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     start, ~1M first-touch faults and its exit.  The guard cannot price it from what it measures today: --no-mmap
     engaged wins 18% at 6 CPUs (sampled 6.2-7.4 s remaining) and loses 4.5% at 8 (4.2-5.8 s), and mmap wins 10% at
     8 (4.16-4.52 s), so neither a uniform nor a copying-reader increase is safe without a measured hybrid price.
+    **v0.18.54: on a long input the engaged loss was the batch tuner** (CHANGELOG v0.18.54).  A 97 GiB --no-mmap
+    run at 8 CPUs swung 13.9-15.8 s on page faults: runs whose tuner doubled to 128 (2 GiB, 1.1-2.3 s a batch on
+    shared cards) held 859-1,156 frames behind the in-order writer, 23-26 GiB.  Compress now pays decompress's cost
+    gate for a size never run (15.11 -> 14.11 s; --tar 16.03 -> 14.97).  Still open: the frames held scale with the
+    whole frame rate times the batch latency, which the tuner does not price -- a long enough input still pays one
+    trial -- and FrameMem's plain pages (huge pages need a compaction-stall predictor; none known).
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

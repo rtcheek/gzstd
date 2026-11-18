@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.53";
+static constexpr const char * GZSTD_VERSION = "0.18.54";
 //
 // Architecture overview:
 //
@@ -37573,8 +37573,9 @@ struct DevStats {
 // --adapt profile persisted 769; the next run then ALLOCATED 769 per stream on
 // the strength of that number.  One shared state also forced one answer on
 // devices that differ (this host mixes H100 PCIe and NVL cards), and the answer
-// depends on frame size as much as on the card: 1 MiB frames run best at
-// 512-1024, 16 MiB frames at 128 with 512 22% slower (48 GiB, one H100).
+// depends on frame size and direction: decompress runs best at 512-1024 for
+// 1 MiB frames and 128 for 16 MiB, with 512 22% slower (48 GiB, one H100).
+// Compress's pinned bests there were 512 at 1 MiB and 32 at 16 MiB.
 //
 // Now each device tunes itself, measures only what it ran, and may grow past
 // its bringup allocation when that is still paying.  Run-wide signals (the
@@ -37661,10 +37662,10 @@ struct TuneRun {
   // BAR1 re-registration.
   bool explore_ok = false;
   bool decompress = false;               // which sink signal applies
-  // The operation's input size, in the units its batches record (decompress:
-  // compressed bytes; compared with Meter::read_bytes).  0 = unknown, and then
-  // nothing is explored: an experiment must be cheap next to what is LEFT, and
-  // an unknown size cannot say that.
+  // The operation's input size, in the units its batches record (compress:
+  // uncompressed bytes; decompress: compressed bytes), compared with
+  // Meter::read_bytes.  0 = unknown: in-allocation doublings bypass the cost
+  // gate, while growing the allocation requires a known remainder.
   std::atomic<uint64_t> input_bytes{0};
   // Devices tuning in this run: a steep-admitted window may read a device's share
   // of what is left, not all of it (every device reads the same remainder).
@@ -37751,6 +37752,8 @@ struct DeviceTune {
 
   // What was actually measured (tick thread; published under tune_mtx).
   size_t   settled = 0;                  // best batch from a VALID window
+  // This run only: a profile's max may be a losing trial, and its first-touch
+  // host-buffer cost is paid again in a new process.
   size_t   measured_max = 0;             // largest batch with a VALID window
   uint32_t valid_windows = 0, supply_windows = 0, source_windows = 0;
   bool     source_held = false;          // discard the next closure (see SOURCE); inert after a sink latch
@@ -37840,8 +37843,8 @@ struct TunePrior { size_t batch = 0, max = 0; };
 static std::map<std::string, TunePrior> g_tune_priors;
 
 // Frame-size class: the frame's size rounded UP to a power of two, as "f<MiB>"
-// (or "k<KiB>" under 1 MiB).  The best batch moves with frame size -- 512-1024
-// frames at 1 MiB, 128 at 16 MiB on one H100 -- so priors are keyed by it.
+// (or "k<KiB>" under 1 MiB).  The best batch moves with frame size -- decompress
+// ran best at 512-1024 for 1 MiB, 128 for 16 MiB on one H100 -- so priors are keyed by it.
 static std::string tune_frame_class(size_t frame_bytes) {
   size_t k = 1;
   while (k * 1024 < frame_bytes && k < (size_t(1) << 30)) k <<= 1;   // KiB, pow2
@@ -38509,8 +38512,8 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
       // after, of 256 1,134 against 233 -- so on a short run the trial cost a
       // second it never paid back: a 36 GiB archive on two cards took 6.86-7.05 s
       // auto, 5.57-6.09 pinned at the 128 auto settled back on.  Only a known size
-      // is gated -- a pipe explores as before, and so does compress, whose TuneRun
-      // records no input size -- and only a size this device has not measured.
+      // is gated -- a pipe explores as before -- and only a size this device
+      // has not measured in this run: prior runs do not retain the host buffers.
       double left = 0.0; bool known = false;
       const bool unproven = dbl > cur && dbl > T.measured_max;
       const double cost = unproven ? window_cost(dbl, &left, &known) : 0.0;
@@ -43470,10 +43473,31 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // per_dev from the real device count; the run-wide latches live here.
   // Compress allocates at bringup, so it never grows a device mid-run: it
   // explores across runs, through the --adapt profile.
+  //
+  // THE INPUT SIZE ARMS THE COST GATE FOR A SIZE NEVER RUN (v0.18.54), the rule
+  // decompress has had since v0.18.41: a doubling into an unmeasured batch must
+  // cost at most a tenth of the input left (a device's share after a steep step).
+  // Without it compress doubled on any rate within 2%, and a flat curve walked
+  // up to its allocation.  What that costs a HYBRID is host memory: the in-order
+  // writer holds every frame finished behind a GPU batch's first frame, so the
+  // frames held at the peak are about the run's total frame rate times the
+  // longest batch's latency, and each byte of that peak is faulted in once.
+  // MEASURED, 8-H100 server, 8 CPUs, two cards another job also used, a cached
+  // 97 GiB file of 16 MiB frames through --no-mmap: runs whose tuner reached 128
+  // (2 GiB a batch, 1.1-2.3 s each) held 859-1,156 frames, 23-26 GiB and 6.7-8.2M
+  // page faults, and took 15.1-15.8 s with FEWER frames on the cards; runs that
+  // stayed at 32-64 held 302-563 frames, 14-18 GiB and 4.4-5.3M faults, 13.9-14.2.
+  // With the gate: --no-mmap 15.11 -> 14.11 s, --tar 16.03 -> 14.97, mmap 12.59
+  // -> 12.29; at 16 CPUs 8.98 -> 8.54 and 8.38 -> 7.95.  On idle cards, where a
+  // 128 batch is quick: mmap 12.39 -> 11.18, --no-mmap and --tar unchanged, and
+  // --gpu-only on two cards 14.99 -> 12.54.  24 GiB is unchanged (the start, 32
+  // for 16 MiB frames, is compress's measured best on one H100).  A pipe (size 0)
+  // explores as before.
   TuneRun tune_run;
   tune_run.locked.store(opt.gpu_batch_user_set);
   tune_run.explore_ok = false;
   tune_run.decompress = false;
+  tune_run.input_bytes.store(total_in, std::memory_order_relaxed);
   std::unique_ptr<DeviceTune[]> tunes;
 
   // Counts GPUs that failed terminally (init or mid-run).  When the count

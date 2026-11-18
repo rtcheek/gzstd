@@ -633,8 +633,10 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=577
-$EXTENSIVE && EXPECTED_TESTS=924
+EXPECTED_TESTS=578
+$EXTENSIVE && EXPECTED_TESTS=925
+# v0.18.54: +1 GPU cell (compress pays the tuner's cost gate), skipped without a GPU, so
+# 577 -> 578, -e 924 -> 925, and the no-GPU delta grows by one (the CPU-only run still 413).
 # v0.18.53: +1 default cell on both builds (memory goes back while the workers finish:
 # --cpu-only, no CUDA), so 576 -> 577, -e 923 -> 924, the no-GPU deltas unchanged.  The
 # FrameMem self-test gains the drain's and the pool's rules, not a count.  DERIVED.
@@ -1023,8 +1025,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=164   # + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=247   # + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=165   # + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=248   # + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -10717,11 +10719,56 @@ if has_gpu 2>/dev/null; then
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "a small-L2 card starts compress lower; pins and decompress keep their start" \
     || fail "a small-L2 card starts compress lower; pins and decompress keep their start" "got$why"
+
+  # 4. Compress pays the cost gate for a size never run (v0.18.54).  Decompress
+  #    has refused an unmeasured doubling whose window would read more than a
+  #    tenth of the input left since v0.18.41; compress recorded no input size,
+  #    so a flat curve walked up to its allocation -- and in a hybrid every
+  #    doubling lengthens the batch the in-order writer waits on (97 GiB at 8
+  #    CPUs: 23-26 GiB held at 128 against 14-18 at 32-64).  One device, one
+  #    stream, 1 MiB frames, a synthetic peak at 512 and a decision per batch;
+  #    an H100-sized L2 so the start is 128 on any card (3 GiB / 16 = 192
+  #    frames, rounded down); mmap, whose read count advances as frames are
+  #    taken, so the remainder does not depend on how far a reader ran ahead.
+  #    A: the gate lifted (fraction 100): 128 -> 256, its allocation, no refusal.
+  #    B: the gate nearly shut (fraction 0.01): a window at 256 reads 256 MiB of
+  #       ~2.3 GiB left, so it must refuse and never measure 256.  Without the
+  #       input size it climbs to 256 like A (the mutant this cell was run against).
+  #    C: the same bytes through a pipe, size unknown: no gate, it climbs from 8.
+  t0=$(now_ms); why=""
+  head -c $((2304 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((3072 * 1024 * 1024)) > "$TUN/gsrc"
+  gate_run() {   # gate_run LOG FRACTION [args...]
+    local log=$1 fr=$2; shift 2
+    env GZSTD_DEBUG_TUNE_CURVE=512 GZSTD_DEBUG_TUNE_FAST=1 GZSTD_DEBUG_TUNE_L2=52428800 \
+      GZSTD_DEBUG_TUNE_EXPLORE_FRACTION="$fr" "$GZSTD" -v --no-progress -f --gpu-only \
+      --gpu-devices=1 --gpu-streams=1 --chunk-size=1 "$@" 2>"$log"
+  }
+  gate_run "$TUN/gA.err" 100 --mmap=on -c "$TUN/gsrc" > /dev/null || why+=" A:rc=$?"
+  grep -q 'GPU0 f1: starting at 128$' "$TUN/gA.err" || why+=" A-start($(grep -o 'starting at [0-9]*' "$TUN/gA.err" | head -1))"
+  grep -q 'GPU0 f1: settled 256,' "$TUN/gA.err" || why+=" A-not-256($(grep -o 'f1: settled [0-9]*' "$TUN/gA.err"))"
+  grep -q 'not exploring' "$TUN/gA.err" && why+=" A-refused"
+  gate_run "$TUN/gB.err" 0.01 --mmap=on -c "$TUN/gsrc" > /dev/null || why+=" B:rc=$?"
+  grep -q 'a window at 256 would read ~[0-9]* MiB of ~[0-9]* MiB left; not exploring it' "$TUN/gB.err" \
+    || why+=" B-did-not-refuse"
+  # Never 256, rather than settled 128: a run with fewer stale batches reaches the
+  # settled state's +25% probe, and 160 scores better on the synthetic curve -- the
+  # gate then refuses 256 again from there (Codex review, v0.18.54).
+  gb_max=$(grep -o 'GPU0 f1: settled [0-9]*, measured up to [0-9]*' "$TUN/gB.err" | grep -o '[0-9]*$')
+  [[ -n "$gb_max" ]] && (( gb_max < 256 )) || why+=" B-measured-${gb_max:-none}"
+  # A real pipe: a redirected regular file is sized like a named one (v0.18.48).
+  cat "$TUN/gsrc" | gate_run "$TUN/gC.err" 0.01 -c - > /dev/null || why+=" C:rc=$?"
+  grep -q 'not exploring' "$TUN/gC.err" && why+=" C-refused"
+  grep -q 'GPU0 f1: settled 256,' "$TUN/gC.err" || why+=" C-not-256($(grep -o 'f1: settled [0-9]*' "$TUN/gC.err"))"
+  rm -f "$TUN/gsrc"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "compress pays the tuner's cost gate for a size never run (a pipe does not)" \
+    || fail "compress pays the tuner's cost gate for a size never run (a pipe does not)" "got$why"
   rm -rf "$TUN"
 else
   skip "tuner explores past its allocation; the profile keeps only what ran" "no GPU"
   skip "each GPU tunes its own batch (two devices, two peaks)" "no GPU"
   skip "a small-L2 card starts compress lower; pins and decompress keep their start" "no GPU"
+  skip "compress pays the tuner's cost gate for a size never run (a pipe does not)" "no GPU"
 fi
 
 # ────────────────────────────────────────────────────────────
