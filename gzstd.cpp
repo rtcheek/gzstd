@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.57";
+static constexpr const char * GZSTD_VERSION = "0.18.58";
 //
 // Architecture overview:
 //
@@ -5154,6 +5154,18 @@ static void print_help_long()
 "     for a few seconds at this allowance (on 24 CPUs, ~100 GiB); a\n"
 "     smaller one is reported and records nothing.  A few minutes per\n"
 "     reader; --no-profile keeps the result out of the profile.\n"
+"     HYBRID DECODE PRICE (ARCHIVE given, with a seek table, as gzstd\n"
+"     writes): the same for a hybrid decode, which otherwise also starts\n"
+"     its GPUs on 4.0 s and on its own estimate of what they could take\n"
+"     -- an estimate that passed up a 20% win under -t on 4 CPUs.  Child\n"
+"     processes decode ARCHIVE as -d to /dev/null and as -t, and then its\n"
+"     first frames, declining and starting the GPUs in each, in three\n"
+"     rounds.  A hybrid decode whose mode, reader, cached or cold archive,\n"
+"     CPU decoders and allowance, device count, frame size, compression\n"
+"     ratio (by powers of two) and CUDA_VISIBLE_DEVICES match then uses\n"
+"     that price (one measured on a cached archive is not a cold one's):\n"
+"     under -t and to /dev/null as measured, in place of its own\n"
+"     estimate, and elsewhere only when it is above 4.0 s.\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -9641,6 +9653,10 @@ struct HpriceRec {
   double m_early = 0.0, m_late = 0.0;   // the savings' noise (hprice_fit)
   double b = 0.0, t_cpu = 0.0, rounds = 0.0;
   std::string how;   // which rule set the price (hprice_fit)
+  // Where the children's output went: "null" (/dev/null), or "none" for -t, which
+  // writes nothing (v0.18.58).  A decode record's r_* are R at the first settled
+  // window too; its smaller point is a prefix of the archive (calibrate_hprice).
+  std::string sink = "null";
 };
 
 // One process's accumulated observation, filled on the main thread as each
@@ -9899,7 +9915,7 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
       e.put_num("declined_run_s", r.t_cpu);
       e.put_num("rounds", r.rounds);
       e.put_str("rule", r.how);
-      e.put_str("sink", "null");
+      e.put_str("sink", r.sink);
       e.put_num("epoch", HPRICE_EPOCH);
       e.put_num("updated", (double)::time(nullptr));
     }
@@ -11194,10 +11210,15 @@ static uint64_t adapt_decomp_uncompressed_est(int fd, uint64_t comp_size);
 // decision depending on how busy the CPUs were, and took 0.22-0.25 s each to
 // tear down).  What the sampler CAN measure it compares against this price: the
 // most a GPU could save (see gpu_bringup_worth_it), not merely the time left.
-// WHICH PRICE A RUN USES (v0.18.48; v0.18.57, ROADMAP 42a) -- STATE TABLE:
+// WHICH PRICE A RUN USES (v0.18.48; v0.18.57-58, ROADMAP 42a) -- STATE TABLE:
 //   --gpu-only, or --cpu-share               -> no sample, no price (they always start)
 //   a known-size hybrid COMPRESS whose key
-//     (hprice_key) --calibrate FILE priced   -> that calibrated price (hprice_lookup)
+//     (hprice_key) --calibrate FILE priced   -> that calibrated price (compress_nvcomp)
+//   a known-size hybrid DECODE whose key
+//     (hprice_key_decode) --calibrate
+//     ARCHIVE priced                         -> that price, which under -t or to
+//                                               /dev/null also replaces the growth and
+//                                               bound tests (decompress_nvcomp)
 //   any other known-size hybrid run, or
 //     --no-profile                           -> this legacy price
 //   an unknown-size (piped) hybrid, --adapt  -> the backlog gate, no time price
@@ -11257,6 +11278,39 @@ static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 // says so in the record ("rule") -- at 24 CPUs here the break-even sits at ~230 GiB
 // of input, which no calibration can be asked to compress.
 //
+// A HYBRID DECODE'S PRICE (v0.18.58), the same way with --calibrate ARCHIVE.  The
+// legacy guard is mostly right for -d and wrong where the sampler's model is.
+// MEASURED, 8-H100 server, cached base64 archives (ratio 1.33, 16 MiB frames), two
+// idle cards, three rotated rounds, wall s; --cpu-only / engaged at the first settled
+// window / what the default did:
+//   CPUs  archive   -d to /dev/null                    -t
+//    4    24 GiB    7.1-7.4 / 5.5-6.8 / engaged        7.3-7.4 / 5.6-6.0 / declined, 7.7
+//    6    24 GiB    5.4-5.6 / 4.8-5.0 / declined       5.5-5.6 / 5.2-5.8 / declined
+//    8    24 GiB    3.7     / 4.4-4.5 / declined       4.1     / 4.5-4.8 / declined
+//    8    97 GiB    14.0    / 13.7-14.1 / declined     14.2-14.3 / 12.7-13.1 / declined, 14.5
+//   12    97 GiB    8.6-9.7 / 9.0-10.0 / declined      9.6-9.7 / 11.4-11.6 / declined
+//   16    97 GiB    7.0-7.2 / 7.5-7.7 / declined       7.0-8.3 / 8.5-8.9 / declined
+//   24    97 GiB    5.8-5.9 / 6.2-6.4 / declined       5.6-5.8 / 6.0-7.9 / declined
+// The -d miss (6 CPUs) was the bound test: 2.6-3.5 s against 4.0.  The -t misses were
+// the growth test ("nearly keeps up": the backlog grew 0.04-0.25 of what the pool
+// took) -- and at 8 CPUs on 97 GiB the bound said a GPU could save at most 0.7-1.0 s
+// where it saved 1.3: -t verifies on the cards and copies nothing back, and the
+// reader the model holds fixed does not stay fixed once the cards take frames.  So a
+// decode price is R at the first settled window, as compress's is, and a run that
+// takes one as measured (-t, or -d to /dev/null) decides as compress does: the
+// waiting test, then R above the price; the growth and bound tests, whose model the
+// calibration has measured past, are off.  Its key carries the archive's ratio class
+// (the more compressible archive of v0.18.47's table won at 8-12 CPUs where base64
+// ties or loses) and its residency (a cold archive's drive paces its reader).  The
+// grid ran on CPUs of the socket whose memory did NOT hold the archives (that node's
+// memory was full of page cache); with them local, 6 CPUs, a 24 GiB archive:
+// --calibrate priced -d at 3.22 s and -t at 2.27, and -d took 4.05-4.15 s priced
+// against 5.13 for --cpu-only, -t 3.47-3.68 against 5.12-5.14 (the legacy guard: -d
+// 4.04-5.19, -t 5.15-5.16); that record on the remote CPUs: -d 4.71-4.86 against
+// 5.21-5.24, -t 4.36-4.44 against 5.23-5.39.  8 CPUs, where an engaged -d loses:
+// priced 4.03 s (extrapolated above both points), and it declined as the legacy did.  A decode's smaller point is a prefix of the archive, not a later
+// decision (calibrate_hprice).
+//
 // HPRICE_MIN_R: an early point under this measures little but the bringup, and
 // the class records nothing.  HPRICE_MIN_SPAN: two points closer than this do not
 // fit a slope.
@@ -11284,8 +11338,14 @@ static void gz_capture_caller_cvd()
 // setting, a user's --read-threads (a different reader pool), and the caller's
 // CUDA_VISIBLE_DEVICES (hashed; "all" when unset, which an empty value is not).  Exact match only: nothing interpolates between keys.
 // A calibration child computes the same key the same way and reports it.
-static std::string hprice_key(const char * reader, int workers, int devices,
-                              size_t chunk_bytes, const Options & opt)
+// The current input's compression-ratio class from its seek table (v0.18.58; set by
+// table_checksums_load), floor(log2(the data frames' decoded bytes / their compressed
+// bytes)), 0 for a ratio under 2, -1 = no usable table.  Part of a hybrid decode
+// price's key (hprice_key_decode): how far a CPU pool falls behind its reader, and so
+// what a GPU can take, depends on the ratio, and the whole table's answer is the same
+// in every run of one archive (a prefix's calibration child reads the same table).
+static std::atomic<int> g_input_ratio_class{-1};
+static std::string hprice_mask_tag()
 {
   gz_capture_caller_cvd();
   std::string mask = "all";
@@ -11296,12 +11356,46 @@ static std::string hprice_key(const char * reader, int workers, int devices,
     std::snprintf(hx, sizeof hx, "m%08llx", (unsigned long long)(h & 0xffffffffull));
     mask = hx;
   }
+  return mask;
+}
+static std::string hprice_key(const char * reader, int workers, int devices,
+                              size_t chunk_bytes, const Options & opt)
+{
+  const std::string mask = hprice_mask_tag();
   const GzCpuAllowance & cpus = gz_cpu_allowance();
   char rt[24] = "";
   if (opt.read_threads > 0) std::snprintf(rt, sizeof rt, "_r%zu", opt.read_threads);
   char b[260];
   std::snprintf(b, sizeof b, "%s_w%d_a%uq%u_d%d_f%zu_l%d%s%s%s_%s", reader, workers, cpus.mask,
                 cpus.quota, devices, chunk_bytes >> 20, opt.level, opt.ultra ? "u" : "", rt,
+                (opt.gpu_batch_user_set || opt.gpu_streams_user_set) ? "_tuned" : "", mask.c_str());
+  return b;
+}
+// A hybrid DECODE's key (v0.18.58): the mode (d = -d, t = -t, which verifies on the
+// cards and copies nothing back), the reader path and its threads, whether the small
+// allowance's one-decoder rule is on (g_hyb_decomp_cpu_cap, "c"), the archive's
+// residency as the reader judged it (g_hprice_reader_cold: w cached, k cold, u not
+// asked; a price measured on a cached archive is not a cold one's), the CPU decoders, the
+// allowance, the device bound, the archive's largest frame in bytes and its ratio class
+// (g_input_ratio_class; "xu" without a table), a user's GPU batch or stream setting,
+// and the caller's mask.  No level: the archive's, not this run's, and its ratio is in
+// the class.
+static std::string hprice_key_decode(char mode, const char * reader, int readers, int cap,
+                                     int cold, int workers, int devices, size_t frame_bytes,
+                                     const Options & opt)
+{
+  const std::string mask = hprice_mask_tag();
+  const GzCpuAllowance & cpus = gz_cpu_allowance();
+  const int xc = g_input_ratio_class.load(std::memory_order_relaxed);
+  char xs[16];
+  if (xc >= 0) std::snprintf(xs, sizeof xs, "x%d", xc);
+  else std::snprintf(xs, sizeof xs, "xu");
+  char b[260];
+  // A foreign archive's frame size need not be a whole MiB: keep the bytes and their
+  // unit, so distinct sub-MiB frames do not all share f0 (Codex review).
+  std::snprintf(b, sizeof b, "%c_%s%d%s%s_w%d_a%uq%u_d%d_f%zub_%s%s_%s", mode, reader, readers,
+                cap > 0 ? "c" : "", cold == 1 ? "k" : cold == 0 ? "w" : "u", workers, cpus.mask,
+                cpus.quota, devices, frame_bytes, xs,
                 (opt.gpu_batch_user_set || opt.gpu_streams_user_set) ? "_tuned" : "", mask.c_str());
   return b;
 }
@@ -11378,7 +11472,11 @@ static HpriceFit hprice_fit(double re, double se, double me, double rl, double s
 // "engage@T" or "decline@T": its sampler decides at its first settled window at or
 // after T seconds, whatever R is and whatever the keeps-up test says, and reports
 // that R, that time, the first usable stream's registration and its key at exit.
-struct HpriceChild { int mode = 0; double at_s = 0.0; };   // mode 1 engage, 2 decline
+// A DECODE child reports the same windowed R (v0.18.58), and
+// GZSTD_CALIBRATE_HPRICE_BYTES=N makes it decode only the archive's first N bytes, a
+// frame boundary from the seek table (the smaller point; see calibrate_hprice): the
+// parallel reader treats N as the end of the input and the progress counts to N.
+struct HpriceChild { int mode = 0; double at_s = 0.0; uint64_t limit = 0; };   // mode 1 engage, 2 decline
 static const HpriceChild & hprice_child()
 {
   static const HpriceChild hc = [] {
@@ -11391,10 +11489,20 @@ static const HpriceChild & hprice_child()
       c.mode = std::strcmp(m, "engage") == 0 ? 1 : std::strcmp(m, "decline") == 0 ? 2 : 0;
       c.at_s = at;
     }
+    const char * l = ::getenv("GZSTD_CALIBRATE_HPRICE_BYTES");
+    char * end = nullptr;
+    const unsigned long long n = c.mode && l ? std::strtoull(l, &end, 10) : 0ull;
+    if (c.mode && l && end != l && *end == '\0') c.limit = (uint64_t)n;
 #endif
     return c;
   }();
   return hc;
+}
+// The input size a calibration child decodes: the archive's, or its prefix.
+static inline uint64_t hprice_child_size(uint64_t size)
+{
+  const uint64_t lim = hprice_child().limit;
+  return lim > 0 && lim < size ? lim : size;
 }
 static std::atomic<double> g_hprice_child_r{-1.0};           // R at the child's decision
 static std::atomic<double> g_hprice_child_t{-1.0};           // seconds into the sample
@@ -11409,6 +11517,16 @@ static std::atomic<double> g_hprice_done_s{-1.0};            // ... finished com
 // input's probe arms, so a non-null value there is not a settled path (Codex
 // review).  Null = not settled yet: the price stays legacy.
 static std::atomic<const char *> g_hprice_reader{nullptr};
+// The decode reader's threads (v0.18.58), stored before g_hprice_reader (release; the
+// lookup acquires): a cold archive's three against a cached one's twelve on 96 CPUs.
+static std::atomic<int> g_hprice_reader_n{0};
+// ...and the archive's residency as that reader judged it (1 cold, 0 cached, -1 not
+// asked: an explicit --direct-read, --no-direct-read or --read-threads): a cold
+// archive at 9-31 CPUs takes the same three buffered readers as a cached one, and its
+// drive, not its page cache, sets how far the pool falls behind.  A calibration's
+// buffered warm-ups can cache an archive that fits; O_DIRECT warm-ups can keep it
+// cold.  The children report the key they actually measured.
+static std::atomic<int> g_hprice_reader_cold{-1};
 static std::mutex g_hprice_key_mx;
 static std::string g_hprice_key;                             // the run's key, once known
 
@@ -11424,7 +11542,8 @@ static std::string g_hprice_key;                             // the run's key, o
 // run must not pay for a lookup that usually finds nothing (Codex review).  So:
 // no entry in the file holds a price -> none, without a fingerprint; and the
 // fingerprint is taken only where procfs names the GPUs, else no price.
-static bool hprice_load(std::map<std::string, HpriceRec> & out, std::string & why)
+static bool hprice_load(std::map<std::string, HpriceRec> & out, std::string & why,
+                        const char * dir = "compress")
 {
   AdaptJv root;
   if (adapt_profile_load(adapt_profile_path(), root) != AdaptProfileRead::OK) {
@@ -11435,7 +11554,7 @@ static bool hprice_load(std::map<std::string, HpriceRec> & out, std::string & wh
   bool any = false;
   if (entries && entries->t == AdaptJv::OBJ)
     for (const auto & en : entries->obj) {
-      const AdaptJv * c0 = en.second.t == AdaptJv::OBJ ? en.second.get("compress") : nullptr;
+      const AdaptJv * c0 = en.second.t == AdaptJv::OBJ ? en.second.get(dir) : nullptr;
       const AdaptJv * h0 = c0 && c0->t == AdaptJv::OBJ ? c0->get("hybrid_price") : nullptr;
       if (h0 && h0->t == AdaptJv::OBJ && !h0->obj.empty()) { any = true; break; }
     }
@@ -11457,7 +11576,7 @@ static bool hprice_load(std::map<std::string, HpriceRec> & out, std::string & wh
     why = "the GPU driver has changed since it was measured";
     return false;
   }
-  const AdaptJv * cj = entry->get("compress");
+  const AdaptJv * cj = entry->get(dir);
   const AdaptJv * hp = cj && cj->t == AdaptJv::OBJ ? cj->get("hybrid_price") : nullptr;
   if (hp && hp->t == AdaptJv::OBJ)
     for (const auto & kv : hp->obj) {
@@ -11473,6 +11592,7 @@ static bool hprice_load(std::map<std::string, HpriceRec> & out, std::string & wh
       r.s_late  = e.gnum("saved_late_s", 0.0);
       r.b       = e.gnum("bringup_s", 0.0);
       r.how     = e.gstr("rule", "");
+      r.sink    = e.gstr("sink", "null");
       if (r.price > 0.0 && std::isfinite(r.price)) out[kv.first] = r;
     }
   if (out.empty()) { why = "none measured"; return false; }
@@ -11644,7 +11764,7 @@ static bool gpu_bringup_worth_it(const Options & opt,
                                  size_t behind_frames = 0, int * pool_keeps_up = nullptr,
                                  const std::function<size_t()> & pushed = {},
                                  GpuSamplerTestClock * test_clock = nullptr,
-                                 const std::function<double(std::string &)> & price = {})
+                                 const std::function<double(std::string &, bool &)> & price = {})
 {
   if (opt.gpu_only) return true;
   // GZSTD_DEBUG_GPU_GUARD_SEC overrides the guard; 0 disables the check so the
@@ -11909,18 +12029,21 @@ static bool gpu_bringup_worth_it(const Options & opt,
   // The test hook wins over a price, as over the legacy one; a calibration child
   // records its key at its decision instead (below).
   bool priced = false;
+  bool priced_as_measured = false;   // where it was measured: /dev/null, or -t (no sink)
   if (price && !hchild.mode && !guard_hooked) {
     std::string why;
-    double pg = price(why);
+    bool am = false;
+    double pg = price(why, am);
     for (int i = 0; pg == -2.0 && test_signal && i < 50; ++i) {
       std::unique_lock<std::mutex> lk(mx);
       cv.wait_for(lk, std::chrono::milliseconds(10));
       lk.unlock();
-      pg = price(why);
+      pg = price(why, am);
     }
     if (!hchild.mode && pg > 0.0 && std::isfinite(pg)) {
       guard_sec = pg;
       priced = true;
+      priced_as_measured = am;
       guard_note = ", this machine's calibrated price";
     }
     if (!hchild.mode) {
@@ -11992,12 +12115,14 @@ static bool gpu_bringup_worth_it(const Options & opt,
     // window's R read 6.13 s in every round where ~3 were left (a window whose frames
     // finish behind a straggler); the pooled readers' late R were right.  An early
     // decision keeps the window's R -- what the default compares with the price.
+    // A decode child always decides early (v0.18.58): its smaller point is a smaller
+    // input, a prefix of the archive (see calibrate_hprice).
     if (hchild.mode) {
       if (t >= hchild.at_s && rate > 0.0 && prev_rate > 0.0
           && (rate <= prev_rate * GPU_SAMPLE_SETTLED || t >= hchild.at_s + 1.0)) {
         const double rate_all = (p - p_warm) / std::max(1e-6, t - t_warm);
         const double r_late = hchild.at_s > 0.0 && rate_all > 0.0 ? (1.0 - p) / rate_all : remaining;
-        if (price) { std::string w; (void)price(w); }   // records the run's key, settled by now
+        if (price) { std::string w; bool am = false; (void)price(w, am); }   // records the run's key
         g_hprice_decide_s.store(gz_since_start_s(), std::memory_order_relaxed);
         g_hprice_child_r.store(r_late, std::memory_order_relaxed);
         g_hprice_child_t.store(t, std::memory_order_relaxed);
@@ -12057,7 +12182,13 @@ static bool gpu_bringup_worth_it(const Options & opt,
       }
     }
     // No rate means no remaining-time estimate: preserve the budget fallback.
-    const bool enough_time = !test_growth || rate <= 0.0 || could_save > guard_sec;
+    // A DECODE PRICE AS MEASURED (v0.18.58; see HPRICE_MIN_R) replaces this bound test
+    // and the growth test below: the calibration measured what engaging saves at this
+    // key, where the bound's model -- a reader whose rate the cards do not change --
+    // was wrong under -t.  So such a run asks what compress asks: the waiting test,
+    // then R above the price (the windowed-rate test above).
+    const bool enough_time = !test_growth || priced_as_measured || rate <= 0.0
+                          || could_save > guard_sec;
     // What each window saw (-vv), so the burst a reader makes while it fills its
     // queue can be told from a surplus that lasts: the backlog and the frames the
     // reader has queued at the window's end, and the fewest waiting within it.
@@ -12087,7 +12218,7 @@ static bool gpu_bringup_worth_it(const Options & opt,
     // hook's share decides this growth test alone, bypassing cap/EOF, so a cell
     // can force either answer; the time and waiting tests remain independent.)
     const bool grown = grew > 0.0 && grew >= took * share;
-    const bool enough = !test_growth
+    const bool enough = !test_growth || priced_as_measured
         || (share_hook >= 0.0 ? grown : capped || grown || reader_done);
     const bool behind = waiting && enough;
     if (test_behind) {
@@ -12104,6 +12235,10 @@ static bool gpu_bringup_worth_it(const Options & opt,
       if (test_growth && n > 0 && (size_t)n < sizeof behind_why) {
         if (capped)
           std::snprintf(behind_why + n, sizeof behind_why - (size_t)n, " and reached its cap");
+        else if (priced_as_measured)
+          std::snprintf(behind_why + n, sizeof behind_why - (size_t)n,
+                        " and grew %.0f while the pool took %.0f (no growth test: a measured price)",
+                        grew, took);
         else
           std::snprintf(behind_why + n, sizeof behind_why - (size_t)n,
                         " and grew %.0f while the pool took %.0f (a GPU must find %.0f)",
@@ -20257,6 +20392,8 @@ static std::atomic<uint64_t> g_input_max_frame{0};
 // batch can never hold more frames than the archive has.
 static std::atomic<uint64_t> g_input_frames{0};
 static std::atomic<bool>     g_input_geom_known{false};
+// v0.18.58: also the archive's ratio class (g_input_ratio_class, defined with the
+// hybrid price's state, which keys on it).
 
 // The frame size a DECOMPRESS should size its host budgets and GPU slabs from.
 // Shared with the CPU-only build: both decoders budget these output frames.
@@ -23200,6 +23337,18 @@ static void cpu_decomp_worker(
       if (bp) bp->release(1);
       continue;
     }
+    // GZSTD_DEBUG_CPU_DECODE_US=N (test-only, v0.18.58): each CPU decode of a frame
+    // takes N microseconds longer, so a suite-sized archive keeps one decoder busy
+    // past a card's bringup (the --calibrate ARCHIVE price cell: an engaged child's
+    // cards must decode frames, or it is refused).
+    {
+      static const long slow_us = [] {
+        const char * e = std::getenv("GZSTD_DEBUG_CPU_DECODE_US");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 && v <= 1000000 ? v : 0L;
+      }();
+      if (slow_us) std::this_thread::sleep_for(std::chrono::microseconds(slow_us));
+    }
 
 #ifdef HAVE_NVCOMP
     // A staged decompress Task names a REGION OF THE ARCHIVE and carries no
@@ -23983,6 +24132,14 @@ static size_t stream_frames_to_queue_mt(
       if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
     }
   }
+  // A hybrid decode price's reader (v0.18.58, hprice_key_decode): its path and the
+  // pool AFTER that memory fit, not the count the caller asked for (Codex review);
+  // the count first, so the lookup's acquire of the path sees both.  Final here: a
+  // filesystem refusing O_DIRECT later keeps the key it had.
+#ifdef HAVE_NVCOMP
+  g_hprice_reader_n.store(n_readers, std::memory_order_relaxed);
+  g_hprice_reader.store(dfd >= 0 ? "direct" : "pread", std::memory_order_release);
+#endif
 
   // --adapt reader scale-up (M4 action 3): size the slot ring for the CAP up
   // front — the modulo geometry is frozen at spawn, so a late-woken reader
@@ -25056,6 +25213,9 @@ static size_t stream_frames_to_queue(
           }
         }
       }
+#ifdef HAVE_NVCOMP
+      g_hprice_reader_cold.store(cold, std::memory_order_relaxed);   // before the reader's release
+#endif
       const bool cold_direct = cold == 1 && !opt.gpu_only
                             && gz_cpu_allowance().allowed() <= 8;
       // A CACHED archive on 4 CPUs or fewer keeps its buffered readers, and the
@@ -25154,7 +25314,14 @@ static size_t stream_frames_to_queue(
                + (cold == 1 && !opt.direct_read ? " (the archive is cold)" : "")
                + (cached_direct && dfd >= 0 ? " (the archive is cached; the drive keeps up)" : "")
                + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
-        size_t r = stream_frames_to_queue_mt(pfd, dfd, fsz, n_readers,
+        // A calibration child's prefix (hprice_child_size) ends the input here, after
+        // every choice above was made on the whole archive, as a default run's are.
+#ifdef HAVE_NVCOMP
+        const uint64_t mt_size = hprice_child_size(fsz);
+#else
+        const uint64_t mt_size = fsz;
+#endif
+        size_t r = stream_frames_to_queue_mt(pfd, dfd, mt_size, n_readers,
                                              queue, m, opt, max_frame_decomp_out, abort,
                                              fallback, raw_data, (uint64_t)first_decomp,
                                              buffered_reader_cap);
@@ -25164,6 +25331,15 @@ static size_t stream_frames_to_queue(
       }
     }
   }
+#endif
+
+  // Only the parallel reader stops at a calibration child's prefix: this one reads to
+  // the end, which would measure the whole archive as the small point.
+#ifdef HAVE_NVCOMP
+  if (hprice_child().limit > 0)
+    die("GZSTD_CALIBRATE_HPRICE_BYTES needs the parallel reader, which this input did not take");
+  g_hprice_reader_n.store(1, std::memory_order_relaxed);
+  g_hprice_reader.store("stream", std::memory_order_release);
 #endif
 
   // Read buffer with offset-based tracking to avoid per-iteration shifts.
@@ -29839,6 +30015,22 @@ static const GzFloorPre & gz_floor_precuda()
 // every card not known to be below the floor, before any mask.  0 = none listed
 // or unreadable.  For a decision that must come before CUDA starts.
 static int gz_precuda_gpu_count() { return gz_floor_precuda().usable; }
+// A hybrid price key's device bound (v0.18.57; shared with decode in v0.18.58): the
+// pre-CUDA count is the host's cards, a caller's mask bounds it by the entries it
+// names (its identity is in the key too), and --gpu-devices by its count.
+static int hprice_device_bound(const Options & opt)
+{
+  int dev = gz_precuda_gpu_count();
+  gz_capture_caller_cvd();
+  if (g_caller_cvd_set == 1) {
+    int named = 0;
+    std::stringstream ss(g_caller_cvd);
+    for (std::string tok; std::getline(ss, tok, ',');) if (!tok.empty()) ++named;
+    dev = std::min(dev, named);
+  }
+  if (opt.gpu_devices > 0) dev = std::min(dev, opt.gpu_devices);
+  return dev;
+}
 
 // THE PROVISIONAL DEVICE COUNT (v0.18.48): what a deferred bringup (hybrid, and
 // --gpu-only's overlap) sizes its throttle floor and scheduler by before CUDA can
@@ -37221,6 +37413,9 @@ static void table_checksums_clear()
   g_input_max_frame.store(0, std::memory_order_relaxed);
   g_input_frames.store(0, std::memory_order_relaxed);
   g_input_geom_known.store(false, std::memory_order_relaxed);
+#ifdef HAVE_NVCOMP
+  g_input_ratio_class.store(-1, std::memory_order_relaxed);
+#endif
 }
 
 static void table_checksums_load(FILE * in, const Options * opt)
@@ -37247,6 +37442,12 @@ static void table_checksums_load(FILE * in, const Options * opt)
     g_input_frames.store(st.u_off.empty() ? 0 : (uint64_t)(st.u_off.size() - 1),
                          std::memory_order_relaxed);
     g_input_geom_known.store(true, std::memory_order_relaxed);
+#ifdef HAVE_NVCOMP
+    const uint64_t cz = st.c_off.back() - st.c_off.front(), uz = st.u_off.back() - st.u_off.front();
+    int rc = 0;
+    if (cz > 0) for (uint64_t q = uz / cz; q >= 2 && rc < 62; q >>= 1) ++rc;   // floor(log2(uz / cz))
+    g_input_ratio_class.store(cz > 0 ? rc : -1, std::memory_order_relaxed);
+#endif
   }
   if (g_no_check) return;                           // --no-check: geometry only
   if (st.checksums.empty()) return;                 // table carries no checksums
@@ -44123,21 +44324,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #endif
       // -2 = the reader has not settled its path (the suite's virtual clock waits for
       // it; nothing else does); -1 = legacy, `why` says why.
-      auto hprice_for_run = [&](std::string & why) -> double {
+      auto hprice_for_run = [&](std::string & why, bool & as_measured) -> double {
+        as_measured = false;
         const char * rd = opt.tar_mode ? "tar" : g_hprice_reader.load(std::memory_order_relaxed);
         if (!rd) { why = "no calibrated price yet: the reader has not settled its path"; return -2.0; }
-        // The pre-CUDA count is the host's cards; a caller's mask bounds it by the
-        // entries it names (its identity is in the key too).
-        int dev = gz_precuda_gpu_count();
-        gz_capture_caller_cvd();
-        if (g_caller_cvd_set == 1) {
-          int named = 0;
-          std::stringstream ss(g_caller_cvd);
-          for (std::string tok; std::getline(ss, tok, ',');) if (!tok.empty()) ++named;
-          dev = std::min(dev, named);
-        }
-        if (opt.gpu_devices > 0) dev = std::min(dev, opt.gpu_devices);
-        const std::string key = hprice_key(rd, cpu_threads, dev, host_chunk, opt);
+        const std::string key = hprice_key(rd, cpu_threads, hprice_device_bound(opt), host_chunk, opt);
         {
           std::lock_guard<std::mutex> lk(g_hprice_key_mx);
           g_hprice_key = key;
@@ -44163,6 +44354,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                         ? "; this run writes elsewhere, so the legacy 4.0 s (a lower price applies to /dev/null only)"
                         : "");
         why = b;
+        as_measured = null_sink;
         return null_sink ? r.price : std::max(r.price, GPU_INIT_GUARD_SEC);
       };
       if (!gpu_bringup_worth_it(opt, comp_progress, bringup_mx, bringup_cv,
@@ -48643,6 +48835,8 @@ static void gpu_decomp_worker(
           for (size_t i = 0; i < C.filled; ++i)
             in_sum += batch_comp_sizes[i];
           if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_done(now_ns(), in_sum);
+          if (g_hprice_counting)   // a calibration child's check only (v0.18.58)
+            g_hprice_gpu_bytes.fetch_add(in_sum, std::memory_order_relaxed);
           // This device's tuner: what ran, at the size intake asked for.
           if (!C.throttle_limited)
             device_tune_record(tune, C.stream_index, C.pop_req, C.filled,
@@ -49236,6 +49430,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 {
   g_hyb_decomp_cpu_cap.store(0, std::memory_order_relaxed);   // this input's producer decides
   g_hyb_decomp_cap_waits.store(0, std::memory_order_relaxed);
+  // This input's reader, bringup decision and first stream (v0.18.58, as compress's
+  // since v0.18.57): the price's key and a calibration child's report must not read
+  // the previous input's.
+  g_hprice_reader.store(nullptr, std::memory_order_relaxed);
+  g_hprice_reader_n.store(0, std::memory_order_relaxed);
+  g_hprice_reader_cold.store(-1, std::memory_order_relaxed);
+  g_hprice_decide_ns.store(0, std::memory_order_relaxed);
+  g_first_gpu_stream_ns.store(0, std::memory_order_relaxed);
+  g_hprice_gpu_bytes.store(0, std::memory_order_relaxed);
+  g_hprice_counting = hprice_child().mode != 0;   // before any worker starts
   // Process-global because reclaimed workers survive across input files.  Keep a
   // per-file baseline so v0.17.61's warning counts only devices lost while this
   // input was running, not every device retired earlier in the invocation.
@@ -50010,7 +50214,8 @@ gds_out_declined:
   // Denominator for the "is the GPU still worth starting" sample: the archive's
   // own size, which Meter::read_bytes counts up to.  With no known size, the
   // bringup guard uses queued frame output and producer completion instead.
-  const uint64_t decomp_src_bytes = known_input_size(opt, in);
+  // A calibration child decoding a prefix counts to the prefix (hprice_child_size).
+  const uint64_t decomp_src_bytes = hprice_child_size(known_input_size(opt, in));
   tune_run_decomp.input_bytes.store(decomp_src_bytes, std::memory_order_relaxed);
   if (sched) sched->set_source_bytes(decomp_src_bytes);   // tail check's unread estimate
   std::mutex bringup_mx;
@@ -50082,6 +50287,78 @@ gds_out_declined:
          + std::to_string(devices) + " device(s)\n");
   };
 
+  // THIS MACHINE'S CALIBRATED DECODE PRICE (v0.18.58, ROADMAP 42a; see HPRICE_MIN_R),
+  // compress's lookup (compress_nvcomp) with decode's key and its own sinks -- STATE TABLE:
+  //   --no-profile, several inputs, --tar        -> legacy (no child measured them)
+  //   no record for the key, another driver,
+  //     an older epoch, a reader not yet settled -> legacy
+  //   a record, -t                               -> its price (where it was measured:
+  //                                                 -t writes nothing)
+  //   a record, -d to /dev/null                  -> its price
+  //   a record, -d to anything else              -> its price when ABOVE the legacy
+  //                                                 4.0 s, else 4.0 (compress's rule)
+  // The profile is read here, before the sampler's clock starts.
+  std::map<std::string, HpriceRec> hp_recs;
+  std::string hp_skip;   // this run takes no price at all: legacy
+  std::string hp_none;   // the profile has none for this machine: legacy
+#ifndef _WIN32
+  if (opt.no_profile) hp_skip = "--no-profile";
+  else if (opt.inputs.size() > 1) hp_skip = "several inputs share one bringup";
+  else if (opt.tar_mode) hp_skip = "--tar (no calibration child measures it)";
+  else if (defer_detect && !opt.gpu_only && !::getenv("GZSTD_DEBUG_GPU_GUARD_SEC")
+           && !hprice_child().mode && decomp_progress() >= 0.0)
+    (void)hprice_load(hp_recs, hp_none, "decompress");
+#else
+  hp_skip = "no profile on this platform";
+#endif
+  // -2 = the reader has not settled its path; -1 = legacy, `why` says why.
+  auto hprice_for_decode = [&](std::string & why, bool & as_measured) -> double {
+    as_measured = false;
+    const char * rd = g_hprice_reader.load(std::memory_order_acquire);
+    if (!rd) { why = "no calibrated price yet: the reader has not settled its path"; return -2.0; }
+    const bool test = opt.mode == Mode::TEST;
+    const std::string key = hprice_key_decode(test ? 't' : 'd', rd,
+        g_hprice_reader_n.load(std::memory_order_relaxed),
+        g_hyb_decomp_cpu_cap.load(std::memory_order_relaxed),
+        g_hprice_reader_cold.load(std::memory_order_relaxed), cpu_threads,
+        hprice_device_bound(opt), decomp_frame, opt);
+    {
+      std::lock_guard<std::mutex> lk(g_hprice_key_mx);
+      g_hprice_key = key;
+    }
+    if (!hp_skip.empty()) { why = hp_skip + " (key " + key + ")"; return -1.0; }
+    const auto it = hp_recs.find(key);
+    if (it == hp_recs.end()) {
+      why = "no calibrated price for " + key + ": " + (hp_none.empty() ? "none measured" : hp_none);
+      return -1.0;
+    }
+    const HpriceRec & r = it->second;
+    bool null_sink = test;
+    if (!test) {
+      struct stat st {}, nd {};
+      null_sink = out && ::fstat(::fileno(out), &st) == 0 && S_ISCHR(st.st_mode)
+               && ::stat("/dev/null", &nd) == 0 && S_ISCHR(nd.st_mode) && st.st_rdev == nd.st_rdev;
+    }
+    char b[400];
+    std::snprintf(b, sizeof b, "%s, measured %s at R %.2f s (saved %+.2f s) and %.2f s "
+                               "(%+.2f s), bringup %.2f s: %s%s", key.c_str(),
+                  test ? "under -t" : "to /dev/null", r.r_early, r.s_early, r.r_late, r.s_late, r.b,
+                  r.how.c_str(),
+                  !null_sink && r.price < GPU_INIT_GUARD_SEC
+                    ? "; this run writes elsewhere, so the legacy 4.0 s (a lower price applies to /dev/null only)"
+                    : "");
+    why = b;
+    as_measured = null_sink;
+    return null_sink ? r.price : std::max(r.price, GPU_INIT_GUARD_SEC);
+  };
+  // No loaded price means no lookup can succeed: a quiet run then keeps the legacy
+  // sampler without building a key, locking its report slot or formatting a reason
+  // (Codex review).  A calibration child still reports its key, and -vv still says
+  // why a run missed, so a record can be planted under it.
+  std::function<double(std::string &, bool &)> decode_price;
+  if (!hp_recs.empty() || hprice_child().mode || opt.verbosity >= V_DEBUG)
+    decode_price = hprice_for_decode;
+
   auto gpu_bringup = [&]() {
     if (defer_detect) {
       // Is there still enough work left to outlast cuInit?  Asked BEFORE the
@@ -50121,7 +50398,8 @@ gds_out_declined:
                                 // Engage only behind a pool that falls behind (see
                                 // gpu_bringup_worth_it): no pool, no test.
                                 gpu_behind_frames(cpu_threads), &pool_keeps_up,
-                                [&] { return queue.total_tasks(); })) {
+                                [&] { return queue.total_tasks(); }, nullptr,
+                                decode_price)) {
         // --adapt's pipe gate has said why already ("[ADAPT] pipe: ...").
         if (!opt.adapt || decomp_progress() >= 0.0)
           vlog(V_VERBOSE, opt, gpu_decline_message(pool_keeps_up));
@@ -50927,6 +51205,9 @@ gds_out_declined:
         vlog(V_VERBOSE, opt, "[WRITER] join took " + std::to_string(int(ms)) + " ms\n");
     }
   }
+  // A calibration child's work is done here (every worker and the writer have
+  // joined); its exit comes after, and is in the wall time its parent takes.
+  if (g_hprice_counting) g_hprice_done_s.store(gz_since_start_s(), std::memory_order_relaxed);
 
   // No writer exists on this topology to notice a missing sequence number.
   // Consumers and CPU rescues have finished; check this input's original DATA
@@ -52797,8 +53078,28 @@ static void gz_calibrate_child_dies_with(pid_t parent)
 // noise, a 1 s bringup: a price of 4.333 s -- so a cell checks the children, their
 // checks, the report and the record, not a price no small file can measure (the
 // fit itself has its own hook, GZSTD_DEBUG_HPRICE_FIT).
+//
+// --calibrate ARCHIVE's DECODE pass (`decode`, v0.18.58): the same children decode
+// ARCHIVE -- once as -d to /dev/null, once as -t -- at the calibration's -T,
+// --gpu-devices and --read-threads, and the smaller point is a SMALLER INPUT, not a
+// later decision: the archive's first frames, up to a frame boundary from its seek
+// table (GZSTD_CALIBRATE_HPRICE_BYTES), decided at its own first settled window.
+// Four arms a round, each point paired with its own declined run:
+//   declined, engaged          the whole archive       R_early
+//   declined, engaged          its prefix              R_late ~ R_early / 2
+// A late decision does not stand in for a smaller archive here.  MEASURED, 8-H100
+// server, 6 CPUs, a cached 24 GiB base64 archive to /dev/null: engaged at its first
+// window (the sampler's bound 2.6-3.5 s) it won 0.5 s, and engaged 3 s in, when its
+// reader had finished (bound = R = 2.6-4.2 s), it lost 0.45; a 12 GiB archive engaged
+// at once lost 0.50.  The bound a decode's guard compares holds still while the
+// reader runs (both end times are fixed), so a later decision moves the cards' start
+// and not the measure.  Both points are early windows, so their R are in the same
+// units as a default run's -- under -t those read 3-14x the time left (a 97 GiB
+// archive at 12 CPUs: 73-134 s where ~9 were left), and a price in them is compared
+// with the same.  An archive without a seek table records nothing.
 static void calibrate_hprice(const Options & opt, const std::string & file, CalScreen & scr,
-                             std::vector<std::pair<std::string, HpriceRec>> & out)
+                             std::vector<std::pair<std::string, HpriceRec>> & out,
+                             bool decode = false)
 {
   const bool hook = std::getenv("GZSTD_DEBUG_CALIBRATE_BYTES") != nullptr;
   int rounds = hook ? 1 : 3;
@@ -52810,20 +53111,46 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
       opt.gpu_order_ranked ? "--gpu-order=ranked" : "--gpu-order=cuda" };
   if (opt.cpu_threads != 0) common.push_back("-T" + std::to_string(opt.cpu_threads < 0 ? 0 : opt.cpu_threads));
   if (opt.gpu_devices > 0) common.push_back("--gpu-devices=" + std::to_string(opt.gpu_devices));
-  if (opt.ultra) common.push_back("--ultra");
-  common.push_back("-" + std::to_string(opt.level));
-  if (opt.chunk_user_set) { common.push_back("--chunk-size"); common.push_back(std::to_string(opt.chunk_mib)); }
+  if (!decode) {   // an archive's frames and level are its own
+    if (opt.ultra) common.push_back("--ultra");
+    common.push_back("-" + std::to_string(opt.level));
+    if (opt.chunk_user_set) { common.push_back("--chunk-size"); common.push_back(std::to_string(opt.chunk_mib)); }
+  }
   if (opt.read_threads > 0) { common.push_back("--read-threads"); common.push_back(std::to_string(opt.read_threads)); }
-  struct Cls { const char * name; const char * flag; };
-  static const Cls classes[] = { { "FILE as named", nullptr }, { "--no-mmap", "--no-mmap" },
-                                 { "--tar", "--tar" } };
+  // flag: compress's reader option; mode: a decode's -d (to /dev/null) or -t.
+  struct Cls { const char * name; const char * flag; const char * mode; };
+  static const Cls cclasses[] = { { "FILE as named", nullptr, nullptr }, { "--no-mmap", "--no-mmap", nullptr },
+                                  { "--tar", "--tar", nullptr } };
+  static const Cls dclasses[] = { { "-d to /dev/null", nullptr, "-d" }, { "-t", nullptr, "-t" } };
   {
     char b[400];
-    std::snprintf(b, sizeof b,
-      "[CALIBRATE] hybrid price: when a hybrid compress should start its GPUs, measured on %s at "
-      "this CPU allowance -- %d round%s of declined / engaged runs per reader (FILE as named, "
-      "--no-mmap, --tar), each its own process\n", file.c_str(), rounds, rounds == 1 ? "" : "s");
+    if (decode)
+      std::snprintf(b, sizeof b,
+        "[CALIBRATE] hybrid decode price: when a hybrid decode should start its GPUs, measured on "
+        "%s at this CPU allowance -- %d round%s of declined / engaged runs on the archive and on "
+        "its first frames, as -d to /dev/null and as -t, each its own process\n",
+        file.c_str(), rounds, rounds == 1 ? "" : "s");
+    else
+      std::snprintf(b, sizeof b,
+        "[CALIBRATE] hybrid price: when a hybrid compress should start its GPUs, measured on %s at "
+        "this CPU allowance -- %d round%s of declined / engaged runs per reader (FILE as named, "
+        "--no-mmap, --tar), each its own process\n", file.c_str(), rounds, rounds == 1 ? "" : "s");
     scr.say(b);
+  }
+  // A decode's prefixes end on the frame boundaries its seek table lists.
+  std::vector<uint64_t> frame_ends;
+  if (decode) {
+    if (FILE * af = std::fopen(file.c_str(), "rb")) {
+      tarx::TarSeekTable st;
+      if (tarx::parse_foreign_seek_table(af, st, &opt, false) && st.valid())
+        frame_ends.assign(st.c_off.begin() + 1, st.c_off.end());
+      std::fclose(af);
+    }
+    if (frame_ends.size() < 2) {
+      scr.say("[CALIBRATE] hybrid decode price: NOT MEASURED -- " + file + " has no seek table to "
+              "take a smaller prefix from (gzstd writes one); the legacy 4.0 s stays\n");
+      return;
+    }
   }
   const int devnull = ::open("/dev/null", O_RDWR | O_CLOEXEC);
   // r/t/b: the R, the sample time and the bringup the child reported; dec/done: when
@@ -52837,8 +53164,10 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
   // process's own (gz_capture_caller_cvd): restore it, or remove one placed since.
   gz_capture_caller_cvd();
   const std::string cvd_env = "CUDA_VISIBLE_DEVICES=" + g_caller_cvd;
-  // One child: decide as told, report, and the wall time to waitpid.
-  auto run_arm = [&](const Cls & cls, bool engage, double at, const std::string & label) -> Arm {
+  // One child: decide as told, report, and the wall time to waitpid.  `limit`: a
+  // decode child's prefix in bytes (0 = the whole archive).
+  auto run_arm = [&](const Cls & cls, bool engage, double at, const std::string & label,
+                     uint64_t limit = 0) -> Arm {
     Arm a;
     int pfd[2];
     if (::pipe(pfd) != 0) { a.why = std::string("no pipe for a child: ") + std::strerror(errno); return a; }
@@ -52846,7 +53175,9 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
     // Built before the fork: between fork and exec only async-signal-safe calls.
     std::vector<std::string> sargs = common;
     if (cls.flag) sargs.push_back(cls.flag);
-    for (const char * s : { file.c_str(), "-o", "/dev/null" }) sargs.push_back(s);
+    if (cls.mode) sargs.push_back(cls.mode);
+    sargs.push_back(file);
+    if (!cls.mode || std::strcmp(cls.mode, "-t") != 0) { sargs.push_back("-o"); sargs.push_back("/dev/null"); }
     std::vector<const char *> cargv;
     for (const std::string & s : sargs) cargv.push_back(s.c_str());
     cargv.push_back(nullptr);
@@ -52854,15 +53185,18 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
     std::snprintf(modeenv, sizeof modeenv, "GZSTD_CALIBRATE_HPRICE=%s@%.3f",
                   engage ? "engage" : "decline", at);
     const std::string fdenv = "GZSTD_CALIBRATE_GPUC_FD=" + std::to_string(pfd[1]);
+    const std::string limenv = "GZSTD_CALIBRATE_HPRICE_BYTES=" + std::to_string((unsigned long long)limit);
     std::vector<char *> cenv;
     for (char ** e = environ; *e; ++e)
       if (std::strncmp(*e, "GZSTD_CALIBRATE_GPUC_FD=", 24) != 0
           && std::strncmp(*e, "GZSTD_CALIBRATE_HPRICE=", 23) != 0
+          && std::strncmp(*e, "GZSTD_CALIBRATE_HPRICE_BYTES=", 29) != 0
           && std::strncmp(*e, "CUDA_VISIBLE_DEVICES=", 21) != 0)
         cenv.push_back(*e);
     if (g_caller_cvd_set == 1) cenv.push_back(const_cast<char *>(cvd_env.c_str()));
     cenv.push_back(const_cast<char *>(fdenv.c_str()));
     cenv.push_back(modeenv);
+    if (limit > 0) cenv.push_back(const_cast<char *>(limenv.c_str()));
     cenv.push_back(nullptr);
     scr.step(label);
     const auto c0 = std::chrono::steady_clock::now();
@@ -52932,6 +53266,13 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
       a.ok = true;
       a.key = key;
     }
+    if (opt.verbosity >= V_DEBUG) {
+      char d[400];
+      std::snprintf(d, sizeof d, "[CALIBRATE]     %s: %.2f s; decided at %.3f s on R %.2f s, bringup %.2f s, "
+                    "%llu bytes on the cards%s%s\n", label.c_str(), a.wall, a.t, a.r, a.b, gbytes,
+                    a.why.empty() ? "" : " -- ", a.why.c_str());
+      scr.say(d);
+    }
     return a;
   };
   auto median = [](std::vector<double> v) {
@@ -52939,18 +53280,30 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
     const size_t n = v.size();
     return n == 0 ? -1.0 : n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
   };
-  for (const Cls & cls : classes) {
+  const Cls * classes = decode ? dclasses : cclasses;
+  const size_t nclasses = decode ? sizeof dclasses / sizeof dclasses[0] : sizeof cclasses / sizeof cclasses[0];
+  const char * what = decode ? "hybrid decode price" : "hybrid price";
+  for (size_t ci = 0; ci < nclasses; ++ci) {
+    const Cls & cls = classes[ci];
     const std::string nm = cls.name;
+    const std::string tag = std::string(what) + " (" + nm + ")";
     auto not_measured = [&](const std::string & why) {
-      scr.say("[CALIBRATE] hybrid price (" + nm + "): NOT MEASURED -- " + why + "; the legacy 4.0 s stays\n");
+      scr.say("[CALIBRATE] " + tag + ": NOT MEASURED -- " + why + "; the legacy 4.0 s stays\n");
     };
-    const Arm w0 = run_arm(cls, false, 0.0, "hybrid price (" + nm + "): warm-up, declined");
-    Arm w1 = run_arm(cls, true, 0.0, "hybrid price (" + nm + "): warm-up, engaged");
+    Arm w0 = run_arm(cls, false, 0.0, tag + ": warm-up, declined");
+    Arm w1 = run_arm(cls, true, 0.0, tag + ": warm-up, engaged");
     // The engaged warm-up is what wakes idle cards, and a card's first start after
     // idle is the slow one (~0.9 s on the 8-H100 server): if its cards came up after
     // the pool had finished, once more, now warm.
     if (!w1.ok && w0.ok && w1.why.rfind("an engaged child", 0) == 0)
-      w1 = run_arm(cls, true, 0.0, "hybrid price (" + nm + "): warm-up, engaged again");
+      w1 = run_arm(cls, true, 0.0, tag + ": warm-up, engaged again");
+    // A buffered first warm-up can cache a cold input (a newly written archive
+    // may be uncached after O_DIRECT output).  If that changes its reader key,
+    // its time to the end of its work does not describe the engaged warm-up's
+    // regime either: repeat the decline, then require matching keys as before.
+    // O_DIRECT warm-ups can both remain cold, which needs no retry.
+    if (w0.ok && w1.ok && w0.key != w1.key)
+      w0 = run_arm(cls, false, 0.0, tag + ": warm-up, declined again (reader key changed)");
     if (!w0.ok || !w1.ok) {
       not_measured("warm-up: " + (!w0.ok ? w0.why : w1.why));
       continue;
@@ -52959,7 +53312,7 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
     const std::string key = w1.key;
     if (std::any_of(out.begin(), out.end(), [&](const std::pair<std::string, HpriceRec> & kr) {
           return kr.first == key; })) {
-      scr.say("[CALIBRATE] hybrid price (" + nm + "): the same reader and key as a class above ("
+      scr.say("[CALIBRATE] " + tag + ": the same reader and key as a class above ("
               + key + "); not measured twice\n");
       continue;
     }
@@ -52972,49 +53325,71 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
     // cards started on nothing.  The pool's real time left at the decision is that
     // run's time from its decision to the end of its work, both on its clock (no
     // assumed process start or exit; Codex review).  The fit still uses the R each
-    // sampler reported, the R a default run compares.
+    // sampler reported, the R a default run compares.  A decode's prefix is sized
+    // the same way: the share of the archive that leaves r_late_want of real work.
     const double r_left = w0.done > w0.dec && w0.dec > 0.0 ? std::min(w1.r, w0.done - w0.dec) : w1.r;
     const double r_late_want = std::max(0.5 * r_left, w1.b + 0.5);
     if (!hook && (r_left < HPRICE_MIN_R || r_left - r_late_want < HPRICE_MIN_SPAN)) {
       char b[400];
-      std::snprintf(b, sizeof b, "FILE is too small at this allowance: %.2f s of CPU work were left "
+      std::snprintf(b, sizeof b, "%s is too small at this allowance: %.2f s of CPU work were left "
                     "at the decision and the cards took %.2f s to start; a price needs %.1f s and "
-                    "%.1f s more than the bringup (a larger FILE, or fewer CPUs with -T)",
-                    r_left, w1.b, HPRICE_MIN_R, 0.5 + HPRICE_MIN_SPAN);
+                    "%.1f s more than the bringup (a larger %s, or fewer CPUs with -T)",
+                    decode ? "ARCHIVE" : "FILE", r_left, w1.b, HPRICE_MIN_R, 0.5 + HPRICE_MIN_SPAN,
+                    decode ? "ARCHIVE" : "FILE");
       not_measured(b);
       continue;
     }
-    // The late arm's decision: r_left - r_late_want after the early one.
-    const double at_late = hook ? 0.0 : w1.t + (r_left - r_late_want);
-    std::vector<double> td, te, tl, re, rl, bb;
+    // The late arm's decision: r_left - r_late_want after the early one.  A decode's
+    // instead: the first frame boundary at or past that share of the archive's data.
+    const double at_late = hook || decode ? 0.0 : w1.t + (r_left - r_late_want);
+    uint64_t prefix = 0;
+    if (decode) {
+      const double share = hook ? 0.5 : std::min(0.95, std::max(0.05, r_late_want / r_left));
+      const uint64_t want = (uint64_t)(share * (double)frame_ends.back());
+      prefix = *std::lower_bound(frame_ends.begin(), frame_ends.end(), want);
+      if (prefix >= frame_ends.back()) prefix = frame_ends[frame_ends.size() - 2];
+    }
+    // Arms: compress 0 declined, 1 engaged early, 2 engaged late; a decode also 3,
+    // the prefix declined (2 is the prefix engaged).
+    const int narms = decode ? 4 : 3;
+    std::vector<double> td, te, tl, tdl, re, rl, bb;
     bool bad = false;
     std::string bad_why;
     for (int rd = 0; rd < rounds && !bad; ++rd)
-      for (int k = 0; k < 3 && !bad; ++k) {
-        const int arm = (k + rd) % 3;
+      for (int k = 0; k < narms && !bad; ++k) {
+        const int arm = (k + rd) % narms;
         char lb[200];
-        std::snprintf(lb, sizeof lb, "hybrid price (%s): round %d of %d, %s", nm.c_str(), rd + 1, rounds,
-                      arm == 0 ? "declined" : arm == 1 ? "engaged early" : "engaged late");
+        std::snprintf(lb, sizeof lb, "%s: round %d of %d, %s", tag.c_str(), rd + 1, rounds,
+                      decode ? (arm == 0 ? "declined" : arm == 1 ? "engaged"
+                                : arm == 2 ? "first frames, engaged" : "first frames, declined")
+                             : (arm == 0 ? "declined" : arm == 1 ? "engaged early" : "engaged late"));
         const Arm a = arm == 0 ? run_arm(cls, false, 0.0, lb)
-                    : arm == 1 ? run_arm(cls, true, 0.0, lb) : run_arm(cls, true, at_late, lb);
+                    : arm == 1 ? run_arm(cls, true, 0.0, lb)
+                    : arm == 2 ? run_arm(cls, true, at_late, lb, prefix)
+                               : run_arm(cls, false, 0.0, lb, prefix);
         if (!a.ok || a.key != key) {
           bad = true;
-          bad_why = std::string(lb).substr(std::strlen("hybrid price (") + nm.size() + 3) + ": "
+          bad_why = std::string(lb).substr(tag.size() + 2) + ": "
                   + (a.ok ? "the reader took another path (" + a.key + ")" : a.why);
           break;
         }
         if (arm == 0) td.push_back(a.wall);
         else if (arm == 1) { te.push_back(a.wall); re.push_back(a.r); bb.push_back(a.b); }
-        else { tl.push_back(a.wall); rl.push_back(a.r); bb.push_back(a.b); }
+        else if (arm == 2) { tl.push_back(a.wall); rl.push_back(a.r); bb.push_back(a.b); }
+        else tdl.push_back(a.wall);
       }
     if (bad) {
       not_measured(bad_why);
       continue;
     }
     double r_e = median(re), r_l = median(rl);
-    // Paired by round: each round's declined run against that round's engaged ones.
+    // Paired by round: each round's declined run against that round's engaged ones
+    // (a decode's prefix against its own declined prefix).
     std::vector<double> pe, pl;
-    for (size_t i = 0; i < td.size(); ++i) { pe.push_back(td[i] - te[i]); pl.push_back(td[i] - tl[i]); }
+    for (size_t i = 0; i < td.size(); ++i) {
+      pe.push_back(td[i] - te[i]);
+      pl.push_back((decode ? tdl[i] : td[i]) - tl[i]);
+    }
     double s_e = median(pe), s_l = median(pl);
     auto spread = [](const std::vector<double> & v, double mid) {
       double m = 0.0;
@@ -53030,20 +53405,28 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
       b_med = 1.0;
     }
     const HpriceFit f = hprice_fit(r_e, s_e, m_e, r_l, s_l, m_l, b_med);
-    char b[720];
-    std::snprintf(b, sizeof b,
-      "[CALIBRATE]   %s: declined %.2f s; engaged at R %.2f s: %.2f s (%s %.2f s, +/- %.2f), at R "
-      "%.2f s: %.2f s (%s %.2f s, +/- %.2f); bringup %.2f s%s\n", key.c_str(), t_d, r_e, median(te),
-      s_e > 0 ? "saved" : "lost", std::fabs(s_e), m_e, r_l, median(tl), s_l > 0 ? "saved" : "lost",
-      std::fabs(s_l), m_l, b_med, hook ? " (test hook: the points are fixed)" : "");
+    char b[800];
+    if (decode)
+      std::snprintf(b, sizeof b,
+        "[CALIBRATE]   %s: declined %.2f s; engaged at R %.2f s: %.2f s (%s %.2f s, +/- %.2f); its "
+        "first %.1f GiB declined %.2f s, engaged at R %.2f s: %.2f s (%s %.2f s, +/- %.2f); bringup "
+        "%.2f s%s\n", key.c_str(), t_d, r_e, median(te), s_e > 0 ? "saved" : "lost", std::fabs(s_e),
+        m_e, (double)prefix / 1073741824.0, median(tdl), r_l, median(tl), s_l > 0 ? "saved" : "lost",
+        std::fabs(s_l), m_l, b_med, hook ? " (test hook: the points are fixed)" : "");
+    else
+      std::snprintf(b, sizeof b,
+        "[CALIBRATE]   %s: declined %.2f s; engaged at R %.2f s: %.2f s (%s %.2f s, +/- %.2f), at R "
+        "%.2f s: %.2f s (%s %.2f s, +/- %.2f); bringup %.2f s%s\n", key.c_str(), t_d, r_e, median(te),
+        s_e > 0 ? "saved" : "lost", std::fabs(s_e), m_e, r_l, median(tl), s_l > 0 ? "saved" : "lost",
+        std::fabs(s_l), m_l, b_med, hook ? " (test hook: the points are fixed)" : "");
     if (!f.ok) {
       not_measured(f.how);
       scr.say(b);
       continue;
     }
     char p[400];
-    std::snprintf(p, sizeof p, "[CALIBRATE] hybrid price (%s): start the GPUs above %.2f s of CPU work "
-                  "left (the legacy guard: 4.0 s) -- %s\n", nm.c_str(), f.price, f.how);
+    std::snprintf(p, sizeof p, "[CALIBRATE] %s: start the GPUs above %.2f s of CPU work "
+                  "left (the legacy guard: 4.0 s) -- %s\n", tag.c_str(), f.price, f.how);
     scr.say(p);
     scr.say(b);
     HpriceRec rec;
@@ -53051,6 +53434,7 @@ static void calibrate_hprice(const Options & opt, const std::string & file, CalS
     rec.r_early = r_e; rec.s_early = s_e; rec.r_late = r_l; rec.s_late = s_l;
     rec.m_early = m_e; rec.m_late = m_l;
     rec.b = b_med; rec.t_cpu = t_d; rec.rounds = rounds; rec.how = f.how;
+    rec.sink = cls.mode && std::strcmp(cls.mode, "-t") == 0 ? "none" : "null";
     out.emplace_back(key, rec);
   }
   if (devnull >= 0) ::close(devnull);
@@ -53634,12 +54018,18 @@ static int run_calibrate(Options opt)
   // HYBRID PRICE (v0.18.57, ROADMAP 42a): FILE only (the synthetic corpus's GPU
   // rate does not transfer, see above), any device count, and still before this
   // process starts CUDA.  Skipped under the suite's small-corpus hook unless asked.
-  std::vector<std::pair<std::string, HpriceRec>> hprice_recs;
+  // The DECODE price (v0.18.58): ARCHIVE only, the same way.
+  std::vector<std::pair<std::string, HpriceRec>> hprice_recs, dhprice_recs;
 #ifdef HAVE_NVCOMP
-  if (!std::getenv("GZSTD_CALIBRATE_GPUC_FD") && !cal_file.empty() && !opt.cpu_only
+  if (!std::getenv("GZSTD_CALIBRATE_GPUC_FD") && !opt.cpu_only
+      && (!cal_file.empty() || !cal_archive.empty())
       && (!gpuc_test_hook || std::getenv("GZSTD_DEBUG_CALIBRATE_HPRICE"))) {
-    if (gz_precuda_gpu_count() > 0) calibrate_hprice(opt, cal_file, scr, hprice_recs);
-    else scr.say("[CALIBRATE] hybrid price: no GPU device; nothing to price\n");
+    if (gz_precuda_gpu_count() > 0) {
+      if (!cal_file.empty()) calibrate_hprice(opt, cal_file, scr, hprice_recs);
+      if (!cal_archive.empty()) calibrate_hprice(opt, cal_archive, scr, dhprice_recs, true);
+    } else {
+      scr.say("[CALIBRATE] hybrid price: no GPU device; nothing to price\n");
+    }
   }
 #endif
 
@@ -53845,6 +54235,7 @@ static int run_calibrate(Options opt)
 
     AdaptObs dobs;
     dobs.gpuc = dgpuc_samples;
+    dobs.hprice = dhprice_recs;
     dobs.payload_bytes = corpus.size();
     dobs.wall_ns = synth_wall(rows[2], rows[3]);
     dobs.cpu_ema_gibs = rows[2].gibs;
@@ -56966,11 +57357,11 @@ static int gzstd_main(int argc, char ** argv)
       }
     }
 #ifdef HAVE_NVCOMP
-    // A hybrid price child (v0.18.57, calibrate_hprice): its key, the R and the time
-    // its sampler decided at, its bringup to the first usable stream (-1 when it
-    // declined or no stream came up), the bytes its cards compressed, whether a card
-    // faulted, and when -- from this process's start -- it decided and its work was
-    // done.  No line = the decision never came.
+    // A hybrid price child (v0.18.57, calibrate_hprice): its key, the windowed R (a
+    // decode's too, v0.18.58) and the time its sampler decided at, its bringup to the first
+    // usable stream (-1 when it declined or no stream came up), the bytes its cards
+    // compressed or decoded, whether a card faulted, and when -- from this process's
+    // start -- it decided and its work was done.  No line = the decision never came.
     std::string hkey;
     {
       std::lock_guard<std::mutex> lk(g_hprice_key_mx);
@@ -56987,8 +57378,11 @@ static int gzstd_main(int argc, char ** argv)
       // adapt_obs.fault is sticky: a GPU fault's CPU rebuild clears the restart and
       // abort flags before it runs, and its cards' bytes and first stream survive
       // it (Codex review) -- a rebuilt run must not pass for an engaged one.
+      // A decode fault sets neither flag: its frames go to a CPU rescue, which the
+      // rescue counter records (see the --calibrate GPU rows).
       const int fault = adapt_obs.fault || g_gpu_failed_restart.load(std::memory_order_relaxed)
-                     || g_gpu_aborted.load(std::memory_order_relaxed) ? 1 : 0;
+                     || g_gpu_aborted.load(std::memory_order_relaxed)
+                     || g_gpu_cpu_rescue_runs.load(std::memory_order_relaxed) > 0 ? 1 : 0;
       char line[400];
       const int n = std::snprintf(line, sizeof line, "hprice %s %.4f %.4f %.4f %llu %d %.4f %.4f\n",
                                   hkey.c_str(), hr, g_hprice_child_t.load(std::memory_order_relaxed), hb,

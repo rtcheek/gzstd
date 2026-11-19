@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.57  
+**Covers:** v0.9.50 → v0.18.58  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,95 @@
 
 ---
 
+
+## v0.18.58 — a hybrid decode starts its GPUs at a price --calibrate ARCHIVE measured on this machine, which under -t and to /dev/null also replaces the growth and bound tests (ROADMAP 42a; 8-H100 server, 6 CPUs, a cached 24 GiB archive: -t --cpu-only 5.12-5.14 s, legacy 5.15-5.16, priced 3.47-3.68; -d to /dev/null 5.13, legacy 4.04-5.19, priced 4.05-4.15)
+
+**What the legacy guard got wrong.**  A hybrid decode samples its CPU pool, and starts its GPUs only when
+the pool is behind its reader, behind by enough to pay for a GPU's own threads (the growth test,
+v0.18.44), and when the most a GPU could save (the bound, v0.18.47) clears 4.0 s.  Measured on the 8-H100
+server (cached base64 archives of 16 MiB frames, ratio 1.33, two idle cards, three rotated rounds; wall s,
+--cpu-only / engaged at the first settled window / what the default did):
+
+| CPUs | archive | -d to /dev/null | -t |
+|---|---|---|---|
+| 4 | 24 GiB | 7.1-7.4 / 5.5-6.8 / engaged | 7.3-7.4 / 5.6-6.0 / declined, 7.7 |
+| 6 | 24 GiB | 5.4-5.6 / 4.8-5.0 / declined | 5.5-5.6 / 5.2-5.8 / declined |
+| 8 | 24 GiB | 3.7 / 4.4-4.5 / declined | 4.1 / 4.5-4.8 / declined |
+| 8 | 97 GiB | 14.0 / 13.7-14.1 / declined | 14.2-14.3 / 12.7-13.1 / declined, 14.5 |
+| 12 | 97 GiB | 8.6-9.7 / 9.0-10.0 / declined | 9.6-9.7 / 11.4-11.6 / declined |
+| 16 | 97 GiB | 7.0-7.2 / 7.5-7.7 / declined | 7.0-8.3 / 8.5-8.9 / declined |
+| 24 | 97 GiB | 5.8-5.9 / 6.2-6.4 / declined | 5.6-5.8 / 6.0-7.9 / declined |
+
+-d missed one cell (6 CPUs: the bound, 2.6-3.5 s against 4.0).  -t missed two, both by the growth test
+("nearly keeps up", the backlog growing 0.04-0.25 of what the pool took), and at 8 CPUs on 97 GiB the
+bound said a GPU could save at most 0.7-1.0 s where it saved 1.3: -t verifies on the cards and copies
+nothing back, and the reader the bound holds fixed speeds up once cards take frames.  So the tests' model,
+not only their price, is what a measurement has to replace.
+
+**--calibrate ARCHIVE now measures it.**  After the device-count pass, before the calibrating process
+touches CUDA, child processes decode ARCHIVE as a default run would at this CPU allowance (-T,
+--gpu-devices, --read-threads as given), once as -d to /dev/null and once as -t, declining or engaging at
+their first settled window, and then decode only its first frames the same way: a prefix ending on a
+frame of the archive's seek table (GZSTD_CALIBRATE_HPRICE_BYTES caps the parallel reader's file size after
+every reader choice was made on the whole archive).  The smaller point is a smaller input and not, as for
+compress, a later decision, because a decode's bound holds still while its reader runs: at 6 CPUs an
+engage at the first window won 0.5 s, one 3 s in (reader done) lost 0.45, and a 12 GiB archive engaged at
+once lost 0.50.  Four arms a round, each point paired with its own declined run, three rounds rotated,
+every wall time to waitpid; v0.18.57's fit and checks, plus a decode's: a card fault means its CPU rescue
+ran.  An archive without a seek table records nothing.
+
+**A default run reads it.**  The key: -d or -t, the reader's path and threads, the small allowance's
+one-decoder rule, the archive's residency as that reader judged it (a calibration caches an archive
+that fits, so a cold archive -- whose drive, not its page cache, paces the reader -- keeps the legacy
+rules; a calibration whose first warm-up read the archive cold runs it again, cached), the CPU decoders and allowance, the device bound, the largest frame, the archive's ratio
+class (floor(log2) of the seek table's decoded over compressed bytes; more compressible archives won at
+8-12 CPUs where base64 ties), a user's batch or stream setting and the caller's CUDA_VISIBLE_DEVICES.  A
+price taken AS MEASURED (-t, or -d to /dev/null) decides as compress does: the waiting test, then R above
+the price, with the growth and bound tests off -- the calibration measured what engaging saves at this
+key, including what the cards' threads cost the pool.  To any other sink the price applies only above 4.0
+s and both tests stay (compress's rule: a lower price may make another sink decline more, never engage
+more).  Several inputs, --tar and --no-profile keep 4.0 s.  -vv says which price a run took and why; a
+--calibrate at -vv prints every child's decision.
+
+**Measured** (8-H100 server, 6 CPUs on the socket whose memory holds the cached 24 GiB archive):
+--calibrate priced -d at 3.22 s (the whole archive engaged at R 6.38 saved 1.06 +/- 0.07 s; its first 9.2
+GiB at R 3.11 lost 0.03 +/- 0.01; bringup 1.55) and -t at 2.27 s (saved 1.47 +/- 0.09; 9.2 GiB at R 2.25
+lost 0.01 +/- 0.23; bringup 1.81).  Four rotated rounds, wall time:
+
+| | --cpu-only | legacy default | priced default |
+|---|---|---|---|
+| -d to /dev/null | 5.13 x4 | 5.19, 4.04, 5.13, 4.15 | 4.05-4.15 |
+| -t | 5.12-5.14 | 5.15-5.16 | 3.47-3.68 |
+
+At 8 CPUs (same archive and socket), where engaging a -d LOSES (the whole archive -0.07 +/- 0.09 s, its
+first 14.3 GiB -0.35), --calibrate priced -d at 4.03 s, extrapolated above both points, and -t at 3.03 s
+(+0.27 / -0.34): -d --cpu-only 3.47-3.50, legacy 3.49-3.56, priced 3.51-3.54 (declined, as the legacy
+did); -t 3.46-3.47, 3.46-3.51, priced 3.17-3.38.
+
+**Where the page cache sits moves both.**  On this two-socket host node 0's memory is full of page cache
+(5.7 GiB free of 756), so every newly read or re-faulted page lands on node 1, even for a reader pinned to
+node 0, and a fixture's placement changed during the session.  A 6-CPU -t child on node-0 CPUs, reading
+node-1 pages, saw a first-window R of 15-26 s where 5.2-6.3 were left, ran 5.55 s against 5.17, and its
+cards saved little; on node-1 CPUs they saved 1.0-1.5 s.  The grid above ran on node-0 CPUs.  Nothing keys
+locality, but a price measured with the archive local still paid with it remote: the 6-CPU record on node-0
+CPUs, three rounds, -d --cpu-only 5.21-5.24 s, legacy 4.85-5.29, priced 4.71-4.86; -t 5.23-5.39, 5.17-5.25,
+priced 4.36-4.44 (ROADMAP 42a).
+
+**Tests.**  New default cell in Small-input GPU gate: records planted under the keys a -vv decode prints,
+decided on the sampler's synthetic job, whose backlog never grows (so the growth test declines every run
+it applies to): no record declines; 5 s to /dev/null engages with the growth test off; 5 s to a file
+keeps it and declines; 20 s declines on the price; -t looks up its own key and takes 5 s as measured; -T
+2, --no-profile, another driver and the guard hook keep 4.0 s.  New -e cell: --calibrate ARCHIVE under
+its test hook, one CPU decoder slowed by GZSTD_DEBUG_CPU_DECODE_US so an engaged child's card gets frames,
+records both classes (a first warm-up that read the archive cold, as one gzstd just wrote O_DIRECT is, runs
+again), a prefix child takes under 0.75 of the whole one's time, a default -t run takes the price, and the
+same run under --cold misses it.  Six mutants are each caught: no growth bypass; a bypass on any price rather than an
+as-measured one; no d/t in the key; decode reading compress's records; -t not as measured; a prefix child
+ignoring its limit.  Codex: design and code review in two rounds, no blocker.  Fixed from it: the reader count was
+published before the reader's memory fit could lower it; sub-MiB frame sizes all keyed f0 (the key now
+carries exact bytes); a quiet run built a key it could not use; the default cell erased the -d record
+before its exclusion checks; and no check showed a cold key missing a warm price (a --cold run now
+does).  Its warm-versus-cold point is why the key carries residency.  Suites: -e 929/0/1, CPU-only 414/0/134.
 
 ## v0.18.57 — a hybrid compress starts its GPUs at a price --calibrate FILE measured on this machine, not the flat 4.0 s (ROADMAP 42a; 8-H100 server, 24 CPUs, a cached 97 GiB file to /dev/null: the legacy guard engaged and took 6.10-6.22 s, the calibrated price declines and takes 5.43-5.45, --cpu-only 5.40-5.43; 6 CPUs, 14.5 GiB: 4.14-4.16 -> 3.54-4.16, --cpu-only 4.14-4.15)
 

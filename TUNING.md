@@ -59,7 +59,7 @@ the profile, so that the first `--adapt` run already has them.
 | `gzstd --calibrate` | CPU and GPU compress and decompress rates, on generated data in memory. On a host with 2 or more GPUs, also what it costs to start each number of GPUs. |
 | `gzstd --calibrate -o /mnt/data/NEWFILE` | also the write rate of that filesystem: it writes a scratch file there, syncs it, then deletes it. The path must not already exist. |
 | `gzstd --calibrate FILE` | also the GPU compression rate at each number of GPUs, on your own data, and when a hybrid compress should start its GPUs. See the next two sections. |
-| `gzstd --calibrate ARCHIVE` | also the GPU decompression rate at each number of GPUs, on your own `.zst`. gzstd recognizes an archive by its first bytes, not its name; give FILE and ARCHIVE together to measure both. |
+| `gzstd --calibrate ARCHIVE` | also the GPU decompression rate at each number of GPUs, on your own `.zst`, and when a hybrid decode should start its GPUs. gzstd recognizes an archive by its first bytes, not its name; give FILE and ARCHIVE together to measure both. |
 | add `--no-profile` | prints the measurements without saving them. |
 
 Calibrate again after a hardware change, a driver update, or a move to a different kind of storage.
@@ -102,6 +102,40 @@ FILE has to keep the CPUs busy for a few seconds: about 25 GiB of typical data o
 host with many cores, the default CPU count (up to 96 workers) needs more data than a calibration
 can reasonably use, so a price is mostly useful at a limited CPU count. Prices are dropped when the
 GPU driver changes, and replaced by the next calibration.
+
+## When a hybrid decode starts its GPUs
+
+A hybrid `-d` or `-t` makes the same choice, with two more tests: the CPUs must be falling behind
+the reader by enough to pay for the GPUs' own threads, and the GPUs must be able to save more than
+4.0 s (they can't finish before the reader does). On a host with 8 H100 GPUs, decoding cached
+24 GiB and 97 GiB archives of base64 with two GPUs, those rules were right on most CPU counts but
+passed up wins on a few. On 6 CPUs, `-t` took 5.15 s where starting the GPUs took 3.5–3.7. Under `-t`
+the GPUs verify frames on the card and copy nothing back, so they help more than the estimate
+behind the tests assumes.
+
+`gzstd --calibrate ARCHIVE` measures it, as for compress: it decodes ARCHIVE as `-d` to `/dev/null`
+and as `-t`, and then only its first frames, starting the GPUs and not starting them, three times
+each. ARCHIVE needs a seek table, which gzstd writes by default:
+
+```
+[CALIBRATE] hybrid decode price (-t): start the GPUs above 2.27 s of CPU work left (the legacy guard: 4.0 s) -- between the measured points
+```
+
+A later decode uses a price only when it runs the same way: `-d` or `-t`, the same way of reading
+and number of reader threads, an archive that is also cached (or also not: a calibration caches
+an archive that fits in memory, so a cold one keeps the built-in rules), number of CPU decoders and CPU limit, number of GPUs, frame size,
+`CUDA_VISIBLE_DEVICES`, and an archive compressed about as well (gzstd groups ratios by powers of
+two). Under `-t`, and for `-d` to `/dev/null`, the measured price then replaces the other two
+tests: the CPUs only have to be behind the reader, and enough work left. For any other output the
+price is used only when it is above 4.0 s, and the other tests stay. `-vv` shows which price a run
+used and why. On that host, 6 CPUs and the 24 GiB archive: `-d` to `/dev/null` 5.13 s with `--cpu-only`
+and 4.05–4.15 s priced, where 4.0 s started the GPUs in two runs of four.
+
+On a host with two CPU sockets, a cached archive is read faster by CPUs on the socket whose memory
+holds it, and that changes what the GPUs save: on that host, a 6-CPU `-t` gained 1.0–1.5 s from the
+GPUs with the archive in local memory and almost nothing with it on the other socket in one test.
+A price measured with the archive local still paid off with it remote (a 6-CPU `-t` took 4.4 s
+against 5.2–5.4 for `--cpu-only`), but calibrate on the CPUs you decode with.
 
 ## How many GPUs to use for `--gpu-only`
 

@@ -943,7 +943,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     when it started at 32 (pinned 32 4.74-4.88), ~5%.  The halving probe has no affordability check
     at all, and TUNE_STEEP lets an unproven doubling cost up to 1 / devices of what is left.
 
-42. **Hybrid runs and their GPUs: what is left after v0.18.46-48 (and v0.18.57's price).**  v0.18.46 capped a regular-file hybrid
+42. **Hybrid runs and their GPUs: what is left after v0.18.46-48 (and v0.18.57-58's prices).**  v0.18.46 capped a regular-file hybrid
     `-d` and `-t` at two cards (the pipe rule, extended); v0.18.47 engages only when the most a GPU could
     save clears the guard; v0.18.48-49 closed the rest of this item's list except (a) and (b)'s cold mmap.
     (a) **COMPRESS DONE v0.18.57, for a host that runs --calibrate FILE: the guard is this machine's measured
@@ -958,13 +958,32 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     spec in one place, by rtcheek's call: a fit may EXTRAPOLATE (at 24 CPUs the break-even sits at ~230 GiB of
     input), and the record says when it does.  **STILL OPEN:** (1) an uncalibrated host keeps 4.0 s -- no
     built-in rule fits both ends, and only this server has been calibrated; run --calibrate FILE on the 2080 Ti
-    and 5090 hosts and compare their prices with this one's; (2) decompress and the -d --tar decode pool keep
-    4.0 s -- the same machinery with --calibrate ARCHIVE is the next step; (3) at the default allowance of a
+    and 5090 hosts and compare their prices with this one's; (2) a -d --tar extract and its decode pool keep
+    4.0 s (decompress is DONE, v0.18.58: below); (3) at the default allowance of a
     large host (96 workers here) no FILE a calibration can hold reaches R of a few seconds, so that key stays
     unpriced; (4) what engaging costs at 24 CPUs is the exit's freeing of ~5-6 GiB of frame memory held behind
     the writer (0.70-0.88 s): trimming FrameMem at the last frame and skipping the GPU frees did not move it,
     and fewer frames held during GPU batches is the untried lever; (5) a file sink inherits only the upward half
     of a /dev/null price -- a sink-keyed calibration (-o TARGET) would give it the rest.
+    **DECOMPRESS DONE v0.18.58, for a host that runs --calibrate ARCHIVE.**  The legacy guard was right in
+    most cells and wrong where its model was (8-H100 server, cached base64 archives, two cards): -d passed up
+    9% at 6 CPUs (the bound test, 2.6-3.5 s against 4.0); -t passed up 20% at 4 CPUs and 9% at 8 CPUs on
+    97 GiB, both by the growth test, and at 8 CPUs the bound said a GPU could save 0.7-1.0 s where it saved
+    1.3 (-t verifies on the cards; the reader the model holds fixed speeds up once cards take frames).
+    --calibrate ARCHIVE now prices -d to /dev/null and -t, with a PREFIX of the archive (a seek-table frame
+    end) as the smaller point: a decode's bound holds still while its reader runs, so a later decision moved
+    only the cards' start.  The key adds d|t, the reader's threads, the one-decoder cap, the archive's
+    residency (a calibration caches an archive that fits, so a cold one keeps the legacy rules) and its ratio class
+    (powers of two, from its seek table).  A run that takes a price as measured (-t, -d to
+    /dev/null) decides as compress does, the waiting test then R > price, with the growth and bound tests
+    off; any other sink keeps them, at max(price, 4.0).  6 CPUs, 24 GiB, archive local to the CPUs: -d
+    --cpu-only 5.13 s, legacy 4.04-5.19 (engaged in two of four), priced 4.05-4.15; -t 5.12-5.14, legacy
+    5.15-5.16, priced 3.47-3.68.  **STILL OPEN:** (6) WHERE THE PAGE CACHE SITS moves the price and the
+    win: on this two-socket host, node 0's memory is full of page cache, so new pages land on node 1; a
+    6-CPU -t on node-0 CPUs read first-window R 15-26 s (local: 5.2-6.3) and its cards saved little where
+    on local pages they saved 1.0-1.5 s.  Nothing keys locality, but the 6-CPU record measured local still
+    paid remote (-d 4.71-4.86 s against --cpu-only 5.21-5.24, -t 4.36-4.44 against 5.23-5.39): smaller wins,
+    no loss.  (7) a -d --tar decode (the extract pool's own 4.0 s test, --adapt only) has no price.
     (b) ~~**hybrid compress of a named file started every card**~~ **FIXED v0.18.48**: it takes two at most,
     as a pipe's compress (v0.18.40) and a named file's decode (v0.18.46) already did (8 CPUs, a cached
     24 GiB file: every card 7.31-7.37 s, two 4.53-4.58, `--cpu-only` 5.03-5.04).  Codex dissented: no
