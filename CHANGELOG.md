@@ -1,12 +1,101 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.56  
+**Covers:** v0.9.50 → v0.18.57  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.57 — a hybrid compress starts its GPUs at a price --calibrate FILE measured on this machine, not the flat 4.0 s (ROADMAP 42a; 8-H100 server, 24 CPUs, a cached 97 GiB file to /dev/null: the legacy guard engaged and took 6.10-6.22 s, the calibrated price declines and takes 5.43-5.45, --cpu-only 5.40-5.43; 6 CPUs, 14.5 GiB: 4.14-4.16 -> 3.54-4.16, --cpu-only 4.14-4.15)
+
+**What the flat price got wrong.**  A hybrid compress samples its CPU pool for a fraction of a second and starts
+its GPUs when the pool has more than 4.0 s of work left (R).  That price was a legacy budget, never measured.
+Measured on the 8-H100 server (cached base64 files to /dev/null, two idle cards, the sample run with every
+decline but the keeps-up test removed, against --cpu-only, three shuffled rounds, wall time through the process's
+exit), the R at which engaging stops losing is:
+
+| reader | 4 CPUs | 6 | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|
+| mmap (a cached named file) | ~2.5 s | ~3.1 | ~3.1 | ~4.3 | ~4.9 | ~13 |
+| --no-mmap | ~4.0 | 2.9-3.8 | ~4.9 | ~5.2 | (the keeps-up test declines) | |
+| --tar | ~3.1 | 2.9-3.3 | ~3.3 | (declines from 12) | | |
+
+So at 4-8 CPUs the guard passed up wins, and at 24 CPUs a 97 GiB mmap compress (R 5.0 s) engaged two cards and
+lost 16% (5.44 -> 6.29 s).  At each CPU count the saving is a straight line in R (fits from different pairs of
+sizes agree on its intercept within 0.05 s), saving = slope x R - C, with slope = a / (c + a): c the pool's rate,
+a what the cards add net of what they cost it (0.67 at 6 CPUs down to 0.11 at 24).  The 24-CPU loss is not slow
+cards: the engaged run reaches its exit no later than --cpu-only and then spends 0.70-0.88 s in the kernel freeing
+~5-6 GiB of frame memory held behind the in-order writer while GPU batches were out (trimming FrameMem's cache at
+the last frame, and skipping the GPU workers' explicit frees, both moved nothing).  Because a falls as c grows, no
+function of the sampled rate alone fits both ends; the price belongs to the host.
+
+**--calibrate FILE now measures it.**  After the GPU device-count pass, and still before the calibrating process
+touches CUDA, child processes compress FILE to /dev/null as a default run would at this CPU allowance (the
+calibration's own -T, --gpu-devices, level and --chunk-size), once with FILE as named (mmap when cached), once with
+--no-mmap and once with --tar.  Each child's sampler makes the decision it is told to at its first settled window:
+decline; engage; or engage about half its R later (timed from the declined run's own decision and finish, both on
+its clock).  A late decision's R is the pool's rate since the sample's warm-up, not one window's: at 6 CPUs one
+window read 6.13 s where ~3 were left.  Moving the decision, rather than the input size, gives two points from one
+FILE and works for --tar.  It is equivalent here: at 8 CPUs a 12 GiB file engaged at once (R 2.02
+s) lost 0.67 s, and a 24 GiB file engaged 2.75 s in (R 1.89) lost 0.68.  An untimed declined and engaged run come
+first (FILE into the page cache, the cards out of idle), then three rounds with the arms rotated; every wall time
+is taken to waitpid, so the exit's teardown is in it.  A child ends with its parent (PR_SET_PDEATHSIG), which the
+device-count pass's children now do too: killing --calibrate used to leave its active child compressing.
+
+The price comes from paired savings: each round's declined run less that round's engaged ones, the median, and
+their spread as noise.  A point is a win or a loss only when every round agrees.  The price is where the line
+through the two points crosses zero, held between the decided points and never below the measured bringup.
+Nothing is recorded when the slope is inside the noise, when the points contradict each other, when the late point
+leaves less work than the bringup, or when any child failed, never decided, had a card fault (the sticky one: a
+CPU rebuild clears the restart flags), or, engaged, gave its cards no work.  There is no "never": at slope 0.11, noise can flip the slope's sign (Codex review).  A crossing above or
+below both points is extrapolated, and the record says so.  rtcheek's call: at 24 CPUs the break-even sits at ~230
+GiB of input, which no calibration can be asked to compress, so a fit may extrapolate.
+
+**A default run reads it.**  The record's key is the reader path the producer settled on (not a cold input's probe
+arm), the hybrid CPU workers, the CPU allowance they came from (affinity and quota), the device bound before CUDA,
+the frame size, the level, a user's --read-threads and GPU batch or stream setting, and the caller's
+CUDA_VISIBLE_DEVICES, captured before gzstd places a mask of its own.  The profile is read before the sampler's clock
+starts; the sampler asks once, after its warm-up, and gets an in-memory answer -- a reader that has not settled its
+path by then leaves the legacy price, with no waiting.  A hybrid
+compress whose key matches uses the price as its guard: as measured when it writes to /dev/null, and to any other
+sink only when the price is above 4.0 s (a writer that binds leaves the cards nothing to save and their exit still
+to pay, so a /dev/null price may make another sink decline more, never engage more).  Everything else keeps 4.0
+s: no record, --no-profile, another driver (cleared at save, ignored at load), an older HPRICE_EPOCH, several
+inputs (they share one CUDA start and one exit, which no child measured), pipes, and every decompress.  The
+sampling budget stays 2.1 s.  -vv says which price a run took and why.
+
+**Measured** (8-H100 server, two idle cards, cached base64 files to /dev/null, wall time; a calibration takes 4-5
+minutes, most of it the GPU device-count pass that was already there):
+
+| CPUs | --calibrate on | mmap price | --no-mmap | --tar | A/B on | legacy default | priced default | --cpu-only |
+|---|---|---|---|---|---|---|---|---|
+| 24 | 97 GiB | 7.34 s (both points lost: extrapolated) | 9.27 | none (slope in the noise) | 97 GiB x3 | 6.10-6.22 s | 5.43-5.45 | 5.40-5.43 |
+| 8 | 24 GiB | 3.99 (between) | (an earlier build's late-timing bug) | 4.32 | -- | | | |
+| 6 | 24 GiB | 3.59 (between: +1.70 s at R 6.74, -0.15 at 3.32) | 4.96 | 3.80 | 14.5 GiB x7 | 4.14-4.16 | 3.54-4.16 | 4.14-4.15 |
+
+At 6 CPUs one of seven priced runs read R just under the price and declined; the others won 5-15%.  To a regular file
+the 6-CPU run's guard lifts to 4.00 s and declines, as designed.  The prices sit above the size grid's (3.1 at 8 CPUs)
+because engaged runs were ~0.3 s slower than when the grid ran (load average 8, other users): a calibration measures
+the machine as it is.  Delayed decision against a smaller file, at 8 CPUs: a 12 GiB file engaged at once (R 2.02 s)
+lost 0.67 s, a 24 GiB file engaged 2.75 s in (R 1.89) lost 0.68.
+
+**Tests.**  New default cell in Small-input GPU gate: the fit's table through GZSTD_DEBUG_HPRICE_FIT; then
+records planted under the key a -vv run prints, decided on the sampler's synthetic ten-second job: 20 s declines,
+5 s engages, -T 2, --no-profile, another driver and the guard hook keep 4.0, and 2.5 s applies to /dev/null and
+lifts to 4.0 for a file.  New -e cell: --calibrate FILE under its test hook (fixed points) records the --no-mmap
+and --tar classes and FILE as named, and a default --tar run takes the price under the same key.  Six mutants
+are each caught: the sink rule, a key without its workers, a price that beats the test hook, no driver check, no
+noise check, a child key that differs.  Codex reviewed the design (the declined-hybrid baseline, paired noise, no
+"never", the caller's mask and the CPU allowance in the key, the sink rule's direction, the 2.1 s budget, single
+inputs) and then the code: three blockers -- the lookup's I/O and wait inside the sampler's windows, a CPU rebuild
+passing for an engaged run, and an orphaned child on SIGTERM -- and a probe arm's reader in the key, --read-threads
+aliasing and a fixed 0.3 s, all fixed; two more rounds on the repairs (no NVML for a lookup, a failed prctl ends
+the child) left nothing open.  Suites: -e 926/1/1, CPU-only 414/0/134.  The one failure is the -e keeps-up cell's
+decode arms ("fewest waiting 0" in a first window that began before the reader had queued anything), a timing
+flake under load: run alone three times against each build it passed 3/3 on this one and 2/3 on v0.18.56.
 
 
 ## v0.18.56 — a --tar chunk of one member's data is read into an unfilled block, not zero-filled first and then overwritten (ROADMAP 42a; 8-H100 server, idle cards, cached, one 24 GiB member at 8 CPUs: --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51; 97 GiB 19.33 -> 19.01 and, two cards, 14.66 -> 13.66)

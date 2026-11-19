@@ -943,25 +943,28 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     when it started at 32 (pinned 32 4.74-4.88), ~5%.  The halving probe has no affordability check
     at all, and TUNE_STEEP lets an unproven doubling cost up to 1 / devices of what is left.
 
-42. **Hybrid runs and their GPUs: what is left after v0.18.46-48.**  v0.18.46 capped a regular-file hybrid
+42. **Hybrid runs and their GPUs: what is left after v0.18.46-48 (and v0.18.57's price).**  v0.18.46 capped a regular-file hybrid
     `-d` and `-t` at two cards (the pipe rule, extended); v0.18.47 engages only when the most a GPU could
     save clears the guard; v0.18.48-49 closed the rest of this item's list except (a) and (b)'s cold mmap.
-    (a) **OPEN: the guard itself** is the legacy 4.0 s, the one price for CUDA's start, the pool's loss to
-    the cards' host copies and threads, and the teardown (0.15-0.34 s in the H100 runs of (f)),
-    none of which a run can read before CUDA starts; 12 CPUs sits on it here (bounds of 4.03-4.06 s engaged
-    and won 7%, 3.4-3.9 declined and tied).  NOT the profile's `--gpu-only` overhead model (gpuc_overhead_s):
-    no CPU pool loses anything in it, and its wall clock stops before the kernel's teardown (Codex review,
-    v0.18.48).  A measured hybrid price needs its own model.  What it must record (Codex's design): at the
-    sample's decision R, the bound, U, s, the backlog, the pool's size and the sample's length; the first
-    usable stream's registration (not the "online" line); the CPU pool's completed bytes before and during
-    the bringup and each card's delivered bytes; the last CPU frame, the last GPU delivery and the last
-    committed output; and, from --calibrate's parent, the whole process through `waitpid`.  Keyed by
-    direction, CPU allowance, device set, frame geometry, reader path and source/sink class, in its own
-    namespace and epoch.  Fitted against observed `--cpu-only` minus hybrid times from INTERLEAVED
-    calibration runs, validated across the boundary, never extrapolated; a default reads a matching
-    validated model and otherwise keeps 4.0 s; exploration stays opt-in.  The -d --tar decode pool needs
-    its own matched price.  A second host should check v0.18.47's break-even meanwhile (the 5090's
-    code-comment numbers agree: 2.4 s tied, 6-6.5 won).
+    (a) **COMPRESS DONE v0.18.57, for a host that runs --calibrate FILE: the guard is this machine's measured
+    price.**  The legacy 4.0 s was wrong on both sides (8-H100 server, mmap, break-even R ~2.5-3.1 s at 4-8 CPUs,
+    ~13 at 24, where a 97 GiB compress engaged and lost 16%); the saving is linear in R at each CPU count, with a
+    slope a/(c+a) that falls as the pool's rate c grows, so the price is the host's.  --calibrate FILE now fits it
+    per reader class (FILE as named, --no-mmap, --tar) from child processes that decline or engage at two
+    decision points, paired per round, every wall time to waitpid; a default hybrid compress whose key (reader,
+    workers, CPU allowance, device bound, frame size, level, --read-threads, the caller's mask) matches uses it --
+    to /dev/null as measured, elsewhere only when above 4.0 s.  24 CPUs / 97 GiB: 6.10-6.22 s -> 5.43-5.45
+    (--cpu-only 5.40-5.43); 6 CPUs / 14.5 GiB: 4.14-4.16 -> 3.54-4.16.  The design departs from Codex's earlier
+    spec in one place, by rtcheek's call: a fit may EXTRAPOLATE (at 24 CPUs the break-even sits at ~230 GiB of
+    input), and the record says when it does.  **STILL OPEN:** (1) an uncalibrated host keeps 4.0 s -- no
+    built-in rule fits both ends, and only this server has been calibrated; run --calibrate FILE on the 2080 Ti
+    and 5090 hosts and compare their prices with this one's; (2) decompress and the -d --tar decode pool keep
+    4.0 s -- the same machinery with --calibrate ARCHIVE is the next step; (3) at the default allowance of a
+    large host (96 workers here) no FILE a calibration can hold reaches R of a few seconds, so that key stays
+    unpriced; (4) what engaging costs at 24 CPUs is the exit's freeing of ~5-6 GiB of frame memory held behind
+    the writer (0.70-0.88 s): trimming FrameMem at the last frame and skipping the GPU frees did not move it,
+    and fewer frames held during GPU batches is the untried lever; (5) a file sink inherits only the upward half
+    of a /dev/null price -- a sink-keyed calibration (-o TARGET) would give it the rest.
     (b) ~~**hybrid compress of a named file started every card**~~ **FIXED v0.18.48**: it takes two at most,
     as a pipe's compress (v0.18.40) and a named file's decode (v0.18.46) already did (8 CPUs, a cached
     24 GiB file: every card 7.31-7.37 s, two 4.53-4.58, `--cpu-only` 5.03-5.04).  Codex dissented: no

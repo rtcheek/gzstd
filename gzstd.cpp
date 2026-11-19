@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.56";
+static constexpr const char * GZSTD_VERSION = "0.18.57";
 //
 // Architecture overview:
 //
@@ -115,6 +115,9 @@ static constexpr const char * GZSTD_VERSION = "0.18.56";
 #ifndef _WIN32
 #include <sys/syscall.h>   // SYS_memfd_create (--calibrate's RAM-backed corpus file)
 #include <sys/wait.h>      // waitpid (--calibrate's per-device-count children)
+#ifdef __linux__
+#include <sys/prctl.h>     // PR_SET_PDEATHSIG (a --calibrate child ends with its parent)
+#endif
 #endif
 #ifdef __linux__
 #include <sched.h>         // dynamic affinity masks for the CPU allowance
@@ -5133,6 +5136,24 @@ static void print_help_long()
 "     that size but low for much larger ones.  FILE and ARCHIVE are only\n"
 "     read, never written; the generated-data rows are measured as without\n"
 "     them.\n"
+"     HYBRID PRICE (FILE given, any GPU count): when a hybrid compress\n"
+"     should start its GPUs.  The default starts them when its sample of\n"
+"     the CPU pool predicts more than 4.0 s of work left, a price that is\n"
+"     too high on a few CPUs and too low on many (24 CPUs on an 8-H100\n"
+"     server: it started two cards that cost a 97 GiB compress 16%).  Child\n"
+"     processes compress FILE to /dev/null as a default run would at this\n"
+"     CPU allowance (-T, --gpu-devices, the level and --chunk-size as\n"
+"     given), declining and starting the GPUs at two points, in three\n"
+"     rounds, once with FILE as named, once with --no-mmap and once with\n"
+"     --tar; the price is where the measured saving crosses zero.  A hybrid\n"
+"     compress whose reader, CPU workers and allowance, device count,\n"
+"     frame size, level and CUDA_VISIBLE_DEVICES match a priced run then\n"
+"     uses that price instead of 4.0 s: as measured when it writes to\n"
+"     /dev/null, and elsewhere only when it is above 4.0 s (a slow writer\n"
+"     leaves the GPUs nothing to save).  FILE must keep the CPU pool busy\n"
+"     for a few seconds at this allowance (on 24 CPUs, ~100 GiB); a\n"
+"     smaller one is reported and records nothing.  A few minutes per\n"
+"     reader; --no-profile keeps the result out of the profile.\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -8689,6 +8710,11 @@ static constexpr double GPUC_RATE_MIN_S = 2.0;
 // where two take 5.17.  BUMP IT when a release changes per-device startup by
 // enough to move a count.
 static constexpr double GPUC_EPOCH = 1;
+// The hybrid price's epoch (v0.18.57, see GPU_INIT_GUARD_SEC): a default run uses
+// a calibrated price only of this epoch or later.  BUMP IT when a release changes
+// what engaging costs or gains (a bringup, a teardown, the cards' share) by enough
+// to move a break-even, so --calibrate measures it again.
+static constexpr double HPRICE_EPOCH = 1;
 static inline void gpuc_mark_start(uint64_t t)
 {
   uint64_t cur = g_gpuc_first_ns.load(std::memory_order_relaxed);
@@ -9603,6 +9629,20 @@ static AdaptProfileRead adapt_profile_load_at(int dirfd, const std::string & bas
 }
 #endif
 
+// One calibrated hybrid compress price (v0.18.57, ROADMAP 42a; see
+// GPU_INIT_GUARD_SEC): the remaining CPU time above which a hybrid compress
+// engages its cards on this machine, for one key (hprice_key), with the two
+// measured points it was fitted from.  r_* are the sampler's remaining time at
+// the decision, s_* what engaging saved there (negative: it lost), b the cards'
+// bringup from the decision to the first usable stream, t_cpu the declined run.
+struct HpriceRec {
+  double price = -1.0, slope = 0.0, c = 0.0;
+  double r_early = 0.0, s_early = 0.0, r_late = 0.0, s_late = 0.0;
+  double m_early = 0.0, m_late = 0.0;   // the savings' noise (hprice_fit)
+  double b = 0.0, t_cpu = 0.0, rounds = 0.0;
+  std::string how;   // which rule set the price (hprice_fit)
+};
+
 // One process's accumulated observation, filled on the main thread as each
 // operation finishes (multi-file runs sum; rates derive from the sums).
 struct AdaptObs {
@@ -9669,6 +9709,8 @@ struct AdaptObs {
     bool no_rate = false;
   };
   std::vector<GpucSample> gpuc;
+  // --calibrate FILE's hybrid prices (v0.18.57), by key; empty for every other run.
+  std::vector<std::pair<std::string, HpriceRec>> hprice;
 
   void add_meter(const Meter & m, uint64_t wall, bool compress_dir)
   {
@@ -9832,6 +9874,36 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   // never averaged -- and its rate dropped when this sample carries none -- so
   // one --calibrate brings a whole model current, and the default never trusts
   // half an old number (see gpuc_default_choice).
+  // Hybrid prices (v0.18.57): a calibration measures each afresh, so a record is
+  // REPLACED, never averaged with an older one -- the points it was fitted from
+  // describe one session, and a blend of two fits is neither.  GPU-derived: the
+  // driver-change clear in adapt_profile_save drops them all.
+  if (!obs.hprice.empty()) {
+    AdaptJv & hp = dir.set("hybrid_price");
+    hp.t = AdaptJv::OBJ;
+    for (const auto & kr : obs.hprice) {
+      AdaptJv & e = hp.set(kr.first);
+      e = AdaptJv{};
+      e.t = AdaptJv::OBJ;
+      const HpriceRec & r = kr.second;
+      e.put_num("price_s", r.price);
+      e.put_num("slope", r.slope);
+      e.put_num("c_s", r.c);
+      e.put_num("r_early_s", r.r_early);
+      e.put_num("saved_early_s", r.s_early);
+      e.put_num("r_late_s", r.r_late);
+      e.put_num("saved_late_s", r.s_late);
+      e.put_num("noise_early_s", r.m_early);
+      e.put_num("noise_late_s", r.m_late);
+      e.put_num("bringup_s", r.b);
+      e.put_num("declined_run_s", r.t_cpu);
+      e.put_num("rounds", r.rounds);
+      e.put_str("rule", r.how);
+      e.put_str("sink", "null");
+      e.put_num("epoch", HPRICE_EPOCH);
+      e.put_num("updated", (double)::time(nullptr));
+    }
+  }
   for (const AdaptObs::GpucSample & g : obs.gpuc) {
     if (obs.streams_explore) break;
     if (g.devices <= 0 || g.active_ns == 0 || g.wall_ns <= g.active_ns) continue;
@@ -10678,9 +10750,10 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
         for (const std::string & k : gpu_keys)
           if (d2.get(k)) d2.put_num(k, 0);
         // Batch priors are per device and measured on that driver: drop them all.
+        // So are the hybrid prices (v0.18.57): the cards' start and rate are in them.
         d2.obj.erase(std::remove_if(d2.obj.begin(), d2.obj.end(),
                          [](const std::pair<std::string, AdaptJv> & kv) {
-                           return kv.first == "gpu_batch"; }),
+                           return kv.first == "gpu_batch" || kv.first == "hybrid_price"; }),
                      d2.obj.end());
         // The count model and stream lever are GPU-derived too.  Clearing only
         // the older keys would stamp the new driver above their stale rates;
@@ -11121,19 +11194,22 @@ static uint64_t adapt_decomp_uncompressed_est(int fd, uint64_t comp_size);
 // decision depending on how busy the CPUs were, and took 0.22-0.25 s each to
 // tear down).  What the sampler CAN measure it compares against this price: the
 // most a GPU could save (see gpu_bringup_worth_it), not merely the time left.
-// WHICH PRICE A RUN USES (v0.18.48, ROADMAP 42a) -- STATE TABLE:
+// WHICH PRICE A RUN USES (v0.18.48; v0.18.57, ROADMAP 42a) -- STATE TABLE:
 //   --gpu-only, or --cpu-share               -> no sample, no price (they always start)
-//   a known-size hybrid run, any profile     -> this legacy price
+//   a known-size hybrid COMPRESS whose key
+//     (hprice_key) --calibrate FILE priced   -> that calibrated price (hprice_lookup)
+//   any other known-size hybrid run, or
+//     --no-profile                           -> this legacy price
 //   an unknown-size (piped) hybrid, --adapt  -> the backlog gate, no time price
 //   an unknown-size hybrid, no --adapt       -> the work gate; this price as its timeout
-//   GZSTD_DEBUG_GPU_GUARD_SEC                -> the test override, in the sampler
+//   GZSTD_DEBUG_GPU_GUARD_SEC                -> the test override, in the sampler; it
+//                                               wins over a calibrated price too
 // NOT the profile's --gpu-only overhead model (gpuc_overhead_s, which --calibrate
 // fills): that is a --gpu-only run's wall time outside its cards' busy span, with no
 // CPU pool losing to the cards' host copies and threads, and its wall clock stops
 // before the kernel tears the contexts down at exit -- 0.15-0.34 s in the H100 runs
-// of ROADMAP 42f (Codex review).  A measured hybrid price needs its own model, fitted
-// on calibrated --cpu-only and hybrid runs side by side; ROADMAP 42 says what it must
-// record.
+// of ROADMAP 42f (Codex review).  The measured hybrid price has its own model, fitted
+// on declined and engaged hybrid runs side by side (see HPRICE_MIN_R).
 static constexpr double GPU_INIT_GUARD_SEC = 4.0;
 // Startup ramp to discard before trusting the pipeline's rate, then the length of
 // each window the rate is measured over.  Windows repeat until the decision is
@@ -11144,6 +11220,265 @@ static constexpr double GPU_SAMPLE_WINDOW_SEC = 0.15;
 // A window whose rate is within this factor of the previous window's means the
 // startup ramp is over, and that rate is the one to extrapolate.
 static constexpr double GPU_SAMPLE_SETTLED = 1.25;
+
+// THE PRICE A HYBRID COMPRESS PAYS, MEASURED ON THIS MACHINE (v0.18.57, ROADMAP 42a).
+// The legacy 4.0 s is wrong on BOTH sides, by an amount that depends on the host.
+// MEASURED, 8-H100 server, a cached base64 file to /dev/null, two cards idle, the
+// sample run with every decline but the keeps-up test removed, against --cpu-only,
+// three shuffled rounds, wall time through the process's exit: the R (the sampler's
+// remaining CPU time at its decision) at which engaging stops losing --
+//   reader      4 CPUs   6         8      12     16        24
+//   mmap        ~2.5     ~3.1      ~3.1   ~4.3   ~4.9      ~13
+//   --no-mmap   ~4.0     2.9-3.8   ~4.9   ~5.2   (the keeps-up test declines)
+//   --tar       ~3.1     2.9-3.3   ~3.3   (declines from 12)
+// so at 4-8 CPUs the guard passed up wins, and at 24 CPUs a 97 GiB mmap compress
+// (R 5.0 s) engaged and LOST 16% (5.44 -> 6.29 s).  At each CPU count the saving
+// is a straight line in R, saving = slope x R - C (fits from different pairs of
+// sizes agree on C within 0.05 s), with slope = a / (c + a): c the CPU pool's
+// rate, a what the cards add net of what they cost it (0.67 at 6 CPUs, 0.49 at 8,
+// 0.45 at 12, 0.31 at 16, 0.11 at 24) and C 1.4-2.1 s (the cards' bringup, ~1.2-
+// 1.5 s from the decision, plus the tail and the exit).  At 24 CPUs the engaged run
+// reaches its exit no later than --cpu-only; the kernel then spends 0.70-0.88 s
+// freeing ~5-6 GiB of frame memory held behind the in-order writer while GPU
+// batches were out, and the CUDA contexts.  a falls as c grows, so no function of
+// c alone fits both ends: the price is the host's, and it is MEASURED.
+//
+// --calibrate FILE measures it (calibrate_hprice): child processes compress FILE at
+// the calibrating process's own CPU allowance and device rule, each reader class in
+// turn (mmap, --no-mmap, --tar), in three interleaved rounds of three arms: the
+// sampler DECLINES at its first settled window; it ENGAGES there; it engages at a
+// window about R/2 later.  Moving the decision, not the input size, gives two
+// points R_early ~ 2 x R_late from one FILE (and works for --tar).  Each child's
+// wall time is taken to waitpid, so the exit's teardown is in it.  hprice_fit
+// fits the line through the two points and bounds it by what they measured.  A
+// default run reads the record whose key (hprice_key) matches its own exactly and
+// uses its price as the guard; with no record it keeps the legacy 4.0 s.
+// rtcheek's call (2026-11-18): a fit MAY extrapolate beyond the two points, and
+// says so in the record ("rule") -- at 24 CPUs here the break-even sits at ~230 GiB
+// of input, which no calibration can be asked to compress.
+//
+// HPRICE_MIN_R: an early point under this measures little but the bringup, and
+// the class records nothing.  HPRICE_MIN_SPAN: two points closer than this do not
+// fit a slope.
+static constexpr double HPRICE_MIN_R = 2.0;
+static constexpr double HPRICE_MIN_SPAN = 0.5;
+
+// The CALLER's CUDA_VISIBLE_DEVICES, captured at the top of gzstd_main: gzstd
+// installs a guessed mask of its own before CUDA starts (GzGpuMask), so the
+// environment a run reads later is not the device set it was asked to use.
+// -1 = not captured yet, 0 = unset, 1 = set (an empty value is a set mask).
+static int g_caller_cvd_set = -1;
+static std::string g_caller_cvd;
+static void gz_capture_caller_cvd()
+{
+  if (g_caller_cvd_set >= 0) return;
+  const char * cv = ::getenv("CUDA_VISIBLE_DEVICES");
+  g_caller_cvd_set = cv ? 1 : 0;
+  if (cv) g_caller_cvd = cv;
+}
+
+// The record a run looks up: the reader class (mmap | pread | direct | tar), the
+// hybrid CPU workers, the CPU allowance they came from (the affinity mask's CPUs
+// and a cgroup quota: -T6 under eight CPUs is not -T6 under 256), the device
+// bound before CUDA, the frame size, the level, a user's GPU batch or stream
+// setting, a user's --read-threads (a different reader pool), and the caller's
+// CUDA_VISIBLE_DEVICES (hashed; "all" when unset, which an empty value is not).  Exact match only: nothing interpolates between keys.
+// A calibration child computes the same key the same way and reports it.
+static std::string hprice_key(const char * reader, int workers, int devices,
+                              size_t chunk_bytes, const Options & opt)
+{
+  gz_capture_caller_cvd();
+  std::string mask = "all";
+  if (g_caller_cvd_set == 1) {
+    uint64_t h = 1469598103934665603ull;                      // FNV-1a 64
+    for (unsigned char ch : g_caller_cvd) { h ^= ch; h *= 1099511628211ull; }
+    char hx[24];
+    std::snprintf(hx, sizeof hx, "m%08llx", (unsigned long long)(h & 0xffffffffull));
+    mask = hx;
+  }
+  const GzCpuAllowance & cpus = gz_cpu_allowance();
+  char rt[24] = "";
+  if (opt.read_threads > 0) std::snprintf(rt, sizeof rt, "_r%zu", opt.read_threads);
+  char b[260];
+  std::snprintf(b, sizeof b, "%s_w%d_a%uq%u_d%d_f%zu_l%d%s%s%s_%s", reader, workers, cpus.mask,
+                cpus.quota, devices, chunk_bytes >> 20, opt.level, opt.ultra ? "u" : "", rt,
+                (opt.gpu_batch_user_set || opt.gpu_streams_user_set) ? "_tuned" : "", mask.c_str());
+  return b;
+}
+
+// The line through the two measured points and the price it gives.  re/rl are R
+// at the early and late decisions (re > rl); se/sl the median of each round's
+// PAIRED saving there (that round's declined run less its engaged one), and
+// me/ml their noise: the largest distance of any round's saving from that median
+// (0 for one round; three rounds make it a spread, not a confidence interval).
+// b is the measured bringup.  A point is a WIN only when every round won (s - m >
+// 0) and a LOSS only when every round lost (s + m < 0); otherwise it is undecided.
+// Pure: GZSTD_DEBUG_HPRICE_FIT=re,se,me,rl,sl,ml,b prints it and exits.
+//   the points                             price
+//   too close (< MIN_SPAN apart in R), or
+//     the late one inside the bringup      none
+//   savings that differ by no more than
+//     their noise (the slope's sign is
+//     not measured), or fall as R grows    none -- NOT "never": at slope 0.11 the two
+//                                          points' savings differ by ~0.3 s, which
+//                                          noise can flip (Codex review)
+//   a win below a loss (an empty bracket)  none: the noise is larger than the effect
+//   otherwise                              where the line crosses 0, held at or
+//                                          above the largest decided loss's R and
+//                                          at or below the smallest decided win's,
+//                                          and never below b: below it the CPU pool
+//                                          finishes before a card starts (a bringup
+//                                          above a decided win is a contradiction:
+//                                          none)
+// A crossing above both points (both lost) or below both (both won) is
+// EXTRAPOLATED, and the rule says so; it is not capped at the measured R.
+struct HpriceFit { bool ok = false; double price = -1.0, slope = 0.0, c = 0.0; const char * how = ""; };
+static HpriceFit hprice_fit(double re, double se, double me, double rl, double sl, double ml, double b)
+{
+  HpriceFit f;
+  if (!(re > 0.0) || !(rl > 0.0) || !std::isfinite(se) || !std::isfinite(sl)
+      || !(me >= 0.0) || !(ml >= 0.0) || !(re - rl >= HPRICE_MIN_SPAN)) {
+    f.how = "the two decisions are too close in R to fit a line";
+    return f;
+  }
+  if (b > 0.0 && !(rl > b)) {
+    f.how = "the late decision left less CPU work than the bringup takes";
+    return f;
+  }
+  f.slope = (se - sl) / (re - rl);
+  f.c = f.slope * re - se;
+  if (!(se - sl > me + ml)) {
+    f.how = "the savings at the two points differ by no more than their noise: no measured slope";
+    return f;
+  }
+  const bool win_e = se - me > 0.0, win_l = sl - ml > 0.0;
+  const bool loss_e = se + me < 0.0, loss_l = sl + ml < 0.0;
+  const double lo = loss_e ? re : loss_l ? rl : 0.0;          // at or above every decided loss
+  const double hi = win_l ? rl : win_e ? re : HUGE_VAL;       // at or below every decided win
+  if (lo > hi) {
+    f.how = "a decided win below a decided loss: noise, not a price";
+    return f;
+  }
+  if (b > 0.0 && b > hi) {
+    f.how = "the measured bringup is longer than a decided win's R: inconsistent";
+    return f;
+  }
+  const double cross = f.c / f.slope;
+  f.price = std::min(std::max(cross, lo), hi);
+  if (b > 0.0) f.price = std::max(f.price, b);
+  f.how = f.price > re ? "above both measured points (extrapolated)"
+        : f.price < rl ? "below both measured points (extrapolated)"
+        : "between the measured points";
+  f.ok = f.price > 0.0 && std::isfinite(f.price);
+  if (!f.ok) f.how = "no positive price (and no measured bringup to floor it)";
+  return f;
+}
+
+// A --calibrate price child (calibrate_hprice) runs with GZSTD_CALIBRATE_HPRICE=
+// "engage@T" or "decline@T": its sampler decides at its first settled window at or
+// after T seconds, whatever R is and whatever the keeps-up test says, and reports
+// that R, that time, the first usable stream's registration and its key at exit.
+struct HpriceChild { int mode = 0; double at_s = 0.0; };   // mode 1 engage, 2 decline
+static const HpriceChild & hprice_child()
+{
+  static const HpriceChild hc = [] {
+    HpriceChild c;
+#ifndef _WIN32
+    const char * e = ::getenv("GZSTD_CALIBRATE_HPRICE");
+    char m[16] = {0};
+    double at = -1.0;
+    if (e && std::sscanf(e, "%15[a-z]@%lf", m, &at) == 2 && std::isfinite(at) && at >= 0.0) {
+      c.mode = std::strcmp(m, "engage") == 0 ? 1 : std::strcmp(m, "decline") == 0 ? 2 : 0;
+      c.at_s = at;
+    }
+#endif
+    return c;
+  }();
+  return hc;
+}
+static std::atomic<double> g_hprice_child_r{-1.0};           // R at the child's decision
+static std::atomic<double> g_hprice_child_t{-1.0};           // seconds into the sample
+static std::atomic<uint64_t> g_hprice_decide_ns{0};          // when the sampler decided
+static std::atomic<uint64_t> g_first_gpu_stream_ns{0};       // the first registered stream
+static std::atomic<uint64_t> g_hprice_gpu_bytes{0};          // input bytes the cards compressed
+static bool g_hprice_counting = false;                       // this run is a price child
+static std::atomic<double> g_hprice_decide_s{-1.0};          // ... decided, s from process start
+static std::atomic<double> g_hprice_done_s{-1.0};            // ... finished compressing, likewise
+// The compress producer's FINAL reader path, published once it has committed to
+// one ("mmap" | "pread" | "direct" | "pipe"): g_adapt_src_path also names a cold
+// input's probe arms, so a non-null value there is not a settled path (Codex
+// review).  Null = not settled yet: the price stays legacy.
+static std::atomic<const char *> g_hprice_reader{nullptr};
+static std::mutex g_hprice_key_mx;
+static std::string g_hprice_key;                             // the run's key, once known
+
+#ifndef _WIN32
+// This machine's calibrated prices, from the profile: read, never written, and
+// only when the entry's GPU driver is the one running (the price is the cards' as
+// much as the CPUs').  Loaded BEFORE the sampler starts its clock, so no profile
+// I/O falls inside a measured window (Codex review); the run then looks its key
+// up in `out`.  false = none usable; `why` says which.
+//
+// The fingerprint names this machine's entry, and building it can start NVML
+// where the driver's procfs is missing (~300 ms on 8 cards) -- a cost an ordinary
+// run must not pay for a lookup that usually finds nothing (Codex review).  So:
+// no entry in the file holds a price -> none, without a fingerprint; and the
+// fingerprint is taken only where procfs names the GPUs, else no price.
+static bool hprice_load(std::map<std::string, HpriceRec> & out, std::string & why)
+{
+  AdaptJv root;
+  if (adapt_profile_load(adapt_profile_path(), root) != AdaptProfileRead::OK) {
+    why = "no readable profile";
+    return false;
+  }
+  const AdaptJv * entries = root.get("entries");
+  bool any = false;
+  if (entries && entries->t == AdaptJv::OBJ)
+    for (const auto & en : entries->obj) {
+      const AdaptJv * c0 = en.second.t == AdaptJv::OBJ ? en.second.get("compress") : nullptr;
+      const AdaptJv * h0 = c0 && c0->t == AdaptJv::OBJ ? c0->get("hybrid_price") : nullptr;
+      if (h0 && h0->t == AdaptJv::OBJ && !h0->obj.empty()) { any = true; break; }
+    }
+  if (!any) { why = "none measured"; return false; }
+#if defined(HAVE_NVCOMP) && defined(HAVE_NVML)
+  {
+    std::string g, d;
+    if (!adapt_fp_gpus_procfs(g, d)) {
+      why = "this host's GPUs cannot be named without NVML, which a lookup does not start";
+      return false;
+    }
+  }
+#endif
+  const AdaptFp & fp = adapt_fingerprint();   // the procfs path, as checked above
+  const AdaptJv * entry = entries && entries->t == AdaptJv::OBJ ? entries->get(fp.hash) : nullptr;
+  if (!entry || entry->t != AdaptJv::OBJ) { why = "no profile entry for this machine"; return false; }
+  const AdaptJv * dvp = entry->get("driver");
+  if (!dvp || dvp->t != AdaptJv::STR || dvp->str != fp.driver) {
+    why = "the GPU driver has changed since it was measured";
+    return false;
+  }
+  const AdaptJv * cj = entry->get("compress");
+  const AdaptJv * hp = cj && cj->t == AdaptJv::OBJ ? cj->get("hybrid_price") : nullptr;
+  if (hp && hp->t == AdaptJv::OBJ)
+    for (const auto & kv : hp->obj) {
+      const AdaptJv & e = kv.second;
+      if (e.t != AdaptJv::OBJ || !(e.gnum("epoch", 0) >= HPRICE_EPOCH)) continue;
+      HpriceRec r;
+      r.price   = e.gnum("price_s", -1.0);
+      r.slope   = e.gnum("slope", 0.0);
+      r.c       = e.gnum("c_s", 0.0);
+      r.r_early = e.gnum("r_early_s", 0.0);
+      r.s_early = e.gnum("saved_early_s", 0.0);
+      r.r_late  = e.gnum("r_late_s", 0.0);
+      r.s_late  = e.gnum("saved_late_s", 0.0);
+      r.b       = e.gnum("bringup_s", 0.0);
+      r.how     = e.gstr("rule", "");
+      if (r.price > 0.0 && std::isfinite(r.price)) out[kv.first] = r;
+    }
+  if (out.empty()) { why = "none measured"; return false; }
+  return true;
+}
+#endif
 
 // The most a GPU could save a hybrid decode, in seconds: R - Ru = s x R + (B + I) / U,
 // at most R (derived at gpu_bringup_worth_it).  remaining = R, the pool's time
@@ -11308,7 +11643,8 @@ static bool gpu_bringup_worth_it(const Options & opt,
                                  const std::function<size_t()> & backlog = {},
                                  size_t behind_frames = 0, int * pool_keeps_up = nullptr,
                                  const std::function<size_t()> & pushed = {},
-                                 GpuSamplerTestClock * test_clock = nullptr)
+                                 GpuSamplerTestClock * test_clock = nullptr,
+                                 const std::function<double(std::string &)> & price = {})
 {
   if (opt.gpu_only) return true;
   // GZSTD_DEBUG_GPU_GUARD_SEC overrides the guard; 0 disables the check so the
@@ -11317,12 +11653,18 @@ static bool gpu_bringup_worth_it(const Options & opt,
   // survive an honest "is this worth a GPU" test, and every GPU path would stop
   // being exercised.  Test hook only.
   double guard_sec = GPU_INIT_GUARD_SEC;
+  bool guard_hooked = false;
   if (const char * e = std::getenv("GZSTD_DEBUG_GPU_GUARD_SEC")) {
     char * end = nullptr;
     const double v = std::strtod(e, &end);
-    if (end != e && v >= 0.0) guard_sec = v;
+    if (end != e && v >= 0.0) { guard_sec = v; guard_hooked = true; }
   }
-  if (guard_sec <= 0.0) return true;
+  // A --calibrate price child decides at its own window, whatever the guard (see
+  // hprice_child); the suite's guard of 0 must not engage it before that.
+  const HpriceChild & hchild = hprice_child();
+  if (guard_sec <= 0.0 && !hchild.mode) return true;
+  // What the -vv lines say the guard is (see `price` below).
+  std::string guard_note;
   const auto t_start = std::chrono::steady_clock::now();
   // NO DENOMINATOR -- A PIPE (v0.18.5).  This used to engage at once, and the run
   // then waited out cuInit and device setup however little the input turned out
@@ -11479,11 +11821,12 @@ static bool gpu_bringup_worth_it(const Options & opt,
   auto say = [&](bool engage, const char * why, double remaining, double p) {
     if (opt.verbosity >= V_DEBUG) {
       const double el = secs_in();
-      char b[480];
+      char b[560], g[48];
+      std::snprintf(g, sizeof g, "%.1f s", guard_sec);
       std::snprintf(b, sizeof b,
         "[GPU] bringup sample: %.0f%% done at %.0f ms, %s -> %.2f s remaining "
-        "(guard %.1f s) -> %s\n",
-        p * 100.0, el * 1000.0, why, remaining, guard_sec,
+        "(guard %s%s) -> %s\n",
+        p * 100.0, el * 1000.0, why, remaining, g, guard_note.c_str(),
         engage ? "engage" : "skip");
       vlog(V_DEBUG, opt, b);
     }
@@ -11555,8 +11898,44 @@ static bool gpu_bringup_worth_it(const Options & opt,
   if (!hold(GPU_SAMPLE_WARMUP_SEC)) return say(false, "run ended during warm-up", 0.0, frac());
   double p_prev = frac();
   double t_prev = secs_in();
+  const double p_warm = p_prev, t_warm = t_prev;   // a calibration child's late R (below)
   if (p_prev >= 0.98) return say(false, "already done", 0.0, p_prev);
-  const double budget = GPU_SAMPLE_WARMUP_SEC + std::max(GPU_SAMPLE_WINDOW_SEC, 0.5 * guard_sec);
+  // THIS MACHINE'S CALIBRATED PRICE (v0.18.57; see HPRICE_MIN_R), asked once the
+  // warm-up is over, when the reader has normally settled its path (part of the
+  // key); the answer is in memory (the caller read the profile before this clock
+  // started), and a reader that has not settled leaves the legacy price -- no
+  // production wait.  Only the suite's virtual clock, which reaches this point
+  // before any real time passes, waits for the reader (up to 0.5 s, 10 ms steps).
+  // The test hook wins over a price, as over the legacy one; a calibration child
+  // records its key at its decision instead (below).
+  bool priced = false;
+  if (price && !hchild.mode && !guard_hooked) {
+    std::string why;
+    double pg = price(why);
+    for (int i = 0; pg == -2.0 && test_signal && i < 50; ++i) {
+      std::unique_lock<std::mutex> lk(mx);
+      cv.wait_for(lk, std::chrono::milliseconds(10));
+      lk.unlock();
+      pg = price(why);
+    }
+    if (!hchild.mode && pg > 0.0 && std::isfinite(pg)) {
+      guard_sec = pg;
+      priced = true;
+      guard_note = ", this machine's calibrated price";
+    }
+    if (!hchild.mode) {
+      char gb[48];
+      std::snprintf(gb, sizeof gb, "%.2f s", guard_sec);
+      vlog(V_DEBUG, opt, std::string("[GPU] bringup guard: ")
+           + (priced ? std::string(gb) : std::string("4.0 s (the legacy price)")) + "; " + why + "\n");
+    }
+  }
+  // A calibrated price keeps the legacy price's budget, exactly (2.1 s): a 13 s
+  // price must not hold an engage for 6.6 s while the rate settles, and a 2.5 s
+  // one must not decline at 1.35 s, before a backlog that comes later can show
+  // (the keeps-up test's policy is not the price's to change; Codex review).
+  const double budget = GPU_SAMPLE_WARMUP_SEC + std::max(GPU_SAMPLE_WINDOW_SEC,
+      0.5 * (priced ? GPU_INIT_GUARD_SEC : guard_sec));
   double prev_rate = 0.0;
   char behind_why[320] = "";
   // The backlog and the reader's count where the windows begin (see `pushed`).
@@ -11602,6 +11981,34 @@ static bool gpu_bringup_worth_it(const Options & opt,
     if (p >= 0.98) return say(false, "already done", 0.0, p);
     const double rate = (p - p_prev) / std::max(1e-6, t - t_prev);   // fraction per second
     const double remaining = (rate > 0.0) ? (1.0 - p) / rate : -1.0;
+    // A CALIBRATION CHILD (hprice_child) decides here and nowhere else: at the first
+    // window at or after its time whose rate has settled (or a second later, if it
+    // never does), engaging or declining as told, and keeps the R it decided on.
+    // None of the tests below -- the guard, the keeps-up and growth tests, the
+    // budget -- applies: what it measures is the price of exactly this decision.
+    // A LATE decision stands in for a smaller input decided early, whose R a default
+    // run would read off a settled pool: so its R is the pool's rate since the warm-up,
+    // not one 0.15 s window's.  MEASURED, 6 CPUs, 24 GiB mmap: deciding 3.5 s in, the
+    // window's R read 6.13 s in every round where ~3 were left (a window whose frames
+    // finish behind a straggler); the pooled readers' late R were right.  An early
+    // decision keeps the window's R -- what the default compares with the price.
+    if (hchild.mode) {
+      if (t >= hchild.at_s && rate > 0.0 && prev_rate > 0.0
+          && (rate <= prev_rate * GPU_SAMPLE_SETTLED || t >= hchild.at_s + 1.0)) {
+        const double rate_all = (p - p_warm) / std::max(1e-6, t - t_warm);
+        const double r_late = hchild.at_s > 0.0 && rate_all > 0.0 ? (1.0 - p) / rate_all : remaining;
+        if (price) { std::string w; (void)price(w); }   // records the run's key, settled by now
+        g_hprice_decide_s.store(gz_since_start_s(), std::memory_order_relaxed);
+        g_hprice_child_r.store(r_late, std::memory_order_relaxed);
+        g_hprice_child_t.store(t, std::memory_order_relaxed);
+        g_hprice_decide_ns.store(now_ns(), std::memory_order_relaxed);
+        return say(hchild.mode == 1, "calibration child", r_late, p);
+      }
+      prev_rate = rate;
+      p_prev = p;
+      t_prev = t;
+      continue;
+    }
     if (rate > 0.0 && remaining <= guard_sec) return say(false, "windowed rate", remaining, p);
     // Is the CPU pool behind the reader?  Asked of every window, never latched:
     // a pool that falls behind later (a slower stretch of the archive) still
@@ -21679,6 +22086,10 @@ public:
       dev_[device].streams.fetch_add(1, std::memory_order_relaxed);
     int n = active_gpu_streams_.fetch_add(1, std::memory_order_relaxed) + 1;
     update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
+    {   // the first usable stream: a calibration child's bringup ends here (v0.18.57)
+      uint64_t zero = 0;
+      g_first_gpu_stream_ns.compare_exchange_strong(zero, now_ns(), std::memory_order_relaxed);
+    }
     g_debug_gpu_stream_up.store(true, std::memory_order_release);   // before the signal
     gpu_bringup_signal();     // a stream is live: release the fixed-share barrier
   }
@@ -40558,6 +40969,8 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   C.stats.chunks   += C.filled;
 
   if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_done(now_ns(), in_sum);
+  if (g_hprice_counting)   // a calibration child's check only (no shared update otherwise)
+    g_hprice_gpu_bytes.fetch_add(in_sum, std::memory_order_relaxed);
 
   // This device's tuner: what ran, at the size intake asked for.
   if (!C.throttle_limited)
@@ -42864,6 +43277,15 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     g_stage_read_err.clear();
   }
   g_debug_gpu_stream_up.store(false, std::memory_order_release);   // before any worker
+  // This file's reader path, bringup decision and first stream (v0.18.57): the
+  // price's key and a calibration child's report must not read the previous
+  // file's.  --adapt's add_meter keeps a path it has seen when none is stored.
+  g_adapt_src_path.store(nullptr, std::memory_order_relaxed);
+  g_hprice_reader.store(nullptr, std::memory_order_relaxed);
+  g_hprice_decide_ns.store(0, std::memory_order_relaxed);
+  g_first_gpu_stream_ns.store(0, std::memory_order_relaxed);
+  g_hprice_gpu_bytes.store(0, std::memory_order_relaxed);
+  g_hprice_counting = hprice_child().mode != 0;   // before any worker starts
   g_dstage_bytes.store(0, std::memory_order_relaxed);
   g_dstage_frames.store(0, std::memory_order_relaxed);
   g_dstage_cpu_bytes.store(0, std::memory_order_relaxed);
@@ -43664,6 +44086,85 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // A full byte/depth cap proves consumer backpressure, which can also come
       // from the writer's throttle.  It does not prove that a GPU will be faster.
       int pool_keeps_up = 0;
+      // THIS MACHINE'S PRICE FOR THIS RUN (v0.18.57; see HPRICE_MIN_R): the record
+      // --calibrate FILE filed under this run's key, if any.  The profile is read
+      // HERE, before the sampler's clock starts, so no I/O falls in a measured window;
+      // the sampler asks for the price once after its warm-up and gets an in-memory
+      // answer, with no waiting: a reader that has not settled its path by then
+      // (g_hprice_reader) leaves the legacy price (Codex review).  A --tar compress is
+      // its own class whatever its block reader.  The device bound is the one the
+      // device rule set before CUDA (two for a named file), which a calibration child
+      // shares.  STATE TABLE (Codex review):
+      //   several inputs (not --tar)            -> legacy: they share one CUDA start and
+      //                                            one exit, which no child measured
+      //   no record for the key, --no-profile,
+      //     another driver, an older epoch,
+      //     a reader not yet settled             -> legacy
+      //   a record, output to /dev/null          -> its price (where it was measured)
+      //   a record, any other output             -> its price when it is ABOVE the
+      //                                            legacy 4.0 s, else 4.0: a writer that
+      //                                            binds leaves the cards nothing to
+      //                                            save and their exit still to pay, so
+      //                                            a measured null-sink price may only
+      //                                            make another sink decline MORE
+      // A record never expires by age: it stands until --calibrate measures it again,
+      // the driver changes (cleared at save and ignored at load), the fingerprint
+      // (CPU model and count, GPU models, kernel) changes, or HPRICE_EPOCH moves.
+      std::map<std::string, HpriceRec> hp_recs;
+      std::string hp_skip;   // this run takes no price at all: legacy
+      std::string hp_none;   // the profile has none for this machine: legacy
+#ifndef _WIN32
+      if (opt.no_profile) hp_skip = "--no-profile";
+      else if (!opt.tar_mode && opt.inputs.size() > 1) hp_skip = "several inputs share one bringup";
+      else if (!::getenv("GZSTD_DEBUG_GPU_GUARD_SEC") && !hprice_child().mode && comp_progress() >= 0.0)
+        (void)hprice_load(hp_recs, hp_none);
+#else
+      hp_skip = "no profile on this platform";
+#endif
+      // -2 = the reader has not settled its path (the suite's virtual clock waits for
+      // it; nothing else does); -1 = legacy, `why` says why.
+      auto hprice_for_run = [&](std::string & why) -> double {
+        const char * rd = opt.tar_mode ? "tar" : g_hprice_reader.load(std::memory_order_relaxed);
+        if (!rd) { why = "no calibrated price yet: the reader has not settled its path"; return -2.0; }
+        // The pre-CUDA count is the host's cards; a caller's mask bounds it by the
+        // entries it names (its identity is in the key too).
+        int dev = gz_precuda_gpu_count();
+        gz_capture_caller_cvd();
+        if (g_caller_cvd_set == 1) {
+          int named = 0;
+          std::stringstream ss(g_caller_cvd);
+          for (std::string tok; std::getline(ss, tok, ',');) if (!tok.empty()) ++named;
+          dev = std::min(dev, named);
+        }
+        if (opt.gpu_devices > 0) dev = std::min(dev, opt.gpu_devices);
+        const std::string key = hprice_key(rd, cpu_threads, dev, host_chunk, opt);
+        {
+          std::lock_guard<std::mutex> lk(g_hprice_key_mx);
+          g_hprice_key = key;
+        }
+        if (!hp_skip.empty()) { why = hp_skip + " (key " + key + ")"; return -1.0; }
+        const auto it = hp_recs.find(key);
+        if (it == hp_recs.end()) {
+          why = "no calibrated price for " + key + ": " + (hp_none.empty() ? "none measured" : hp_none);
+          return -1.0;
+        }
+        const HpriceRec & r = it->second;
+        bool null_sink = false;
+        {
+          struct stat st {}, nd {};
+          null_sink = out && ::fstat(::fileno(out), &st) == 0 && S_ISCHR(st.st_mode)
+                   && ::stat("/dev/null", &nd) == 0 && S_ISCHR(nd.st_mode) && st.st_rdev == nd.st_rdev;
+        }
+        char b[400];
+        std::snprintf(b, sizeof b, "%s, measured to /dev/null at R %.2f s (saved %+.2f s) and %.2f s "
+                                   "(%+.2f s), bringup %.2f s: %s%s", key.c_str(), r.r_early, r.s_early,
+                      r.r_late, r.s_late, r.b, r.how.c_str(),
+                      !null_sink && r.price < GPU_INIT_GUARD_SEC
+                        ? "; this run writes elsewhere, so the legacy 4.0 s (a lower price applies to /dev/null only)"
+                        : "");
+        why = b;
+        return null_sink ? r.price : std::max(r.price, GPU_INIT_GUARD_SEC);
+      };
       if (!gpu_bringup_worth_it(opt, comp_progress, bringup_mx, bringup_cv,
                                 [&] { return comp_progress() >= 0.98; },
                                 [&]() -> double {
@@ -43674,7 +44175,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                   return results.producer_done;
                                 },
                                 [&] { return queue.backlog_frames(); },
-                                gpu_behind_frames(cpu_threads), &pool_keeps_up)) {
+                                gpu_behind_frames(cpu_threads), &pool_keeps_up,
+                                {}, nullptr, hprice_for_run)) {
         // --adapt's pipe gate has said why already ("[ADAPT] pipe: ...").
         if (!opt.adapt || comp_progress() >= 0.0)
           vlog(V_VERBOSE, opt, gpu_decline_message(pool_keeps_up));
@@ -44291,6 +44793,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
     g_adapt_src_path.store("mmap", std::memory_order_relaxed);
+    g_hprice_reader.store("mmap", std::memory_order_relaxed);   // final (see g_hprice_reader)
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     // Hand consumed pages back while the run proceeds; see InputRetirer.
@@ -44467,6 +44970,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                 // itself under --adapt (the two timed passes above stay fixed;
                 // see rd_adaptive in pooled_read_chunks).
                 ReadWindow c; c.start_chunk = b.start_chunk + b.chunks.load();
+                g_hprice_reader.store(td ? "direct" : "pread", std::memory_order_relaxed);   // final
                 ok = pooled_read_chunks(gpu_chunk, m, &nv_pool,
                                         td, td ? 1 : n_readers, td ? fdd : dr_fd,
                                         nv_emit, &c, &opt);
@@ -44480,10 +44984,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // on its own description (dr_direct, above): O_DIRECT cannot be toggled on
       // the borrowed buffered one.  A failed O_DIRECT reopen leaves it -1, the
       // reader returns false exactly as before, and fread takes over.
-      if (!nv_probed)
-      reader_done = pooled_read_chunks(gpu_chunk, m, &nv_pool,
-        want_direct_read, want_direct_read ? 1 : n_readers,
-        want_direct_read ? dr_direct.f : dr_fd, nv_emit, nullptr, &opt);
+      if (!nv_probed) {
+        g_hprice_reader.store(want_direct_read ? "direct" : "pread", std::memory_order_relaxed);   // final
+        reader_done = pooled_read_chunks(gpu_chunk, m, &nv_pool,
+          want_direct_read, want_direct_read ? 1 : n_readers,
+          want_direct_read ? dr_direct.f : dr_fd, nv_emit, nullptr, &opt);
+      }
       if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
     }
     // pool alloc failure: fall through to fread+copy below.
@@ -44501,6 +45007,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // frames releases its input.  Recycled blocks through a bounce buffer since
     // v0.18.12 (GzPipeBlocks).
     GzPipeReader reader(in, opt, m, host_chunk);
+    g_hprice_reader.store("pipe", std::memory_order_relaxed);   // final: no calibration class
     size_t n_host = 0;
     while (auto blk = reader.next(n_host)) {
       size_t off = 0;
@@ -44855,6 +45362,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // complete; a worker that never finished exported nothing and is absent.
   g_compress_pass_stats.pipeline = true;
   g_compress_pass_stats.cpu_threads = cpuagg.threads;
+  // A calibration child's work is done here (every worker has joined); its exit
+  // comes after, and is in the wall time its parent takes (calibrate_hprice).
+  if (g_hprice_counting) g_hprice_done_s.store(gz_since_start_s(), std::memory_order_relaxed);
   if (json_sink && !opt.stats_json.empty()) {
     std::lock_guard<std::mutex> lk(json_sink->m);
     for (const std::vector<StreamStats> & streams : json_sink->per_dev) {
@@ -52246,6 +52756,307 @@ static std::string cal_size(double bytes)
   return b;
 }
 
+#ifdef HAVE_NVCOMP
+// A --calibrate child (the device-count and hybrid price passes) ends with its
+// parent: killed, or terminated by a signal whose handler re-raises it, the parent
+// used to leave its active child compressing on (Codex review, v0.18.57).  Called
+// between fork and exec, so async-signal-safe only: prctl and getppid are plain
+// system calls.  A parent already gone by then (the window before prctl) ends it
+// at once.
+static void gz_calibrate_child_dies_with(pid_t parent)
+{
+#ifdef __linux__
+  // A guard that could not be installed (a seccomp filter's EPERM) is no guard:
+  // the child would outlive a terminated parent, so it does not run at all.
+  if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || ::getppid() != parent) ::_exit(127);
+#else
+  (void)parent;
+#endif
+}
+
+// --calibrate FILE's HYBRID PRICE pass (v0.18.57, ROADMAP 42a; the model and the
+// measurements are at HPRICE_MIN_R).  For each reader class -- FILE as named
+// (mmap when cached), --no-mmap, --tar -- child processes of this binary compress
+// FILE to /dev/null the way a default hybrid run at this allowance would (the
+// calibrating process's own -T, --gpu-devices, level and --chunk-size), and the
+// sampler in each makes the decision it is told to (hprice_child):
+//   declined  at its first settled window       the run the guard would leave alone
+//   early     engaged at the same window        R_early
+//   late      engaged ~R_early/2 later          R_late ~ R_early / 2
+// first once each untimed (FILE into the page cache, the cards out of idle), then
+// in `rounds` rounds with the arms' order rotated.  Every wall time is taken to
+// waitpid, so the kernel's teardown at exit is in it.  The saving at each point is
+// the median declined time less the median engaged one; hprice_fit fits the price.
+// A record goes into `out` under the key the children report, and only when every
+// arm reported the same key and every engaged arm started a card.  Runs BEFORE
+// this process touches CUDA (as the device-count pass does), so the children's
+// bringup is their own.  Test hook: under GZSTD_DEBUG_CALIBRATE_BYTES (the suite's
+// tiny corpus) it runs only with GZSTD_DEBUG_CALIBRATE_HPRICE=1, every arm decides
+// at its first window, one round (GZSTD_DEBUG_CALIBRATE_HPRICE_ROUNDS=N sets it),
+// and the fit is given fixed points -- R 6 and 3 s, saved +0.5 and -0.4 s, no
+// noise, a 1 s bringup: a price of 4.333 s -- so a cell checks the children, their
+// checks, the report and the record, not a price no small file can measure (the
+// fit itself has its own hook, GZSTD_DEBUG_HPRICE_FIT).
+static void calibrate_hprice(const Options & opt, const std::string & file, CalScreen & scr,
+                             std::vector<std::pair<std::string, HpriceRec>> & out)
+{
+  const bool hook = std::getenv("GZSTD_DEBUG_CALIBRATE_BYTES") != nullptr;
+  int rounds = hook ? 1 : 3;
+  if (const char * e = std::getenv("GZSTD_DEBUG_CALIBRATE_HPRICE_ROUNDS")) {
+    const int v = std::atoi(e);
+    if (v >= 1 && v <= 9) rounds = v;
+  }
+  std::vector<std::string> common = { "gzstd", "-q", "--no-profile", "-k", "-f",
+      opt.gpu_order_ranked ? "--gpu-order=ranked" : "--gpu-order=cuda" };
+  if (opt.cpu_threads != 0) common.push_back("-T" + std::to_string(opt.cpu_threads < 0 ? 0 : opt.cpu_threads));
+  if (opt.gpu_devices > 0) common.push_back("--gpu-devices=" + std::to_string(opt.gpu_devices));
+  if (opt.ultra) common.push_back("--ultra");
+  common.push_back("-" + std::to_string(opt.level));
+  if (opt.chunk_user_set) { common.push_back("--chunk-size"); common.push_back(std::to_string(opt.chunk_mib)); }
+  if (opt.read_threads > 0) { common.push_back("--read-threads"); common.push_back(std::to_string(opt.read_threads)); }
+  struct Cls { const char * name; const char * flag; };
+  static const Cls classes[] = { { "FILE as named", nullptr }, { "--no-mmap", "--no-mmap" },
+                                 { "--tar", "--tar" } };
+  {
+    char b[400];
+    std::snprintf(b, sizeof b,
+      "[CALIBRATE] hybrid price: when a hybrid compress should start its GPUs, measured on %s at "
+      "this CPU allowance -- %d round%s of declined / engaged runs per reader (FILE as named, "
+      "--no-mmap, --tar), each its own process\n", file.c_str(), rounds, rounds == 1 ? "" : "s");
+    scr.say(b);
+  }
+  const int devnull = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+  // r/t/b: the R, the sample time and the bringup the child reported; dec/done: when
+  // it decided and when its work was done, in seconds from its own start.
+  struct Arm {
+    bool ok = false;
+    double wall = -1.0, r = -1.0, t = -1.0, b = -1.0, dec = -1.0, done = -1.0;
+    std::string key, why;
+  };
+  // The children see the device set the CALLER asked for, not a mask of this
+  // process's own (gz_capture_caller_cvd): restore it, or remove one placed since.
+  gz_capture_caller_cvd();
+  const std::string cvd_env = "CUDA_VISIBLE_DEVICES=" + g_caller_cvd;
+  // One child: decide as told, report, and the wall time to waitpid.
+  auto run_arm = [&](const Cls & cls, bool engage, double at, const std::string & label) -> Arm {
+    Arm a;
+    int pfd[2];
+    if (::pipe(pfd) != 0) { a.why = std::string("no pipe for a child: ") + std::strerror(errno); return a; }
+    (void)::fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    // Built before the fork: between fork and exec only async-signal-safe calls.
+    std::vector<std::string> sargs = common;
+    if (cls.flag) sargs.push_back(cls.flag);
+    for (const char * s : { file.c_str(), "-o", "/dev/null" }) sargs.push_back(s);
+    std::vector<const char *> cargv;
+    for (const std::string & s : sargs) cargv.push_back(s.c_str());
+    cargv.push_back(nullptr);
+    char modeenv[96];
+    std::snprintf(modeenv, sizeof modeenv, "GZSTD_CALIBRATE_HPRICE=%s@%.3f",
+                  engage ? "engage" : "decline", at);
+    const std::string fdenv = "GZSTD_CALIBRATE_GPUC_FD=" + std::to_string(pfd[1]);
+    std::vector<char *> cenv;
+    for (char ** e = environ; *e; ++e)
+      if (std::strncmp(*e, "GZSTD_CALIBRATE_GPUC_FD=", 24) != 0
+          && std::strncmp(*e, "GZSTD_CALIBRATE_HPRICE=", 23) != 0
+          && std::strncmp(*e, "CUDA_VISIBLE_DEVICES=", 21) != 0)
+        cenv.push_back(*e);
+    if (g_caller_cvd_set == 1) cenv.push_back(const_cast<char *>(cvd_env.c_str()));
+    cenv.push_back(const_cast<char *>(fdenv.c_str()));
+    cenv.push_back(modeenv);
+    cenv.push_back(nullptr);
+    scr.step(label);
+    const auto c0 = std::chrono::steady_clock::now();
+    const pid_t parent = ::getpid();
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+      gz_calibrate_child_dies_with(parent);
+      ::close(pfd[0]);
+      if (devnull >= 0) { ::dup2(devnull, STDIN_FILENO); ::dup2(devnull, STDOUT_FILENO); }
+      ::execve("/proc/self/exe", const_cast<char * const *>(cargv.data()), cenv.data());
+      ::_exit(127);
+    }
+    const int fork_errno = errno;
+    ::close(pfd[1]);
+    if (pid < 0) {
+      a.why = std::string("could not start a child: ") + std::strerror(fork_errno);
+      ::close(pfd[0]);
+      return a;
+    }
+    std::string rep, pend;
+    char b[512];
+    for (;;) {
+      if (scr.tty) {
+        struct pollfd pf {};
+        pf.fd = pfd[0]; pf.events = POLLIN;
+        const int pr = ::poll(&pf, 1, 250);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) {
+          char s[200];
+          std::snprintf(s, sizeof s, "%s, %.1f s", label.c_str(), std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - c0).count());
+          scr.status(s);
+          continue;
+        }
+      }
+      const ssize_t k = ::read(pfd[0], b, sizeof b);
+      if (k < 0) { if (errno == EINTR) continue; break; }
+      if (k == 0) break;
+      pend.append(b, (size_t)k);
+      for (size_t nl; (nl = pend.find('\n')) != std::string::npos;) {
+        const std::string line = pend.substr(0, nl);
+        pend.erase(0, nl + 1);
+        if (line.rfind("hprice ", 0) == 0) rep = line;   // "prog" lines are progress only
+      }
+    }
+    ::close(pfd[0]);
+    int st = 0;
+    pid_t w;
+    while ((w = ::waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
+    a.wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+    // A usable arm exited 0 and reported its decision; an engaged one also started
+    // a card that compressed something, and no card faulted (a CPU rebuild's time
+    // is not an engaged run's); a declined one gave the cards nothing.
+    char key[260] = {0};
+    unsigned long long gbytes = 0;
+    int fault = 1;
+    const bool exited0 = w == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    const bool reported = std::sscanf(rep.c_str(), "hprice %259s %lf %lf %lf %llu %d %lf %lf", key, &a.r,
+                                      &a.t, &a.b, &gbytes, &fault, &a.dec, &a.done) == 8 && a.r > 0.0;
+    a.why = !exited0 ? "a child failed"
+          : !reported ? "a child's sampler never decided (the run ended first)"
+          : fault ? "a card faulted"
+          : engage && !(a.b > 0.0) ? "an engaged child started no card"
+          : engage && gbytes == 0 ? "an engaged child's cards started after the CPU pool had finished"
+          : !engage && gbytes ? "a declined child gave the cards work" : "";
+    if (a.why.empty()) {
+      a.ok = true;
+      a.key = key;
+    }
+    return a;
+  };
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return n == 0 ? -1.0 : n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+  };
+  for (const Cls & cls : classes) {
+    const std::string nm = cls.name;
+    auto not_measured = [&](const std::string & why) {
+      scr.say("[CALIBRATE] hybrid price (" + nm + "): NOT MEASURED -- " + why + "; the legacy 4.0 s stays\n");
+    };
+    const Arm w0 = run_arm(cls, false, 0.0, "hybrid price (" + nm + "): warm-up, declined");
+    Arm w1 = run_arm(cls, true, 0.0, "hybrid price (" + nm + "): warm-up, engaged");
+    // The engaged warm-up is what wakes idle cards, and a card's first start after
+    // idle is the slow one (~0.9 s on the 8-H100 server): if its cards came up after
+    // the pool had finished, once more, now warm.
+    if (!w1.ok && w0.ok && w1.why.rfind("an engaged child", 0) == 0)
+      w1 = run_arm(cls, true, 0.0, "hybrid price (" + nm + "): warm-up, engaged again");
+    if (!w0.ok || !w1.ok) {
+      not_measured("warm-up: " + (!w0.ok ? w0.why : w1.why));
+      continue;
+    }
+    if (w0.key != w1.key) { not_measured("the two warm-ups took different reader paths"); continue; }
+    const std::string key = w1.key;
+    if (std::any_of(out.begin(), out.end(), [&](const std::pair<std::string, HpriceRec> & kr) {
+          return kr.first == key; })) {
+      scr.say("[CALIBRATE] hybrid price (" + nm + "): the same reader and key as a class above ("
+              + key + "); not measured twice\n");
+      continue;
+    }
+    // BOTH points must be ones where the cards deliver (Codex review): the late one
+    // at half the early R, but at least half a second above the warm-up's bringup,
+    // and the two at least HPRICE_MIN_SPAN apart.  WHEN to decide late comes from the
+    // declined warm-up's own clock, not from its sampler's R: a pooled reader's first
+    // windows can overstate R by a third (--no-mmap, 8 CPUs, 24 GiB: 5.96 s where 4.1
+    // were left), and a late decision timed from that came after the run's end -- its
+    // cards started on nothing.  The pool's real time left at the decision is that
+    // run's time from its decision to the end of its work, both on its clock (no
+    // assumed process start or exit; Codex review).  The fit still uses the R each
+    // sampler reported, the R a default run compares.
+    const double r_left = w0.done > w0.dec && w0.dec > 0.0 ? std::min(w1.r, w0.done - w0.dec) : w1.r;
+    const double r_late_want = std::max(0.5 * r_left, w1.b + 0.5);
+    if (!hook && (r_left < HPRICE_MIN_R || r_left - r_late_want < HPRICE_MIN_SPAN)) {
+      char b[400];
+      std::snprintf(b, sizeof b, "FILE is too small at this allowance: %.2f s of CPU work were left "
+                    "at the decision and the cards took %.2f s to start; a price needs %.1f s and "
+                    "%.1f s more than the bringup (a larger FILE, or fewer CPUs with -T)",
+                    r_left, w1.b, HPRICE_MIN_R, 0.5 + HPRICE_MIN_SPAN);
+      not_measured(b);
+      continue;
+    }
+    // The late arm's decision: r_left - r_late_want after the early one.
+    const double at_late = hook ? 0.0 : w1.t + (r_left - r_late_want);
+    std::vector<double> td, te, tl, re, rl, bb;
+    bool bad = false;
+    std::string bad_why;
+    for (int rd = 0; rd < rounds && !bad; ++rd)
+      for (int k = 0; k < 3 && !bad; ++k) {
+        const int arm = (k + rd) % 3;
+        char lb[200];
+        std::snprintf(lb, sizeof lb, "hybrid price (%s): round %d of %d, %s", nm.c_str(), rd + 1, rounds,
+                      arm == 0 ? "declined" : arm == 1 ? "engaged early" : "engaged late");
+        const Arm a = arm == 0 ? run_arm(cls, false, 0.0, lb)
+                    : arm == 1 ? run_arm(cls, true, 0.0, lb) : run_arm(cls, true, at_late, lb);
+        if (!a.ok || a.key != key) {
+          bad = true;
+          bad_why = std::string(lb).substr(std::strlen("hybrid price (") + nm.size() + 3) + ": "
+                  + (a.ok ? "the reader took another path (" + a.key + ")" : a.why);
+          break;
+        }
+        if (arm == 0) td.push_back(a.wall);
+        else if (arm == 1) { te.push_back(a.wall); re.push_back(a.r); bb.push_back(a.b); }
+        else { tl.push_back(a.wall); rl.push_back(a.r); bb.push_back(a.b); }
+      }
+    if (bad) {
+      not_measured(bad_why);
+      continue;
+    }
+    double r_e = median(re), r_l = median(rl);
+    // Paired by round: each round's declined run against that round's engaged ones.
+    std::vector<double> pe, pl;
+    for (size_t i = 0; i < td.size(); ++i) { pe.push_back(td[i] - te[i]); pl.push_back(td[i] - tl[i]); }
+    double s_e = median(pe), s_l = median(pl);
+    auto spread = [](const std::vector<double> & v, double mid) {
+      double m = 0.0;
+      for (double x : v) m = std::max(m, std::fabs(x - mid));
+      return m;
+    };
+    double m_e = spread(pe, s_e), m_l = spread(pl, s_l);
+    const double t_d = median(td);
+    double b_med = median(bb);
+    if (hook) {   // the fixed points (see the test hook above)
+      r_e = 6.0; s_e = 0.5; m_e = 0.0;
+      r_l = 3.0; s_l = -0.4; m_l = 0.0;
+      b_med = 1.0;
+    }
+    const HpriceFit f = hprice_fit(r_e, s_e, m_e, r_l, s_l, m_l, b_med);
+    char b[720];
+    std::snprintf(b, sizeof b,
+      "[CALIBRATE]   %s: declined %.2f s; engaged at R %.2f s: %.2f s (%s %.2f s, +/- %.2f), at R "
+      "%.2f s: %.2f s (%s %.2f s, +/- %.2f); bringup %.2f s%s\n", key.c_str(), t_d, r_e, median(te),
+      s_e > 0 ? "saved" : "lost", std::fabs(s_e), m_e, r_l, median(tl), s_l > 0 ? "saved" : "lost",
+      std::fabs(s_l), m_l, b_med, hook ? " (test hook: the points are fixed)" : "");
+    if (!f.ok) {
+      not_measured(f.how);
+      scr.say(b);
+      continue;
+    }
+    char p[400];
+    std::snprintf(p, sizeof p, "[CALIBRATE] hybrid price (%s): start the GPUs above %.2f s of CPU work "
+                  "left (the legacy guard: 4.0 s) -- %s\n", nm.c_str(), f.price, f.how);
+    scr.say(p);
+    scr.say(b);
+    HpriceRec rec;
+    rec.price = f.price; rec.slope = f.slope; rec.c = f.c;
+    rec.r_early = r_e; rec.s_early = s_e; rec.r_late = r_l; rec.s_late = s_l;
+    rec.m_early = m_e; rec.m_late = m_l;
+    rec.b = b_med; rec.t_cpu = t_d; rec.rounds = rounds; rec.how = f.how;
+    out.emplace_back(key, rec);
+  }
+  if (devnull >= 0) ::close(devnull);
+}
+#endif
+
 static int run_calibrate(Options opt)
 {
   const double GiB = 1024.0 * 1024.0 * 1024.0;
@@ -52645,8 +53456,10 @@ static int run_calibrate(Options opt)
           if (std::strncmp(*e, "GZSTD_CALIBRATE_GPUC_FD=", 24) != 0) cenv.push_back(*e);
         cenv.push_back(const_cast<char *>(fdenv.c_str()));
         cenv.push_back(nullptr);
+        const pid_t parent = ::getpid();
         const pid_t pid = ::fork();
         if (pid == 0) {
+          gz_calibrate_child_dies_with(parent);
           ::close(pfd[0]);
           ::execve("/proc/self/exe", const_cast<char * const *>(cargv.data()), cenv.data());
           ::_exit(127);
@@ -52816,6 +53629,17 @@ static int run_calibrate(Options opt)
         if (dfd >= 0) ::close(dfd);
       }
     }
+  }
+#endif
+  // HYBRID PRICE (v0.18.57, ROADMAP 42a): FILE only (the synthetic corpus's GPU
+  // rate does not transfer, see above), any device count, and still before this
+  // process starts CUDA.  Skipped under the suite's small-corpus hook unless asked.
+  std::vector<std::pair<std::string, HpriceRec>> hprice_recs;
+#ifdef HAVE_NVCOMP
+  if (!std::getenv("GZSTD_CALIBRATE_GPUC_FD") && !cal_file.empty() && !opt.cpu_only
+      && (!gpuc_test_hook || std::getenv("GZSTD_DEBUG_CALIBRATE_HPRICE"))) {
+    if (gz_precuda_gpu_count() > 0) calibrate_hprice(opt, cal_file, scr, hprice_recs);
+    else scr.say("[CALIBRATE] hybrid price: no GPU device; nothing to price\n");
   }
 #endif
 
@@ -53002,6 +53826,7 @@ static int run_calibrate(Options opt)
   std::fclose(devnull);
 
   cobs.gpuc = gpuc_samples;
+  cobs.hprice = hprice_recs;
   // Record both directions like qualifying --adapt runs.
   if (!opt.no_profile && opt.deferred_exit == EXIT_OK) {
     // Wall synthesis falls back to whichever engine measured, so one dead
@@ -53463,6 +54288,11 @@ static int gzstd_main(int argc, char ** argv)
 {
   setup_signal_handlers();
   gz_announce_debug_env();
+#ifdef HAVE_NVCOMP
+  // Before any mask of gzstd's own is placed: the hybrid price's key names the
+  // device set the CALLER asked for (hprice_key).
+  gz_capture_caller_cvd();
+#endif
 
   // Test-only: deterministic GPU fault injection (see g_debug_fail_gpu_after).
   if (std::getenv("GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST"))
@@ -56135,6 +56965,41 @@ static int gzstd_main(int argc, char ** argv)
         (void)w;
       }
     }
+#ifdef HAVE_NVCOMP
+    // A hybrid price child (v0.18.57, calibrate_hprice): its key, the R and the time
+    // its sampler decided at, its bringup to the first usable stream (-1 when it
+    // declined or no stream came up), the bytes its cards compressed, whether a card
+    // faulted, and when -- from this process's start -- it decided and its work was
+    // done.  No line = the decision never came.
+    std::string hkey;
+    {
+      std::lock_guard<std::mutex> lk(g_hprice_key_mx);
+      hkey = g_hprice_key;
+    }
+    const double hr = g_hprice_child_r.load(std::memory_order_relaxed);
+    if (hprice_child().mode && !hkey.empty() && hr > 0.0) {
+      const uint64_t d0 = g_hprice_decide_ns.load(std::memory_order_relaxed);
+      const uint64_t s0 = g_first_gpu_stream_ns.load(std::memory_order_relaxed);
+      const double hb = d0 && s0 > d0 ? double(s0 - d0) / 1e9 : -1.0;
+      // What the cards compressed, and whether any of them faulted: a point is a
+      // point only if its cards delivered work and none fell back (Codex review).
+      const unsigned long long gbytes = g_hprice_gpu_bytes.load(std::memory_order_relaxed);
+      // adapt_obs.fault is sticky: a GPU fault's CPU rebuild clears the restart and
+      // abort flags before it runs, and its cards' bytes and first stream survive
+      // it (Codex review) -- a rebuilt run must not pass for an engaged one.
+      const int fault = adapt_obs.fault || g_gpu_failed_restart.load(std::memory_order_relaxed)
+                     || g_gpu_aborted.load(std::memory_order_relaxed) ? 1 : 0;
+      char line[400];
+      const int n = std::snprintf(line, sizeof line, "hprice %s %.4f %.4f %.4f %llu %d %.4f %.4f\n",
+                                  hkey.c_str(), hr, g_hprice_child_t.load(std::memory_order_relaxed), hb,
+                                  gbytes, fault, g_hprice_decide_s.load(std::memory_order_relaxed),
+                                  g_hprice_done_s.load(std::memory_order_relaxed));
+      if (n > 0 && (size_t)n < sizeof line) {
+        const ssize_t w = ::write(rfd, line, (size_t)n);   // a lost line = an unusable arm
+        (void)w;
+      }
+    }
+#endif
   }
 #endif
 
@@ -56202,6 +57067,25 @@ int main(int argc, char ** argv)
         return 2;
       }
       std::printf("%.3f\n", gpu_reader_headroom(v[0], v[1], v[2], v[3], v[4]));
+      return 0;
+    }
+#endif
+#ifdef HAVE_NVCOMP
+    // Hidden hook (v0.18.57): the hybrid price's fit (hprice_fit) on given points,
+    // R_early,saved_early,noise_early,R_late,saved_late,noise_late,bringup ->
+    // "price P slope S c C: rule"
+    // or "none: why", then exit.  Its arithmetic, checked without a calibration.
+    if (const char * e = ::getenv("GZSTD_DEBUG_HPRICE_FIT")) {
+      double v[7] = {0, 0, 0, 0, 0, 0, 0};
+      if (std::sscanf(e, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
+                      &v[6]) != 7) {
+        std::fprintf(stderr, "gzstd: GZSTD_DEBUG_HPRICE_FIT wants R_early,saved_early,noise_early,"
+                             "R_late,saved_late,noise_late,bringup\n");
+        return 2;
+      }
+      const HpriceFit f = hprice_fit(v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+      if (f.ok) std::printf("price %.3f slope %.3f c %.3f: %s\n", f.price, f.slope, f.c, f.how);
+      else      std::printf("none: %s\n", f.how);
       return 0;
     }
 #endif

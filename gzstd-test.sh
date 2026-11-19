@@ -633,8 +633,12 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=579
-$EXTENSIVE && EXPECTED_TESTS=926
+EXPECTED_TESTS=580
+$EXTENSIVE && EXPECTED_TESTS=928
+# v0.18.57: +1 GPU cell in Small-input GPU gate (a hybrid compress takes this machine's
+# calibrated price, only for its own key) and +1 GPU cell, -e only, beside the
+# --calibrate device-count cells (the hybrid price pass): 579 -> 580, -e 926 -> 928;
+# no-GPU delta 165 -> 166, -e 248 -> 250 (the CPU-only run stays 414).
 # v0.18.56: +1 cell in Native tar archiving (a chunk of one member's data is read
 # without a zero fill), run with or without a GPU: 578 -> 579, -e 925 -> 926, no-GPU
 # delta unchanged (the CPU-only run 413 -> 414).
@@ -1028,8 +1032,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=165   # + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=248   # + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=166   # + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=250   # + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7396,6 +7400,103 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
     [[ -z "$bh_why" ]] && pass "$bh_t" || fail "$bh_t" "$bh_why"
   fi
 
+  # THIS MACHINE'S HYBRID PRICE (v0.18.57, ROADMAP 42a).  --calibrate FILE files a price
+  # per key (reader, CPU workers and allowance, device bound, frame size, level, the
+  # caller's GPU mask); a hybrid compress whose key matches takes it as its bringup
+  # guard, and every other run keeps the legacy 4.0 s.  The sampler's synthetic job
+  # (GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting: ~9.75 s left at its first window, a pool
+  # behind its reader, a virtual clock) makes each decision independent of the host,
+  # and the suite's global guard override is UNSET: it wins over any price.  A
+  # planted record: 20 s declines; 5 s engages; 2.5 s applies to /dev/null and lifts
+  # to 4.0 for a regular-file output (a lower price measured to /dev/null may not
+  # make another sink engage more); another -T, --no-profile, another driver and the
+  # guard override keep the legacy price.  And the fit's arithmetic, by its hook.
+  hp_t="a hybrid compress takes this machine's calibrated GPU price, and only for its own key"
+  if command -v python3 >/dev/null 2>&1; then
+    hp_why=""; HP="$TMPDIR/hprice"; mkdir -p "$HP"
+    # hprice_fit's table: between the points, above both (extrapolated, not capped at
+    # the measured R), below both, savings inside their noise, a late point inside the
+    # bringup, and the calibration hook's fixed points.
+    for hp_c in "4.4,0.43,0.05,2.2,-0.21,0.05,1.3=price 2.922 " "5,-0.85,0.05,2.5,-1.13,0.05,1.3=price 12.589 " \
+                "6,1.5,0.1,3,0.3,0.1,1.2=price 2.250 " "5,-0.5,0.05,2.5,-0.6,0.1,1.3=none: the savings" \
+                "5,0.3,0.05,1.0,0.1,0.05,1.3=none: the late" "6,0.5,0,3,-0.4,0,1=price 4.333 "; do
+      hp_got=$(GZSTD_DEBUG_HPRICE_FIT="${hp_c%=*}" timeout --foreground -k 5 20 "$GZSTD" 2>/dev/null </dev/null \
+               | head -c 200 | tr -cd '[:print:]')
+      [[ "$hp_got" == "${hp_c#*=}"* ]] || hp_why+=" fit(${hp_c%=*})=[$hp_got]"
+    done
+    # This machine's profile entry, from a tiny-corpus calibration (no FILE: no price).
+    env XDG_CACHE_HOME="$HP/x" GZSTD_DEBUG_CALIBRATE_BYTES=8388608 timeout --foreground -k 10 120 \
+      "$GZSTD" --calibrate >/dev/null 2>&1 || hp_why+=" [calibrate rc=$?]"
+    hp_run() {   # hp_run NAME OUT [ENV=V...] -- ARGS... -> $HP/err (the guard override unset)
+      local name=$1 out=$2; shift 2
+      local envs=()
+      while (( $# )) && [[ "$1" != -- ]]; do envs+=("$1"); shift; done
+      [[ "${1:-}" == -- ]] && shift
+      env -u GZSTD_DEBUG_GPU_GUARD_SEC XDG_CACHE_HOME="$HP/x" GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting \
+        GZSTD_DEBUG_NO_FEW_FRAMES_CPU=1 "${envs[@]}" timeout --foreground -k 10 120 "$GZSTD" --hybrid -vv \
+        -k -f "$@" "$TMPDIR/large.bin" -o "$out" 2>"$HP/err" || hp_why+=" $name:rc=$?"
+    }
+    hp_line() { tr '\r' '\n' < "$HP/err" | grep -aE 'bringup (guard|sample)' | tr '\n' ' '; }
+    hp_plant() {   # hp_plant PRICE [DRIVER]: the record under $hp_key, in this machine's entry
+      python3 - "$HP/x/gzstd/profile.json" "$hp_key" "$1" "${2:-}" <<'PYEOF'
+import json, sys
+p, key, price, drv = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+j = json.load(open(p))
+for e in j['entries'].values():
+    e.setdefault('compress', {})['hybrid_price'] = {key: {
+        'price_s': price, 'r_early_s': 6, 'saved_early_s': 0.5, 'r_late_s': 3, 'saved_late_s': -0.4,
+        'bringup_s': 1, 'rule': 'planted', 'epoch': 1}}
+    if drv: e['driver'] = drv
+json.dump(j, open(p, 'w'))
+PYEOF
+    }
+    # No record: the legacy price, and the key a record would need.
+    hp_run legacy /dev/null -- -T 1
+    hp_key=$(tr '\r' '\n' < "$HP/err" | grep -aoE 'no calibrated price for [^:]+' | head -1 | sed 's/.* for //')
+    [[ "$hp_key" == mmap_w1_a* || "$hp_key" == pread_w1_a* ]] || hp_why+=" key=[$hp_key]:[$(hp_line)]"
+    grep -qa 'bringup sample:.*(guard 4.0 s) -> engage' "$HP/err" || hp_why+=" legacy:[$(hp_line)]"
+    if [[ -n "$hp_key" && -s "$HP/x/gzstd/profile.json" ]]; then
+      hp_plant 20
+      hp_run p20 /dev/null -- -T 1
+      { grep -qa "bringup guard: 20.00 s; $hp_key" "$HP/err" \
+          && grep -qa "bringup sample:.*(guard 20.0 s, this machine's calibrated price) -> skip" "$HP/err"; } \
+        || hp_why+=" p20:[$(hp_line)]"
+      hp_plant 5
+      hp_run p5 /dev/null -- -T 1
+      grep -qa "bringup sample:.*(guard 5.0 s, this machine's calibrated price) -> engage" "$HP/err" \
+        || hp_why+=" p5:[$(hp_line)]"
+      # Another allowance's key (-T 2) has no record.
+      hp_run p5-T2 /dev/null -- -T 2
+      { grep -qa 'no calibrated price for [a-z]*_w2_a[^:]*: none measured' "$HP/err" \
+          && grep -qa 'bringup sample:.*(guard 4.0 s) -> engage' "$HP/err"; } || hp_why+=" p5-T2:[$(hp_line)]"
+      hp_run p5-noprof /dev/null -- -T 1 --no-profile
+      grep -qa 'bringup guard: 4.0 s (the legacy price); --no-profile' "$HP/err" || hp_why+=" noprof:[$(hp_line)]"
+      # The test hook wins over a record: no lookup at all.
+      hp_run p5-hook /dev/null GZSTD_DEBUG_GPU_GUARD_SEC=0.05 -- -T 1
+      ! grep -qaE "bringup guard:|calibrated price" "$HP/err" || hp_why+=" hook:[$(hp_line)]"
+      hp_plant 2.5
+      hp_run p2.5-null /dev/null -- -T 1
+      grep -qa "bringup sample:.*(guard 2.5 s, this machine's calibrated price) -> engage" "$HP/err" \
+        || hp_why+=" p2.5-null:[$(hp_line)]"
+      hp_run p2.5-file "$HP/o.zst" -- -T 1
+      { grep -qa 'bringup guard: 4.00 s; .*this run writes elsewhere, so the legacy 4.0 s' "$HP/err" \
+          && grep -qa "bringup sample:.*(guard 4.0 s, this machine's calibrated price) -> engage" "$HP/err"; } \
+        || hp_why+=" p2.5-file:[$(hp_line)]"
+      "$GZSTD" --cpu-only -d -q -c "$HP/o.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || hp_why+=" p2.5-file:bytes"
+      hp_plant 20 not-this-driver
+      hp_run p20-driver /dev/null -- -T 1
+      { grep -qa 'bringup guard: 4.0 s (the legacy price); no calibrated price for .*: the GPU driver has changed' \
+          "$HP/err" && grep -qa 'bringup sample:.*(guard 4.0 s) -> engage' "$HP/err"; } \
+        || hp_why+=" driver:[$(hp_line)]"
+    else
+      hp_why+=" [no key or no profile to plant in]"
+    fi
+    rm -rf "$HP"
+    [[ -z "$hp_why" ]] && pass "$hp_t" || fail "$hp_t" "$hp_why"
+  else
+    skip "$hp_t" "needs python3"
+  fi
+
   # THE WRITER WAKES FOR THE GPU FRAME IT WAITS ON (v0.18.48).  push_to_slot woke
   # the writer for CPU frames only; a GPU batch's frames waited for the batch's end.
   # In a hybrid run the CPU pool's pushes woke it every few ms, until the pool had
@@ -7602,6 +7703,7 @@ else
   skip "a GPU worker with nothing left to take is not set up" "no GPU"
   skip "--adapt starts a pipe's GPUs only when the CPUs fall behind" "no GPU"
   skip "--adapt files a run whose GPUs got nothing as hybrid" "no GPU"
+  skip "a hybrid compress takes this machine's calibrated GPU price, and only for its own key" "no GPU"
 fi
 
 # ONE INPUT BELOW A GPU BATCH, IN A RUN THAT IS NOT (v0.18.25).  The startup gate asks
@@ -10292,6 +10394,57 @@ PYEOF2
     skip "--calibrate FILE records every device count (overhead and rate)" "needs two GPUs with 4 GiB free"
     skip "--calibrate ARCHIVE FILE records every decompress and compress count" "needs two GPUs with 4 GiB free"
     skip "--calibrate without FILE records device-count overhead only" "needs two GPUs with 4 GiB free"
+  fi
+  # --calibrate FILE's HYBRID PRICE PASS (v0.18.57, ROADMAP 42a): per reader class,
+  # child processes of the binary decline or engage as told and report their key,
+  # decision and bringup; an engaged child must give its cards work, a declined one
+  # none.  The test hook fixes the fit's points (a price of 4.333 s) and runs one
+  # round, so this checks the children, their checks, the keys and the record -- and
+  # that a default run computes the SAME key and takes the price.  -T 1 at level 15
+  # in 1 MiB frames keeps a 768 MiB file running ~3.5 s, past one card's bringup;
+  # --gpu-devices=1 pins the key's device bound under any caller mask (Codex review).
+  # -e: fifteen children, ~40 s.
+  hc_t="--calibrate FILE prices a hybrid compress per reader, under the key a default run looks up"
+  if has_gpu && command -v python3 >/dev/null 2>&1; then
+    HC="$TMPDIR/hpcal"; mkdir -p "$HC"; hc_why=""
+    head -c 603979776 /dev/urandom 2>/dev/null | base64 -w0 2>/dev/null | head -c 805306368 > "$HC/f.b64"
+    t0=$(now_ms); rc=0
+    env XDG_CACHE_HOME="$HC/x" $ACB GZSTD_DEBUG_CALIBRATE_HPRICE=1 timeout --foreground -k 10 600 \
+      "$GZSTD" --calibrate -T 1 -15 --chunk-size 1 --gpu-devices=1 "$HC/f.b64" 2>"$HC/c.err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    [[ $rc -eq 0 ]] || hc_why+=" [calibrate rc=$rc]"
+    hc_keys=$(python3 - "$HC/x/gzstd/profile.json" <<'PYEOF' 2>/dev/null
+import json, sys
+j = json.load(open(sys.argv[1]))
+for e in j['entries'].values():
+    for k, v in sorted(e.get('compress', {}).get('hybrid_price', {}).items()):
+        print(k, '%.3f' % v['price_s'], v.get('rule', ''))
+PYEOF
+)
+    hc_tar=$(awk '$1 ~ /^tar_w1_a[0-9]+q[0-9]+_d1_f1_l15_/ && $2 == "4.333" {print $1}' <<< "$hc_keys")
+    [[ -n "$hc_tar" ]] || hc_why+=" [no --tar record]"
+    awk '$1 ~ /^pread_w1_/ && $2 == "4.333"' <<< "$hc_keys" | grep -q . || hc_why+=" [no --no-mmap record]"
+    # FILE as named: mmap, or (no mmap on this kernel) the --no-mmap class's own key.
+    { awk '$1 ~ /^mmap_w1_/ && $2 == "4.333"' <<< "$hc_keys" | grep -q . \
+        || grep -qa 'hybrid price (--no-mmap): the same reader and key as a class above' "$HC/c.err"; } \
+      || hc_why+=" [FILE as named: $(tr '\r' '\n' < "$HC/c.err" | grep -a 'hybrid price (FILE' | tail -1)]"
+    grep -qa 'hybrid price (--tar): start the GPUs above 4.33 s of CPU work left' "$HC/c.err" \
+      || hc_why+=" [no --tar price line]"
+    # A default --tar run: the same key, and the price as its guard.
+    if [[ -n "$hc_tar" ]]; then
+      env -u GZSTD_DEBUG_GPU_GUARD_SEC XDG_CACHE_HOME="$HC/x" GZSTD_DEBUG_GPU_SAMPLER_SIGNAL=waiting \
+        timeout --foreground -k 10 120 "$GZSTD" --hybrid --tar -vv -k -f -T 1 -15 --chunk-size 1 --gpu-devices=1 "$HC/f.b64" \
+        -o "$HC/o.tzst" >/dev/null 2>"$HC/d.err" || hc_why+=" [default --tar rc=$?]"
+      { grep -qa "bringup guard: 4.33 s; $hc_tar, measured to /dev/null" "$HC/d.err" \
+          && grep -qa "bringup sample:.*(guard 4.3 s, this machine's calibrated price) -> engage" "$HC/d.err"; } \
+        || hc_why+=" [default --tar: $(tr '\r' '\n' < "$HC/d.err" | grep -aE 'bringup (guard|sample)' | tr '\n' ' ')]"
+    fi
+    [[ -z "$hc_why" ]] && pass "$hc_t" || fail "$hc_t" "$hc_why [records: $(tr '\n' ';' <<< "$hc_keys")]"
+    rm -rf "$HC"
+  elif command -v python3 >/dev/null 2>&1; then
+    skip "$hc_t" "no GPU"
+  else
+    skip "$hc_t" "needs python3"
   fi
 fi  # $EXTENSIVE (--calibrate device-count pass)
 

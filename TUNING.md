@@ -22,6 +22,10 @@ gzstd --calibrate /path/to/a/typical/large/file /path/to/a/typical/archive.zst
 From then on `--gpu-only` starts the number of GPUs those measurements predict is fastest, with or
 without `--adapt`. See [How many GPUs](#how-many-gpus-to-use-for---gpu-only).
 
+With any number of GPUs, `--calibrate FILE` also measures **when the default (hybrid) mode should
+start them at all**, at the number of CPUs you calibrate with. See
+[When a hybrid compress starts its GPUs](#when-a-hybrid-compress-starts-its-gpus).
+
 Everything is stored in one file per user, `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`. Delete
 it to start over. `--no-profile` makes a run neither read nor write it, which is what you want for
 benchmarks.
@@ -54,11 +58,50 @@ the profile, so that the first `--adapt` run already has them.
 |---|---|
 | `gzstd --calibrate` | CPU and GPU compress and decompress rates, on generated data in memory. On a host with 2 or more GPUs, also what it costs to start each number of GPUs. |
 | `gzstd --calibrate -o /mnt/data/NEWFILE` | also the write rate of that filesystem: it writes a scratch file there, syncs it, then deletes it. The path must not already exist. |
-| `gzstd --calibrate FILE` | also the GPU compression rate at each number of GPUs, on your own data. See the next section. |
+| `gzstd --calibrate FILE` | also the GPU compression rate at each number of GPUs, on your own data, and when a hybrid compress should start its GPUs. See the next two sections. |
 | `gzstd --calibrate ARCHIVE` | also the GPU decompression rate at each number of GPUs, on your own `.zst`. gzstd recognizes an archive by its first bytes, not its name; give FILE and ARCHIVE together to measure both. |
 | add `--no-profile` | prints the measurements without saving them. |
 
 Calibrate again after a hardware change, a driver update, or a move to a different kind of storage.
+
+## When a hybrid compress starts its GPUs
+
+In the default mode a compress starts on the CPUs, and in its first half second it measures how much
+work they have left. Starting GPUs costs about one to two seconds before they help, plus the time to
+tear them down when the program exits, so they are only worth it when enough work is left. Without a
+measurement for your machine, gzstd starts them when the CPUs have more than **4.0 s** of work left.
+
+That one number is too high on a few CPUs and too low on many. Measured on a host with 8 H100 GPUs,
+compressing a cached file to `/dev/null` with two GPUs, the remaining work above which starting
+them pays off was about 2.5–3.1 s on 4–8 CPUs, but about 13 s on 24 CPUs. There, a 97 GiB file had
+5 s of work left, so the 4.0 s rule started the GPUs, and the run took 6.1–6.2 s instead of 5.4.
+
+`gzstd --calibrate FILE` measures that point on your machine, at the number of CPUs it runs with (so
+use the `-T` or CPU limit you use for real work). It compresses FILE several times in separate
+processes, starting the GPUs early, starting them later, and not starting them, three times each.
+Then it repeats that with `--no-mmap` and with `--tar`. It prints one price per way of reading the
+input:
+
+```
+[CALIBRATE] hybrid price (FILE as named): start the GPUs above 7.34 s of CPU work left (the legacy guard: 4.0 s) -- above both measured points (extrapolated)
+```
+
+A later compress uses a price only when it runs the same way: the same way of reading, number of CPU
+workers and CPU limit, number of GPUs, frame size, level, `--read-threads` and
+`CUDA_VISIBLE_DEVICES`. Otherwise it keeps 4.0 s. A price measured below 4.0 s is used only when
+the output goes to `/dev/null`, as during calibration. For any other output gzstd uses 4.0 s
+instead, because when writing the output is the slowest part, faster compression saves nothing.
+`-vv` shows which price a run used and why:
+
+```
+[GPU] bringup guard: 3.59 s; mmap_w4_a6q0_d2_f16_l3_all, measured to /dev/null at R 6.74 s (saved +1.70 s) and 3.32 s (-0.15 s), bringup 1.66 s: between the measured points
+```
+
+FILE has to keep the CPUs busy for a few seconds: about 25 GiB of typical data on 6–8 CPUs, and about
+100 GiB on 24. If it's too small, gzstd says so and records nothing for that way of reading. On a
+host with many cores, the default CPU count (up to 96 workers) needs more data than a calibration
+can reasonably use, so a price is mostly useful at a limited CPU count. Prices are dropped when the
+GPU driver changes, and replaced by the next calibration.
 
 ## How many GPUs to use for `--gpu-only`
 
