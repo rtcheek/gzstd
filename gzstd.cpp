@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.59";
+static constexpr const char * GZSTD_VERSION = "0.18.60";
 //
 // Architecture overview:
 //
@@ -5516,12 +5516,14 @@ static void print_help_long()
 "     overlaps with file writes (small files written by a worker pool), so\n"
 "     it is faster than `gzstd -d | tar -x` on many-small-file archives.\n"
 "     A full extract of a gzstd archive splits its members across\n"
-"     parallel parsers, each decoding its own frames; when the members\n"
-"     are too few or too uneven for that to spread the work (two large\n"
-"     files, or one among many small ones), a shared pool decodes for\n"
-"     all of them instead. Automatic sizing uses up to 8 decoders;\n"
-"     -T N (including -T0) keeps its allowance, subject to frame count\n"
-"     and memory.\n"
+"     parallel parsers, each decoding its own frames.  A file over half\n"
+"     the archive is itself split between parsers in 64 MiB pieces\n"
+"     (smaller under a memory limit), unless the archive is stored\n"
+"     nearly uncompressed.  When the members are otherwise too few or\n"
+"     too uneven for the parsers to spread the work, a shared pool\n"
+"     decodes for all of them instead.  Automatic sizing uses up to 8\n"
+"     decoders; -T N (including -T0) keeps its allowance, subject to\n"
+"     frame count and memory.\n"
 "     Restores regular files, directories, symlinks, hardlinks, FIFOs and\n"
 "     device nodes with permissions and modification time; owners are\n"
 "     restored only when running as root — by NAME first, like GNU tar\n"
@@ -32493,6 +32495,12 @@ struct InEntry {
   uint64_t  hdr_off = 0, data_off = 0, entry_end = 0;
 };
 
+// The member the parallel extract may cut inside its data (v0.18.60, ROADMAP
+// 45c): a plain regular file of our own member index over half the tar stream,
+// by entry number, with where its header and data lie.  The cut points are
+// chosen by Extractor::run_parallel, on its part-window grid.
+struct TarSplitCand { size_t entry = 0; uint64_t hdr_off = 0, data_off = 0, size = 0; };
+
 // Zero-copy view of file data: a span into a decompressed frame, kept alive by
 // the refcount.  A small file is usually one segment; it spans two (rarely
 // more) when it crosses a frame boundary.  The writer pool writes straight
@@ -32664,6 +32672,14 @@ static uint64_t gz_frames_ram_budget()
 {
   const uint64_t ram = get_available_ram_bytes();
   return ram ? std::min<uint64_t>((uint64_t)4 << 30, ram / 4) : (uint64_t)4 << 30;
+}
+
+// An archive stored at over 90% of its source decodes nearly for free: the
+// parallel extract neither pools its decode (v0.18.59) nor cuts a member for it
+// (v0.18.60), since there is no decode to spread.
+static constexpr double TAR_TRIVIAL_DECODE = 0.90;
+static double tar_comp_ratio(const std::vector<uint64_t> & c_off, const std::vector<uint64_t> & u_off) {
+  return (!u_off.empty() && u_off.back() > 0) ? (double)c_off.back() / (double)u_off.back() : 0.0;
 }
 
 // A large file's part job: the Extractor's large_window_ (tar_part_window).
@@ -33263,6 +33279,7 @@ public:
   // bar (the Extractor's own m_ stays null to avoid double counting).
   void run_parallel(FILE * in,
                     const std::vector<uint64_t> & bounds,
+                    const std::vector<TarSplitCand> & splits,
                     const std::vector<uint64_t> & c_off,
                     const std::vector<uint64_t> & u_off,
                     const Options & dopt, Meter * feed_meter) {
@@ -33281,56 +33298,182 @@ public:
       return (size_t)(std::upper_bound(u_off.begin(), u_off.end(), v) - u_off.begin()) - 1;
     };
 
-    // Partition entries into N contiguous groups, snapping splits to entry
-    // boundaries and balancing summed data bytes.  Cap N by the frame count too:
-    // adjacent partitions share their boundary frame (decoded by both), so more
+    // Partition the tar stream into N contiguous byte ranges balanced by size.
+    // A range ends at an entry boundary or, since v0.18.60, inside the data of a
+    // member the planner offers (`splits`: plain regular files of our own index)
+    // at a multiple of the writer's part window from the data's start, so every
+    // part job keeps the offsets and sizes one partition would give it and an
+    // O_DIRECT part stays aligned.  Cap N by the frame count too: adjacent
+    // partitions share their boundary frame (decoded by both), so more
     // partitions than frames would just multiply that redundant decode.
+    //
+    // CUT INSIDE A MEMBER (ROADMAP 45c).  Partitions used to end on member
+    // boundaries only, so an archive of one member never reached this path (it
+    // took the serial walk), and few members gave few partitions.  MEASURED
+    // (8-H100 server, cached, 26 GB of base64 in 16 MiB frames, extracted to NVMe,
+    // three rotated rounds): one member by the serial walk 9.85-10.23 s at 4 CPUs
+    // and 8.25-8.40 at 64; the same bytes as one partition with the decode pool
+    // 8.52-9.05 and 7.49-7.62; as two members 7.93-8.34 and 7.06-7.22; as four
+    // members 7.62-7.75 at 4 CPUs.  The partition whose range holds a cut member's
+    // header creates the file and publishes it (SplitMember); a partition that
+    // starts inside the member waits for that, writes its own parts of the file,
+    // and parses on from the member's end.  The last part written finalizes the
+    // file, as for one partition.
+    //
+    // NEAREST CUT, NOT THE LAST ONE BELOW THE TARGET (v0.18.60).  Taking the last
+    // boundary below each target gave a leading directory entry a partition of
+    // its own when N was small (ROADMAP 45d: two members at -T 2 were the
+    // directory alone, then both files).
+    //
+    // ONLY A MEMBER OVER HALF THE STREAM IS CUT.  Below that, entry boundaries
+    // can already give two even halves, and cutting more measured no better:
+    // two 12 GiB members 8.08-8.43 s at 4 CPUs uncut against 8.39-8.75 cut, 48 of
+    // 512 MiB and /usr tied.  Over half, no partitioning on entry boundaries can
+    // spread the work, and the cut is the whole gain (the one-member numbers above;
+    // 9.68-10.09 -> 8.16-8.26 at 4 CPUs, 8.19-8.46 -> 7.88-7.95 at 64, the run's
+    // peak RSS 17-19 GB -> 1-5 as the serial walk's mapped archive goes).
+    // Nor for a trivial decode (TAR_TRIVIAL_DECODE): the cut spreads decode, and
+    // the writes of one file do not spread -- the kernel takes the file's lock
+    // for each buffered write, and ext4 for each O_DIRECT write that allocates.
+    // MEASURED, 8 GiB of random bytes as one member beside its directory, 64
+    // CPUs: cut 2.89-3.15 s against 2.54-2.81 uncut (a tie at 4); a probe writing
+    // 24 GiB on 16 threads into /dev/shm, 2.55 GiB/s to one file and 29 to 16.
     const size_t nframes = c_off.size() - 1;
+    const uint64_t W = large_window_;
+    const uint64_t total = bounds.empty() ? 0 : bounds.back();
+    // The member to cut, if any (the planner offers at most one: see `splits`).
+    const TarSplitCand * cm = nullptr;
+    uint64_t grid_count = 0;                 // its cut points: data_off + k*W, k = 1..grid_count
+    for (const TarSplitCand & sc : splits) {
+      if (sc.entry < nent && sc.size > W && sc.size > total / 2
+          && tar_comp_ratio(c_off, u_off) <= TAR_TRIVIAL_DECODE
+          && sc.hdr_off == (sc.entry ? bounds[sc.entry - 1] : 0) && sc.data_off > sc.hdr_off
+          && sc.size <= bounds[sc.entry] - sc.data_off) {
+        cm = &sc; grid_count = (sc.size - 1) / W;
+        break;
+      }
+    }
     int N = std::max(1, std::min(resolve_cpu_threads(dopt.cpu_threads), 16));
-    N = std::min<int>(N, (int)nent);
+    N = (int)std::min<uint64_t>((uint64_t)N, (uint64_t)nent + grid_count);
     N = std::min<int>(N, (int)nframes);
     if (const int fit = par_extract_mem_fit(c_off, u_off); fit < N) {
       vlog(V_VERBOSE, dopt, "[TAR] memory: " + std::to_string(fit) + " of " + std::to_string(N)
            + " extract partitions fit a quarter of the memory left\n");
       N = fit;
     }
-    struct Part { size_t a, b; };            // entries [a, b)
-    std::vector<Part> parts;
+    // Each cut is the candidate nearest its target, after the cut before it,
+    // among the entry boundaries (binary search) and the member's grid (a
+    // division): neither list is built, so this costs O(N log entries).
+    struct Cut { uint64_t off; bool in_member; };
+    std::vector<Cut> cuts;                   // ascending: partition pi ends at cuts[pi]
     {
-      const uint64_t total = bounds.empty() ? 0 : bounds.back();
-      size_t a = 0;
-      for (int g = 0; g < N && a < nent; ++g) {
-        size_t b;
-        if (g == N - 1) { b = nent; }        // last group takes the rest
-        else {
-          uint64_t target = (uint64_t)((double)total * (double)(g + 1) / (double)N);
-          b = a;
-          while (b < nent && bounds[b] < target) ++b;
-          if (b <= a) b = a + 1;             // guarantee progress
+      uint64_t after = 0;
+      for (int g = 1; g < N; ++g) {
+        const uint64_t target = (uint64_t)((double)total * (double)g / (double)N);
+        Cut best{0, false}; uint64_t dist = UINT64_MAX;
+        auto offer = [&](uint64_t off, bool in_member) {
+          if (off <= after || off >= total) return;
+          const uint64_t d = off < target ? target - off : off - target;
+          if (!best.off || d < dist || (d == dist && off < best.off)) { best = Cut{off, in_member}; dist = d; }
+        };
+        if (nent > 1) {
+          const auto last = bounds.end() - 1;   // the stream's end is not a cut
+          const auto lo = std::upper_bound(bounds.begin(), last, after);
+          const auto it = std::lower_bound(lo, last, target);
+          if (it != last) offer(*it, false);
+          if (it != lo) offer(*(it - 1), false);
         }
-        parts.push_back({a, b});
-        a = b;
+        if (grid_count) {
+          const uint64_t first = after < cm->data_off ? 1 : (after - cm->data_off) / W + 1;
+          if (first <= grid_count) {
+            uint64_t q = target < cm->data_off ? 1 : (target - cm->data_off) / W;
+            q = std::max(first, std::min(q, grid_count));
+            offer(cm->data_off + q * W, true);
+            if (q < grid_count) offer(cm->data_off + (q + 1) * W, true);
+          }
+        }
+        if (!best.off) break;
+        cuts.push_back(best);
+        after = best.off;
       }
     }
+    // THE CUT MEMBER'S HEAD REACHES ITS HEADER EARLY.  The head -- the partition
+    // that parses the header -- creates the file, in archive order as one
+    // partition would, and the partitions continuing the member wait for that
+    // before they read a frame.  Whatever the head parses before the header is
+    // their wait.  When a cut member was the last of a long slice, the
+    // partitions ran nearly in turn (MEASURED, a first build that cut every
+    // member: 48 x 512 MiB 7.3-8.0 s -> 19.0-21.7, /usr 29.1-29.9 -> 42.6-42.8 at
+    // 4 CPUs).  Creating the file before any partition started (a second build)
+    // replaced an existing file before its header was read, so a damaged header
+    // destroyed it where the serial walk left it alone (Codex review).  So the
+    // head parses no more than one part window before the header -- a leading
+    // directory, a few small files -- or the cut nearest the header moves to it.
+    if (cm && cm->hdr_off > 0) {
+      bool cut_inside = false;
+      uint64_t hstart = 0;                   // where the head's slice starts
+      for (const Cut & c : cuts) { cut_inside |= c.in_member; if (c.off <= cm->hdr_off) hstart = c.off; }
+      if (cut_inside && cm->hdr_off - hstart > W) {
+        size_t k = 0;
+        for (size_t j = 1; j < cuts.size(); ++j) {
+          const auto d = [&](uint64_t o) { return o < cm->hdr_off ? cm->hdr_off - o : o - cm->hdr_off; };
+          if (d(cuts[j].off) < d(cuts[k].off)) k = j;
+        }
+        cuts[k] = Cut{cm->hdr_off, false};
+        std::sort(cuts.begin(), cuts.end(), [](const Cut & a, const Cut & b) { return a.off < b.off; });
+      }
+    }
+    // The member cut: the partition starting at its header is its head; each
+    // partition starting at one of its grid points continues it.
+    split_members_.clear();
+    split_heads_.clear();
+    std::vector<SplitMember *> cont_of(cuts.size() + 1, nullptr);
+    for (size_t k = 0; k < cuts.size(); ++k) {
+      if (!cuts[k].in_member) continue;
+      if (split_members_.empty()) {
+        split_members_.push_back(std::make_unique<SplitMember>());
+        SplitMember * sm = split_members_.back().get();
+        sm->data_off = cm->data_off; sm->size = cm->size; sm->entry_end = bounds[cm->entry];
+        sm->head_end = cuts[k].off;
+        sm->head_part = 0;
+        for (size_t j = 0; j < k; ++j) if (cuts[j].off <= cm->hdr_off) sm->head_part = j + 1;
+        split_heads_.emplace(cm->data_off, sm);
+      }
+      cont_of[k + 1] = split_members_.back().get();
+    }
+    if (dopt.verbosity >= V_VERBOSE) {
+      char b[160];
+      std::snprintf(b, sizeof b, "[TAR] parallel-extract: %zu partitions over %zu entries, %zu frames\n",
+                    cuts.size() + 1, nent, nframes);
+      std::string l = b;
+      if (!split_members_.empty()) {
+        size_t ncut = 0;
+        for (const Cut & c : cuts) ncut += c.in_member;
+        l += "[TAR] parallel-extract: " + std::to_string(split_members_.size()) + " member(s) cut "
+           + std::to_string(ncut) + " time(s) on the " + std::to_string(W >> 20) + " MiB part grid\n";
+      }
+      vlog(V_VERBOSE, dopt, l);
+    }
 
-    // Per-partition frame/byte geometry, used by both decode modes: entry byte
-    // range [start, end) and the frames [f0, f1] covering it (a boundary frame
-    // straddling a split is decoded once per owning partition, as before).
-    struct PG { size_t f0, f1; uint64_t start, end; };
-    std::vector<PG> pg(parts.size());
+    // Per-partition frame/byte geometry, used by both decode modes: byte range
+    // [start, end) and the frames [f0, f1] covering it (a boundary frame
+    // straddling a cut is decoded once per owning partition, as before).
+    // `cont`: the cut member this partition starts inside, or null.
+    struct PG { size_t f0, f1; uint64_t start, end; SplitMember * cont; };
+    std::vector<PG> pg(cuts.size() + 1);
     size_t total_items = 0;
-    for (size_t pi = 0; pi < parts.size(); ++pi) {
-      const Part pr = parts[pi];
-      const uint64_t start = pr.a == 0 ? 0 : bounds[pr.a - 1];
+    for (size_t pi = 0; pi < pg.size(); ++pi) {
+      const uint64_t start = pi == 0 ? 0 : cuts[pi - 1].off;
       // The LAST partition also owns what follows the last entry: the two zero
       // blocks and tar's padding, which can fill whole frames of their own (512
       // bytes a frame in a t2sz-style archive).  Ending it at the last entry left
       // those frames unread and undecoded -- unlike the serial walk -- while the
       // output was credited with their bytes (v0.18.28 review).
-      const uint64_t end   = pi + 1 == parts.size() ? u_off.back() : bounds[pr.b - 1];
-      pg[pi] = PG{ frame_of(start), frame_of(end - 1), start, end };
+      const uint64_t end   = pi + 1 == pg.size() ? u_off.back() : cuts[pi].off;
+      pg[pi] = PG{ frame_of(start), frame_of(end - 1), start, end, cont_of[pi] };
       total_items += pg[pi].f1 - pg[pi].f0 + 1;
     }
+    const std::vector<PG> & parts = pg;      // one partition per PG
 
     // ---- shared frame-decode pool (Phase 1 of the decoupled extractor) ----
     // The K parse partitions stay put, but under --adapt decode no longer runs
@@ -33376,11 +33519,9 @@ public:
     // measured here is not a restriction on a user's allowance on another host.
     constexpr int    TAR_SINK_DECODERS     = 8;
     constexpr double TAR_POOL_MIN_GAIN     = 1.25;
-    constexpr double TAR_TRIVIAL_DECODE    = 0.90;   // stored at >90% of source
     const bool force_pool = std::getenv("GZSTD_FORCE_POOL") != nullptr;
     const bool legacy_pool = dopt.adapt || force_pool;
-    const double comp_ratio =
-        (!u_off.empty() && u_off.back() > 0) ? (double)c_off.back() / (double)u_off.back() : 0.0;
+    const double comp_ratio = tar_comp_ratio(c_off, u_off);
     double total_decode = 0.0, max_part_decode = 0.0;
     for (const PG & g : pg) {
       const double work = (double)(u_off[g.f1 + 1] - u_off[g.f0]);
@@ -34266,6 +34407,16 @@ public:
           auto_start_cv.wait(lk, [&] { return auto_started; });
         }
         const PG g = pg[pi];
+        // A partition starting inside the cut member (ROADMAP 45c) waits for its
+        // head to create the file, or to fail to, before it reads a frame: it
+        // holds no frame budget while it waits, and the head, which starts at the
+        // member's header, waits on nothing a later partition holds.
+        std::shared_ptr<BigFile> cont_big;
+        if (g.cont) {
+          std::unique_lock<std::mutex> lk(g.cont->mx);
+          g.cont->cv.wait(lk, [&] { return g.cont->published; });
+          cont_big = g.cont->big;
+        }
         // Each parse thread owns an inline DCtx (used whenever it decodes a frame
         // itself).  next_dispatch = first frame not yet decoded-inline or
         // dispatched-to-the-pool; frames in [next_consume, next_dispatch) are in
@@ -34324,8 +34475,36 @@ public:
           return fb;
         };
         StreamReader r(std::move(producer), u_off[g.f0], g.end);
-        if (g.start > u_off[g.f0]) r.skip(g.start - u_off[g.f0]);   // align to the entry boundary
-        parse(r, &pctx[pi]);
+        if (g.start > u_off[g.f0]) r.skip(g.start - u_off[g.f0]);   // align to the slice start
+        if (g.cont) {
+          // This partition's parts of the cut member, then everything after it.
+          const SplitMember & sm = *g.cont;
+          const uint64_t data_end = sm.data_off + sm.size;
+          const uint64_t hi = std::min(g.end, data_end);
+          if (cont_big) enqueue_parts(r, cont_big, g.start - sm.data_off, hi - sm.data_off);
+          else r.skip(hi - g.start);
+          if (g.end > data_end) {
+            r.skip(sm.entry_end - data_end);   // the member's block padding
+            parse(r, &pctx[pi]);
+          }
+        } else {
+          parse(r, &pctx[pi]);
+        }
+        // The cut member's head is this partition, but its parse never reached
+        // the header -- a damaged header, or an index that placed the member
+        // where the stream holds something else: the member was not extracted,
+        // which is an error, and the partitions continuing it must not wait
+        // forever.
+        for (const auto & up : split_members_) {
+          if (up->head_part != pi) continue;
+          bool done;
+          { std::lock_guard<std::mutex> lk(up->mx); done = up->published; }
+          if (!done) {
+            fail_data("(archive)", "no member at tar offset " + std::to_string(up->data_off)
+                      + ", where the member index places one's data; it was not extracted");
+            publish_split(*up, nullptr);
+          }
+        }
         // Read and decode the rest of the slice, as run_sink drains the serial
         // walk's: the last partition's parse stops at the zero blocks, before its
         // padding frames, and any partition's stops at tar-level damage.
@@ -34350,6 +34529,8 @@ public:
       auto_start_cv.notify_all();
     }
     for (auto & t : workers) t.join();
+    split_heads_.clear();
+    split_members_.clear();   // every part holds its own reference to its file
     if (feed_meter && inline_decoded.load(std::memory_order_relaxed))
       feed_meter->note_cpu_decode_threads((int)workers.size());
     if (pool_on) {
@@ -34936,7 +35117,9 @@ private:
   // partition worker parses into a private ParCtx (no shared-vector races);
   // run_parallel merges them in partition order after join, preserving global
   // archive order for finish_deferred (hardlinks forward, dir metadata reverse).
-  struct ParCtx { std::vector<Hard> hardlinks; std::vector<DirMeta> dirmeta; };
+  // `stop`: the partition's slice ended inside a cut member's data (its head,
+  // split_head), so parse() returns after that entry.
+  struct ParCtx { std::vector<Hard> hardlinks; std::vector<DirMeta> dirmeta; bool stop = false; };
   // Guards the map_owner name→id caches, which the parallel workers hit
   // concurrently (only as root, and only misses touch NSS — contention is nil).
   std::mutex owner_mx_;
@@ -35258,6 +35441,36 @@ private:
     std::atomic<int>  parts_left{0};
     std::atomic<bool> failed{false};
   };
+  // The member run_parallel cuts across partitions (ROADMAP 45c).  Its head --
+  // the partition starting at its header -- checks the header against the
+  // index, creates and sizes the file as dispatch_large does, and publishes it
+  // here; each partition starting inside the member waits for that before it
+  // reads a frame, then queues its own parts of the same BigFile.  The last part
+  // written, whoever queued it, finalizes the file.  `big` null: the head did
+  // not create it (a per-file failure, reported by the head, or a header that
+  // does not match the index), and the others skip their data, as the serial
+  // parser skips a member it could not create.
+  struct SplitMember {
+    uint64_t data_off = 0, size = 0, entry_end = 0;
+    uint64_t head_end = 0;          // the head's parts end here (the member's first cut)
+    size_t   head_part = 0;         // the partition that parses its header
+    std::mutex mx; std::condition_variable cv;
+    bool published = false;         // under mx
+    std::shared_ptr<BigFile> big;   // under mx
+  };
+  std::vector<std::unique_ptr<SplitMember>> split_members_;   // run_parallel's cuts
+  std::unordered_map<uint64_t, SplitMember *> split_heads_;   // by data offset, read-only once workers start
+  // Parts that will never be queued: if every queued part is already written,
+  // this thread is the last owner and finalizes.
+  void unaccount_parts(BigFile & b, int n) {
+    if (n > 0 && b.parts_left.fetch_sub(n, std::memory_order_acq_rel) == n) finalize_big(b);
+  }
+  void publish_split(SplitMember & sm, std::shared_ptr<BigFile> big) {
+    { std::lock_guard<std::mutex> lk(sm.mx);
+      if (sm.published) return;
+      sm.published = true; sm.big = std::move(big); }
+    sm.cv.notify_all();
+  }
   struct Job {
     std::string rel; uint32_t mode = 0; int64_t mtime = 0; uint64_t uid = 0, gid = 0;
     std::vector<DataSeg> segs; uint64_t size = 0; ExtMeta ext;
@@ -35802,7 +36015,8 @@ private:
   // (cheap metadata ops), then hand out large_window_-sized zero-copy part jobs
   // to the writer pool.  The queue bound (q_max_bytes_) backpressures this
   // thread, so a huge file never pins more than the in-queue windows' frames.
-  void dispatch_large(StreamReader & r, const std::string & rel, const InEntry & e, int root) {
+  void dispatch_large(StreamReader & r, const std::string & rel, const InEntry & e, int root,
+                      SplitMember * sm = nullptr) {
     auto big = std::make_shared<BigFile>();
     big->rel = rel; big->mode = e.mode; big->mtime = e.mtime;
     big->uid = e.uid; big->gid = e.gid; big->ext = e.ext; big->size = e.size;
@@ -35821,34 +36035,80 @@ private:
       big->direct = false;
       fd = create_file(rel, scratch_mode, false, root);
     }
-    if (fd < 0) { fail_errno(rel, errno); r.skip(e.size); return; }
+    // A cut member's head (`sm`, ROADMAP 45c) queues only the parts before the
+    // member's first cut, and publishes the file, or its failure, to the
+    // partitions that continue it.
+    const uint64_t mine = sm ? sm->head_end - sm->data_off : e.size;
+    if (fd < 0) {
+      fail_errno(rel, errno);
+      if (sm) publish_split(*sm, nullptr);
+      r.skip(mine); return;
+    }
     // Pre-size the file: parts pwrite their absolute offsets concurrently,
     // zero skips become holes, and trailing holes / exact length need no
     // final ftruncate.
     if (::ftruncate(fd, (off_t)e.size) != 0) {
-      fail_io(rel, "ftruncate failed"); ::close(fd); r.skip(e.size); return;
+      fail_io(rel, "ftruncate failed"); ::close(fd);
+      if (sm) publish_split(*sm, nullptr);
+      r.skip(mine); return;
     }
     big->mfd = fd;
+    // Every part of the file, whichever partition queues it.
     const int parts = (int)((e.size + large_window_ - 1) / large_window_);
     big->parts_left.store(parts, std::memory_order_relaxed);
-    uint64_t off = 0; int enq = 0;
+    if (sm) publish_split(*sm, big);
+    enqueue_parts(r, big, 0, mine);
+  }
+
+  // Part jobs for the bytes [lo, hi) of `big`, read from `r`.  lo is a multiple
+  // of the part window, and hi one too or the file's end, so the jobs are the
+  // ones one partition would queue for the whole file.  A stream that ends first
+  // fails the file and un-accounts the parts never queued; if every queued part
+  // has already been written, this thread is the last owner and finalizes.
+  void enqueue_parts(StreamReader & r, const std::shared_ptr<BigFile> & big,
+                     uint64_t lo, uint64_t hi) {
+    const int parts = hi > lo ? (int)((hi - lo + large_window_ - 1) / large_window_) : 0;
+    uint64_t off = lo; int enq = 0;
     bool ok = true;
     for (; enq < parts; ++enq) {
-      Job j; j.big = big; j.off = off; j.rel = rel; j.root = root;
-      j.size = std::min<uint64_t>(large_window_, e.size - off);
+      Job j; j.big = big; j.off = off; j.rel = big->rel; j.root = big->root;
+      j.size = std::min<uint64_t>(large_window_, hi - off);
       if (!r.read_segs(j.size, j.segs)) { ok = false; break; }   // truncated stream
       off += j.size;
       enqueue(std::move(j));
     }
     if (!ok) {
-      fail_data(rel, "truncated file data");
+      fail_data(big->rel, "truncated file data");
       big->failed.store(true);
-      // Un-account the parts that were never enqueued; if every enqueued part
-      // already completed, this thread is the last owner and finalizes.
-      int missing = parts - enq;
-      if (big->parts_left.fetch_sub(missing, std::memory_order_acq_rel) == missing)
-        finalize_big(*big);
+      unaccount_parts(*big, parts - enq);
     }
+  }
+
+  // The head of the member run_parallel cut (ROADMAP 45c): check the header the
+  // stream holds against the index that offered the cut, then create the file
+  // and queue the parts in this partition's slice (dispatch_large).  The slice
+  // ends inside the member's data either way, so the partition's parse ends
+  // here.  A header that is not the plain regular file of that size the index
+  // described is a data error -- the index is a claim, not evidence -- and the
+  // partitions continuing it skip their data.
+  void split_head(StreamReader & r, const std::string & rel, const InEntry & e, int root,
+                  SplitMember & sm, ParCtx * par) {
+    par->stop = true;
+    const uint64_t mine = sm.head_end - sm.data_off;
+    const bool regular = e.typeflag == '0' || e.typeflag == '\0' || e.typeflag == '7';
+    if (!regular || e.is_sparse || e.size != sm.size) {
+      fail_data("(archive)", "the member index does not match the tar stream at " + rel);
+      publish_split(sm, nullptr);
+      r.skip(mine);
+      return;
+    }
+    if (rel.empty() || has_dotdot(rel)) {   // as handle_entry: skipped, the second loudly
+      if (!rel.empty()) fail(rel, "unsafe path (parent-directory traversal) — skipped");
+      publish_split(sm, nullptr);
+      r.skip(mine);
+      return;
+    }
+    dispatch_large(r, rel, e, root, &sm);
   }
   // --sparse extract: write [data,data+n) at file offset `at`, leaving holes for
   // all-zero SPARSE_BLK runs (skip the pwrite).  The caller ftruncate()s to the
@@ -36197,6 +36457,7 @@ private:
       }
 
       handle_entry(r, e, par);
+      if (par && par->stop) return;   // a cut member's head: the slice ends in its data
     }
   }
 
@@ -36252,6 +36513,13 @@ private:
       list_count(e);
       if (e.size) { r.skip(e.size); r.skip(pad); }
       return;
+    }
+
+    // A member run_parallel cut: this partition holds its header and the first
+    // of its data, and its slice ends inside that data (ROADMAP 45c).
+    if (par && !split_heads_.empty()) {
+      const auto it = split_heads_.find(r.consumed_total);
+      if (it != split_heads_.end()) { split_head(r, rel, e, root, *it->second, par); return; }
     }
 
     // GNU sparse: place each stored segment at its logical offset, leaving holes.
@@ -37469,8 +37737,10 @@ static bool tar_output_alias_collision(
 
 static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt,
                                      TarSeekTable & st, std::vector<uint64_t> & bounds,
-                                     bool * decoded_cpu = nullptr) {
+                                     bool * decoded_cpu = nullptr,
+                                     std::vector<TarSplitCand> * splits = nullptr) {
   bounds.clear();
+  if (splits) splits->clear();
   // DUPLICATES ARE REJECTED ON THE FILESYSTEM SPELLING, NOT THE ARCHIVE'S.  This
   // planner exists to partition members across workers, which is only safe when
   // no two members name one output file -- and `a//b`, `a/./b` and `a/b` are one
@@ -37509,16 +37779,33 @@ static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt
             || e.entry_end < e.data_off || e.entry_end > s2.tar_size
             || !no_dup(seen, e.name)) { ok = false; break; }
         prev = e.entry_end;
+        // The member whose data may be cut across partitions (ROADMAP 45c): a
+        // plain regular file over half the stream (only one can be) whose entry
+        // ends at its data rounded up to a block, as tar lays it out, in an
+        // archive whose decode is not trivial (run_parallel's rules; it also
+        // needs it larger than a writer job).  The partition that parses its
+        // header checks the header against this (Extractor::split_head): the
+        // index is a claim, not evidence.
+        const bool regular = e.typeflag == '0' || e.typeflag == '\0' || e.typeflag == '7';
+        if (splits && splits->empty() && regular && !e.is_sparse
+            && e.size > TAR_PART_WINDOW_MIN && e.size > s2.tar_size / 2
+            && tar_comp_ratio(s2.c_off, s2.u_off) <= TAR_TRIVIAL_DECODE
+            && e.data_off <= e.entry_end && e.size <= e.entry_end - e.data_off
+            && e.entry_end - e.data_off == (e.size + TAR_BLK - 1) / TAR_BLK * TAR_BLK)
+          splits->push_back(TarSplitCand{bounds.size(), e.hdr_off, e.data_off, e.size});
         bounds.push_back(e.entry_end);
         nt.emplace_back(key(e.name), e.typeflag);
       }
       if (ok && (tar_leaf_dir_collision(nt)
                  || tar_output_alias_collision(dest_fd, nt))) ok = false;
-      if (ok) { st = std::move(s2); have = true; } else bounds.clear();
+      if (ok) { st = std::move(s2); have = true; }
+      else { bounds.clear(); if (splits) splits->clear(); }
     }
   }
 
   // Foreign zstd-seekable archives (t2sz-style): header-hop for the geometry.
+  // No member is cut there: the scan does not record where a member's data
+  // starts.
   if (!have) {
     TarSeekTable s2; std::vector<ScanEnt> fes;
     if (parse_foreign_seek_table(in, s2)
@@ -38797,6 +39084,23 @@ static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool 
 // floating-point knife edge.  One card at the frame counts above starts where it
 // did; the H100 rows keep 64 on two cards and 32 on six, and four go 32 -> 64,
 // where v0.18.41 measured a tie.
+//
+// TIMES 2^(THE ARCHIVE'S RATIO CLASS) (v0.18.60, ROADMAP 41).  The factor 3 is
+// base64's.  A frame of compressible data decodes on a GPU in a time set by its
+// own length, not the batch's: matches copy serially within a frame, so a batch
+// costs about the same however few frames it holds until the card is full, and
+// the batch has to hold more frames for the run to go faster.  MEASURED, one
+// H100, --gpu-only -d, cached, 16 MiB frames of 5.4:1 text (ratio class 2), a
+// batch's decode kernel 440-480 ms at 16 and at 32 frames, wall seconds:
+//   archive (frames)    64            128          256          auto (v0.18.59)
+//   1.4 GiB (90)        2.27-2.36     1.81-1.82    1.85-1.87    4.74-5.09
+//   5.5 GiB (356)       4.44-4.45     3.03-3.08    2.60-2.87    7.72-7.74
+//   22 GiB (1418)       13.38-13.48   8.42-8.54    5.56-5.63    10.68-10.76
+// and on the RTX 5090 above the text rows' best was 128 where this law gave 16 and
+// 32.  The class is floor(log2(decoded / compressed)) from the seek table
+// (g_input_ratio_class): 0 for base64 (1.33:1), whose starts do not move, -1 with
+// no table.  x4 for that text puts the starts at 64, 128 and 128 (the 2 GiB
+// target caps it), where the tuner's walk takes over.
 static size_t tune_decomp_start(size_t frame_bytes, uint64_t input_bytes, int devices,
                                 uint64_t frames) {
   const size_t base = tune_default_start(frame_bytes, input_bytes, /*decompress=*/true, devices);
@@ -38804,6 +39108,8 @@ static size_t tune_decomp_start(size_t frame_bytes, uint64_t input_bytes, int de
   const uint64_t per_dev = std::max<uint64_t>(1, frames / (uint64_t)std::max(1, devices));
   size_t p = 1;                       // the largest power of two <= 3 x sqrt(per_dev)
   while (p < HARD_BATCH_CAP && uint64_t(2 * p) * uint64_t(2 * p) <= 9 * per_dev) p <<= 1;
+  if (const int rc = g_input_ratio_class.load(std::memory_order_relaxed); rc > 0)
+    p = std::min<size_t>(p << std::min(rc, 4), HARD_BATCH_CAP);   // x 2^class (above)
   const size_t cap = std::max<size_t>(1, size_t(TUNE_DECOMPRESS_START_BYTES
                                                 / std::max<size_t>(1, frame_bytes)));
   return std::min<size_t>(std::max(base, std::min(p, cap)), AUTO_TUNE_BATCH_CEILING);
@@ -39241,6 +39547,28 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
                                + (fast ? 0 : streams);
     return double(probe_batches) * double(next) * per_frame;
   };
+  // What ONE batch at `next` reads, at the same bytes per frame.
+  auto one_batch = [&](size_t next) -> double {
+    return double(next) * double(full_bytes) / double(full) / double(std::max<size_t>(1, cur));
+  };
+  // A DECOMPRESS CLIMB ON STEEP EVIDENCE PAYS FROM ITS FIRST BATCH (v0.18.60,
+  // ROADMAP 41).  When halving cut the rate by TUNE_STEEP or more, or a doubling
+  // raised it by as much, a batch's time hardly depends on its size, so the next
+  // doubling is faster per frame from its first batch: running it costs nothing
+  // even if the run ends before a window at that size can close, and the gate
+  // asks only that one batch of it fit in this device's share of what is left
+  // (the windows it may never finish are not lost work).  Decompress only:
+  // compress allocates at bringup and was not measured.  MEASURED, one H100,
+  // 5.4:1 text (above tune_decomp_start's table): the walk halved 32 -> 16 at
+  // 440 ms a batch either way, measured 32 again for a full window, then refused
+  // 64 ("a window at 64 would read ~860 MiB of ~391 MiB left"); with the climb
+  // and the ratio start, 1.4 GiB 4.74-5.09 s -> 2.27-2.67, 5.5 GiB 7.72-7.74 ->
+  // 3.08-3.15, 22 GiB 10.68-10.76 -> 7.56-7.66 (it climbs 128 -> 256).  Base64
+  // halves at 1.2-1.4x a step there, under TUNE_STEEP, and keeps the gate.
+  // Staged paths (--direct-stage, --gds-only) keep their walk and the window
+  // gate: their batch also sizes staged I/O and registered buffers, which this
+  // was not measured on, and they cannot grow buffers (explore_ok) (Codex review).
+  const bool steep_climb = R.decompress && R.explore_ok;
   // At the ceiling and still improving: explore past it if this path can grow
   // its buffers and the throttle can always grant a pop that large.
   size_t want = 0;
@@ -39300,11 +39628,25 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     } else {
       T.steep = cur_thr > 0.0 && T.prev_thr >= cur_thr * TUNE_STEEP;
       T.prev_thr = T.best_thr; T.prev_batch = T.best_batch;
-      tune_propose(T, std::min(T.best_batch, C));
-      T.phase = DeviceTune::Phase::DOUBLE;
-      if (opt.verbosity >= V_VERBOSE)
-        vlog(V_VERBOSE, opt, tag + "halving worse, will try doubling (best="
-             + std::to_string(T.best_batch) + ")\n");
+      // Steeply worse: the best size's rate is already known, so double it now
+      // rather than measure it again for a window first (see steep_climb).
+      const size_t dbl = std::min(T.best_batch * 2, C);
+      double left = 0.0; bool known = false;
+      if (steep_climb && T.steep && dbl > T.best_batch) (void)window_cost(dbl, &left, &known);
+      if (steep_climb && T.steep && dbl > T.best_batch
+          && (!known || one_batch(dbl) <= left / double(std::max(1, R.devices)))) {
+        tune_propose(T, dbl);
+        T.phase = DeviceTune::Phase::DOUBLE;
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, tag + "halving steeply worse, doubling at once (best="
+               + std::to_string(T.best_batch) + " -> " + std::to_string(dbl) + ")\n");
+      } else {
+        tune_propose(T, std::min(T.best_batch, C));
+        T.phase = DeviceTune::Phase::DOUBLE;
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, tag + "halving worse, will try doubling (best="
+               + std::to_string(T.best_batch) + ")\n");
+      }
     }
   } else if (T.phase == DeviceTune::Phase::DOUBLE) {
     bool improving;
@@ -39332,8 +39674,10 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
       double left = 0.0; bool known = false;
       const bool unproven = dbl > cur && dbl > T.measured_max;
       const double cost = unproven ? window_cost(dbl, &left, &known) : 0.0;
+      const double share = left / double(std::max(1, R.devices));
       if (unproven && known
-          && cost > (T.steep ? 1.0 / double(std::max(1, R.devices)) : tune_explore_fraction()) * left) {
+          && (T.steep && steep_climb ? one_batch(dbl) > share
+              : cost > (T.steep ? share : tune_explore_fraction() * left))) {
         if (opt.verbosity >= V_VERBOSE)
           vlog(V_VERBOSE, opt, tag + "a window at " + std::to_string(dbl) + " would read ~"
                + std::to_string((uint64_t)(cost / ONE_MIB)) + " MiB of ~"
@@ -52082,28 +52426,35 @@ static int extract_tar(const Options & opt, Meter * m)
     };
     if (members.empty() && arc != "-" && !opt.keep_going && !opt.tar_to_stdout) {
       tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
+      std::vector<tarx::TarSplitCand> psplits;
       bool decoded_cpu = false;
-      const bool planned = tarx::build_full_parallel_plan(in, dest_fd, opt, pst, pbounds, &decoded_cpu);
+      const bool planned = tarx::build_full_parallel_plan(in, dest_fd, opt, pst, pbounds,
+                                                          &decoded_cpu, &psplits);
       if (decoded_cpu) m->note_cpu_decode_threads(1);
       if (planned) {
+        // The slices the plan can make: one per entry, and one more per part
+        // window inside a member over half the stream, which run_parallel cuts
+        // (ROADMAP 45c), so an archive of one large member takes this path too.
+        // run_parallel counts them again on its writers' window and reports the
+        // partitions it made.
+        uint64_t slices = pbounds.size();
+        {
+          const uint64_t W = tarx::tar_part_window(), half = pbounds.empty() ? 0 : pbounds.back() / 2;
+          if (tarx::tar_comp_ratio(pst.c_off, pst.u_off) <= tarx::TAR_TRIVIAL_DECODE)
+            for (const tarx::TarSplitCand & sc : psplits)
+              if (sc.size > W && sc.size > half) slices += (sc.size - 1) / W;
+        }
         int Np = std::min<int>({resolve_cpu_threads(opt.cpu_threads), 16,
-                                (int)pbounds.size(), (int)(pst.c_off.size() - 1),
+                                (int)std::min<uint64_t>(slices, 16), (int)(pst.c_off.size() - 1),
                                 tarx::par_extract_mem_fit(pst.c_off, pst.u_off)});
         if (Np >= 2) {
           warn_indexed_direct_read();   // this route really is page-cached
-          if (opt.verbosity >= V_VERBOSE) {
-            char b[160];
-            std::snprintf(b, sizeof b,
-              "[TAR] parallel-extract: %d partitions over %zu entries, %zu frames\n",
-              Np, pbounds.size(), pst.c_off.size() - 1);
-            vlog(V_VERBOSE, opt, b);
-          }
 #ifdef HAVE_NVCOMP
           gz_require_usable_gpu(opt, "--tar parallel extract");   // CPU route
 #endif
           tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
           ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
-          ex.run_parallel(in, pbounds, pst.c_off, pst.u_off, opt, m);
+          ex.run_parallel(in, pbounds, psplits, pst.c_off, pst.u_off, opt, m);
           // The data frames were counted as they were read; the index and seek
           // table the plan was built from are the archive's skippable frames.
           m->skipped_input_bytes.fetch_add(pst.skippable_bytes, std::memory_order_relaxed);

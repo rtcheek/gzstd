@@ -633,8 +633,12 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=582
-$EXTENSIVE && EXPECTED_TESTS=931
+EXPECTED_TESTS=584
+$EXTENSIVE && EXPECTED_TESTS=933
+# v0.18.60: +1 cell after it (a member over half the stream is cut across extract
+# partitions), no GPU needed, and +1 GPU cell in GPU batch tuner (decompress doubles
+# at once on a steep halving; a compressible archive starts higher): 582 -> 584,
+# -e 931 -> 933; the CPU-only run 415 -> 416 passed (+1 skip).
 # v0.18.59: +1 cell after Native tar extraction (a default extract pools its decode only
 # when its partitions cannot spread it), no GPU needed: 581 -> 582, -e 930 -> 931; the
 # CPU-only run 414 -> 415.
@@ -11121,12 +11125,40 @@ if has_gpu 2>/dev/null; then
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "compress pays the tuner's cost gate for a size never run (a pipe does not)" \
     || fail "compress pays the tuner's cost gate for a size never run (a pipe does not)" "got$why"
+  # 5. Decompress on steep evidence, and a compressible archive's start (v0.18.60,
+  #    ROADMAP 41).  On text a GPU batch's time hardly depends on its size (one
+  #    H100: 440-480 ms at 16 and 32 frames), so the walk halved, measured the start
+  #    again, then could not afford to climb: 5.5 GiB 7.7 s against 2.6 at 256.
+  #    A: the base64 archive above (start 64, ratio class 0) on a synthetic peak
+  #       AT its start: halving to 32 halves the rate, so it doubles at once to
+  #       128 without measuring 64 again, and settles back at 64.
+  #    B: 120 frames of 1 MiB of word=N text (5.2:1, ratio class 2) start at 128,
+  #       four times the frame law's 32 (3 x sqrt(120), rounded down to a power of 2).
+  t0=$(now_ms); why=""
+  env GZSTD_DEBUG_TUNE_CURVE=64 GZSTD_DEBUG_TUNE_FAST=1 "$GZSTD" -v --no-progress -f -d --gpu-only \
+    --gpu-devices=1 --gpu-streams=1 "$TUN/a.zst" -o /dev/null 2>"$TUN/sA.err" || why+=" A:rc=$?"
+  grep -q 'GPU0 f1: starting at 64$' "$TUN/sA.err" || why+=" A-start($(grep -o 'starting at [0-9]*' "$TUN/sA.err" | head -1))"
+  grep -q 'halving steeply worse, doubling at once (best=64 -> 128)' "$TUN/sA.err" \
+    || why+=" A-no-climb($(grep -o 'halving[^(]*' "$TUN/sA.err" | head -1))"
+  grep -q 'GPU0 f1: settled 64,' "$TUN/sA.err" || why+=" A-not-64($(grep -o 'f1: settled [0-9]*' "$TUN/sA.err"))"
+  awk -v n=$((120 * 1024 * 1024)) 'BEGIN { split("request session backup delta index commit worker stream frame batch", w, " ");
+      s = 0; for (i = 0; s < n; i++) { t = w[i % 10 + 1] "=" i * 7919 " "; printf "%s", t; s += length(t) } }' \
+    | head -c $((120 * 1024 * 1024)) > "$TUN/txt"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$TUN/txt" -o "$TUN/txt.zst" 2>/dev/null || why+=" B:create"
+  rm -f "$TUN/txt"
+  "$GZSTD" -v --no-progress -f -d --gpu-only --gpu-devices=1 "$TUN/txt.zst" -o /dev/null 2>"$TUN/sB.err" \
+    || why+=" B:rc=$?"
+  grep -q 'GPU0 f1: starting at 128$' "$TUN/sB.err" || why+=" B-start($(grep -o 'starting at [0-9]*' "$TUN/sB.err" | head -1))"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "decompress doubles at once on a steep halving; a compressible archive starts higher" \
+    || fail "decompress doubles at once on a steep halving; a compressible archive starts higher" "got$why"
   rm -rf "$TUN"
 else
   skip "tuner explores past its allocation; the profile keeps only what ran" "no GPU"
   skip "each GPU tunes its own batch (two devices, two peaks)" "no GPU"
   skip "a small-L2 card starts compress lower; pins and decompress keep their start" "no GPU"
   skip "compress pays the tuner's cost gate for a size never run (a pipe does not)" "no GPU"
+  skip "decompress doubles at once on a steep halving; a compressible archive starts higher" "no GPU"
 fi
 
 # ────────────────────────────────────────────────────────────
@@ -19641,6 +19673,85 @@ rm -rf "$DP"
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$dp_why" ]] && pass "a default extract pools its decode only when its partitions cannot spread it" \
   || fail "a default extract pools its decode only when its partitions cannot spread it" "$dp_why"
+
+# A MEMBER OVER HALF THE STREAM IS CUT ACROSS PARTITIONS (v0.18.60, ROADMAP 45c).
+# Partitions ended on member boundaries, so an archive of one large member took
+# the serial walk, and one dominant member left one partition with most of the
+# work.  Such a member is now cut on the writers' 64 MiB part grid: its header
+# starts a partition, which checks it, creates the file and publishes it; the
+# partitions starting inside the member wait for that, then write their own
+# parts.  Arms:
+#   a 200 MB member beside a small one, -T 4 -> cut (twice, on 64 MiB windows); the bytes, mode,
+#     mtime and a user xattr (in the header only, not the index: the head's
+#     metadata) are the source's; a symlink planted at its path is replaced, and
+#     what it pointed at is untouched
+#   a regular file already at its path         -> cut, and replaced by the member
+#   35 MB of another member before it, under a 512 MiB limit (32 MiB windows,
+#     three partitions), -T 3                    -> cut once: the first target's
+#     nearest point is inside the member, which would leave the head parsing 35 MB
+#     before the header, so that cut moves to the header (no more than a window)
+#   the same member read-only (0440)          -> cut, written whole, mode 0440
+#     (O_DIRECT's sub-4K tail reopens the file to write: it is created writable)
+#   the same at -T 1                         -> the serial walk, no cut
+#   two 70 MB members, each under half       -> partitions, no cut
+#   a 70 MB member of random bytes            -> no cut (the decode is nearly free)
+t0=$(now_ms); ct_why=""
+CT="$TMPDIR/cut"; rm -rf "$CT"; mkdir -p "$CT/a/d" "$CT/b/d" "$CT/r/d"
+head -c 150000000 /dev/urandom | base64 -w0 > "$CT/a/d/big"
+head -c 5000 /dev/urandom | base64 > "$CT/a/d/small"
+for ct_i in 1 2; do head -c 52500000 /dev/urandom | base64 -w0 > "$CT/b/d/m$ct_i"; done
+head -c 70000000 /dev/urandom > "$CT/r/d/rnd"
+ct_xa=(); setfattr -n user.gzcut -v head "$CT/a/d/big" 2>/dev/null && ct_xa=(--xattrs)
+chmod 0640 "$CT/a/d/big"; touch -m -d @946684800 "$CT/a/d/big"
+mkdir -p "$CT/p/d"; head -c 26250000 /dev/urandom | base64 -w0 > "$CT/p/d/a"; ln "$CT/a/d/big" "$CT/p/d/big"
+for ct_a in a b r p; do
+  "$GZSTD" -q -f --cpu-only --tar "${ct_xa[@]}" --chunk-size 1 -C "$CT/$ct_a" -o "$CT/$ct_a.tzst" d \
+    2>/dev/null || ct_why+=" create-$ct_a:$?"
+done
+echo keep > "$CT/victim"
+ct_x() {  # ct_x ARCHIVE LABEL GZSTD-ARGS...: extract at -v into $CT/x
+  local a=$1 l=$2 rc=0; shift 2
+  rm -rf "$CT/x"; mkdir -p "$CT/x/d"
+  case $l in
+    cut) ln -s "$CT/victim" "$CT/x/d/big" ;;
+    existing) echo old > "$CT/x/d/big" ;;
+  esac
+  timeout --foreground -k 5 120 "$GZSTD" -d -v --cpu-only "$@" --tar "$CT/$a.tzst" -C "$CT/x" \
+    2>"$CT/$l.err" || rc=$?
+  (( rc == 0 )) || ct_why+=" $l:rc=$rc"
+  diff -r "$CT/$a/d" "$CT/x/d" >/dev/null 2>&1 || ct_why+=" $l:tree"
+}
+ct_x a cut -T 4 "${ct_xa[@]}"
+grep -aqE 'parallel-extract: 1 member\(s\) cut [1-9][0-9]* time' "$CT/cut.err" \
+  || ct_why+=" cut:[$(grep -a 'parallel-extract' "$CT/cut.err" | sed 's/\x1b\[K//' | tr '\n' ' ')]"
+[[ ! -L "$CT/x/d/big" && $(stat -c '%a %Y' "$CT/x/d/big") == "640 946684800" ]] \
+  || ct_why+=" cut:meta[$(stat -c '%F %a %Y' "$CT/x/d/big")]"
+[[ $(cat "$CT/victim") == keep ]] || ct_why+=" cut:symlink-followed"
+(( ${#ct_xa[@]} == 0 )) || [[ $(getfattr --only-values -n user.gzcut "$CT/x/d/big" 2>/dev/null) == head ]] \
+  || ct_why+=" cut:xattr"
+ct_x a existing -T 4
+grep -aqE 'member\(s\) cut [1-9]' "$CT/existing.err" || ct_why+=" existing:not-cut"
+pm_tree "$CT/cg"; echo $((512 << 20)) > "$CT/cg/sys/fs/cgroup/job/step/memory.max"
+GZSTD_DEBUG_CGROUP_ROOT="$CT/cg" ct_x p prefix -T 3
+grep -aq 'parallel-extract: 1 member(s) cut 1 time(s) on the 32 MiB part grid' "$CT/prefix.err" \
+  || ct_why+=" prefix:[$(grep -a 'parallel-extract' "$CT/prefix.err" | sed 's/\x1b\[K//' | tr '\n' ' ')]"
+ct_x a serial -T 1
+chmod 0440 "$CT/a/d/big"; touch -m -d @946684800 "$CT/a/d/big"
+"$GZSTD" -q -f --cpu-only --tar --chunk-size 1 -C "$CT/a" -o "$CT/a.tzst" d 2>/dev/null || ct_why+=" create-ro:$?"
+ct_x a readonly -T 4
+grep -aqE 'member\(s\) cut [1-9]' "$CT/readonly.err" || ct_why+=" readonly:not-cut"
+[[ $(stat -c '%a %Y' "$CT/x/d/big") == "440 946684800" ]] || ct_why+=" readonly:meta[$(stat -c '%a %Y' "$CT/x/d/big")]"
+! grep -aq 'parallel-extract' "$CT/serial.err" || ct_why+=" serial:parallel"
+ct_x b halves -T 4
+grep -aq 'parallel-extract: [0-9]* partitions' "$CT/halves.err" && ! grep -aq 'member(s) cut' "$CT/halves.err" \
+  || ct_why+=" halves:[$(grep -a 'parallel-extract' "$CT/halves.err" | sed 's/\x1b\[K//' | tr '\n' ' ')]"
+ct_x r random -T 4
+grep -aq 'parallel-extract: [0-9]* partitions' "$CT/random.err" && ! grep -aq 'member(s) cut' "$CT/random.err" \
+  || ct_why+=" random:[$(grep -a 'parallel-extract' "$CT/random.err" | sed 's/\x1b\[K//' | tr '\n' ' ')]"
+rm -rf "$CT"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$ct_why" ]] && pass "a member over half the stream is cut across extract partitions" \
+  || fail "a member over half the stream is cut across extract partitions" "$ct_why"
 
 # ============================================================
 # Selective extraction (-d --tar ARCHIVE MEMBER..., positional -C)

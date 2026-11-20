@@ -1109,7 +1109,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51; 97 GiB two cards 14.66 -> 13.66.  Compare reader paths on one
     inode (a hard link), not on two fixtures.
 45. **A default -d --tar extract of few members decoded on few threads.**  FIXED v0.18.59 for the parallel
-    extract; the GPU half of the question is measured and open.  Asked as "price the -d --tar decode" (42a(7)):
+    extract, and v0.18.60 for one large member (c); the GPU half of the question is measured and open.  Asked as "price the -d --tar decode" (42a(7)):
     8-H100 server, cached base64 archives of 16 MiB frames, node-1 CPUs, two idle cards, x3 rotated.
     **GPUs lose on both extract routes.**  The parallel extract (an indexed archive of two or more members)
     starts GPUs only under --adapt: to /dev/shm, forced engagement was the slowest arm at 4-12 CPUs (two 12 GiB
@@ -1137,10 +1137,9 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     than its decoded one); under real cgroup limits the pool ran 7.44 s at 1 GiB and 11.42 at 512 MiB against
     inline's 23.50 and 27.17, where sharing the partitions' quarter (the review's first proposal) gave 12.56 and
     27.97.  A pool thread that cannot start (a PID limit, no memory) leaves the extract inline.
-    **Still open:** (c) a ONE-member archive never reaches the parallel extract (partitions end on members), so it
-    stays at the serial parser's ~2.2 GiB/s -- splitting a large member across partitions by byte range is the
-    lever; (d) the partitioner gives a leading directory entry a partition of its own when N is small (two 8 MB
-    members at -T 2: the directory alone, then both files), which the pool now covers but inline would not;
+    **Still open:** (c) ~~a ONE-member archive never reaches the parallel extract~~ **DONE v0.18.60** (below);
+    (d) ~~the partitioner gives a leading directory entry a partition of its own~~ **DONE v0.18.60**: each cut is
+    the candidate nearest its target, not the last one below it;
     (e) PRE-EXISTING: under a tight task limit a default -d --tar ABORTS ("terminate called without an active
     exception"; systemd TasksMax=18 and 12, v0.18.58 and v0.18.59 alike): the writer pool and the partitions have
     no fallback when a thread cannot start, as the new pool now has (fixing it means joining partial parser and
@@ -1160,6 +1159,34 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     --hybrid permits a measured engagement (counting the parser's backpressure), not an eager CUDA start.
     Test the backend x --adapt x hook matrix, mixed eligible and oversize frames, partial and total GPU failure,
     and USE_NVCOMP=OFF.  Measured on this host the GPUs lost here, so this is about honouring the request.
+    **v0.18.60: a member over half the stream is cut across partitions (c).**  The premise was wrong: the serial
+    parser was not what held one member (dispatch-blocked 96% at 64 CPUs, the writers 97% busy).  Measured on the
+    8-H100 server, cached 26 GB of base64 in 16 MiB frames to NVMe: the serial walk 9.8-10.1 s at 4 CPUs and
+    8.2-8.5 at 64; one partition fed by the decode pool 8.5-9.1 and 7.5-8.4; cut into 3 or 16 partitions 8.1-8.2
+    and 7.9-8.0, at a peak RSS of 1-5 GB against 17-19 (the serial walk maps the archive).  The cut is on the
+    writers' part grid, so each part is the job one partition would queue.  The partition holding the header
+    checks it against the index, creates the file in archive order and publishes it; the partitions continuing
+    the member wait for that before they read a frame, so that partition parses at most one part window before
+    the header (else a cut moves to the header).  Two designs measured and dropped on the way: the head met the
+    header at the end of a long slice and the partitions ran nearly in turn (48 x 512 MiB 7.8 -> 21.7 s); the
+    file created before any partition started replaced an existing file before its header was read (Codex).
+    Only a member over half the stream is cut (two 12 GiB halves cut lost up to 3%; 48 x 512 MiB and /usr tied),
+    and never in a trivial-decode archive (8 GiB of random bytes cut: 2.89-3.15 s against 2.54-2.81 at 64 CPUs);
+    one member among 47 small ones runs 9.18-9.38 -> 8.45-8.77 s at 4 CPUs but 8.00-8.08 -> 8.16-8.26 at 64.
+    (j) PRE-EXISTING, raised by the review: the parallel extract may create a file before another partition
+    processes its parent's directory entry, so a destination directory that already exists without owner write
+    (which make_dir would widen) can refuse the file; v0.18.59's partitions of a [d/] [d/big] archive race the
+    same way.  **What binds one large file now is its writes**: 16 threads writing 24 GiB into
+    /dev/shm ran 2.55 GiB/s into one file and 29 into sixteen (the kernel serialises buffered writes to one
+    inode), and O_DIRECT to this NVMe ~3.1 GiB/s either way (the drive).  So a fast buffered sink holds one big
+    member to ~2.5 GiB/s whatever the extractor does: 24 GiB to /dev/shm took 9.6-10.7 s as one file and 3.0 as
+    eight.  Open: (h) writing one file faster than its inode lock allows on a buffered sink -- mmap'd writes
+    avoid the lock but turn ENOSPC into SIGBUS, so not that; nothing else found.  (i) PRE-EXISTING, found by
+    v0.18.60's cell: --xattrs restores no user.* attribute on a READ-ONLY regular file for a non-root
+    extractor (v0.18.59 the same, serial and parallel, small and large files): apply_ext runs after
+    set_meta_fd by design (the access ACL must override the mode's group bits), so the fchmod to 0440 comes
+    first and fsetxattr then fails EACCES, reported only at -v.  The fix needs an order that keeps both: user
+    xattrs before the chmod, the ACL after it, and chown's clearing of security.capability in mind.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

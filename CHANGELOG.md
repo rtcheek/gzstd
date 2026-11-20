@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.59  
+**Covers:** v0.9.50 → v0.18.60  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,150 @@
 
 ---
 
+
+## v0.18.60 — a -d --tar extract cuts a member over half the archive across its parallel parsers, and a GPU decode of compressible data starts at a larger batch and climbs on steep evidence (ROADMAP 45c/d and 41; 8-H100 server: a cached 26 GB member extracted to NVMe 9.72-9.79 s -> 8.10-8.29 at 4 CPUs, 8.17-8.48 -> 7.88-7.94 at 64; --gpu-only -d of 5.5 GiB of text on one H100 7.56-7.78 -> 2.92-2.95 s)
+
+**The premise was wrong, and the change is still worth having.**  ROADMAP 45(c) said an archive of one member
+never reaches the parallel extract (partitions end on members), so it stays at the serial parser's ~2.2 GiB/s,
+and that splitting a member across partitions by byte range was the lever.  Measured first (cached 26 GB of
+base64 in 16 MiB frames, node-1 CPUs, extracted to NVMe, three rotated rounds, wall s): the serial walk's
+parser was never what held it.  At 64 CPUs its -v read "writer pool 97% busy, parse thread dispatch-blocked
+96%".  What the same bytes took on each route:
+
+| the 26 GB as | 4 CPUs | 64 CPUs | 64 CPUs to /dev/shm |
+|---|---|---|---|
+| one member, serial walk | 9.75-10.58 | 8.12-9.42 | 10.27-12.35 |
+| one member, one partition fed by the decode pool | 8.52-9.13 | 7.49-8.82 | 9.59-11.67 |
+| two members, two partitions + pool | 7.76-8.35 | 7.05-7.34 | 5.31-6.43 |
+| four members | 7.54-7.75 | 6.94-7.18 | 3.80-4.27 |
+| eight members | 8.44-8.56 | 6.97-8.39 | 2.98-3.01 |
+
+The decode pool alone recovers most of it at 4 CPUs (decode-bound); a fast sink takes many files and one file
+alike only at the rate one file can be written.  A probe of 16 threads writing 24 GiB in 64 MiB parts:
+/dev/shm 2.55 GiB/s into one file (48 s of kernel time) and 29 into sixteen -- the kernel takes a file's lock
+for every buffered write -- and O_DIRECT to this NVMe 3.0-3.3 GiB/s either way, preallocated or not (the
+drive).  So one large member is held to ~2.5 GiB/s on a fast buffered sink whatever the extractor does, and
+to the drive on this one; ROADMAP 45(h).
+
+**The change.**  The planner offers the one member of our own index that may be cut: a plain regular file
+(not sparse) over half the tar stream, whose entry ends at its data rounded up to a block, in an archive whose
+decode is not trivial.  run_parallel cuts the tar stream at the candidate nearest each of its targets, among the
+entry boundaries and every multiple of the writers' part window from that member's data start -- so each part
+job is the one a single partition would queue, and an O_DIRECT part stays aligned.  Neither list is built: the
+boundaries are searched and the grid is a division.  The partition holding the member's header (its head)
+checks the header against the index (a plain regular file of that size: the index is a claim, not evidence),
+creates and sizes the file in archive order exactly as one partition would, and publishes it; each partition
+starting inside the member waits for that before it reads a frame, then queues its own parts of the same file.
+The last part written, by whichever writer, finalizes the file.  The head parses at most one part window before
+the header; when more would precede it, the cut nearest the header moves to it.  A header that does not match,
+or a head that never reaches its header, is a data error, and the others skip their data.  An archive of one
+large member now takes the parallel extract; the call site counts the slices the cuts make.
+
+**Four things measured or reviewed and changed on the way.**
+- *A head that met the header at the end of a long slice* (the first build, which cut every member): each
+  partition waited for the one before it to work through its own members, and they ran nearly in turn --
+  48 x 512 MiB 7.8-8.0 s -> 19.0-21.7, /usr (817K entries) 29.1-29.9 -> 42.6-42.8 at 4 CPUs.
+- *The file created before any partition started* (the second build, which fixed that): Codex found it replaced
+  an existing file before its header was read, so a damaged header destroyed a file the serial walk left alone,
+  and it made a pre-existing unwritable parent fail where an earlier directory entry would have widened it first.
+  Creating at the header in archive order, with the header near the head's start, keeps both the speed and the
+  serial walk's order.  (The parent case remains for any file in a different partition from its directory entry,
+  as in v0.18.59: ROADMAP 45j.)
+- *Only a member over half the stream is cut.*  Cutting every member larger than a part window measured no
+  better where entry boundaries already give two even halves: two 12 GiB members 8.08-8.43 s at 4 CPUs uncut
+  against 8.39-8.75 cut, 48 x 512 MiB and /usr tied.  Over half, no partitioning on entry boundaries can spread
+  the work, and the cut is the whole gain.
+- *Not in a trivial-decode archive* (stored at over 90% of its source, the pool's rule): the cut spreads decode,
+  and writes to one file do not spread.  8 GiB of random bytes beside its directory, 64 CPUs: cut 2.89-3.15 s,
+  uncut 2.54-2.81 (a tie at 4).
+
+**Nearest cut, not the last below the target (ROADMAP 45d).**  Partitions used to end at the last entry boundary
+below each target, which gave a leading directory a partition of its own when N was small.
+
+**Final A/B** against v0.18.59's routing (the same source with only a test hook added), NVMe, three rotated rounds:
+
+| archive | 4 CPUs v0.18.59 | v0.18.60 | 64 CPUs v0.18.59 | v0.18.60 |
+|---|---|---|---|---|
+| one 26 GB member | 9.72-9.79 | 8.10-8.29 | 8.17-8.48 | 7.88-7.94 |
+| one 24 GiB member among 47 of 40 MiB | 9.18-9.38 | 8.45-8.77 | 8.00-8.08 | 8.16-8.26 |
+| two 12 GiB members (not cut) | 8.02-8.14 | 7.87-8.02 | 7.19-7.24 | 7.23-7.38 |
+| 48 x 512 MiB (not cut) | 7.81-7.93 | 7.84-7.91 | 7.11-7.34 | 7.10-7.34 |
+
+The last two rows are from the round before the final design, which cut neither by the same rule.  The mixed
+archive's 2% at 64 CPUs, against its 7% at 4, held in two rounds (8.16-8.41 -> 8.18-8.46 in the first).
+
+Peak RSS of the one-member run 17.1-18.6 GB -> 0.9-5.0 GB (the serial walk maps the archive).  Every shape
+extracted byte-identical with its modes and times at 4 and 64 CPUs (one, two, four and 48 members, the mixed
+archive, random bytes).
+
+**Found on the way, PRE-EXISTING, not changed (ROADMAP 45i):** --xattrs restores no user.* attribute on a
+read-only regular file for a non-root extractor (v0.18.59 the same, serial and parallel): the attributes are
+applied after the mode by design (the access ACL must override the mode's group bits), so fsetxattr meets
+mode 0440 and fails EACCES, reported only at -v.
+
+**The GPU decode tuner on compressible data (ROADMAP 41).**  One H100, --gpu-only -d to /dev/null, cached
+archives of 16 MiB frames, every GPU arm right after a --cpu-only decode, two or three shuffled rounds, wall s:
+
+| archive (frames) | auto v0.18.59 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|
+| base64 1 GiB (65) | 1.54-1.62 | 1.50-1.51 | 1.48-1.51 | 1.45-1.47 | 1.46 | 1.44-1.73 |
+| base64 4 GiB (257) | 2.21-2.28 | 2.38 | 2.18-2.20 | 1.90-1.93 | 1.81-1.90 | 1.70-1.77 |
+| base64 16 GiB (1025) | 3.71-3.76 | 6.25-6.28 | 5.31-5.33 | 4.03-4.06 | 3.49 | 3.29-3.31 |
+| text 1.4 GiB (90) | 4.74-5.09 | | | 2.27-2.36 | 1.81-1.82 | 1.85-1.87 |
+| text 5.5 GiB (356) | 7.72-7.74 | | | 4.44-4.45 | 3.03-3.08 | 2.60-2.87 |
+| text 22 GiB (1418) | 10.68-10.76 | | | 13.38-13.48 | 8.42-8.54 | 5.56-5.63 |
+
+On text (5.4:1, word=N tokens) a batch's decode kernel took 440-480 ms at 16 frames and at 32 alike: a frame
+of compressible data decodes in a time set by its own length (matches copy serially), so a batch costs about
+the same however few frames it holds, and the run's time falls as 1/batch.  The walk started at 16-64 (the
+frame law, 3 x sqrt(frames), fitted to base64), halved, measured the start again for a full window, and then
+refused to climb: "a window at 64 would read ~860 MiB of ~391 MiB left".  On this host base64 too ran best at
+the largest batch, where the RTX 5090 measured 64 best and 256 23% slower on the same 16 GiB (v0.18.44's
+table), so the best batch is the host's and no constant changed for base64.  Two changes, both from the data
+and the tuner's own evidence:
+- The decompress start is multiplied by 2^(the archive's ratio class), floor(log2(decoded / compressed)) from
+  its seek table: 0 for base64, whose starts do not move; 2 for this text, x4 (64, 128 and 128, the 2 GiB
+  decoded target capping it).  The 5090's text rows ran best at 128 where the law gave 16 and 32.
+- Decompress only: a halving that cut the rate by TUNE_STEEP (1.6) or more doubles the best size at once rather
+  than measure it again for a window, and under steep evidence a doubling is admitted when one batch of it fits
+  in the device's share of what is left -- it is faster per frame from its first batch, so the windows the run
+  may never finish are not lost work.  Base64 halves at 1.2-1.4x a step there and keeps the gate.
+
+| archive | auto v0.18.59 | ratio start only | steep climb only | v0.18.60 |
+|---|---|---|---|---|
+| text 1.4 GiB (90) | 4.74-5.09 | 2.28-2.35 | 4.76-4.77 | 2.15-2.19 |
+| text 5.5 GiB (356) | 7.72-7.74 | 3.09-3.39 | 6.34-6.35 | 2.92-2.95 |
+| text 22 GiB (1418) | 10.68-10.76 | 8.89-9.00 | 8.46-8.53 | 7.29-7.35 |
+| base64 4 GiB (257) | 2.00-2.07 | | | 2.04-2.36 |
+| base64 16 GiB (1025) | 3.52-3.84 | | | 3.50-3.53 |
+
+The last column and the base64 rows are the final A/B, three shuffled rounds, which ran the old auto at
+4.56-4.64, 7.56-7.78 and 10.58-10.68 s on the text; the middle columns are the prototype's runs.
+
+Data a GPU may decode fast at a high ratio does not lose either (the review asked): 8 GiB of zeros (7483:1, the
+class capped at 4, a start of 128 against 64) 1.71-1.79 s -> 1.58-1.62, and a sparse-like file (a random 64 KiB
+block per MiB of zeros, 16:1) 1.74-1.81 -> 1.60-1.64, three shuffled rounds.
+
+A fixture trap on the way: text archives made by concatenating copies of one compressed corpus (the recipe of
+the v0.18.44 checks) carry only their last copy's seek table, so they have no ratio class and the start does
+not move; an archive compressed in one pass does.
+
+**Tests.**  A new cell after the default-pool one: a 200 MB member beside a small one at -T 4 is cut, and its
+bytes, mode, mtime and a user xattr (in the header only, not the index) are the source's; a symlink planted at
+its path is replaced and its target untouched; a regular file already at its path is replaced at the header;
+under a fake 512 MiB cgroup (32 MiB windows, three partitions) a 35 MB member before it makes the first cut
+move to its header (cut once, not twice); the member read-only (0440) is written whole; -T 1 takes the serial
+walk; two 70 MB members (each under half) and a 70 MB member of random bytes are not cut.  A new GPU cell in
+the batch tuner section: on a synthetic peak at its start of 64, a base64 archive's walk halves steeply and
+doubles at once to 128, then settles back at 64; 120 frames of text (ratio class 2) start at 128 against the
+frame law's 32.  Mutants each caught: a continuation writing 4 KiB off (every cut arm's tree), no cuts, no moved cut (the prefix archive cut twice), no ratio start (the text starts at 32), no steep climb (halving worse, will try doubling).  584 / -e 933 / CPU-only 416 (+1 skip).  Codex (gpt-6.1-sol, xhigh), two rounds.  Round 1, NOT SAFE, three blockers, all taken: creating the cut
+member's file before any partition started replaced an existing file before its header was read and made a
+pre-existing unwritable parent fail (its patch fell back to one ordered parser whenever the destination existed;
+taken as a different design instead, creation at the header in archive order with the header near the head's
+start, so a re-extraction keeps the cut); the planner copied every regular member's name and the selection built
+every candidate (now one candidate, and the boundaries searched, its code); the steep climb reached the staged
+paths (now decompress with growable buffers only).  Round 2: SAFE TO STAGE, no blocker; it checked the waits,
+the moved cut and the part accounting, with a model of 60,000 synthetic archive geometries.  Suites: -e 932/0/1 in 30 min 55 s (the one skip the host-timing trivial-skip cell, as before), CPU-only 416/0/135.
 
 ## v0.18.59 — a default -d --tar extract decodes on a shared pool of up to 8 decoders when its partitions cannot spread the decode (ROADMAP 45; 8-H100 server, cached archives extracted to NVMe: two 12 GiB members 11.4-12.1 s -> 7.1-8.1, one 24 GiB member among 47 small ones 22.0-22.2 s -> 8.2-9.4)
 
