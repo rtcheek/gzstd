@@ -633,8 +633,11 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=581
-$EXTENSIVE && EXPECTED_TESTS=930
+EXPECTED_TESTS=582
+$EXTENSIVE && EXPECTED_TESTS=931
+# v0.18.59: +1 cell after Native tar extraction (a default extract pools its decode only
+# when its partitions cannot spread it), no GPU needed: 581 -> 582, -e 930 -> 931; the
+# CPU-only run 414 -> 415.
 # v0.18.58: +1 GPU cell in Small-input GPU gate (a hybrid decode takes this machine's
 # calibrated price, and replaces its growth test only where measured) and +1 GPU cell,
 # -e only, beside the --calibrate device-count cells (the hybrid decode price pass):
@@ -2314,7 +2317,9 @@ LAST_TEST_MS=$(( $(now_ms) - t0 ))
 # decode route wrote a literal 1 -- `-d -T 3` and a 3-partition `-d --tar` alike -- where
 # compress has reported its pool since v0.18.19.  It is now the largest CPU decode pool
 # that frames reached: the -T pool for -d and -t (also under --tar's walk), the
-# partitions of a parallel extract, the seek feeder's pool; 1 for the one-frame and
+# partitions of a parallel extract that decode inline, its shared decoders when a
+# default extract's partitions cannot spread the decode (v0.18.59: t.tzst's big.txt
+# leaves fewer than 3 effective decoders) or under GZSTD_FORCE_POOL, the seek feeder's pool; 1 for the one-frame and
 # streaming decoders; 0 when nothing was decoded (an indexed selection matching
 # nothing).  Explicit -T throughout, so no number depends on this host's cores.  (A
 # foreign header-hop decodes on one thread: the accounting cell's no-match arm.)
@@ -2328,6 +2333,8 @@ head -c 5000 /dev/urandom > "$TT/one"
 head -c 100 "$TT/one" > "$TT/one100"   # a frame with no content size, as zstd writes from a pipe
 { printf '\x28\xb5\x2f\xfd\x00\x00\x21\x03\x00'; cat "$TT/one100"; } > "$TT/sizeless.zst"
 "$GZSTD" -q --cpu-only --tar --chunk-size 1 -C "$TT" -o "$TT/t.tzst" t 2>/dev/null || why+=" tar:$?"
+mkdir -p "$TT/b"; for i in $(seq -w 1 30); do head -c 75000 /dev/urandom | base64 > "$TT/b/f$i"; done
+"$GZSTD" -q --cpu-only --tar --chunk-size 1 -C "$TT" -o "$TT/b.tzst" b 2>/dev/null || why+=" tarb:$?"
 tt_threads() { grep -o '"cpu": { "threads": [0-9]*' "$TT/r.json" 2>/dev/null | grep -o '[0-9]*$'; }
 tt_run() {  # tt_run LABEL WANT-THREADS WANT-EXIT GZSTD-ARGS...
   local label=$1 want=$2 wrc=$3 rc=0; shift 3
@@ -2340,7 +2347,8 @@ tt_run d-T3 3 0 -d -T 3 -c "$TT/multi.zst"
 tt_run t-T2 2 0 -t -T 2 "$TT/multi.zst"
 tt_run one-frame 1 0 -d -c "$TT/one.zst"
 tt_run sizeless 1 0 -d -c "$TT/sizeless.zst"
-tt_run tar-parallel 3 0 -d --tar -T 3 "$TT/t.tzst" -C "$TT/x"
+tt_run tar-pooled 3 0 -d --tar -T 3 "$TT/t.tzst" -C "$TT/x"
+tt_run tar-inline 3 0 -d --tar -T 3 "$TT/b.tzst" -C "$TT/x"     # 30 even members: 3 partitions
 GZSTD_FORCE_POOL=1 tt_run tar-pool 3 0 -d --tar -T 3 "$TT/t.tzst" -C "$TT/x"   # the shared decoders
 tt_run tar-walk 2 0 -d --tar -T 2 --keep-going "$TT/t.tzst" -C "$TT/x"
 tt_run tar-test 2 0 -t --tar -T 2 "$TT/t.tzst"
@@ -19557,6 +19565,83 @@ PYEOF
   rm -rf "$XS" "$XOUT" "$XARC"
 fi
 
+# A DEFAULT EXTRACT POOLS ITS DECODE WHEN ITS PARTITIONS CANNOT SPREAD IT (v0.18.59).
+# Inline, each partition decodes its own frames, and partitions end on member
+# boundaries: two 12 GiB members extracted in 11.4-11.8 s at 4-64 CPUs, one 24 GiB
+# member among 47 small ones in 22 s, where the shared decode pool took 7-9.  The
+# pool now goes on when the partitions alone would decode on fewer threads than
+# the pool's effective parallelism by a quarter, counting shared boundary
+# frames too. Automatic sizing caps at 8; explicit -T keeps its allowance,
+# subject to frames and RAM. Each arm reads the route from -v and checks the tree:
+#   two members, -T 4    -> pooled at 4 decoders
+#   two members, -T 12   -> pooled at 12 (explicit allowance)
+#   64 small members, -T 4 -> inline (inside the quarter)
+#   random bytes, -T 8   -> inline                 (decode nearly free)
+#   two ~1 MiB members, -T 32 -> inline (only ~2 MiB of whole-frame work)
+#   under a 128 MiB limit, a member of random bytes -> the pool's quarter (32 MiB)
+#     holds 15 slots, each a decoded frame and the largest COMPRESSED one, which a
+#     stored frame makes larger than the decoded; counted as two decoded frames,
+#     as --adapt's and GZSTD_FORCE_POOL's slots still are, it would be 16
+t0=$(now_ms); dp_why=""
+DP="$TMPDIR/dpool"; rm -rf "$DP"; mkdir -p "$DP/few" "$DP/bal" "$DP/rnd" "$DP/tiny" "$DP/inf"
+for dp_i in 1 2; do head -c 6000000 /dev/urandom | base64 > "$DP/few/f$dp_i"; done
+for dp_i in $(seq -w 1 64); do head -c 48000 /dev/urandom | base64 > "$DP/bal/b$dp_i"; done
+for dp_i in 1 2; do head -c 2500000 /dev/urandom > "$DP/rnd/r$dp_i"; done
+for dp_i in 1 2; do truncate -s $(((1 << 20) - 512)) "$DP/tiny/t$dp_i"; done
+cp "$DP/few/f1" "$DP/few/f2" "$DP/inf/"; head -c $((3 << 20)) /dev/urandom > "$DP/inf/r"
+chmod 0440 "$DP/few/f1"; chmod 0750 "$DP/few"
+touch -m -d @946684800 "$DP/few/f1" "$DP/few/f2" "$DP/few"
+for dp_a in few bal rnd inf; do
+  "$GZSTD" -q -f --cpu-only --tar --chunk-size 1 -C "$DP" -o "$DP/$dp_a.tzst" "$dp_a" 2>/dev/null \
+    || dp_why+=" create-$dp_a:$?"
+done
+# No leading directory entry: each tiny member occupies exactly one frame;
+# tar's final zero blocks form a short third frame.
+"$GZSTD" -q -f --cpu-only --tar --chunk-size 1 -C "$DP/tiny" -o "$DP/tiny.tzst" t1 t2 2>/dev/null \
+  || dp_why+=" create-tiny:$?"
+dp_x() {  # dp_x ARCHIVE LABEL WANT-REGEX GZSTD-ARGS...
+  local a=$1 l=$2 want=$3 rc=0; shift 3
+  rm -rf "$DP/x"; mkdir "$DP/x"
+  timeout --foreground -k 5 120 "$GZSTD" -d -v --cpu-only "$@" --tar "$DP/$a.tzst" -C "$DP/x" \
+    > "$DP/$l.err" 2>&1 || rc=$?
+  [[ $rc -eq 0 ]] || dp_why+=" $l:rc=$rc"
+  if [[ "$a" == tiny ]]; then
+    diff -r "$DP/tiny" "$DP/x" > /dev/null 2>&1 || dp_why+=" $l:tree"
+  else
+    diff -r "$DP/$a" "$DP/x/$a" > /dev/null 2>&1 || dp_why+=" $l:tree"
+    [[ "$(stat -c '%a %Y' "$DP/$a")" == "$(stat -c '%a %Y' "$DP/x/$a")" ]] \
+      || dp_why+=" $l:dir-metadata"
+    for dp_f in "$DP/$a"/*; do
+      [[ "$(stat -c '%a %Y' "$dp_f")" == "$(stat -c '%a %Y' "$DP/x/$a/${dp_f##*/}")" ]] \
+        || dp_why+=" $l:${dp_f##*/}:metadata"
+    done
+  fi
+  grep -aqE "$want" "$DP/$l.err" \
+    || dp_why+=" $l:[$(grep -a 'parallel-extract\|\[TAR\] decode' "$DP/$l.err" | sed 's/\x1b\[K//' | tr '\n' ' ' | cut -c1-200)]"
+}
+dp_x few few4 'decode pool: on .*up to 4 decoder' -T 4
+dp_x few few12 'decode pool: on .*up to 12 decoder' -T 12
+dp_x bal bal4 'decode: inline -- .*the pool on 4$' -T 4
+dp_x rnd rnd8 'decode: inline -- .*nearly free' -T 8
+dp_x tiny tiny32 'decode: inline' -T 32
+# Under a 128 MiB limit the pool takes its own quarter, as --adapt's has since
+# v0.18.31; a default pool's slot counts the largest compressed frame (15 slots
+# for inf.tzst), --adapt's and the force hook's stay two decoded frames (16 for
+# few.tzst's 1 MiB frames).
+pm_tree "$DP/cg"
+echo $((128 << 20)) > "$DP/cg/sys/fs/cgroup/job/step/memory.max"
+GZSTD_DEBUG_CGROUP_ROOT="$DP/cg" dp_x inf limited 'decode pool: on .*up to 12 decoder\(s\), 15-frame budget' -T 12
+GZSTD_DEBUG_CGROUP_ROOT="$DP/cg" dp_x few adaptive 'decode pool: adaptive .*up to 12 decoder\(s\), 16-frame budget' \
+  -T 12 --adapt --no-profile
+GZSTD_DEBUG_CGROUP_ROOT="$DP/cg" GZSTD_FORCE_POOL=1 \
+  dp_x few forced 'decode pool: forced on.*up to 12 decoder\(s\), 16-frame budget' -T 12
+grep -aq 'decode pool' "$DP/bal4.err" "$DP/rnd8.err" "$DP/tiny32.err" \
+  && dp_why+=" inline-arm-started-a-pool"
+rm -rf "$DP"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$dp_why" ]] && pass "a default extract pools its decode only when its partitions cannot spread it" \
+  || fail "a default extract pools its decode only when its partitions cannot spread it" "$dp_why"
+
 # ============================================================
 # Selective extraction (-d --tar ARCHIVE MEMBER..., positional -C)
 # ============================================================
@@ -20009,10 +20094,11 @@ PYEOF
   #      at least one GPU stream, and stay byte-identical to tar.  (GPU-gated;
   #      whether the GPU actually wins any frames off the CPU pool is timing-
   #      dependent on this box, so we assert correctness, not the frame split.)
-  #      --hybrid is REQUIRED, not incidental: with no explicit backend flag,
-  #      asymmetric mode defaults decompress to --cpu-only on PCIe Gen<4, which
-  #      clears gpu_capable and makes GZSTD_POOL_GPU inert -- so this test
-  #      silently asserted nothing on Gen4+ and failed outright on Gen3.
+  #      --hybrid was REQUIRED when this cell was written: with no explicit backend
+  #      flag, a PCIe Gen<4 host then decompressed --cpu-only, which clears
+  #      gpu_capable and makes GZSTD_POOL_GPU inert.  That rule went in v0.17.51
+  #      (hybrid is the default in every direction since v0.17.86); --hybrid stays,
+  #      harmless, so the cell does not depend on what the default is.
   if has_gpu 2>/dev/null; then
     rm -rf "$SX/gpout"; mkdir -p "$SX/gpout"
     gpout=$(GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 "$GZSTD" -d -v --hybrid --tar "$SX/legit.tar.zst" -C "$SX/gpout" 2>&1)

@@ -959,7 +959,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     input), and the record says when it does.  **STILL OPEN:** (1) an uncalibrated host keeps 4.0 s -- no
     built-in rule fits both ends, and only this server has been calibrated; run --calibrate FILE on the 2080 Ti
     and 5090 hosts and compare their prices with this one's; (2) a -d --tar extract and its decode pool keep
-    4.0 s (decompress is DONE, v0.18.58: below); (3) at the default allowance of a
+    4.0 s (decompress is DONE, v0.18.58: below; -d --tar measured, item 45); (3) at the default allowance of a
     large host (96 workers here) no FILE a calibration can hold reaches R of a few seconds, so that key stays
     unpriced; (4) what engaging costs at 24 CPUs is the exit's freeing of ~5-6 GiB of frame memory held behind
     the writer (0.70-0.88 s): trimming FrameMem at the last frame and skipping the GPU frees did not move it,
@@ -983,7 +983,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     6-CPU -t on node-0 CPUs read first-window R 15-26 s (local: 5.2-6.3) and its cards saved little where
     on local pages they saved 1.0-1.5 s.  Nothing keys locality, but the 6-CPU record measured local still
     paid remote (-d 4.71-4.86 s against --cpu-only 5.21-5.24, -t 4.36-4.44 against 5.23-5.39): smaller wins,
-    no loss.  (7) a -d --tar decode (the extract pool's own 4.0 s test, --adapt only) has no price.
+    no loss.  (7) ~~a -d --tar decode has no price~~ MEASURED v0.18.59, NOT PRICED: starting GPUs lost on
+    both extract routes at every CPU count tried, so a price would only learn never; see 45.
     (b) ~~**hybrid compress of a named file started every card**~~ **FIXED v0.18.48**: it takes two at most,
     as a pipe's compress (v0.18.40) and a named file's decode (v0.18.46) already did (8 CPUs, a cached
     24 GiB file: every card 7.31-7.37 s, two 4.53-4.58, `--cpu-only` 5.03-5.04).  Codex dissented: no
@@ -1107,6 +1108,58 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     it, the same binary); a chunk of one member's data is now read into an unfilled block: 24 GiB at 8 CPUs
     --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51; 97 GiB two cards 14.66 -> 13.66.  Compare reader paths on one
     inode (a hard link), not on two fixtures.
+45. **A default -d --tar extract of few members decoded on few threads.**  FIXED v0.18.59 for the parallel
+    extract; the GPU half of the question is measured and open.  Asked as "price the -d --tar decode" (42a(7)):
+    8-H100 server, cached base64 archives of 16 MiB frames, node-1 CPUs, two idle cards, x3 rotated.
+    **GPUs lose on both extract routes.**  The parallel extract (an indexed archive of two or more members)
+    starts GPUs only under --adapt: to /dev/shm, forced engagement was the slowest arm at 4-12 CPUs (two 12 GiB
+    members: 12.2-12.6 s at 4 CPUs against --adapt --cpu-only 10.6-11.1, 9.0-10.1 against 6.6-6.9 at 12), and
+    --adapt's lazy 4.0 s test engaged 11 of 12 runs, losing up to 1.5 s (the 64-frame GPU batches block the
+    partitions' in-order reads: the head-of-line item in the table below).  Every other -d --tar (one member, -O,
+    --keep-going, a foreign archive) runs the ordinary hybrid decode into the serial tar parser, which caps it at
+    ~2.2 GiB/s whatever the CPUs (a 24 GiB member: 10.3-11.7 s at 4-12 CPUs): engaging lost 0.9-1.7 s at every
+    count, and the default engaged at 4-8 CPUs, because the decoders block on the parser, the reader's backlog
+    grows, and the sampler reads that as a slow pool.  OPEN: (a) a sink-paced decline -- the sampler should see
+    its decoders wait on the FrameSink, on any host, rather than a calibrated price that says never; (b) retire
+    or fix --adapt's lazy GPU decoders in the extract pool.
+    **The fix: the decode pool by default where the partitions cannot spread the decode.**  Inline, each
+    partition decodes its own frames, and partitions end on member boundaries, so two 12 GiB members extracted
+    in 11.4-11.8 s at 4-64 CPUs and one 24 GiB member among 47 small ones in 21.9-22.2 s.  --adapt's pool
+    (v0.15.20, opt-in) had the answer: GZSTD_FORCE_POOL took 8.1-8.5 s and 8.2-9.4 at 4-64 CPUs to NVMe.  The pool
+    goes on when the threads inline decodes on (whole-frame work over the largest partition's, boundary frames
+    counted twice as they are decoded) are fewer by a quarter than the pool could run after its frame and memory
+    limits, fully provisioned (the contraction controller was slower in every cell).  The automatic allowance
+    takes at most 8 decoders, because 62 finished no sooner than 8 and held 7.9 GiB against 4.2; an explicit -T N
+    or -T0 takes its own allowance (review).  Kept inline, measured: 48 x 512 MiB and /usr (817K entries), where
+    inline already has 10-16 even partitions and the pool tied at 4-24 CPUs and lost 1-10% at 64; random bytes
+    (the pool lost 6-12%; --adapt's trivial-decode rule).  Its frames take their own quarter of the memory left,
+    as --adapt's pool has since v0.18.31, a slot counting the largest compressed frame (a stored frame is larger
+    than its decoded one); under real cgroup limits the pool ran 7.44 s at 1 GiB and 11.42 at 512 MiB against
+    inline's 23.50 and 27.17, where sharing the partitions' quarter (the review's first proposal) gave 12.56 and
+    27.97.  A pool thread that cannot start (a PID limit, no memory) leaves the extract inline.
+    **Still open:** (c) a ONE-member archive never reaches the parallel extract (partitions end on members), so it
+    stays at the serial parser's ~2.2 GiB/s -- splitting a large member across partitions by byte range is the
+    lever; (d) the partitioner gives a leading directory entry a partition of its own when N is small (two 8 MB
+    members at -T 2: the directory alone, then both files), which the pool now covers but inline would not;
+    (e) PRE-EXISTING: under a tight task limit a default -d --tar ABORTS ("terminate called without an active
+    exception"; systemd TasksMax=18 and 12, v0.18.58 and v0.18.59 alike): the writer pool and the partitions have
+    no fallback when a thread cannot start, as the new pool now has (fixing it means joining partial parser and
+    writer pools and a defined failure result; the review moved the parse-start gate's declaration before the
+    thread vector, so a failed parser start cannot first destroy a condition variable with waiters); (f) the automatic 8 is this host's (NVMe and
+    tmpfs sinks, July's soak too): a slow-core, fast-sink host could want more.  The review's sketch of a measured
+    alternative: the committed-write counters, decoder timing, and one bounded concurrency probe when the writers
+    lack decoded input, kept only when end-to-end throughput improves and tried only while enough work remains
+    -- never reading backlog behind a blocked parser as a slow pool; not free (settling, thread startup), so
+    measure before replacing the constant; the 1.25 margin and 0.90 ratio are heuristics, not guarantees; (g) an
+    explicit --gpu-only or --hybrid never reaches the extract pool's GPU decoders (only --adapt's lazy test and
+    the GZSTD_POOL_GPU hook do; --gpu-only only requires a usable GPU, v0.17.77, then decodes on the CPUs).  The
+    review's design: --gpu-only routes eligible frames to GPU decoders whatever the CPU heuristic, with the CPU
+    workers kept from racing them away and unsupported frames, rescue, a failed initialisation and the watchdog
+    handled as the plain decode handles them, and no-device, no-eligible-frame and all-devices-fail defined;
+    device and stream requests honoured; CUDA contexts and host buffers counted in memory as well as VRAM;
+    --hybrid permits a measured engagement (counting the parser's backpressure), not an eager CUDA start.
+    Test the backend x --adapt x hook matrix, mixed eligible and oversize frames, partial and total GPU failure,
+    and USE_NVCOMP=OFF.  Measured on this host the GPUs lost here, so this is about honouring the request.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

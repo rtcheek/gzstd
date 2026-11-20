@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.58";
+static constexpr const char * GZSTD_VERSION = "0.18.59";
 //
 // Architecture overview:
 //
@@ -2866,8 +2866,9 @@ struct Options {
   // registration, the tar staging pool -- must keep testing gds_only.
   bool region_staged() const { return gds_only || direct_stage; }
   // True if the user explicitly passed --cpu-only, --gpu-only, or --hybrid.
-  // When false, apply_backend_defaults() picks from mode + measured input residency:
-  // hybrid compress; warm-file decompress CPU-only; cold/unknown hybrid on every PCIe gen.
+  // When false, apply_backend_defaults() picks hybrid in every direction (v0.17.86):
+  // cpu-only only with no GPU or where an --adapt profile measured it faster.  (It
+  // once sent warm-file and PCIe Gen<4 decompress cpu-only; both rules are gone.)
   bool backend_user_set = false;
   // True if the user passed any flag that only makes sense in hybrid/GPU mode
   // (--gpu-batch, --gpu-streams, --gpu-devices, --gpu-order, --gpu-mem-frac, --pinned/-no-pinned,
@@ -5514,6 +5515,13 @@ static void print_help_long()
 "     Decompression runs on the full parallel CPU/GPU pipeline and\n"
 "     overlaps with file writes (small files written by a worker pool), so\n"
 "     it is faster than `gzstd -d | tar -x` on many-small-file archives.\n"
+"     A full extract of a gzstd archive splits its members across\n"
+"     parallel parsers, each decoding its own frames; when the members\n"
+"     are too few or too uneven for that to spread the work (two large\n"
+"     files, or one among many small ones), a shared pool decodes for\n"
+"     all of them instead. Automatic sizing uses up to 8 decoders;\n"
+"     -T N (including -T0) keeps its allowance, subject to frame count\n"
+"     and memory.\n"
 "     Restores regular files, directories, symlinks, hardlinks, FIFOs and\n"
 "     device nodes with permissions and modification time; owners are\n"
 "     restored only when running as root — by NAME first, like GNU tar\n"
@@ -33245,7 +33253,7 @@ public:
   // Partitions the entries into N contiguous groups balanced by data bytes;
   // each worker runs the standard parse/handle_entry over its byte slice,
   // dispatching file writes to the SHARED writer pool.  Frame decode is either
-  // inline on the parse thread (the proven default) or, under --adapt, routed
+  // inline on the parse thread or, under --adapt / for uneven partitions, routed
   // through a SHARED decode pool so a huge file stuck in one partition still
   // decodes across every core and mixed huge+tiny partitions self-balance (see
   // the pool block below).  Dirs/symlinks/specials/sparse are handled
@@ -33333,32 +33341,101 @@ public:
     // writer pool stops dispatching, its queued frames drain, and the decoders
     // move to whichever partitions still have work.  Each partition keeps a
     // private in-order reorder buffer (frames finish out of order); a global
-    // frame budget bounds total buffered decode exactly as seek_feed does.  The
-    // default (no --adapt) path keeps the proven inline decode below.
+    // frame budget bounds total buffered decode exactly as seek_feed does.
     // GZSTD_FORCE_POOL routes decode through the pool WITHOUT --adapt (no
     // governor/probe/warmup) so the pure decode-pool cost can be A/B'd against
     // the inline path under identical writer settings.
-    const bool use_pool = dopt.adapt || (std::getenv("GZSTD_FORCE_POOL") != nullptr);
-    uint64_t max_usz = 1;
-    for (size_t k = 0; k + 1 < u_off.size(); ++k)
+    //
+    // A DEFAULT EXTRACT TAKES THE POOL WHEN ITS PARTITIONS CANNOT SPREAD THE DECODE
+    // (v0.18.59).  Inline, each partition decodes its own frames on its parse
+    // thread, so about total / largest-partition threads decode (`inline_par`),
+    // counting WHOLE frames, including the duplicate work at split boundaries,
+    // whatever the CPU allowance: partitions end on member boundaries, so an
+    // archive of few members, or of one member much larger than the rest, gets
+    // few.  MEASURED (8-H100 server, cached base64 archives of 16 MiB frames,
+    // extracted to NVMe, three rotated rounds):
+    //   two 12 GiB members (inline_par 2), 4-64 CPUs: inline 11.4-11.8 s at every
+    //     count, the pool 8.1-8.2 s at 4 CPUs and 7.1-8.6 at 8-64;
+    //   one 24 GiB member and 47 of 40 MiB (inline_par 1.1): inline 21.9-22.2 s,
+    //     the pool 9.0-9.1 at 4 CPUs and 8.2-9.4 at 12-64;
+    //   48 of 512 MiB, and /usr (817K entries; inline_par 9-12 at 12-64 CPUs, 2.9
+    //     at 4): the pool tied at 4-24 CPUs and lost 1-10% at 64.
+    // So below the available pool parallelism by a quarter, the pool
+    // goes on at that many decoders, fully provisioned as GZSTD_FORCE_POOL runs it
+    // (--adapt's contraction controller was 0-1.3 s slower in every cell above).
+    // The automatic allowance starts with eight because more did not finish sooner
+    // on this host: 8 decoders against 62 at 64 CPUs,
+    // 8.4-8.6 s against 8.8-9.0 and 9.2-9.3 against 9.6-9.7, peak RSS 4.2 GiB
+    // against 7.9 (what is left is the writers' part windows, v0.18.30, which any
+    // extract at the sink's speed fills: 5.0 GiB for the 48 members inline), and
+    // the July soak saw 8 decoders feed a tmpfs sink as fast as 96.  The quarter:
+    // 48 members at 4 CPUs (inline_par 2.9 of 3) tied, two members (2 of 3) won
+    // 17-29%.  Not under --adapt, which keeps its own pool and controller, nor for
+    // a trivial-decode archive (prefer_inline, below: the pool lost 6-12% there).
+    // An explicit -T N / -T0 bypasses that automatic cap: the sink/CPU balance
+    // measured here is not a restriction on a user's allowance on another host.
+    constexpr int    TAR_SINK_DECODERS     = 8;
+    constexpr double TAR_POOL_MIN_GAIN     = 1.25;
+    constexpr double TAR_TRIVIAL_DECODE    = 0.90;   // stored at >90% of source
+    const bool force_pool = std::getenv("GZSTD_FORCE_POOL") != nullptr;
+    const bool legacy_pool = dopt.adapt || force_pool;
+    const double comp_ratio =
+        (!u_off.empty() && u_off.back() > 0) ? (double)c_off.back() / (double)u_off.back() : 0.0;
+    double total_decode = 0.0, max_part_decode = 0.0;
+    for (const PG & g : pg) {
+      const double work = (double)(u_off[g.f1 + 1] - u_off[g.f0]);
+      total_decode += work;
+      max_part_decode = std::max(max_part_decode, work);
+    }
+    const double inline_par = max_part_decode ? total_decode / max_part_decode : 0.0;
+    const int allowance = resolve_cpu_threads(dopt.cpu_threads);
+    const int sink_dec = dopt.cpu_threads == 0 ? std::min(allowance, TAR_SINK_DECODERS) : allowance;
+    uint64_t max_usz = 1, max_csz = 0;
+    for (size_t k = 0; k + 1 < u_off.size(); ++k) {
       max_usz = std::max<uint64_t>(max_usz, u_off[k + 1] - u_off[k]);
-    // Hard RAM ceiling on frames in flight: same 4 GiB accounting as seek_feed
-    // (each in-flight frame can hold a compressed + a decompressed buffer), so a
-    // count-only budget cannot balloon RAM on huge --chunk-size archives.  No
-    // more than a quarter of the memory left (v0.18.31, gz_frames_ram_budget).
-    const size_t ram_cap_frames =
-        (size_t)std::max<uint64_t>(2, gz_frames_ram_budget() / (2 * max_usz));
-    // Decoder-pool CAP: the most decoders the adaptive controller may grow to
-    // (default all cores).  The pool starts EMPTY and grows only when writers
-    // starve; GZSTD_POOL_DECODERS overrides the cap for A/B measurement.  Never
-    // more than the RAM budget or the frame count allows.
-    int want_dec = resolve_cpu_threads(dopt.cpu_threads);
+      max_csz = std::max<uint64_t>(max_csz, c_off[k + 1] - c_off[k]);
+    }
+    // FRAMES IN FLIGHT: the pool's own quarter of the memory left (v0.18.31,
+    // gz_frames_ram_budget), as --adapt's has taken since then, beside the
+    // partitions' quarter (par_extract_mem_fit), the writers' quarter and their
+    // queue's eighth (start_pool): 7/8 nominal.  The v0.18.59 review proposed that
+    // a DEFAULT pool share the partitions' quarter instead, so a default extract
+    // reserves no more than v0.18.58's.  MEASURED under real cgroup limits
+    // (systemd MemoryMax, no swap; two 12 GiB members, 64 CPUs): with its own
+    // quarter the pool survived wherever inline did, 7.95 s against inline's 23.50
+    // at 1 GiB and 13.69 against 27.17 at 512 MiB; sharing left 3 decoders at 1 GiB
+    // (12.56 s) and none at 512 MiB (inline, 27.97).  --adapt's and
+    // GZSTD_FORCE_POOL's count stays v0.18.58's (a decoded and an equal compressed
+    // buffer a slot).  A default pool's slot counts the largest COMPRESSED frame as
+    // it is (review): a valid frame can carry any number of empty blocks, so an
+    // archive's ratio does not bound one frame's compressed size by its decoded
+    // one. Also reserve a decoder context per slot: on tiny-frame archives an
+    // explicit large -T can otherwise allocate more context memory than the
+    // whole container holds, before any frame is decoded. An engaged pool's
+    // slot count is at least its decoder count, covering every context. No forced
+    // minimum: if not one slot fits, the extract stays inline.
+    const uint64_t frame_ram = gz_frames_ram_budget();
+    const size_t legacy_ram_frames =
+        (size_t)std::max<uint64_t>(2, frame_ram / (2 * max_usz));
+    const uint64_t auto_slot_bytes = max_usz + std::max<uint64_t>(1, max_csz) + ZSTD_estimateDCtxSize();
+    const size_t auto_ram_frames = (size_t)(frame_ram / auto_slot_bytes);
+    const size_t ram_cap_frames = legacy_pool ? legacy_ram_frames : auto_ram_frames;
+    // START HIGH at the cap. GZSTD_POOL_DECODERS overrides the requested count
+    // for A/B measurement, subject to the same frame and memory ceilings.
+    int want_dec = legacy_pool ? allowance : sink_dec;
     if (const char * e = std::getenv("GZSTD_POOL_DECODERS")) {
       int v = std::atoi(e);
       if (v > 0) want_dec = v;
     }
+    const size_t dec_items = legacy_pool ? total_items : nframes;
     const int n_dec_max = std::max<int>(1, (int)std::min<size_t>(
-        (size_t)std::max(1, want_dec), std::min<size_t>(ram_cap_frames, total_items)));
+        (size_t)std::max(1, want_dec), std::min<size_t>(ram_cap_frames, dec_items)));
+    // One whole-frame decode cannot be split across decoders. This floor on
+    // pool time avoids claiming parallelism unavailable on a tiny archive.
+    const double pool_par = std::min((double)n_dec_max, total_decode / (double)max_usz);
+    const bool auto_pool = !legacy_pool && auto_ram_frames > 0 && comp_ratio <= TAR_TRIVIAL_DECODE
+                        && inline_par * TAR_POOL_MIN_GAIN <= pool_par;
+    const bool use_pool = legacy_pool || auto_pool;
     // Buffered-ahead budget = ~2 frames of runway per decoder, capped by the RAM
     // ceiling.  Only consumed while OFFLOADING (decode-bound); when the pool is
     // idle (write-bound) no frames are dispatched so nothing is buffered.
@@ -33371,8 +33448,8 @@ public:
     // writers starve" design -- `offload_active` is initialised to the pool state
     // and the contract controller never clears it; only the flap test hook
     // toggles it.  The comment said otherwise for several versions.)
-    // GZSTD_FORCE_POOL forces it fully on with no --adapt -- kept for A/B.
-    const bool force_pool = std::getenv("GZSTD_FORCE_POOL") != nullptr;
+    // GZSTD_FORCE_POOL forces it fully on with no --adapt -- kept for A/B -- and a
+    // default extract's pool (auto_pool, above) runs the same way.
     // TRIVIAL-DECODE SHORT-CIRCUIT: when the archive is barely compressed (stored
     // or near-stored -- already-compressed media, encrypted backups), decode is
     // ~free, so the decoupled read->queue->decode pool only adds per-frame handoff
@@ -33386,15 +33463,15 @@ public:
     // which then can't feed the writers.  So route trivial-decode extracts to inline
     // and skip the pool entirely; a genuinely compressed archive (real decode work,
     // where the decouple earns its keep) still gets the pool.  This is a property of
-    // the DATA (like the <2% D2H-cost rule), not a machine-specific tuning.
-    const double comp_ratio =
-        (!u_off.empty() && u_off.back() > 0) ? (double)c_off.back() / (double)u_off.back() : 0.0;
+    // the DATA (like the <2% D2H-cost rule), not a machine-specific tuning.  A
+    // default extract (no --adapt) never starts the pool for such an archive
+    // (auto_pool, above), so this is --adapt's.
     // Excludes the force/flap test hooks, which need the pool spawned (a flap toggle
     // dispatching to an unspawned pool would wedge on the budget).
     const bool prefer_inline = dopt.adapt && !force_pool
         && std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") == nullptr
         && std::getenv("GZSTD_NO_PREFER_INLINE") == nullptr   // test: run the pool on trivial decode
-        && comp_ratio > 0.90;
+        && comp_ratio > TAR_TRIVIAL_DECODE;
     const bool pool_on = use_pool && !prefer_inline;   // actually spawn + drive the decode pool
     // START-HIGH / CONTRACT: under the pool (--adapt or force), the decode pool is
     // ON from t=0 -- readers+decoders are over-provisioned up front and the
@@ -33402,8 +33479,9 @@ public:
     // Grow-from-zero can't adapt in time for short jobs (over before it ramps) and
     // the reader, being first, would starve the pipe if slow off the draw; idle
     // pool threads block on empty queues (~free), so over-provisioning is cheap.
-    // Inline decode is the default when there is no pool (!use_pool) or the archive
-    // is trivial-decode (prefer_inline, above).
+    // Inline decode is what runs when there is no pool (!use_pool: a default extract
+    // whose partitions spread the decode, or a trivial-decode one) or the archive is
+    // trivial-decode under --adapt (prefer_inline, above).
     std::atomic<bool> offload_active{ pool_on };
     // Whether a partition decoded any frame itself (pure inline, or before an
     // offload): the partitions are then a CPU decode pool too (--stats-json).
@@ -33417,13 +33495,26 @@ public:
       else
         std::snprintf(b, sizeof b,
           "[TAR] decode pool: %s, up to %d decoder(s), %zu-frame budget over %zu frames\n",
-          force_pool ? "forced on" : "adaptive (start-high, contracts when idle)",
+          force_pool ? "forced on"
+          : auto_pool ? "on (the partitions alone would decode on too few threads)"
+          : "adaptive (start-high, contracts when idle)",
           n_dec_max, budget_frames, total_items);
       vlog(V_VERBOSE, dopt, b);
     }
+    // Why a default extract took the pool or not, in the numbers the rule compares.
+    if (!dopt.adapt && !force_pool && dopt.verbosity >= V_VERBOSE) {
+      char b[224];
+      std::snprintf(b, sizeof b,
+        "[TAR] decode: %s -- the partitions alone decode on about %.1f thread(s) (whole-frame "
+        "work over the largest partition's), the pool on %d%s\n",
+        auto_pool ? "pooled" : "inline", inline_par, ram_cap_frames ? n_dec_max : 0,
+        comp_ratio > TAR_TRIVIAL_DECODE ? "; the archive stores at over 90% of its source, "
+                                          "so decode is nearly free" : "");
+      vlog(V_VERBOSE, dopt, b);
+    }
 
-    // Global frame budget.  A permit is held from the moment a frame is queued
-    // until the owning parse thread consumes it (its whole RAM lifetime).
+    // Global frame budget. A permit covers dispatch through take_pool, then
+    // the partition/writer reservations cover the returned FrameBuf's lifetime.
     // try_acquire (opportunistic prefetch) yields to any thread blocked in
     // acquire, so a starved partition always wins the next permit over another
     // partition's read-ahead -- fair and starvation-free.
@@ -33523,6 +33614,10 @@ public:
         }
         const size_t usz = (size_t)(u_off[it.k + 1] - u_off[it.k]);
         FrameBuf fb = decompress_seek_frame(it.comp.data(), it.comp.size(), usz, it.k, dctx);
+        // take_pool may immediately release/reuse this slot after publication.
+        // Drop its compressed allocation first so the new default's byte
+        // reservation cannot overlap a successor's compressed buffer.
+        if (auto_pool) std::vector<char>().swap(it.comp);
         {
           std::lock_guard<std::mutex> lk(psync[it.pi].mx);
           psync[it.pi].ready.emplace(it.k, std::move(fb));
@@ -33566,7 +33661,9 @@ public:
     auto spawn_decoder = [&] {
       d_retire.push_back(std::make_unique<std::atomic<bool>>(false));
       dworkers.emplace_back(decoder_loop, d_retire.back().get());
-      if (!feed_meter) return;      // --stats-json: the decoders running now
+      // An automatic pool can fall back after partial startup. Publish its
+      // count only once the whole startup succeeds; idle threads decoded none.
+      if (!feed_meter || auto_pool) return;
       int active = 0;
       for (auto & f : d_retire) if (!f->load(std::memory_order_relaxed)) ++active;
       feed_meter->note_cpu_decode_threads(active);
@@ -33985,9 +34082,39 @@ public:
     std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
     std::thread controller;
     const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
-    if (pool_on) grow_pool(n_dec_max);   // START HIGH: readers + decoders up front
-    if (use_pool && force_pool) {
-      // A/B baseline: fully-provisioned pool, no contraction (offload forced on).
+    // A DEFAULT POOL IS OPTIONAL, so a thread it cannot start (a PID limit's
+    // EAGAIN, or no memory for a thread) leaves the extract inline, as the
+    // DirectWriter's drain thread falls back to synchronous writes (review).
+    auto start_decode_pool = [&] {
+      bool failed = false;
+      try { grow_pool(n_dec_max); }   // START HIGH: readers + decoders up front
+      catch (const std::system_error &) { if (!auto_pool) throw; failed = true; }
+      catch (const std::bad_alloc &)    { if (!auto_pool) throw; failed = true; }
+      if (failed) {
+        // keep the opt-in paths' existing behaviour (they rethrow above).
+        // No parse producer has started, so no frame has been dispatched and
+        // no permit is held. Join the idle workers now so fallback retains
+        // only the original parse/writer threads and their stack mappings.
+        offload_active.store(false, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(gf_mx); gf_open = true; }
+        gf_cv.notify_all();
+        { std::lock_guard<std::mutex> lk(qmx); qdone = true; }
+        qcv.notify_all();
+        for (auto & t : readers) t.join();
+        { std::lock_guard<std::mutex> lk(ddmx); ddqdone = true; }
+        ddcv.notify_all();
+        for (auto & t : dworkers) t.join();
+        readers.clear(); dworkers.clear(); r_retire.clear(); d_retire.clear();
+        if (feed_meter) feed_meter->reader_threads.store(1, std::memory_order_relaxed);
+        vlog(V_VERBOSE, dopt, "[TAR] decode pool: thread allowance exhausted; using inline decode\n");
+      }
+      if (auto_pool && feed_meter && !dworkers.empty())
+        feed_meter->note_cpu_decode_threads((int)dworkers.size());
+    };
+    if (pool_on && !auto_pool) start_decode_pool();
+    if (use_pool && (force_pool || auto_pool)) {
+      // A/B baseline, and a default extract's pool: fully provisioned, no
+      // contraction (offload on throughout).
     } else if (use_pool && flap) {
       // Test hook: rapidly toggle offload so producers constantly switch
       // inline<->pool, exercising both transition directions + concurrent decode.
@@ -34121,10 +34248,23 @@ public:
     if (gpu_force) spawn_gpu_workers();
 
     std::vector<ParCtx> pctx(parts.size());
+    // Reserve the essential parse threads BEFORE an automatic pool takes any
+    // optional thread slots. Otherwise pool startup could succeed but leave
+    // too few slots for the very parsers that the old inline route could run.
+    // Declare the gate and its state before workers so they outlive it on
+    // exceptional unwind too. If a later parser cannot start, destroying a CV
+    // with waiters can hang before the pre-existing joinable-thread failure
+    // reaches std::terminate.
+    std::mutex auto_start_mx; std::condition_variable auto_start_cv;
+    bool auto_started = false;
     std::vector<std::thread> workers;
     workers.reserve(parts.size());
     for (size_t pi = 0; pi < parts.size(); ++pi) {
       workers.emplace_back([&, pi] {
+        if (auto_pool) {
+          std::unique_lock<std::mutex> lk(auto_start_mx);
+          auto_start_cv.wait(lk, [&] { return auto_started; });
+        }
         const PG g = pg[pi];
         // Each parse thread owns an inline DCtx (used whenever it decodes a frame
         // itself).  next_dispatch = first frame not yet decoded-inline or
@@ -34152,7 +34292,7 @@ public:
           // there; suppress its read_bytes so the reported input isn't inflated.
           const bool count_read = !(k == g.f0 && g.start > u_off[g.f0]);
           FrameBuf fb;
-          if (!use_pool) {                              // pure inline (no --adapt / no force)
+          if (!use_pool) {                              // pure inline (no pool: see auto_pool)
             fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
             inline_decoded.store(true, std::memory_order_relaxed);
             next_dispatch = k + 1;
@@ -34204,6 +34344,11 @@ public:
         while (next_consume < next_dispatch) { take_pool(next_consume++); budget.release(); }
       });
     }
+    if (auto_pool) {
+      start_decode_pool();
+      { std::lock_guard<std::mutex> lk(auto_start_mx); auto_started = true; }
+      auto_start_cv.notify_all();
+    }
     for (auto & t : workers) t.join();
     if (feed_meter && inline_decoded.load(std::memory_order_relaxed))
       feed_meter->note_cpu_decode_threads((int)workers.size());
@@ -34246,7 +34391,7 @@ public:
         gpu_watch_thr.join();
       }
 #endif
-      if (!force_pool && dopt.verbosity >= V_VERBOSE) {
+      if (!force_pool && !auto_pool && dopt.verbosity >= V_VERBOSE) {
         // Report the SETTLED (still-active, non-retired) pool -- start-high means
         // the peak is always n_dec_max, so the contracted size is the useful one.
         int ar = 0, ad = 0;

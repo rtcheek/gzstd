@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.58  
+**Covers:** v0.9.50 → v0.18.59  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,124 @@
 
 ---
 
+
+## v0.18.59 — a default -d --tar extract decodes on a shared pool of up to 8 decoders when its partitions cannot spread the decode (ROADMAP 45; 8-H100 server, cached archives extracted to NVMe: two 12 GiB members 11.4-12.1 s -> 7.1-8.1, one 24 GiB member among 47 small ones 22.0-22.2 s -> 8.2-9.4)
+
+**Asked as a price, answered as a route.**  The next item after v0.18.58 was a calibrated GPU price for
+`-d --tar`.  Measured first (cached base64 archives of 16 MiB frames, node-1 CPUs, two idle cards, three
+rotated rounds, wall s), starting GPUs lost on both of extract's routes at every CPU count tried:
+
+| route | CPUs | --cpu-only (or declined) | GPUs started | what the default did |
+|---|---|---|---|---|
+| parallel extract, two 12 GiB members, --adapt, to /dev/shm | 4 | 10.57-11.07 | 12.24-12.60 | engaged 3/3, 10.58-11.42 |
+| | 6 | 7.92-8.65 | 10.20-11.14 | engaged 3/3, 8.90-9.37 |
+| | 8 | 7.23-7.55 | 9.90-10.54 | engaged 3/3, 8.78-9.06 |
+| | 12 | 6.61-6.86 | 9.03-10.06 | engaged 2/3, 7.24-7.89 |
+| serial walk, one 24 GiB member, to /dev/shm | 4 | 11.58-11.81 | 12.53-12.69 | engaged, 12.46-12.67 |
+| | 6 | 11.02-11.11 | 12.41-12.53 | engaged, 12.24-12.62 |
+| | 8 | 10.70-10.87 | 12.42-12.52 | engaged, 12.40-12.54 |
+| | 12 | 10.48-11.08 | 11.76-12.83 | declined, 10.78-11.07 |
+
+The parallel extract starts GPUs only under --adapt, whose lazy 4.0 s test engaged in 11 of 12 runs; the
+GPU streams' 64-frame batches hold up the partitions' in-order reads.  The serial walk (one member, -O,
+--keep-going, a foreign archive) is capped by its one tar parser at ~2.2 GiB/s whatever the CPUs, and the
+hybrid sampler reads the backlog that builds behind the parser as a slow CPU pool.  A calibration would have
+measured "never" here at the cost of ~40 children extracting 24 GiB each, and the cause is not this host's:
+both are open in ROADMAP 45.  What the grid showed instead: the default parallel extract took 11.4-11.6 s at
+4, 6, 8 and 12 CPUs alike.
+
+**What was wrong.**  A full extract of an indexed archive splits its members into up to min(CPUs, 16)
+partitions, each parsing its slice and, by default, decoding its own frames on its own thread.  Partitions
+end on member boundaries, so an archive of few members, or of one member much larger than the rest, decodes
+on as many threads as it has large members, whatever the allowance.  --adapt has had a shared decode pool
+since v0.15.20 that decodes any partition's frames on any core; in July it measured 1.8x faster
+decode-bound and neutral write-bound, and it stayed behind --adapt as part of the adaptive design.
+
+**The rule.**  A default extract (no --adapt) uses the pool when the threads inline would decode on --
+whole-frame work over its largest partition's, counting the boundary frames two partitions both decode --
+are fewer by a quarter than the decoders the pool could run after its frame and memory limits; never for an
+archive stored at over 90% of its source (--adapt's trivial-decode rule).  The automatic allowance takes at
+most 8 decoders; an explicit -T N or -T0 takes its own allowance (review).  The pool runs fully provisioned,
+as GZSTD_FORCE_POOL runs it.  -v says which, with both numbers.  Measured (wall s, NVMe, x3; inline /
+the pool at the allowance / --adapt --cpu-only):
+
+| archive | P | CPUs | inline | pool | --adapt |
+|---|---|---|---|---|---|
+| two 12 GiB members | 2 | 4 | 11.44-11.54 | 8.06-8.24 | 8.57-9.06 |
+| | | 8 | 11.51-11.56 | 7.09-7.15 | 7.09-7.31 |
+| | | 24 | 11.35-11.53 | 7.34-7.50 | 7.56-7.78 |
+| | | 64 | 11.61-11.83 | 8.11-8.49 | 8.51-8.73 |
+| one 24 GiB + 47 x 40 MiB | 1.1 | 4 | 21.98-22.11 | 8.95-9.12 | 9.51-10.01 |
+| | | 12 | 21.87-21.95 | 8.21-8.30 | 8.29-8.33 |
+| | | 64 | 22.10-22.13 | 8.51-9.35 | 9.79-10.38 |
+| 48 x 512 MiB | 2.9 / 10-13 | 4 | 7.81-7.93 | 7.55-7.65 | 7.89-8.31 |
+| | | 64 | 6.99-7.12 | 7.29-7.45 | 7.56-7.67 |
+| /usr, 817K entries | 2.9 / 9-11 | 4 | 29.52-30.03 | 30.33-30.56 | 28.29-30.95 |
+| | | 12 | 25.27-26.42 | 23.07-24.67 | 23.77-24.56 |
+| | | 64 | 22.17-23.16 | 23.24-25.31 | 22.49-23.27 |
+| 8 GiB random bytes | (trivial) | 64 | 2.64-2.80 | 3.05-3.11 | 2.77-2.87 |
+
+P is the threads inline decodes on.  The first two shapes take the pool at every allowance; the last three
+stay inline (48 members at 4 CPUs is 2.9 of 3, inside the quarter, where the pool won 3%; /usr at 4 CPUs the
+same, where it lost 2%).  Eight decoders, not the allowance: at 64 CPUs 8 finished as soon as 62 (two
+members 8.44-8.57 s against 8.78-8.98; one large member 9.21-9.30 against 9.60-9.70) at 4.2 GiB peak RSS
+against 7.9.  The 4.2 GiB is the extract writers' part windows and queue (v0.18.30, a quarter and an eighth
+of free memory), which fill whenever the parser runs at the sink's speed: a fixed mmap threshold left it
+unchanged, and the 48 members extract inline at 5.0 GiB.  The contraction controller stays --adapt's: it was
+0-1.3 s slower than the fully provisioned pool in every cell.
+
+**Final binary against the same source with the rule off** (default verbosity, NVMe, x3 rotated):
+
+| archive | CPUs | rule off | v0.18.59 | peak RSS, GiB (off / on) |
+|---|---|---|---|---|
+| two 12 GiB members | 4 | 11.41-11.44 | 7.90-8.06 | 0.4 / 0.6-1.0 |
+| | 64 | 11.94-12.11 | 7.06-7.66 | 0.6-0.7 / 4.1 |
+| one 24 GiB + 47 x 40 MiB | 4 | 22.02-22.05 | 9.07-9.44 | 0.3 / 0.6-0.9 |
+| | 64 | 22.01-22.21 | 8.18-8.19 | 1.4 / 4.0-4.1 |
+
+**Memory.**  The pool's frames take their own quarter of the memory left, as --adapt's have since v0.18.31,
+beside the partitions' quarter and the writers' quarter and eighth.  The review found the per-slot count
+wrong for a default pool: two decoded frames, where a stored frame's compressed bytes exceed its decoded ones
+(a valid frame can carry any number of empty blocks); a default pool's slot now counts the largest
+compressed frame (--adapt and the hook keep their count).  It also proposed that a default pool share the
+partitions' quarter, so a default extract reserves no more than v0.18.58's; measured under real limits (a
+systemd user scope, MemoryMax, no swap; the two members at 64 CPUs, one run each, every tree identical, no run
+killed), its own quarter is kept:
+
+| limit | v0.18.58 inline | shared quarter | own quarter (v0.18.59) |
+|---|---|---|---|
+| 1 GiB | 23.50 | 12.56 (3 decoders) | 7.44 (8 decoders, 9 frames) |
+| 512 MiB | 27.17 | 27.97 (inline: no slot fit) | 11.42 (4 decoders, 4 frames) |
+| 256 MiB | 32.05 (serial walk) | -- | 30.14 (serial walk) |
+
+At 1 GiB the memory fit cut the partitions to two and the first held only the directory entry, so inline
+decoded on one thread.
+
+**Threads.**  The pool is optional, so a pool thread that cannot start (a PID limit's EAGAIN, or no memory)
+now leaves the extract inline, as the DirectWriter's drain thread falls back to synchronous writes; the parse
+threads start first and wait until the pool has (review).  systemd TasksMax: 40, pooled, 7.14 s; 30 and 24,
+"thread allowance exhausted; using inline decode", 12.2 s, tree identical.  At 18 and 12 the extract aborts
+("terminate called without an active exception") in v0.18.58 as in v0.18.59: the writer pool and the
+partitions have no such fallback (ROADMAP 45e).
+
+**Tests.**  New cell after Native tar extraction: two members at -T 4 decode on the pool at 4 decoders and
+at -T 12 at 12 (an explicit allowance), 64 even members at -T 4 stay inline (3.5 of 4: inside the quarter),
+random bytes at -T 8 stay inline, two one-frame members at -T 32 stay inline (two frames' work), and under a
+fake 128 MiB limit a default pool on an archive with a stored frame gets 15 slots where --adapt and the hook
+get 16; each tree identical, with modes and mtimes.  Six mutants each caught: the rule off, the
+trivial-decode exclusion dropped, the quarter dropped, the 8 applied to an explicit -T, the old slot count,
+and the pool's parallelism not bounded by whole frames.  The --stats-json thread cell's -T 3
+extract now takes the pool (3 decoders, as before 3 partitions), so it gains an arm on 30 even members that
+stays inline.  Codex, three rounds: the first (NOT SAFE) found the per-slot count, a pool thread that cannot
+start killing an extract that ran before, a parallelism estimate that ignored boundary frames and the
+limits, and answered the maintainer's portability question (an explicit -T should not inherit this host's 8;
+explicit GPU backends deserve a follow-up, ROADMAP 45g); its proposal to share the partitions' quarter was
+measured and not taken.  The second (NOT SAFE) found two defects its own first patch had brought: the
+parse-start gate declared after the thread vector it guards, and decoder contexts left out of a slot (a
+512-byte-frame archive at -T 1024 under a 64 MiB limit planned 1,024 decoders, ~94 MiB of contexts; now
+173).  The third: SAFE TO STAGE, no further defect.  Suites: -e 928/2/1 (30m38s): the keeps-up cell (the
+v0.18.57 timing flake) and the --calibrate FILE price cell (its --tar class unrecorded once) each failed
+once, and passed alone on this build, 3/3 and 4/4; neither touches the extract.  CPU-only 415/0/134.
 
 ## v0.18.58 — a hybrid decode starts its GPUs at a price --calibrate ARCHIVE measured on this machine, which under -t and to /dev/null also replaces the growth and bound tests (ROADMAP 42a; 8-H100 server, 6 CPUs, a cached 24 GiB archive: -t --cpu-only 5.12-5.14 s, legacy 5.15-5.16, priced 3.47-3.68; -d to /dev/null 5.13, legacy 4.04-5.19, priced 4.05-4.15)
 
