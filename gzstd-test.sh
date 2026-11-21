@@ -633,8 +633,12 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=584
-$EXTENSIVE && EXPECTED_TESTS=933
+EXPECTED_TESTS=586
+$EXTENSIVE && EXPECTED_TESTS=935
+# v0.18.61: +2 cells after the v0.18.60 cut cell (extract keeps setuid under root's
+# chown, and xattrs on read-only files and dirs; an extract whose threads cannot all
+# start finishes on the ones that did), no GPU needed: 584 -> 586, -e 933 -> 935; the
+# CPU-only run 416 -> 418 passed.
 # v0.18.60: +1 cell after it (a member over half the stream is cut across extract
 # partitions), no GPU needed, and +1 GPU cell in GPU batch tuner (decompress doubles
 # at once on a steep halving; a compressible archive starts higher): 582 -> 584,
@@ -19752,6 +19756,172 @@ rm -rf "$CT"
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$ct_why" ]] && pass "a member over half the stream is cut across extract partitions" \
   || fail "a member over half the stream is cut across extract partitions" "$ct_why"
+
+# ROADMAP 45i (v0.18.61): the order an extract restores metadata in.  The chown
+# came after the chmod, and the kernel clears S_ISUID on any chown, even to the
+# ids a file already has, so a root extract restored a setuid file as 0755.  And
+# a user.* xattr needs write permission on the inode (an O_WRONLY descriptor is
+# not enough), so a read-only file lost every one -- small, large (part jobs over
+# 4 MiB), sparse -- and so did a 0555 directory.  GZSTD_DEBUG_FAKE_ROOT runs the
+# chown, to the runner's own ids, which clears the bit all the same.  The xattr
+# and ACL checks need setfattr/setfacl and a filesystem that keeps them.
+t0=$(now_ms); mt_why=""
+MT="$TMPDIR/meta45i"; chmod -R u+w "$MT" 2>/dev/null; rm -rf "$MT"; mkdir -p "$MT/src/d/sub"
+echo small > "$MT/src/d/ro"; echo suid > "$MT/src/d/suid"; echo sub > "$MT/src/d/sub/f"
+head -c 4500000 /dev/urandom | base64 -w0 > "$MT/src/d/bigro"
+truncate -s 16M "$MT/src/d/sp"
+printf tail | dd of="$MT/src/d/sp" bs=1 seek=$((12 << 20)) conv=notrunc 2>/dev/null
+mt_x=(); mt_acl=0
+if setfattr -n user.k -v probe "$MT/src/d/ro" 2>/dev/null; then
+  mt_x=(--xattrs)
+  for f in ro bigro sp sub; do setfattr -n user.k -v "v-$f" "$MT/src/d/$f"; done
+  if command -v setfacl >/dev/null 2>&1 && setfacl -m u:65534:r-- "$MT/src/d/ro" 2>/dev/null; then
+    mt_acl=1; mt_x+=(--acls)
+  fi
+fi
+chmod 0440 "$MT/src/d/ro" "$MT/src/d/bigro" "$MT/src/d/sp"; chmod 04755 "$MT/src/d/suid"
+chmod 0555 "$MT/src/d/sub"
+touch -m -d @946684800 "$MT/src/d/ro" "$MT/src/d/bigro" "$MT/src/d/sp" "$MT/src/d/suid"
+"$GZSTD" -q -f --cpu-only --tar --sparse "${mt_x[@]}" --chunk-size 1 -C "$MT/src" -o "$MT/a.tzst" d \
+  2>/dev/null || mt_why+=" create:$?"
+for mt_root in 0 1; do for mt_t in 1 4; do
+  mt_l="root$mt_root-T$mt_t"; mt_o="$MT/x$mt_l"; mkdir -p "$mt_o"; rc=0
+  if (( mt_root )); then
+    GZSTD_DEBUG_FAKE_ROOT=1 timeout --foreground -k 5 120 "$GZSTD" -d -q -f --cpu-only -T $mt_t --tar \
+      "${mt_x[@]}" -C "$mt_o" "$MT/a.tzst" 2>/dev/null || rc=$?
+  else
+    timeout --foreground -k 5 120 "$GZSTD" -d -q -f --cpu-only -T $mt_t --tar \
+      "${mt_x[@]}" -C "$mt_o" "$MT/a.tzst" 2>/dev/null || rc=$?
+  fi
+  (( rc == 0 )) || { mt_why+=" $mt_l:rc=$rc"; continue; }
+  diff -r "$MT/src/d" "$mt_o/d" >/dev/null 2>&1 || mt_why+=" $mt_l:tree"
+  mt_m=$(cd "$mt_o/d" && stat -c %a ro bigro sp suid sub | tr '\n' ' ')
+  [[ $mt_m == "440 440 440 4755 555 " ]] || mt_why+=" $mt_l:modes[$mt_m]"
+  mt_m=$(cd "$mt_o/d" && stat -c %Y ro bigro sp suid | sort -u | tr '\n' ' ')
+  [[ $mt_m == "946684800 " ]] || mt_why+=" $mt_l:mtimes[$mt_m]"
+  (( $(stat -c %b "$mt_o/d/sp") < 1024 )) || mt_why+=" $mt_l:sparse"
+  if (( ${#mt_x[@]} )); then
+    for f in ro bigro sp sub; do
+      [[ $(getfattr --only-values -n user.k "$mt_o/d/$f" 2>/dev/null) == "v-$f" ]] || mt_why+=" $mt_l:xattr-$f"
+    done
+  fi
+  if (( mt_acl )); then
+    getfacl -cpn "$mt_o/d/ro" 2>/dev/null | grep -q '^user:65534:r--' || mt_why+=" $mt_l:acl"
+  fi
+done; done
+# --xattrs WITHOUT --acls also carries binary system.posix_acl_* attributes.
+# Force the access ACL before user.k: it must not undo the temporary owner-write
+# bit before user.k is set, nor may the final chmod overwrite the ACL.  The
+# second member deliberately has an ACL with owner rw but a read-only tar mode,
+# proving the same ACL-over-mode precedence as the textual --acls path.
+if (( mt_acl )) && command -v python3 >/dev/null 2>&1; then
+  python3 -I - "$MT/raw-acl.tar" <<'MTRAWACL' || mt_why+=" raw-acl:fixture"
+import io, struct, sys, tarfile
+
+def record(key, value):
+    body = key.encode() + b"=" + value + b"\n"
+    length = len(body) + 2
+    while True:
+        encoded = str(length).encode() + b" " + body
+        if len(encoded) == length:
+            return encoded
+        length = len(encoded)
+
+with tarfile.open(sys.argv[1], "w", format=tarfile.USTAR_FORMAT) as tf:
+    for name, owner in (("rawro", 4), ("override", 6)):
+        acl = struct.pack("<I", 2) + b"".join(
+            struct.pack("<HHI", tag, perm, uid) for tag, perm, uid in
+            ((1, owner, 0xffffffff), (2, 4, 65534), (4, 4, 0xffffffff),
+             (16, 4, 0xffffffff), (32, 0, 0xffffffff)))
+        pax = record("SCHILY.xattr.system.posix_acl_access", acl) + record("SCHILY.xattr.user.k", b"kept")
+        hdr = tarfile.TarInfo("PaxHeaders/" + name)
+        hdr.type, hdr.size = tarfile.XHDTYPE, len(pax)
+        tf.addfile(hdr, io.BytesIO(pax))
+        hdr = tarfile.TarInfo(name)
+        hdr.mode, hdr.size = 0o440, 5
+        tf.addfile(hdr, io.BytesIO(b"data\n"))
+MTRAWACL
+  "$GZSTD" -q -f --cpu-only -o "$MT/raw-acl.zst" "$MT/raw-acl.tar" 2>/dev/null \
+    || mt_why+=" raw-acl:compress"
+  mkdir -p "$MT/raw-acl"
+  timeout --foreground -k 5 120 "$GZSTD" -d -q --cpu-only --tar --xattrs -T 1 \
+    -C "$MT/raw-acl" "$MT/raw-acl.zst" 2>/dev/null || mt_why+=" raw-acl:extract"
+  mt_m=$(cd "$MT/raw-acl" && stat -c %a rawro override | tr '\n' ' ')
+  [[ $mt_m == "440 640 " ]] || mt_why+=" raw-acl:modes[$mt_m]"
+  for f in rawro override; do
+    [[ $(getfattr --only-values -n user.k "$MT/raw-acl/$f" 2>/dev/null) == kept ]] \
+      || mt_why+=" raw-acl:xattr-$f"
+    getfacl -cpn "$MT/raw-acl/$f" 2>/dev/null | grep -q '^user:65534:r--' \
+      || mt_why+=" raw-acl:acl-$f"
+  done
+fi
+chmod -R u+w "$MT"; rm -rf "$MT"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+mt_n="extract keeps setuid under root's chown, and xattrs on read-only files and dirs"
+(( ${#mt_x[@]} )) || mt_n+=" (no user xattrs here: modes only)"
+[[ -z "$mt_why" ]] && pass "$mt_n" || fail "$mt_n" "$mt_why"
+
+# ROADMAP 45e (v0.18.61): a thread an extract could not start (a PID or task
+# limit's EAGAIN: systemd TasksMax, a container's pids.max) unwound through a
+# joinable std::thread vector into std::terminate -- the writer pool, the parse
+# threads, seek-extract's decoders.  GZSTD_DEBUG_EXTRACT_THREADS=N fails every
+# extract thread start after the first N, in start order: at -T 4 the 4 parse
+# threads, then the 4 writers, then a default decode pool.
+#   8 members, N=0  this thread parses every partition and writes every file
+#   8 members, N=2  2 parse threads take the 4 partitions in turn; no writer
+#   8 members, N=5  4 parse threads, 1 writer
+#   a cut member, N=1  one parse thread takes the head, then its continuation
+#   seek-extract, N=1  only the parse thread: no decoder, no writer
+#   seek-extract, N=0  a clean error (exit 1), not an abort
+#   --adapt, N=0   its decode pool falls back to inline decode (it rethrew)
+t0=$(now_ms); th_why=""
+TH="$TMPDIR/thr45e"; rm -rf "$TH"; mkdir -p "$TH/m/d" "$TH/c/d"
+for th_i in 1 2 3 4 5 6 7 8; do head -c 2250000 /dev/urandom | base64 -w0 > "$TH/m/d/m$th_i"; done
+head -c 52500000 /dev/urandom | base64 -w0 > "$TH/c/d/big"; echo small > "$TH/c/d/small"
+for th_a in m c; do
+  "$GZSTD" -q -f --cpu-only --tar --chunk-size 1 -C "$TH/$th_a" -o "$TH/$th_a.tzst" d 2>/dev/null \
+    || th_why+=" create-$th_a:$?"
+done
+th_x() {  # th_x ARCHIVE LABEL N GZSTD-ARGS...: extract at -v -T 4 into $TH/x; sets th_rc
+  local a=$1 l=$2 n=$3; shift 3; th_rc=0
+  rm -rf "$TH/x"; mkdir -p "$TH/x"
+  GZSTD_DEBUG_EXTRACT_THREADS=$n timeout --foreground -k 5 120 "$GZSTD" -d -v -f --cpu-only -T 4 --tar \
+    "$TH/$a.tzst" -C "$TH/x" "$@" 2>"$TH/$l.err" || th_rc=$?
+}
+th_has() {  # th_has LABEL TEXT: the run's -v output carries TEXT
+  sed 's/\x1b\[K//g' "$TH/$1.err" | tr '\r' '\n' | grep -aqF -- "$2" || th_why+=" $1:[no: $2]"
+}
+th_ok() {  # th_ok LABEL ARCHIVE: exit 0 and the whole tree back
+  (( th_rc == 0 )) || th_why+=" $1:rc=$th_rc"
+  diff -r "$TH/$2/d" "$TH/x/d" >/dev/null 2>&1 || th_why+=" $1:tree"
+}
+th_x m all0 0; th_ok all0 m
+th_has all0 "thread allowance: 0 of 4 parse threads started; this thread parses every partition"
+th_has all0 "thread allowance: 0 of 4 writer threads started; the parse threads write the files themselves"
+th_x m all2 2; th_ok all2 m
+th_has all2 "thread allowance: 2 of 4 parse threads started; they take the partitions in turn"
+th_has all2 "thread allowance: 0 of 4 writer threads started"
+th_x m all5 5; th_ok all5 m
+th_has all5 "thread allowance: 1 of 4 writer threads started"
+! grep -aq 'parse threads started' "$TH/all5.err" || th_why+=" all5:parse-short"
+th_x c cut1 1; th_ok cut1 c
+th_has cut1 "member(s) cut 1 time(s)"
+th_has cut1 "thread allowance: 1 of "
+th_has cut1 "parse threads started; they take the partitions in turn"
+th_x m seek1 1 d/m2 d/m7; (( th_rc == 0 )) || th_why+=" seek1:rc=$th_rc"
+cmp -s "$TH/m/d/m2" "$TH/x/d/m2" && cmp -s "$TH/m/d/m7" "$TH/x/d/m7" && [[ ! -e $TH/x/d/m1 ]] \
+  || th_why+=" seek1:members"
+th_has seek1 "seek-extract: thread allowance: 0 of "
+th_has seek1 "thread allowance: 0 of 4 writer threads started"
+th_x m seek0 0 d/m2
+(( th_rc == 1 )) || th_why+=" seek0:rc=$th_rc"
+th_has seek0 "cannot start the --tar parse thread"
+th_x m adapt0 0 --adapt; th_ok adapt0 m
+th_has adapt0 "decode pool: thread allowance exhausted; using inline decode"
+rm -rf "$TH"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$th_why" ]] && pass "an extract whose threads cannot all start finishes on the ones that did" \
+  || fail "an extract whose threads cannot all start finishes on the ones that did" "$th_why"
 
 # ============================================================
 # Selective extraction (-d --tar ARCHIVE MEMBER..., positional -C)

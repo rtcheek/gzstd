@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.60";
+static constexpr const char * GZSTD_VERSION = "0.18.61";
 //
 // Architecture overview:
 //
@@ -23971,6 +23971,27 @@ static void gz_fifo_gate(const char * env)
   ::close(fd);
 }
 
+// GZSTD_DEBUG_EXTRACT_THREADS=N (v0.18.61, ROADMAP 45e): a -d --tar extract's
+// thread starts after the first N fail with EAGAIN, as a PID or task limit fails
+// them, so the suite can prove every fallback on any host.  Counted across the
+// threads the extractor itself starts, in the order they start: the parse
+// threads, the writer pool and its --adapt supervisor and extras, the decode
+// pool and its controller, seek-extract's decoders, and -d's stream parse
+// thread.  Not the progress bar (optional, skipped on failure), the GPU decode
+// workers (their own fallback), nor the plain decoder that feeds a serial walk
+// (ROADMAP 46).
+static void gz_extract_thread_gate()
+{
+  static const long allow = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_EXTRACT_THREADS");
+    return (e && *e) ? std::strtol(e, nullptr, 10) : -1L;
+  }();
+  if (allow < 0) return;
+  static std::atomic<long> used{0};
+  if (used.fetch_add(1, std::memory_order_relaxed) >= allow)
+    throw std::system_error(EAGAIN, std::generic_category(), "GZSTD_DEBUG_EXTRACT_THREADS");
+}
+
 // Sentinel: stream_frames_to_queue_mt bailed before pushing anything; caller
 // must fall back to the single-threaded reader (which re-reads from offset 0).
 static constexpr size_t MT_READER_BAIL = SIZE_MAX;
@@ -33291,7 +33312,7 @@ public:
     // for that class.  Only this path knows the geometry up front; the streaming
     // extract paths leave wclass_ at -1 and fall back to the flat prior.
     wclass_ = adapt_tar_wclass(u_off.empty() ? 0 : u_off.back(), bounds.size());
-    start_pool();
+    start_pool(/*spawn=*/false);   // the writers start after the parse threads (below)
     const int fd = fileno(in);
     const size_t nent = bounds.size();
     auto frame_of = [&](uint64_t v) {
@@ -33794,14 +33815,22 @@ public:
       for (auto & f : r_retire) if (!f->load(std::memory_order_relaxed)) ++active;
       feed_meter->reader_threads.store(std::max(1, active), std::memory_order_relaxed);
     };
+    // A start that throws (ROADMAP 45e: a PID or task limit) leaves no flag
+    // without its thread behind it.
     auto spawn_reader = [&] {
       r_retire.push_back(std::make_unique<std::atomic<bool>>(false));
-      readers.emplace_back(reader_loop, r_retire.back().get());
+      try {
+        gz_extract_thread_gate();
+        readers.emplace_back(reader_loop, r_retire.back().get());
+      } catch (...) { r_retire.pop_back(); throw; }
       publish_readers();
     };
     auto spawn_decoder = [&] {
       d_retire.push_back(std::make_unique<std::atomic<bool>>(false));
-      dworkers.emplace_back(decoder_loop, d_retire.back().get());
+      try {
+        gz_extract_thread_gate();
+        dworkers.emplace_back(decoder_loop, d_retire.back().get());
+      } catch (...) { d_retire.pop_back(); throw; }
       // An automatic pool can fall back after partial startup. Publish its
       // count only once the whole startup succeeds; idle threads decoded none.
       if (!feed_meter || auto_pool) return;
@@ -33827,6 +33856,15 @@ public:
       target = std::min(target, n_dec_max);
       while ((int)readers.size()  < target) spawn_reader();
       while ((int)dworkers.size() < target) spawn_decoder();
+    };
+    // The controller's re-spawn after a contraction it reverts: as many of `n`
+    // as the thread allowance starts (ROADMAP 45e), never an exception out of
+    // the controller thread, which would be std::terminate.
+    auto try_spawn = [&](bool reader, int n) {
+      int k = 0;
+      try { for (; k < n; ++k) { if (reader) spawn_reader(); else spawn_decoder(); } }
+      catch (const std::system_error &) {} catch (const std::bad_alloc &) {}
+      return k;
     };
 
     // ---- GPU-stream decoders in the pool (Phase 2: adaptive engagement) ----
@@ -34223,19 +34261,34 @@ public:
     std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
     std::thread controller;
     const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
-    // A DEFAULT POOL IS OPTIONAL, so a thread it cannot start (a PID limit's
-    // EAGAIN, or no memory for a thread) leaves the extract inline, as the
-    // DirectWriter's drain thread falls back to synchronous writes (review).
+    // The controller is optional too: without it the pool stays as it started.
+    auto start_controller = [&](std::function<void()> body) {
+      try {
+        gz_extract_thread_gate();
+        controller = std::thread(std::move(body));
+      } catch (const std::system_error &) {
+      } catch (const std::bad_alloc &) {
+      }
+      if (!controller.joinable())
+        vlog(V_VERBOSE, dopt, "[TAR] decode pool: thread allowance exhausted; no pool controller\n");
+    };
+    // A POOL IS OPTIONAL, so a thread it cannot start (a PID limit's EAGAIN, or
+    // no memory for a thread) leaves the extract inline, as the DirectWriter's
+    // drain thread falls back to synchronous writes (review).  The default pool
+    // since v0.18.59; --adapt's and GZSTD_FORCE_POOL's since v0.18.61 (ROADMAP
+    // 45e), which rethrew into std::terminate.
+    bool pool_failed = false;
     auto start_decode_pool = [&] {
       bool failed = false;
       try { grow_pool(n_dec_max); }   // START HIGH: readers + decoders up front
-      catch (const std::system_error &) { if (!auto_pool) throw; failed = true; }
-      catch (const std::bad_alloc &)    { if (!auto_pool) throw; failed = true; }
+      catch (const std::system_error &) { failed = true; }
+      catch (const std::bad_alloc &)    { failed = true; }
       if (failed) {
-        // keep the opt-in paths' existing behaviour (they rethrow above).
-        // No parse producer has started, so no frame has been dispatched and
-        // no permit is held. Join the idle workers now so fallback retains
-        // only the original parse/writer threads and their stack mappings.
+        pool_failed = true;
+        // No parse producer has dispatched yet (an --adapt or forced pool starts
+        // before the parse threads, a default one while they wait at its gate),
+        // so no frame is in the pool and no permit is held. Join the idle workers
+        // now so fallback retains only the parse/writer threads and their stacks.
         offload_active.store(false, std::memory_order_relaxed);
         { std::lock_guard<std::mutex> lk(gf_mx); gf_open = true; }
         gf_cv.notify_all();
@@ -34253,13 +34306,15 @@ public:
         feed_meter->note_cpu_decode_threads((int)dworkers.size());
     };
     if (pool_on && !auto_pool) start_decode_pool();
-    if (use_pool && (force_pool || auto_pool)) {
+    if (pool_failed) {
+      // No pool to drive: offload stays off, and the producers decode inline.
+    } else if (use_pool && (force_pool || auto_pool)) {
       // A/B baseline, and a default extract's pool: fully provisioned, no
       // contraction (offload on throughout).
     } else if (use_pool && flap) {
       // Test hook: rapidly toggle offload so producers constantly switch
       // inline<->pool, exercising both transition directions + concurrent decode.
-      controller = std::thread([&] {
+      start_controller([&] {
         bool on = true;
         for (;;) {
           {
@@ -34281,7 +34336,7 @@ public:
       // trivial-decode archive never reaches here (prefer_inline routes it to the
       // fused inline path, where the pool's collapse-to-1+1 would starve writers).
       const bool ctl_dbg = std::getenv("GZSTD_DEBUG_POOL_CTL") != nullptr;
-      controller = std::thread([&] {
+      start_controller([&] {
         int ar = n_dec_max, ad = n_dec_max;          // active readers / decoders
         int r_floor = 1, d_floor = 1;                // locked minimums (raised on a revert)
         int r_empty = 0, d_empty = 0, ddq_back = 0, cooldown = 0;
@@ -34336,8 +34391,8 @@ public:
               // ~2 windows (the re-balance transient a big retire kicks up).
               const double r_post = rate_back(6);
               if (r_post < r_pre * 0.85) {             // contraction dropped throughput -> undo + lock
-                if (pending == 1) { for (int i=0;i<pending_n;++i) spawn_reader();  ar += pending_n; r_floor = ar; act = "REVERT-R"; }
-                else              { for (int i=0;i<pending_n;++i) spawn_decoder(); ad += pending_n; d_floor = ad; act = "REVERT-D"; }
+                if (pending == 1) { ar += try_spawn(true, pending_n);  r_floor = ar; act = "REVERT-R"; }
+                else              { ad += try_spawn(false, pending_n); d_floor = ad; act = "REVERT-D"; }
                 cooldown = 3;
               } else act = "keep";
               pending = 0;
@@ -34389,23 +34444,26 @@ public:
     if (gpu_force) spawn_gpu_workers();
 
     std::vector<ParCtx> pctx(parts.size());
-    // Reserve the essential parse threads BEFORE an automatic pool takes any
-    // optional thread slots. Otherwise pool startup could succeed but leave
-    // too few slots for the very parsers that the old inline route could run.
-    // Declare the gate and its state before workers so they outlive it on
-    // exceptional unwind too. If a later parser cannot start, destroying a CV
-    // with waiters can hang before the pre-existing joinable-thread failure
-    // reaches std::terminate.
+    // Reserve the essential parse threads BEFORE the writers and an automatic
+    // pool take any thread slots, and hold them at a gate until both have
+    // started.  Otherwise the writers and the pool could start and leave too few
+    // slots for the parsers that decode: under TasksMax=18 sixteen writers
+    // started and one thread parsed 24 GiB in 22.6 s against 7.2 (ROADMAP 45e).
+    // The gate also keeps every job from the queue until the writers are up, or
+    // known absent (inline_writes_).  Declared before workers so they outlive them.
     std::mutex auto_start_mx; std::condition_variable auto_start_cv;
     bool auto_started = false;
-    std::vector<std::thread> workers;
-    workers.reserve(parts.size());
-    for (size_t pi = 0; pi < parts.size(); ++pi) {
-      workers.emplace_back([&, pi] {
-        if (auto_pool) {
-          std::unique_lock<std::mutex> lk(auto_start_mx);
-          auto_start_cv.wait(lk, [&] { return auto_started; });
-        }
+    // THE PARSE THREADS TAKE THE PARTITIONS IN ARCHIVE ORDER (v0.18.61, ROADMAP
+    // 45e).  One thread per partition, as before, when the thread allowance
+    // holds them; when a PID or task limit fails a start (EAGAIN), the threads
+    // that started share the partitions, and with none the calling thread parses
+    // them all -- where the unwind through this joinable vector used to be
+    // std::terminate.  Ascending order keeps every wait satisfiable: a partition
+    // continuing the cut member waits only on its head, an earlier partition that
+    // some thread has already taken and that waits on no later one; and a
+    // partition holds frame budget only while a thread runs it.
+    std::atomic<size_t> next_part{0};
+    auto run_part = [&](size_t pi) {
         const PG g = pg[pi];
         // A partition starting inside the cut member (ROADMAP 45c) waits for its
         // head to create the file, or to fail to, before it reads a frame: it
@@ -34521,18 +34579,40 @@ public:
         // are only stopped after this join), so every dispatched frame lands in
         // psync[pi].ready.  This also drains the reorder buffer before psync dies.
         while (next_consume < next_dispatch) { take_pool(next_consume++); budget.release(); }
-      });
+    };
+    auto parse_loop = [&] {
+      {
+        std::unique_lock<std::mutex> lk(auto_start_mx);
+        auto_start_cv.wait(lk, [&] { return auto_started; });
+      }
+      for (size_t pi; (pi = next_part.fetch_add(1, std::memory_order_relaxed)) < parts.size(); )
+        run_part(pi);
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(parts.size());
+    try {
+      for (size_t i = 0; i < parts.size(); ++i) {
+        gz_extract_thread_gate();
+        workers.emplace_back(parse_loop);
+      }
+    } catch (const std::system_error &) {
+    } catch (const std::bad_alloc &) {
     }
-    if (auto_pool) {
-      start_decode_pool();
-      { std::lock_guard<std::mutex> lk(auto_start_mx); auto_started = true; }
-      auto_start_cv.notify_all();
-    }
+    if (workers.size() < parts.size())
+      vlog(V_VERBOSE, dopt, "[TAR] parallel-extract: thread allowance: " + std::to_string(workers.size())
+           + " of " + std::to_string(parts.size()) + " parse threads started; "
+           + (workers.empty() ? std::string("this thread parses every partition\n")
+                              : std::string("they take the partitions in turn\n")));
+    spawn_writers();
+    if (auto_pool) start_decode_pool();
+    { std::lock_guard<std::mutex> lk(auto_start_mx); auto_started = true; }
+    auto_start_cv.notify_all();
+    if (workers.empty()) parse_loop();
     for (auto & t : workers) t.join();
     split_heads_.clear();
     split_members_.clear();   // every part holds its own reference to its file
     if (feed_meter && inline_decoded.load(std::memory_order_relaxed))
-      feed_meter->note_cpu_decode_threads((int)workers.size());
+      feed_meter->note_cpu_decode_threads(std::max(1, (int)workers.size()));
     if (pool_on) {
       // Stop the controller first (no more decoder spawning), then let the
       // decoders drain the queue and exit.
@@ -35238,26 +35318,52 @@ private:
     }
   }
 
-  void set_meta_fd(int fd, uint32_t mode, int64_t mtime, uint64_t uid, uint64_t gid) {
-    (void)::fchmod(fd, mode & 07777);
+  // Restore a regular file's or directory's stored metadata, and its --xattrs/
+  // --acls metadata, through a securely-opened fd.  THE ORDER IS LOAD-BEARING
+  // (v0.18.61, ROADMAP 45i):
+  //  1. THE OWNER FIRST (root only).  The kernel clears S_ISUID (and S_ISGID on a
+  //     group-executable file) and security.capability whenever a regular file's
+  //     owner is set, even to the ids it already has.  With the chown after the
+  //     chmod, a root extract restored every setuid binary as 0755.
+  //  2. THE XATTRS BEFORE THE FINAL MODE.  Setting a user.* attribute needs write
+  //     permission on the inode (an O_WRONLY fd is not enough), so a read-only
+  //     stored mode (a 0440 file, a 0555 directory) refused every one with EACCES
+  //     for a non-root extractor, reported only at -v.  A mode without owner
+  //     write is lifted by 0200 for them, then set exactly.  After the chown, so
+  //     a restored security.capability survives it.
+  //  3. THE ACCESS ACL LAST: it overrides the mode's group bits, so it has to win.
+  //     Raw system.posix_acl_* xattrs too (--xattrs without --acls stores them,
+  //     and a build without libacl restores them): set in the xattr loop, an
+  //     access ACL rewrote the mode bits and undid the lift before a later user.*
+  //     attribute (found by review), and the final chmod would then override it.
+  // Failures (EPERM on system.*/security.*, a filesystem without ACL support) are
+  // best-effort and reported only at -v, like the device-node path.  Default ACLs
+  // (directories only) need a path, so they go through /proc/self/fd to keep the
+  // secure-by-fd guarantee.
+  void set_meta_fd(int fd, bool is_dir, uint32_t mode, int64_t mtime, uint64_t uid, uint64_t gid,
+                   const ExtMeta & ext) {
+    if (as_root_ && ::fchown(fd, (uid_t)uid, (gid_t)gid) != 0) { /* best-effort */ }
+    const mode_t m = (mode_t)(mode & 07777);
+    const bool lift = !ext.xattrs.empty() && !(m & S_IWUSR);
+    (void)::fchmod(fd, lift ? (m | S_IWUSR) : m);
+    auto raw_acl = [](const std::string & name) {
+      return name == "system.posix_acl_access" || name == "system.posix_acl_default";
+    };
+    auto set_xattrs = [&](bool acls) {
+      for (const auto & kv : ext.xattrs) {
+        if (raw_acl(kv.first) != acls) continue;
+        if (::fsetxattr(fd, kv.first.c_str(), kv.second.data(), kv.second.size(), 0) != 0)
+          vlog(V_VERBOSE, opt_, "gzstd: untar: xattr " + kv.first + ": " + std::strerror(errno) + "\n");
+      }
+    };
+    set_xattrs(/*acls=*/false);
+    if (lift) (void)::fchmod(fd, m);
     struct timespec ts[2]; ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0; ts[1] = ts[0];
     (void)::futimens(fd, ts);
-    if (as_root_ && ::fchown(fd, (uid_t)uid, (gid_t)gid) != 0) { /* best-effort */ }
-  }
-
-  // Apply --xattrs/--acls metadata via a securely-opened fd (regular file or
-  // directory).  Must run AFTER set_meta_fd: the access ACL overrides the mode's
-  // group bits, so the ACL has to win.  Default ACLs (directories only) need a
-  // path, so we go through /proc/self/fd to keep the secure-by-fd guarantee.
-  // Failures (EPERM on system.*/security.*, filesystem without ACL support) are
-  // best-effort and reported only at -v, like the device-node path.
-  void apply_ext(int fd, bool is_dir, const ExtMeta & ext) {
-    if (ext.empty()) return;
-    for (const auto & kv : ext.xattrs) {
-      if (::fsetxattr(fd, kv.first.c_str(), kv.second.data(), kv.second.size(), 0) != 0)
-        vlog(V_VERBOSE, opt_, "gzstd: untar: xattr " + kv.first + ": " + std::strerror(errno) + "\n");
-    }
-#ifdef GZSTD_HAVE_ACL
+    set_xattrs(/*acls=*/true);
+#ifndef GZSTD_HAVE_ACL
+    (void)is_dir;
+#else
     if (!ext.acl_access.empty()) {
       acl_t a = ::acl_from_text(ext.acl_access.c_str());
       if (a) {
@@ -35278,10 +35384,10 @@ private:
 #endif
   }
 
-  // Path-based sibling of apply_ext, for members that are never opened for
+  // Path-based sibling of set_meta_fd's xattrs, for members that are never opened for
   // writing: symlinks, FIFOs and device nodes.  Their xattrs (including SELinux
   // contexts) were STORED on create and then silently dropped on extract,
-  // because apply_ext is fd-based and there is no fd for these.  GNU tar
+  // because set_meta_fd is fd-based and there is no fd for these.  GNU tar
   // restores them, so this closes a real fidelity gap for --xattrs/--selinux.
   //
   // Uses the same secure O_NOFOLLOW-per-component walk as everything else, then
@@ -35491,6 +35597,8 @@ private:
   size_t mem_q_cap_ = SIZE_MAX;              // ...but never past this (start_pool: the memory)
   int    mem_writers_ = INT_MAX;             // writers the memory holds, base + extras
   std::vector<std::thread> writers_;
+  // No writer thread could start (ROADMAP 45e): enqueue writes each job itself.
+  bool inline_writes_ = false;
   // Small-file writer-pool timing for the -v [WRITER] diagnosis (gated to -v):
   // busy = time in write_small (create+write+meta), starved = time blocked
   // waiting for a job.  Each thread accumulates locally and flushes ONE atomic
@@ -35535,7 +35643,11 @@ private:
     ~NsAdd() { if (on) acc += now_ns() - t0; }
   };
 
-  void start_pool() {
+  // Size the writer pool and, unless `spawn` is false, start it.  run_parallel
+  // sizes it first (its cuts need large_window_) and starts the writers with
+  // spawn_writers() only after its parse threads, which a thread allowance
+  // short of both should hold first (ROADMAP 45e).
+  void start_pool(bool spawn = true) {
     // Pool size: --write-threads pins it (user wins, always); else auto =
     // min(worker threads, 16) — beyond ~16 the gain plateaus on filesystem
     // metadata/journal contention (tune per box).
@@ -35667,9 +35779,41 @@ private:
       bounce_sz_ = (bounce_sz_ / LD_ALIGN) * LD_ALIGN;   // keep O_DIRECT alignment
       if (bounce_sz_ < BOUNCE_MIN) bounce_sz_ = BOUNCE_MIN;
     }
+    pool_n_ = n; pool_cpu_ = cpu; pool_seed_extra_ = seed_extra;
+    if (spawn) spawn_writers();
+  }
+  int pool_n_ = 1, pool_cpu_ = 1, pool_seed_extra_ = 0;   // start_pool's sizing, for spawn_writers
+  void spawn_writers() {
+    int n = pool_n_;
+    const int cpu = pool_cpu_, seed_extra = pool_seed_extra_;
     if (opt_.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt_, "[UNTAR] " + std::to_string(n) + " writer thread(s)\n");
-    for (int i = 0; i < n; ++i) writers_.emplace_back([this] { writer_loop(); });
+    // A WRITER THAT CANNOT START (v0.18.61, ROADMAP 45e): a PID or task limit
+    // (systemd TasksMax, a container's pids.max) fails a thread start with
+    // EAGAIN, and the exception unwound through this joinable vector into
+    // std::terminate -- every -d --tar extract under such a limit aborted before
+    // writing a file.  The writers that started are the pool; with none, every
+    // job is written by the thread that queues it (enqueue).
+    inline_writes_ = false;
+    bool writers_short = false;   // the allowance is spent: no --adapt extras either
+    try {
+      for (int i = 0; i < n; ++i) {
+        gz_extract_thread_gate();
+        writers_.emplace_back([this] { writer_loop(); });
+      }
+    } catch (const std::system_error &) {
+    } catch (const std::bad_alloc &) {
+    }
+    if ((int)writers_.size() < n) {
+      vlog(V_VERBOSE, opt_, "[UNTAR] thread allowance: " + std::to_string(writers_.size()) + " of "
+           + std::to_string(n) + " writer threads started"
+           + (writers_.empty() ? "; the parse threads write the files themselves\n" : "\n"));
+      n = (int)writers_.size();
+      n_writers_ = n;
+      if (sink_meter_) sink_meter_->writer_pool_threads.store(std::max(1, n), std::memory_order_relaxed);
+      inline_writes_ = writers_.empty();
+      writers_short = true;
+    }
     // --adapt: arm the sizing supervisor.  Extras may bring the pool up to the
     // machine's usable thread count (was capped at +base = a doubled pool), so a
     // CPU/metadata-bound sink on a many-core box can put otherwise-idle cores on
@@ -35683,18 +35827,24 @@ private:
     // governor free to probe writers on top of it — which quietly overrode the
     // pin and made the flag untrustworthy for exactly the hand-tuning it exists
     // for ("the optimum is hardware-dependent — tune it on the target box").
-    if (opt_.adapt && opt_.write_threads == 0) {
+    if (opt_.adapt && opt_.write_threads == 0 && !writers_short) {
       ewgrow_cap_ = std::min(std::max(std::max(n, cpu - n), seed_extra),
                              std::max(0, mem_writers_ - n));
       g_adapt_ewgrow_cap.store(ewgrow_cap_, std::memory_order_relaxed);
       ewsup_stop_ = false;
-      ewsup_ = std::thread([this] { ewriter_supervisor(); });
+      // Optional: without it the pool keeps its base writers.
+      try {
+        gz_extract_thread_gate();
+        ewsup_ = std::thread([this] { ewriter_supervisor(); });
+      } catch (const std::system_error &) {
+      } catch (const std::bad_alloc &) {
+      }
       // Seeded prior: bring the pool up to the profile's settled size right away
       // (same start point as before), but as extras the governor can retire.
       // Only when there IS a seed — publishing a 0 here would clobber a target
       // the governor had already raised (its regime hook can fire at t=0, before
       // this pool exists), which is what stop_pool's reset is for instead.
-      if (seed_extra > 0) adapt_set_ewgrow(seed_extra);
+      if (seed_extra > 0 && ewsup_.joinable()) adapt_set_ewgrow(seed_extra);
     }
   }
   void stop_pool() {
@@ -35740,6 +35890,25 @@ private:
     });
   }
   void enqueue(Job && j) {
+    if (inline_writes_) {
+      // No writer thread (start_pool): the queueing thread writes the job, with
+      // a bounce buffer of its own for an O_DIRECT part, freed after it.  Counted
+      // in flight like a writer's claim, so drain_inflight_writes still waits.
+      // The job is MOVED here, as push_back moves it to a writer: an rvalue
+      // reference alone leaves the caller holding its frame views (and their
+      // decoder permits) while it reads on, e.g. the block padding (review).
+      { std::lock_guard<std::mutex> lk(q_m_); ++q_active_; }
+      {
+        Job job = std::move(j);
+        void * bounce = nullptr;
+        if (job.big) write_part(job, bounce); else write_small(job);
+        if (bounce) ::free(bounce);
+      }
+      std::lock_guard<std::mutex> lk(q_m_);
+      if (q_active_) --q_active_;
+      if (q_.empty() && q_active_ == 0) q_cv_idle_.notify_all();
+      return;
+    }
     std::unique_lock<std::mutex> lk(q_m_);
     // Time blocked on a full job queue (-v): this is the "writer pool can't
     // keep up" signal for the [EXTRACT] line — distinct from the serial
@@ -35869,10 +36038,23 @@ private:
                                           (size_t)(n_writers_ + target) * 2 * large_window_));
         }
         q_cv_prod_.notify_all();   // a wider budget may admit a waiting producer
+        // An extra that cannot start (ROADMAP 45e) ends the growth there, and the
+        // cap comes down to what started, so the wait above does not retry it.
         for (int i = active; i < target; ++i) {
           retire_flags_.push_back(std::make_unique<std::atomic<bool>>(false));
           std::atomic<bool> * rp = retire_flags_.back().get();
-          extra_writers_.emplace_back([this, rp] { ewriter_loop(rp); });
+          try {
+            gz_extract_thread_gate();
+            extra_writers_.emplace_back([this, rp] { ewriter_loop(rp); });
+          } catch (const std::exception &) {   // std::system_error, std::bad_alloc
+            retire_flags_.pop_back();
+            { std::lock_guard<std::mutex> lk(g_adapt_ewgrow_mtx); ewgrow_cap_ = i; }
+            g_adapt_ewgrow_cap.store(i, std::memory_order_relaxed);
+            vlog(V_VERBOSE, opt_, "[UNTAR] thread allowance: --adapt writer extras stop at "
+                 + std::to_string(i) + "\n");
+            target = i;
+            break;
+          }
         }
       } else if (target < active) {                // shrink: retire the newest
         int to_retire = active - target, marked = 0;
@@ -36004,8 +36186,7 @@ private:
   // was pre-truncated to its full size at creation, so holes and length are
   // already exact.
   void finalize_big(BigFile & b) {
-    set_meta_fd(b.mfd, b.mode, b.mtime, b.uid, b.gid);
-    apply_ext(b.mfd, /*is_dir=*/false, b.ext);
+    set_meta_fd(b.mfd, /*is_dir=*/false, b.mode, b.mtime, b.uid, b.gid, b.ext);
     sync_if_asked(b.mfd, b.rel);
     ::close(b.mfd);
     b.mfd = -1;
@@ -36181,8 +36362,7 @@ private:
       }
     }
     if (!ok) fail_errno(j.rel, errno);
-    set_meta_fd(fd, j.mode, j.mtime, j.uid, j.gid);
-    apply_ext(fd, /*is_dir=*/false, j.ext);
+    set_meta_fd(fd, /*is_dir=*/false, j.mode, j.mtime, j.uid, j.gid, j.ext);
     sync_if_asked(fd, j.rel);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(j.size, std::memory_order_relaxed);
@@ -36295,7 +36475,7 @@ private:
           else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
           else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
           // --selinux: the context restores through the security.selinux xattr
-          // (apply_ext's best-effort fsetxattr — EPERM/ENOTSUP reported at -v,
+          // (set_meta_fd's best-effort fsetxattr — EPERM/ENOTSUP reported at -v,
           // never fatal, matching --xattrs).  Stored as text; the kernel wants
           // it NUL-terminated, like libselinux's lsetfilecon writes it.
           else if (opt_.tar_selinux && key == "RHT.security.selinux")
@@ -36815,8 +36995,7 @@ private:
     r.skip(pad);
     if (ok && ::ftruncate(fd, (off_t)e.real_size) != 0) ok = false;
     if (!ok) fail_io(rel, "sparse write failed");
-    set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
-    apply_ext(fd, /*is_dir=*/false, e.ext);
+    set_meta_fd(fd, /*is_dir=*/false, e.mode, e.mtime, e.uid, e.gid, e.ext);
     sync_if_asked(fd, rel);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(e.real_size, std::memory_order_relaxed);
@@ -36844,8 +37023,7 @@ private:
       int dfd = ::openat(pfd, leaf.c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
       ::close(pfd);
       if (dfd < 0) continue;
-      set_meta_fd(dfd, it->mode, it->mtime, it->uid, it->gid);
-      apply_ext(dfd, /*is_dir=*/true, it->ext);
+      set_meta_fd(dfd, /*is_dir=*/true, it->mode, it->mtime, it->uid, it->gid, it->ext);
       ::close(dfd);
     }
   }
@@ -37648,15 +37826,38 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
       }
       ZSTD_freeDCtx(dctx);
     };
+    // A DECODER THAT CANNOT START (v0.18.61, ROADMAP 45e): a PID or task limit
+    // fails a thread start with EAGAIN, which unwound through this joinable
+    // vector into std::terminate.  The decoders that started decode; with none,
+    // this thread decodes each frame before it slices it.
     std::vector<std::thread> pool;
     pool.reserve((size_t)nthreads);
-    for (int t = 0; t < nthreads; ++t) pool.emplace_back(worker);
-    if (m) m->note_cpu_decode_threads((int)pool.size());
+    try {
+      for (int t = 0; t < nthreads; ++t) {
+        gz_extract_thread_gate();
+        pool.emplace_back(worker);
+      }
+    } catch (const std::system_error &) {
+    } catch (const std::bad_alloc &) {
+    }
+    std::unique_ptr<ZSTD_DCtx, size_t (*)(ZSTD_DCtx *)> inl(nullptr, ZSTD_freeDCtx);
+    std::vector<char> inl_comp;
+    if (pool.empty()) {
+      inl.reset(ZSTD_createDCtx());
+      if (!inl) die("failed to create ZSTD_DCtx");
+      apply_decode_options(inl.get(), opt);
+    }
+    if ((int)pool.size() < nthreads)
+      vlog(V_VERBOSE, opt, "[TAR] seek-extract: thread allowance: " + std::to_string(pool.size())
+           + " of " + std::to_string(nthreads) + " decoder threads started\n");
+    if (m) m->note_cpu_decode_threads(std::max(1, (int)pool.size()));
 
     size_t ri = 0;   // two-pointer walk: ranges and frames both ascend
     for (size_t i = 0; i < nfr; ++i) {
       FrameBuf fb;
-      {
+      if (inl) {
+        fb = decode_seek_frame(fd, plan.c_off, plan.u_off, plan.frames[i], inl_comp, inl.get(), m);
+      } else {
         std::unique_lock<std::mutex> lk(mx);
         cv.wait(lk, [&] { return ready.count(push_next) != 0; });
         auto it = ready.find(push_next);
@@ -52356,8 +52557,11 @@ static int extract_tar(const Options & opt, Meter * m)
   }
   std::atomic<bool> prog_done{false};
   std::thread prog_thr;   // only when it will draw (v0.18.24, see gzstd_main)
-  if (progress_loop_needed(opt, total_in))
-    prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
+  if (progress_loop_needed(opt, total_in)) {
+    // Optional (ROADMAP 45e): a bar a thread limit refuses is no bar.
+    try { prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done); }
+    catch (const std::system_error &) {}
+  }
 
   int rc = EXIT_OK;
   // -v [WRITER] diagnosis accumulators (across archives; the common case is one).
@@ -52521,7 +52725,15 @@ static int extract_tar(const Options & opt, Meter * m)
     ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
     if (opt.tar_to_stdout) ex.set_cat_stdout();   // -c / -O: contents to stdout, in order
     if (!members.empty()) ex.set_members(members, roots);
-    std::thread exth([&] { ex.run_sink(&sink); });
+    // The thread that parses the stream (ROADMAP 45e): when a PID or task limit
+    // refuses even this one, a clean error, not an unwind into std::terminate.
+    std::thread exth;
+    try {
+      gz_extract_thread_gate();
+      exth = std::thread([&] { ex.run_sink(&sink); });
+    } catch (const std::system_error & e) {
+      die(std::string("cannot start the --tar parse thread: ") + e.what());
+    }
 
     Options dopt = opt;
     dopt.sparse_mode = 0;
@@ -52727,8 +52939,11 @@ static int verify_tar(const Options & opt, Meter * m)
   }
   std::atomic<bool> prog_done{false};
   std::thread prog_thr;   // only when it will draw (v0.18.24, see gzstd_main)
-  if (progress_loop_needed(opt, total_in))
-    prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
+  if (progress_loop_needed(opt, total_in)) {
+    // Optional (ROADMAP 45e): a bar a thread limit refuses is no bar.
+    try { prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done); }
+    catch (const std::system_error &) {}
+  }
 
   // Result lines are collected and printed AFTER the progress thread stops, so
   // they don't collide with the bar.
@@ -52772,7 +52987,14 @@ static int verify_tar(const Options & opt, Meter * m)
     g_tar_decomp_sink = &sink;
 
     tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/true);
-    std::thread exth([&] { ex.run_sink(&sink); });
+    // The thread that parses the stream (ROADMAP 45e): when a PID or task limit
+    // refuses even this one, a clean error, not an unwind into std::terminate.
+    std::thread exth;
+    try {
+      exth = std::thread([&] { ex.run_sink(&sink); });
+    } catch (const std::system_error & e) {
+      die(std::string("cannot start the --tar parse thread: ") + e.what());
+    }
 
     Options dopt = opt;
     dopt.sparse_mode = 0;
@@ -53378,9 +53600,17 @@ static int list_tar(const Options & opt, Meter * m)
           std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
           if (!ec) total_in = (uint64_t)z;
         }
-        prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
+        try { prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done); }
+        catch (const std::system_error &) {}   // optional (ROADMAP 45e): no bar
       }
-      std::thread exth([&] { ex.run_sink(&sink); });
+      // The thread that parses the stream (ROADMAP 45e): when a PID or task limit
+      // refuses even this one, a clean error, not an unwind into std::terminate.
+      std::thread exth;
+      try {
+        exth = std::thread([&] { ex.run_sink(&sink); });
+      } catch (const std::system_error & e) {
+        die(std::string("cannot start the --tar parse thread: ") + e.what());
+      }
 
       Options dopt = opt;
       dopt.sparse_mode = 0; dopt.unsafe_overwrite = true; dopt.mode = Mode::DECOMPRESS;

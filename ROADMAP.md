@@ -922,7 +922,13 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     2% a skip still costs at 12 CPUs there (24 costs nothing); and a reader held by its own block memory
     stops the backlog growing, which the test reads as keeping up.
 
-41. **The GPU decode tuner's halving window costs a short run more than it learns.**  v0.18.45 starts a
+41. **The GPU decode tuner's halving window costs a short run more than it learns.**  PARTLY FIXED v0.18.60:
+    the server's text case (below).  A decompress start now takes 2^(the archive's ratio class), and a steep
+    halving doubles at once, admitted when one batch fits what is left (decompress with growable buffers only):
+    one H100, --gpu-only -d, text 1.4 / 5.5 / 22 GiB 4.56-4.64 / 7.56-7.78 / 10.58-10.68 s -> 2.15-2.19 /
+    2.92-2.95 / 7.29-7.35; base64 unchanged (CHANGELOG v0.18.60).  STILL OPEN: the two-2080 Ti short base64 run
+    (class 0, its halving not steep, so the walk is v0.18.45's), the four-card 2,050-frame start at 64 (~5%),
+    and the halving probe's missing affordability check.  v0.18.45 starts a
     two-card decode at the right batch, but a 4 GiB archive on two RTX 2080 Ti that starts AND settles at
     32 runs 1.80-2.06 s against 1.58-1.62 pinned there, and a 24 GiB one settled at 64 runs 6.85-7.07
     against 6.51-6.54.  The walk always halves first, and its window (four batches plus a warm-up at the
@@ -1109,7 +1115,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     --cpu-only 4.96 -> 4.82 s, two cards 4.72 -> 4.51; 97 GiB two cards 14.66 -> 13.66.  Compare reader paths on one
     inode (a hard link), not on two fixtures.
 45. **A default -d --tar extract of few members decoded on few threads.**  FIXED v0.18.59 for the parallel
-    extract, and v0.18.60 for one large member (c); the GPU half of the question is measured and open.  Asked as "price the -d --tar decode" (42a(7)):
+    extract, v0.18.60 for one large member (c), and v0.18.61 for a thread limit (e); the GPU half of the question is measured and open.  Asked as "price the -d --tar decode" (42a(7)):
     8-H100 server, cached base64 archives of 16 MiB frames, node-1 CPUs, two idle cards, x3 rotated.
     **GPUs lose on both extract routes.**  The parallel extract (an indexed archive of two or more members)
     starts GPUs only under --adapt: to /dev/shm, forced engagement was the slowest arm at 4-12 CPUs (two 12 GiB
@@ -1140,11 +1146,17 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     **Still open:** (c) ~~a ONE-member archive never reaches the parallel extract~~ **DONE v0.18.60** (below);
     (d) ~~the partitioner gives a leading directory entry a partition of its own~~ **DONE v0.18.60**: each cut is
     the candidate nearest its target, not the last one below it;
-    (e) PRE-EXISTING: under a tight task limit a default -d --tar ABORTS ("terminate called without an active
-    exception"; systemd TasksMax=18 and 12, v0.18.58 and v0.18.59 alike): the writer pool and the partitions have
-    no fallback when a thread cannot start, as the new pool now has (fixing it means joining partial parser and
-    writer pools and a defined failure result; the review moved the parse-start gate's declaration before the
-    thread vector, so a failed parser start cannot first destroy a condition variable with waiters); (f) the automatic 8 is this host's (NVMe and
+    (e) ~~under a tight task limit a default -d --tar ABORTS~~ **DONE v0.18.61**: every thread the extractor itself
+    starts now has a fallback (the plain decoder feeding a serial walk is 46's).  The writers that start are the pool, and with none the parse threads write their own
+    files; the parse threads that start take the partitions in archive order (a continuation of the cut member
+    waits only on an earlier head), and with none the calling thread parses them all; --adapt's and the forced
+    decode pool fall back to inline decode as the default one did, and their controller is optional;
+    seek-extract's decoders likewise, and the thread that parses its stream exits 1 cleanly where even it cannot
+    start.  The parse threads claim the allowance first (gated until the writers and the pool are up): with the
+    writers first, TasksMax=18 started 16 writers and one parse thread, 22.6 s against 7.2 unlimited on 8 x 3 GiB;
+    parse threads first, 8.6 s at 18, 7.3 at 12, 8.4 at 6.  Before: abort at 18, 12, 8, 6 and 3 on the full
+    extract, and on seek-extract.  GZSTD_DEBUG_EXTRACT_THREADS=N fails every start after the first N, for the
+    suite.  Under --adapt its pool, started before the parse threads, still takes the allowance first; (f) the automatic 8 is this host's (NVMe and
     tmpfs sinks, July's soak too): a slow-core, fast-sink host could want more.  The review's sketch of a measured
     alternative: the committed-write counters, decoder timing, and one bounded concurrency probe when the writers
     lack decoded input, kept only when end-to-end throughput improves and tried only while enough work remains
@@ -1181,12 +1193,34 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     inode), and O_DIRECT to this NVMe ~3.1 GiB/s either way (the drive).  So a fast buffered sink holds one big
     member to ~2.5 GiB/s whatever the extractor does: 24 GiB to /dev/shm took 9.6-10.7 s as one file and 3.0 as
     eight.  Open: (h) writing one file faster than its inode lock allows on a buffered sink -- mmap'd writes
-    avoid the lock but turn ENOSPC into SIGBUS, so not that; nothing else found.  (i) PRE-EXISTING, found by
-    v0.18.60's cell: --xattrs restores no user.* attribute on a READ-ONLY regular file for a non-root
-    extractor (v0.18.59 the same, serial and parallel, small and large files): apply_ext runs after
-    set_meta_fd by design (the access ACL must override the mode's group bits), so the fchmod to 0440 comes
-    first and fsetxattr then fails EACCES, reported only at -v.  The fix needs an order that keeps both: user
-    xattrs before the chmod, the ACL after it, and chown's clearing of security.capability in mind.
+    avoid the lock but turn ENOSPC into SIGBUS, so not that; nothing else found.  (i) ~~--xattrs restores no
+    user.* attribute on a READ-ONLY regular file for a non-root extractor~~ **DONE v0.18.61**, and wider than
+    found: a 0555 directory lost its attributes too, and so did sparse files; and a ROOT extract restored every
+    setuid file without its bit, because the chown came after the chmod and the kernel clears S_ISUID on any
+    chown, even to the ids the file has.  set_meta_fd now restores the owner, then the xattrs (a mode without
+    owner write lifted by 0200 for them), then the mode, the times, and the access ACL last.
+
+46. **A thread that cannot start, outside -d --tar (found v0.18.61).**  Under a PID or task limit (systemd
+    TasksMax, a container's pids.max) a thread start fails with EAGAIN.  v0.18.61 gave the -d --tar extract a
+    fallback for each of its threads (45e); elsewhere, measured with systemd-run --user -p TasksMax=N on a
+    305 MiB archive of 8 members at 64 CPUs:
+    - **Aborts** ("terminate called without an active exception", exit 134): --tar compress at 12 and 6;
+      a plain compress at 6.
+    - **A wrong error**: a plain compress at 12 exits 4 (a data error) with "ZSTD error: Allocation error : not
+      enough memory": libzstd could not start its own workers inside a frame.
+    - **Clean errors, no fallback** (exit 1, "Resource temporarily unavailable" or "cannot start parallel
+      decompress reader threads"): plain -d and -t at 12 and 6; -d --tar of a piped archive at 12, 6 and 3,
+      and at -T 1 (the serial walk's decompress feed) at 6 and 3.  The decoders and readers that did start could carry
+      the run, as the extract's now do.
+    The pattern that fixed 45e applies: a vector of threads that started is joined, never unwound; an optional
+    thread is skipped; an essential one runs on the calling thread or ends in a clean error.
+
+47. **FIFOs and device nodes come back with the umask applied, and as root keep the extractor's owner (found
+    v0.18.61).**  make_special passes the stored mode to mknodat, which the umask filters, and nothing chmods or
+    chowns it afterwards (a regular file's mode is set exactly by fchmod): a FIFO stored 0666 extracts as 0664
+    under umask 002.  GNU tar restores both.  A FIFO or device node cannot be opened for an fd (a FIFO would
+    block), so it wants fchmodat and fchownat through the parent fd, as symlinks' owner already is -- owner
+    first, as for regular files.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

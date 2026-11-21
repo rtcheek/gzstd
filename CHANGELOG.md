@@ -1,10 +1,134 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.60  
+**Covers:** v0.9.50 → v0.18.61  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
+
+---
+
+
+## v0.18.61 — an extract restores a file's owner before its mode and its xattrs before a read-only mode, so a root extract keeps setuid and a read-only file keeps its user xattrs; and a -d --tar extract whose threads cannot all start finishes on the ones that did, where it aborted (ROADMAP 45i, 45e; 8 x 3 GiB extracted at 64 CPUs under systemd TasksMax=18: aborted -> 8.6 s, unlimited 7.21-7.22)
+
+**45(i): the order metadata is restored in.**  set_meta_fd ran fchmod, futimens, then (as root) fchown, and
+apply_ext then set the xattrs and the ACL.  Two defects came from that order, both in every release with
+--tar extraction:
+
+- **Root lost every setuid bit.**  The kernel clears S_ISUID (and S_ISGID on a group-executable file) and
+  security.capability whenever a regular file's owner is set, even to the ids it already has -- checked here
+  directly: a 4755 file fchowned to its own owner reads 755.  So a root restore of /usr/bin brought sudo,
+  passwd and su back as 0755.  GZSTD_DEBUG_FAKE_ROOT runs the same chown to the runner's ids: a 4755 member
+  extracted as 755 at -T 1 and -T 4.
+- **A read-only file or directory lost its user xattrs.**  Setting a user.* attribute needs write permission
+  on the inode -- an O_WRONLY descriptor is not enough -- so after the fchmod to 0440 (or a file created 0440
+  in the first place) every fsetxattr failed EACCES, reported only at -v.  Found by v0.18.60's cell for a
+  large file; measured wider: small files, large files (part jobs), sparse files, and a 0555 directory at
+  finish_deferred, serial and parallel, as root and not.  An access ACL on a read-only file survived (setting
+  one needs ownership, not write), and modes, times and holes were right throughout.
+
+set_meta_fd now takes the xattrs and ACLs too and runs the owner first, then the xattrs (a mode without owner
+write lifted by 0200 for them, and only when there are any), then the exact mode, the times, and the access
+ACL last, since it must override the mode's group bits.  After the chown, a restored security.capability
+survives it.  Every regular-file and directory path goes through it: a small file's job, a large file's last
+part, a sparse file, the deferred directories.
+
+**45(e): a thread that cannot start.**  Under a PID or task limit (systemd TasksMax, a container's pids.max)
+a thread start fails with EAGAIN.  A default -d --tar extract started its writers, then its parse threads, in
+loops that let the exception unwind through a vector of joinable std::threads -- std::terminate, "terminate
+called without an active exception", exit 134, before a file was written.  305 MiB of 8 members at 64 CPUs:
+aborted at TasksMax 18, 12, 8, 6; seek-extract (named members) at 12, 6, 3; v0.18.59's default decode pool was
+the one start with a fallback.  Now every thread the extractor itself starts has one (the plain
+decoder that feeds a serial walk is ROADMAP 46's):
+
+- **Writers**: those that start are the pool; with none, enqueue writes each job on the thread that queues it
+  (its own O_DIRECT bounce buffer).  --adapt's writer supervisor is skipped, and an extra it cannot start ends
+  the growth and lowers its cap, so it does not retry.
+- **Parse threads take the partitions in archive order**, as many threads as start; with none, the calling
+  thread parses every partition.  Ascending order keeps the waits sound: a partition continuing the cut member
+  (v0.18.60) waits only on its head, an earlier partition some thread has already taken, which waits on no
+  later one; and a partition holds frame budget only while a thread runs it.
+- **--adapt's and GZSTD_FORCE_POOL's decode pool** fall back to inline decode as the default one does (they
+  rethrew), its controller is optional, and a controller that re-spawns a stage takes what starts.
+- **Seek-extract's decoders**: those that start decode; with none, the slicing thread decodes each frame.
+- **The thread that parses a seek, serial or -t/-l stream** ends in a clean error (exit 1, "cannot start the
+  --tar parse thread") where even it cannot start.
+
+**The parse threads claim the allowance first.**  The first fallback kept the start order -- writers, then
+parse threads -- and completed everywhere, but TasksMax=18 started 16 writers and then no parse thread, so one
+thread parsed and decoded 24 GiB (8 x 3 GiB, NVMe, node-1 CPUs): 22.6 s, the serial walk's -T 1 time, against
+7.2-8.3 unlimited.  The writers are now sized first (the cuts need the part window) but started after the
+parse threads, which wait at a gate until the writers and the default pool are up (the gate also keeps every
+job off the queue until the writers exist, or are known absent):
+
+| TasksMax | v0.18.60 | writers first | parse threads first |
+|---|---|---|---|
+| unlimited | (the A/B below) | 7.2-8.3 | 7.8-10.7 |
+| 18 | abort | 22.6 | 8.6 |
+| 12 | abort | 22.5 | 7.3 |
+| 6 | abort | 23.2 | 8.4 |
+| 12, -T 1 (the serial walk) | not run | 22.7 | 22.7 |
+
+(one run each).  Under --adapt its pool still starts before the parse threads and so takes the allowance
+first; it then decodes for the one parse thread.
+
+**Unlimited, against v0.18.60** (GPU builds, the default O_DIRECT output to NVMe, node-1 CPUs, cached
+archives, three rotated rounds, wall s; every tree byte-identical, peak RSS unchanged):
+
+| archive | 4 CPUs v0.18.60 | v0.18.61 | 64 CPUs v0.18.60 | v0.18.61 |
+|---|---|---|---|---|
+| one 26 GB member (cut) | 8.04-8.53 | 7.99-9.11 | 7.52-7.58 | 7.50-7.60 |
+| 24 GiB among 47 small | 8.48-8.58 | 8.44-8.51 | 7.96-8.05 | 8.02-8.10 |
+| 8 x 3 GiB | 8.48-8.56 | 8.50-8.57 | 7.23-7.41 | 7.21-7.22 |
+| 48 x 512 MiB | 7.76-7.80 | 7.75-7.85 | 7.26-7.44 | 7.42-7.64 |
+
+(9.11 is the session's first timed run.)  48 x 512 MiB at 64 CPUs, five more rounds: 7.34-7.42 against
+7.23-7.33, ~1.5%, with less user time (24.0-24.5 s against 24.3-25.8).  The same comparison on CPU-only builds
+with --direct, six rotated rounds, three arms: v0.18.60 7.27-8.36, v0.18.61 7.22-7.53, and v0.18.61 with the
+writers started before the parse threads 7.25-7.44 -- a tie, so neither the start order nor the pulled
+partitions costs it; the GPU builds' gap is their code placement (buffered, the CPU-only builds tie at
+2.30-2.50 too).
+
+**Not changed, logged.**  The same failure outside -d --tar (ROADMAP 46): --tar compress aborts at TasksMax 12
+and 6 and a plain compress at 6; a plain compress at 12 exits 4, a data error, with "ZSTD error: Allocation
+error : not enough memory" (libzstd's own workers); plain -d and -t, a piped -d --tar and the -T 1 serial walk
+end in clean errors (exit 1) where their started threads could carry the run.  And FIFOs and device nodes
+come back with the umask applied and, as root, the extractor's owner (a FIFO stored 0666 extracts 0664 under
+umask 002; ROADMAP 47).  ROADMAP 41 now says what v0.18.60 fixed and what it left.
+
+**Tests.**  Two cells after the v0.18.60 cut cell.  Metadata: read-only small, large (part jobs) and sparse
+files and a 0555 directory, each with a user xattr, an ACL on one, and a setuid file, extracted at -T 1 and
+-T 4, plain and under GZSTD_DEBUG_FAKE_ROOT -- modes, mtimes, holes, xattrs, the ACL entry (the xattr and ACL
+checks need setfattr/setfacl).  Threads: a new hook, GZSTD_DEBUG_EXTRACT_THREADS=N, fails every extract
+thread start after the first N; 8 members at N = 0, 2, 5, a cut member at N = 1, seek-extract at N = 1 and 0
+(exit 1), --adapt at N = 0, each byte-identical with the -v line that names its fallback.  Ten mutants,
+each caught by its arm: the chown after the chmod (setuid 755 under fake root), no owner-write lift (every
+read-only xattr lost), the writers' start unguarded (abort), one partition per thread (files missing), no
+inline writes (files missing), no calling-thread parse (tree missing), no inline seek decode (a hang to the
+timeout), the writers started before the parse threads (the fallback lines), the parse thread's start
+unguarded (seek-extract aborts), --adapt's pool rethrowing (abort).  v0.18.60 fails both cells.
+586 / -e 935 / CPU-only 418.
+
+**Codex (gpt-6.1-sol, xhigh), round 1: NOT SAFE TO STAGE, two blockers, both taken.**  (1) Raw ACL xattrs:
+--xattrs without --acls stores system.posix_acl_access as an xattr, and set in the xattr loop (it sorts
+before user.*) it rewrote the mode bits, undoing the owner-write lift, so a read-only file with an ACL still
+lost its user xattrs (v0.18.60 too), and the final chmod could override the ACL (a header 0440 with an ACL
+granting owner rw finished 0440, where v0.18.60 left 0640).  Raw ACLs now go after the final chmod, then the
+textual ACLs; its regression arm (a crafted pax archive) fails on the first build (modes 440 440, the xattr
+lost).  (2) Inline writes left the caller holding the written job: enqueue takes it by rvalue reference, so
+its frame views -- and their decoder permits -- lived on while the parser read the block padding, which a
+foreign archive can put in the next frame.  Not reproduced (two zstd frames split inside a member's padding,
+1000 B, 3 MB and 20 MB members, --throttle-frames=1, no writers: all complete; nor round 2's candidate,
+three sized frames ending a 2 MiB - 513 B member exactly at the second with its padding byte in the third,
+-T 1 under a 64 MiB limit whose RAM-sized throttle held one frame), but the job is now moved into the inline
+write as push_back moves it to a writer.  Also from the review: the hook's coverage is now stated
+exactly.  Round 2: SAFE TO STAGE -- both revised fixes sound by inspection (a raw
+default ACL on a directory, raw beside textual ACLs, a build without libacl, root with S_ISGID), no gate or
+pull cost confined to the GPU build, the hang recorded as unreproduced hygiene; left as useful coverage: a
+raw default ACL on a directory, conflicting raw and textual ACLs, real-root S_ISGID and capabilities.
+
+**Suites.**  -e 934 / 0 / 1 of 935 (32 min; the skip is the host-timing trivial-skip GPU cell, as at
+v0.18.60); CPU-only 418 / 0 / 135 (2 min 54 s; its drift note, expected 419, is v0.18.60's off-by-one).
 
 ---
 
