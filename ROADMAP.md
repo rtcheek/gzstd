@@ -1200,7 +1200,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     chown, even to the ids the file has.  set_meta_fd now restores the owner, then the xattrs (a mode without
     owner write lifted by 0200 for them), then the mode, the times, and the access ACL last.
 
-46. **A thread that cannot start, outside -d --tar (found v0.18.61).**  Under a PID or task limit (systemd
+46. ~~**A thread that cannot start, outside -d --tar (found v0.18.61).**~~ **FIXED v0.18.62** (below the
+    record of what was found).  Under a PID or task limit (systemd
     TasksMax, a container's pids.max) a thread start fails with EAGAIN.  v0.18.61 gave the -d --tar extract a
     fallback for each of its threads (45e); elsewhere, measured with systemd-run --user -p TasksMax=N on a
     305 MiB archive of 8 members at 64 CPUs:
@@ -1214,9 +1215,22 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
       the run, as the extract's now do.
     The pattern that fixed 45e applies: a vector of threads that started is joined, never unwound; an optional
     thread is skipped; an essential one runs on the calling thread or ends in a clean error.
+    **v0.18.62:** every thread start outside the extractor that had no handling goes through gz_try_thread /
+    gz_try_pool (never a throw; DirectWriter's drain, the reclaimer, the CPU rescue pool and a GPU worker's
+    drain already had theirs).  The writer starts first (essential: a clean exit 1), the pools run on the workers that start, the
+    progress bar, the scheduler's tick, the stall guards, the supervisors, the --adapt governor, the NVML pump
+    and the GPU monitor are optional, and what has no thread runs inline: the write pool, the read-ahead, both
+    verifiers, the decode readers (the caller's single reader), the --tar assembler (this thread pushes, or reads
+    and pushes every chunk in order), refused GDS issue and checksum stripes.  A GPU worker that cannot start is a
+    device whose bringup failed (skipped); a deferred bringup that cannot start leaves the GPUs out.  zstd's own
+    workers that cannot start are retried without them (frames, the single-stream path, --sliding-window, a
+    --patch-from prefix referenced again).  Measured, 64 CPUs, systemd TasksMax: every operation completes from 6
+    (GPU build) / 5 (CPU-only) up, and at less ends in a clean error naming the refused thread; a compress at 40
+    exited 4 and every --tar create aborted at every limit tried.  Test hook GZSTD_DEBUG_THREADS=N.
 
-47. **FIFOs and device nodes come back with the umask applied, and as root keep the extractor's owner (found
-    v0.18.61).**  make_special passes the stored mode to mknodat, which the umask filters, and nothing chmods or
+47. ~~**FIFOs and device nodes come back with the umask applied, and as root keep the extractor's owner (found
+    v0.18.61).**~~ **FIXED v0.18.62**: make_special restores the owner (root), then the exact mode, through an
+    O_PATH handle on the node (fchownat AT_EMPTY_PATH, chmod via /proc/self/fd).  make_special passes the stored mode to mknodat, which the umask filters, and nothing chmods or
     chowns it afterwards (a regular file's mode is set exactly by fchmod): a FIFO stored 0666 extracts as 0664
     under umask 002.  GNU tar restores both.  A FIFO or device node cannot be opened for an fd (a FIFO would
     block), so it wants fchmodat and fchownat through the parent fd, as symlinks' owner already is -- owner

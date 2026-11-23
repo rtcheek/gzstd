@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.61";
+static constexpr const char * GZSTD_VERSION = "0.18.62";
 //
 // Architecture overview:
 //
@@ -129,6 +129,69 @@ static constexpr const char * GZSTD_VERSION = "0.18.61";
 #ifdef _WIN32
  #include <io.h>
 #endif
+
+/*======================================================================
+ A THREAD THE SYSTEM REFUSES (v0.18.62, ROADMAP 46)
+ -----------------------------------------------------------------------
+ A PID or task limit (systemd TasksMax, a container's pids.max, RLIMIT_NPROC)
+ fails a thread start with EAGAIN, and std::thread throws std::system_error.
+ Thrown from a loop filling a vector of threads, that unwound through joinable
+ std::thread objects into std::terminate: every compress aborted under such a
+ limit, and the decoders died with "Resource temporarily unavailable" where the
+ threads that did start could have carried the run (v0.18.61 fixed the same in
+ the -d --tar extractor, 45e).  Every start now goes through these: a pool runs
+ on the threads that started, an optional thread is skipped, and an essential
+ one starts before the pools (so they, not it, absorb a shortfall) or ends the
+ run with a clean error.
+
+ GZSTD_DEBUG_THREADS=N fails every start through them after the first N, as a
+ limit would, so the suite proves each fallback on any host.  The extractor's
+ own threads keep their hook (GZSTD_DEBUG_EXTRACT_THREADS).
+ ======================================================================*/
+static void gz_thread_gate()
+{
+  static const long allow = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_THREADS");
+    return (e && *e) ? std::strtol(e, nullptr, 10) : -1L;
+  }();
+  if (allow < 0) return;
+  static std::atomic<long> used{0};
+  if (used.fetch_add(1, std::memory_order_relaxed) >= allow)
+    throw std::system_error(EAGAIN, std::generic_category(), "GZSTD_DEBUG_THREADS");
+}
+
+// Start one thread into `t`; false, never an exception, when it cannot start.
+template <class... A>
+static bool gz_try_thread(std::thread & t, A &&... a)
+{
+  try {
+    gz_thread_gate();
+    t = std::thread(std::forward<A>(a)...);
+    return true;
+  } catch (const std::system_error &) {
+  } catch (const std::bad_alloc &) {
+  }
+  return false;
+}
+
+// Start up to `n` threads, `start(i)` emplacing thread i into `v` (reserved, or
+// the vector's own growth throws bad_alloc, which also stops the loop); returns
+// how many started.  The started ones are in `v` and must be joined as usual.
+template <class F>
+static int gz_try_pool(std::vector<std::thread> & v, int n, F && start)
+{
+  const size_t before = v.size();
+  try {
+    for (int i = 0; i < n; ++i) {
+      gz_thread_gate();
+      start(i);
+    }
+  } catch (const std::system_error &) {
+  } catch (const std::bad_alloc &) {
+  }
+  return (int)(v.size() - before);
+}
+
 #ifdef HAVE_NVCOMP
  #include <cuda_runtime.h>
  #include <nvcomp/zstd.h>
@@ -370,7 +433,10 @@ static nvmlReturn_t gz_nvml_bounded(std::function<nvmlReturn_t()> fn)
     std::lock_guard<std::mutex> lk(p.m);
     if (!p.started) {
       p.started = true;
-      std::thread([&p]{
+      std::thread pump;
+      // A pump the system refuses a thread (ROADMAP 46) is NVML unavailable for
+      // the run, the state a call that never returned leaves too.
+      if (!gz_try_thread(pump, [&p]{
         for (;;) {
           std::shared_ptr<GzNvmlReq> r;
           {
@@ -384,7 +450,11 @@ static nvmlReturn_t gz_nvml_bounded(std::function<nvmlReturn_t()> fn)
           { std::lock_guard<std::mutex> lk3(r->m); r->rc = rc; r->done = true; }
           r->cv.notify_all();
         }
-      }).detach();
+      })) {
+        g_nvml_wedged.store(true, std::memory_order_relaxed);
+        return GZ_NVML_UNAVAILABLE;
+      }
+      pump.detach();
     }
     p.q.push_back(req);
   }
@@ -544,7 +614,7 @@ public:
     const auto state = state_;
     std::lock_guard<std::mutex> lk(state->m);
     if (state->started) return;
-    thr_ = std::thread([state]{
+    const bool ok = gz_try_thread(thr_, [state]{
       try {
         run(state);
       } catch (...) {
@@ -559,6 +629,9 @@ public:
         state->cv_ready.notify_all();
       }
     });
+    // A sampler the system refuses a thread (ROADMAP 46) is an unavailable one,
+    // as an exception in it is above.  stop() returns at once without a thread.
+    if (!ok) { state->dead = true; state->cv_ready.notify_all(); }
     state->started = true;  // publish only after construction succeeds
 #endif
   }
@@ -7975,7 +8048,10 @@ public:
         }
       }
     }
-    thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
+    // Optional (ROADMAP 46): a governor the system refuses a thread takes no
+    // actions -- the run as without --adapt's live steps; stop() joins nothing.
+    if (!gz_try_thread(thr_, &AdaptGovernor::tick_loop_, this))
+      vlog(V_VERBOSE, opt_, "[ADAPT] thread allowance: the governor could not start; no live actions\n");
   }
 
   // Idempotent; joins the tick thread.  Safe to call from the destructor.
@@ -13911,8 +13987,10 @@ private:
       if (!wt2_spawned_ && !seek_seen_.load(std::memory_order_relaxed)
           && g_adapt_writer_probe.load(std::memory_order_relaxed) != 0) {
         wt2_spawned_ = true;
-        g_adapt_writer_probe_engaged.store(true, std::memory_order_relaxed);
-        wt2_ = std::thread(&DirectWriter::writer_loop2, this);
+        // Optional (ROADMAP 46): a refused start, thrown here, would escape this
+        // thread into std::terminate; without it the probe has nothing to measure.
+        if (gz_try_thread(wt2_, &DirectWriter::writer_loop2, this))
+          g_adapt_writer_probe_engaged.store(true, std::memory_order_relaxed);
       }
       drain_one(op);
     }
@@ -14664,7 +14742,9 @@ public:
     std::lock_guard<std::mutex> lk(m_);
     base_ = base; size_ = size; watermark_ = 0; advised_ = 0; done_.clear();
     quit_ = false; pending_lo_ = pending_hi_ = 0;
-    thr_ = std::thread([this]{ worker(); });
+    // Optional (ROADMAP 46): a retirer the system refuses a thread retires
+    // nothing, and the final munmap does the work as it did before v0.17.
+    if (!gz_try_thread(thr_, [this]{ worker(); })) base_ = nullptr;
   }
   // Idempotent: safe to call when never started, and called on every teardown
   // path so the thread cannot outlive the mapping it is advising.
@@ -17227,8 +17307,17 @@ public:
       max_queue_(std::max<size_t>(4, max_queue)) {
     t_start_ = now_ns();
     spawn_one();   // start very low — a single verify thread
+    // NOT EVEN ONE (v0.18.62, ROADMAP 46): the system refused the thread, and
+    // submit() would have blocked forever once the queue filled.  The writer
+    // verifies each frame itself, as -T1's serial path verifies its own.
+    inline_ = threads_.empty();
+    if (inline_ && g_verbosity >= V_VERBOSE)
+      std::fprintf(stderr, "[VERIFY] thread allowance: no verify thread; the writer verifies each frame\n");
   }
-  ~VerifyPool() { finish(); }
+  ~VerifyPool() {
+    finish();
+    if (inline_zds_) ZSTD_freeDStream(inline_zds_);
+  }
 
   VerifyPool(const VerifyPool &) = delete;
   VerifyPool & operator=(const VerifyPool &) = delete;
@@ -17238,6 +17327,23 @@ public:
   // no-op once a failure is known: no point verifying more, we're rebuilding.
   void submit(size_t seq, const FrameBuf & frame) {
     if (g_verify_failed.load(std::memory_order_relaxed)) return;
+    if (inline_) {
+      if (!frame) return;
+      if (!inline_zds_) {
+        inline_zds_ = ZSTD_createDStream();
+        if (!inline_zds_) { mark_failed((size_t)-1); return; }   // fail safe, as worker()
+        attach_verify_dict(inline_zds_);
+        ZSTD_DCtx_setParameter(inline_zds_, ZSTD_d_windowLogMax, 31);
+        inline_scratch_.resize(ZSTD_DStreamOutSize());
+      }
+      const uint64_t vt0 = now_ns();
+      const bool ok = verify_one(inline_zds_, inline_scratch_, *frame);
+      verify_ns_.fetch_add(now_ns() - vt0, std::memory_order_relaxed);
+      frames_.fetch_add(1, std::memory_order_relaxed);
+      bytes_.fetch_add(frame->size(), std::memory_order_relaxed);
+      if (!ok) mark_failed(seq);
+      return;
+    }
     {
       std::unique_lock<std::mutex> lk(m_);
       // Stall accounting: if the queue is full here, verification has fallen
@@ -17366,8 +17472,15 @@ private:
 
   void spawn_one() {
     std::lock_guard<std::mutex> tlk(threads_m_);
-    if ((int)threads_.size() >= max_threads_) return;
-    threads_.emplace_back([this]{ worker(); });
+    if ((int)threads_.size() >= max_threads_ || grow_refused_) return;
+    // Called from the writer thread: a refused start (ROADMAP 46) must not throw
+    // here; the pool stays at the threads it has, and stops trying.
+    // Grow the vector before constructing its new thread.  Starting into a
+    // temporary first would terminate if push_back then failed to allocate.
+    if (gz_try_pool(threads_, 1, [this](int) {
+          threads_.emplace_back([this]{ worker(); });
+        }) == 0)
+      grow_refused_ = true;
   }
 
   // Rate-matched, rate-limited growth.  Called serially from the single writer
@@ -17483,6 +17596,10 @@ private:
   }
 
   const int    max_threads_;
+  bool         grow_refused_ = false;   // a start was refused: no more (threads_m_)
+  bool         inline_ = false;         // no thread at all: submit() verifies (ctor only)
+  ZSTD_DStream *     inline_zds_ = nullptr;
+  std::vector<char>  inline_scratch_;
   const size_t max_queue_;
 
   std::mutex                 m_;
@@ -18419,7 +18536,11 @@ public:
       progressive_sync_(progressive_sync), meter_(meter), bp_(bp),
       drop_behind_(dw ? 0 : drop_behind)
   {
-    if (!inline_writes) worker_ = std::thread(&AsyncWritePool::worker_fn, this);
+    // A write thread the system refuses (ROADMAP 46) leaves the pool inline: the
+    // same writes, on the caller's thread (submit tests worker_.joinable()).
+    if (!inline_writes && !gz_try_thread(worker_, &AsyncWritePool::worker_fn, this)
+        && g_verbosity >= V_VERBOSE)
+      std::fprintf(stderr, "[WRITER] thread allowance: no write thread; writing each batch inline\n");
   }
 
   ~AsyncWritePool() {
@@ -19319,6 +19440,32 @@ static void writer_thread(FILE * out, ResultStore & results,
 struct GzTlCCtx { ZSTD_CCtx * p = nullptr; ~GzTlCCtx() { ZSTD_freeCCtx(p); } };
 static thread_local GzTlCCtx tl_cctx_owner;
 
+// ZSTD'S OWN WORKERS THAT CANNOT START (v0.18.62, ROADMAP 46).  With workers set,
+// libzstd starts its thread pool inside the first compress call, and a PID or
+// task limit that refuses those threads comes back as "Allocation error : not
+// enough memory" -- which gzstd reported as a DATA error (exit 4), every frame
+// of a compress under such a limit.  The frame is compressed again without them,
+// and the run stops asking for them.  An allocation error with no workers is
+// real memory, a runtime error (exit 1), not a data error.
+static std::atomic<bool> g_frame_workers_refused{false};
+static bool gz_frame_workers_refused(size_t r, ZSTD_CCtx * cctx, int workers)
+{
+  if (!ZSTD_isError(r) || workers <= 0 || ZSTD_getErrorCode(r) != ZSTD_error_memory_allocation)
+    return false;
+  if (!g_frame_workers_refused.exchange(true) && g_verbosity >= V_VERBOSE)
+    std::fprintf(stderr, "[CPU] thread allowance: zstd could not start its own workers inside a "
+                         "frame; compressing each frame on its worker alone\n");
+  ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 0);
+  return true;
+}
+static void gz_die_compress_error(size_t r)
+{
+  if (ZSTD_getErrorCode(r) == ZSTD_error_memory_allocation)
+    die(std::string("ZSTD error: ") + ZSTD_getErrorName(r));
+  die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(r));
+}
+
 // Compresses one frame into `out` (a reusable per-thread buffer) and returns the
 // compressed size.  `out` is left sized to >= compressBound, NOT shrunk to csz —
 // the caller uses the returned size, and [csz, out.size()) is undefined padding.
@@ -19342,6 +19489,7 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   // included, and before apply_ultra_cctx, which applies --zstd=overlapLog only
   // to a context that has workers: after it, the first frame of a thread would
   // skip it and the rest would not.
+  if (g_frame_workers_refused.load(std::memory_order_relaxed)) frame_workers = 0;
   st = ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_nbWorkers, frame_workers);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(nbWorkers) error: ") + ZSTD_getErrorName(st));
   if (frame_workers > 0) ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_jobSize, (int)frame_job);
@@ -19357,7 +19505,9 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   // shrinking `out`, so a reused buffer needs no resize on the next frame.
   if (out.size() < bound) out.resize(bound);
   size_t csz = ZSTD_compress2(tl_cctx, out.data(), out.size(), src, src_size);
-  if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
+  if (gz_frame_workers_refused(csz, tl_cctx, frame_workers))
+    csz = ZSTD_compress2(tl_cctx, out.data(), out.size(), src, src_size);
+  if (ZSTD_isError(csz)) gz_die_compress_error(csz);
   return csz;
 }
 
@@ -21010,7 +21160,9 @@ public:
       vecs_[i].resize(chunk);
       free_.push_back((int)i);
     }
-    thr_ = std::thread([this] { run(); });
+    sync_ = !gz_try_thread(thr_, [this] { run(); });   // see take()
+    if (sync_ && g_verbosity >= V_VERBOSE)
+      std::fprintf(stderr, "[READ] thread allowance: no read-ahead thread; reading as it is taken\n");
   }
 #ifndef _WIN32
   ChunkPrefetcher(FILE * in, int dfd, uint64_t off, size_t chunk, int depth,
@@ -21021,7 +21173,9 @@ public:
     const size_t n = (size_t)std::max(depth, 1);
     if (!pool_.init(chunk, n, /*want_thp=*/true)) throw std::bad_alloc();
     for (size_t i = 0; i < n; ++i) free_.push_back((int)i);
-    thr_ = std::thread([this] { run(); });
+    sync_ = !gz_try_thread(thr_, [this] { run(); });   // see take()
+    if (sync_ && g_verbosity >= V_VERBOSE)
+      std::fprintf(stderr, "[READ] thread allowance: no read-ahead thread; reading as it is taken\n");
   }
 #endif
   ~ChunkPrefetcher() {
@@ -21035,6 +21189,22 @@ public:
   ChunkPrefetcher(const ChunkPrefetcher &) = delete;
   ChunkPrefetcher & operator=(const ChunkPrefetcher &) = delete;
   Chunk take() {
+    if (sync_) {
+      // NO READ-AHEAD THREAD (v0.18.62, ROADMAP 46): the system refused one, so
+      // the chunk is read here, as run() would have read it -- a slower stream,
+      // where --sliding-window died ("Resource temporarily unavailable").  The
+      // callers hold at most two chunks and every depth is at least two slots.
+      int s;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        if (free_.empty()) die("internal error: read-ahead taken with no free slot");
+        s = free_.front();
+        free_.pop_front();
+      }
+      char * b = slot_buf(s);
+      const size_t n = fill(b);
+      return Chunk{b, n, s, pipe_ ? (n == 0 || err_ != 0) : n < chunk_};
+    }
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait(lk, [this] { return !full_.empty(); });
     const Chunk c = full_.front();
@@ -21155,6 +21325,7 @@ private:
   std::deque<int> free_;
   std::deque<Chunk> full_;
   bool stop_ = false;
+  bool sync_ = false;            // no reader thread: take() reads (ROADMAP 46)
   std::thread thr_;
 };
 
@@ -24494,23 +24665,27 @@ static size_t stream_frames_to_queue_mt(
   // Supervisor runs alongside; the MAIN thread must fall through to the consumer
   // loop below or nothing drains the slots and every reader blocks on cv_freed.
   std::thread rd_super;
-  try {
-    for (int k = 0; k < cap; ++k) readers.emplace_back([&, k] { prefetch(k); });
-    if (can_scale)
-      rd_super = std::thread([&] {
-        rd_ctl.supervise([&] { return readers_done_early.load(std::memory_order_relaxed); });
-      });
-  } catch (...) {
-    // A partially-created vector contains joinable threads.  Letting construction
-    // unwind through it calls std::terminate; stop and join the subset explicitly.
-    { std::lock_guard<std::mutex> lk(mtx); stop = true; }
-    readers_done_early.store(true, std::memory_order_relaxed);
-    rd_ctl.stop();
-    cv_freed.notify_all();
-    cv_filled.notify_all();
-    for (auto & th : readers) if (th.joinable()) th.join();
-    if (rd_super.joinable()) rd_super.join();
-    die("cannot start parallel decompress reader threads");
+  // A READER THAT CANNOT START (v0.18.62, ROADMAP 46): the readers claim blocks
+  // from one counter, so those that start read them all; and the supervisor only
+  // scales them.  This used to end the run ("cannot start parallel decompress
+  // reader threads") on the first refused start.  With no reader at all nothing
+  // has been read yet, and the caller's single-threaded reader takes the input.
+  const int readers_started = gz_try_pool(readers, cap, [&](int k) {
+    readers.emplace_back([&, k] { prefetch(k); });
+  });
+  if (readers_started == 0) {
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[READ] thread allowance: no parallel reader started; "
+           "reading on this thread\n");
+    return MT_READER_BAIL;
+  }
+  if (readers_started < cap)
+    vlog(V_VERBOSE, opt, "[READ] thread allowance: " + std::to_string(readers_started) + " of "
+         + std::to_string(cap) + " reader threads started\n");
+  if (can_scale) {   // optional: without it the readers keep their starting count
+    gz_try_thread(rd_super, [&] {
+      rd_ctl.supervise([&] { return readers_done_early.load(std::memory_order_relaxed); });
+    });
   }
 
   // From here until the explicit joins below, an allocation failure in the
@@ -26317,8 +26492,14 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
   // die() exits without unwinding any live pipeline or progress thread.
   try {
     auto start_threads = [&]() {
-      // Start writer thread (outputs decompressed frames in original order)
-      wthr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
+      // Start writer thread (outputs decompressed frames in original order).
+      // THE WRITER, THEN THE WORKERS (v0.18.62, ROADMAP 46): under a PID or task
+      // limit the essential thread starts first and the pool runs on the workers
+      // that start, where a refused start ended the run ("CPU decompression
+      // failed: Resource temporarily unavailable").
+      if (!gz_try_thread(wthr, writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr))
+        die("cannot start the output writer thread: the system refused a thread "
+            "(Resource temporarily unavailable -- a PID or task limit?)");
 
       // Start worker threads (they block on the queue until frames arrive)
       pool.reserve((size_t)threads);
@@ -26327,16 +26508,22 @@ static void decompress_cpu_mt_impl(FILE * in, FILE * out, const Options & opt, M
       // carries opt.inputs -- every file named on the line -- so a `-d -r` over N
       // files copied N names per file: quadratic, 46.5% of all instructions over
       // 1,000 small files, 6.8 s of user time over 8,000 (v0.18.23).
-      for (int i = 0; i < threads; ++i) {
+      const int started = gz_try_pool(pool, threads, [&](int i) {
         pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
 #ifdef HAVE_NVCOMP
                           nullptr,
 #endif
                           &cpuagg, bp_ptr,
                           /*discard_results=*/false);   // this path always has a writer
-      }
+      });
+      if (started == 0)
+        die("cannot start a decompression worker thread: the system refused a thread "
+            "(Resource temporarily unavailable -- a PID or task limit?)");
+      if (started < threads)
+        vlog(V_VERBOSE, opt, "[CPU] thread allowance: " + std::to_string(started) + " of "
+             + std::to_string(threads) + " decompression threads started\n");
       if (opt.verbosity >= V_VERBOSE)
-        std::cerr << "[CPU] " << threads << " decompression threads online\n";
+        std::cerr << "[CPU] " << started << " decompression threads online\n";
     };
     if (!run_inline) {
       start_threads();
@@ -26627,7 +26814,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   std::atomic<bool> progress_done{false};
   std::thread progress_thr;
   if (progress_loop_needed(opt, total_in))
-    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
+    gz_try_thread(progress_thr, progress_loop, std::cref(opt), m, total_in, &progress_done);   // optional (46)
 
   ZSTD_CCtx * cctx = ZSTD_createCCtx();
   if (!cctx) die("failed to create ZSTD_CCtx");
@@ -26684,7 +26871,12 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     if (outbuf.size() < bound) outbuf.resize(bound);
     uint64_t comp_t0 = g_perf ? now_ns() : 0;
     size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
-    if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
+    if (gz_frame_workers_refused(csz, cctx, frame_workers)) {   // ROADMAP 46: see there
+      frame_workers = 0;
+      g_cpu_pass_threads.store(1, std::memory_order_relaxed);
+      csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
+    }
+    if (ZSTD_isError(csz)) gz_die_compress_error(csz);
     if (g_perf) {
       g_perf->cpu_compute_ns.fetch_add(now_ns() - comp_t0);
       g_perf->cpu_compute_count.fetch_add(1);
@@ -26755,7 +26947,11 @@ public:
     ZSTD_initDStream(dctx_);
     attach_verify_dict(dctx_);   // after init, which would detach it
     allow_full_window();  // verifies our own compressed output, not user input
-    th_ = std::thread(&StreamVerifier::run, this);
+    // A thread the system refuses (v0.18.62, ROADMAP 46): note_output decodes
+    // each piece itself, the same digest, where the constructor threw.
+    inline_ = !gz_try_thread(th_, &StreamVerifier::run, this);
+    if (inline_)
+      vlog(V_VERBOSE, opt_, "[VERIFY] thread allowance: no verify thread; the stream is decoded as it is written\n");
   }
   ~StreamVerifier() {
     finish();
@@ -26773,6 +26969,11 @@ public:
   // queue back-pressures compression, exactly like the frame verifier.
   void note_output(const void * p, size_t n) {
     if (!n || failed_.load(std::memory_order_relaxed)) return;
+    if (inline_) {
+      if (inline_plain_.empty()) inline_plain_.resize(1 << 20);
+      decode(p, n, inline_plain_);
+      return;
+    }
     auto buf = std::make_shared<std::vector<char>>(
         (const char *)p, (const char *)p + n);
     std::unique_lock<std::mutex> lk(m_);
@@ -26836,24 +27037,29 @@ private:
         buf = std::move(q_.front()); q_.pop_front();
       }
       not_full_.notify_one();
-      saw_input_ = true;
-      ZSTD_inBuffer zin { buf->data(), buf->size(), 0 };
-      while (zin.pos < zin.size) {
-        ZSTD_outBuffer zout { plain.data(), plain.size(), 0 };
-        size_t r = ZSTD_decompressStream(dctx_, &zout, &zin);
-        last_ret_ = r;
-        if (ZSTD_isError(r)) {
-          std::ostringstream os;
-          os << "[VERIFY] sliding-window output failed to decode: "
-             << ZSTD_getErrorName(r) << "\n";
-          vlog(V_ERROR, opt_, os.str());
-          failed_.store(true, std::memory_order_relaxed);
-          not_full_.notify_all();
-          return;
-        }
-        if (zout.pos) { out_d_.update(zout.dst, zout.pos); out_bytes_ += zout.pos; }
-      }
+      if (!decode(buf->data(), buf->size(), plain)) return;
     }
+  }
+  // One piece of the output into the digest; false (and failed_) on a decode error.
+  bool decode(const void * p, size_t n, std::vector<char> & plain) {
+    saw_input_ = true;
+    ZSTD_inBuffer zin { p, n, 0 };
+    while (zin.pos < zin.size) {
+      ZSTD_outBuffer zout { plain.data(), plain.size(), 0 };
+      size_t r = ZSTD_decompressStream(dctx_, &zout, &zin);
+      last_ret_ = r;
+      if (ZSTD_isError(r)) {
+        std::ostringstream os;
+        os << "[VERIFY] sliding-window output failed to decode: "
+           << ZSTD_getErrorName(r) << "\n";
+        vlog(V_ERROR, opt_, os.str());
+        failed_.store(true, std::memory_order_relaxed);
+        not_full_.notify_all();
+        return false;
+      }
+      if (zout.pos) { out_d_.update(zout.dst, zout.pos); out_bytes_ += zout.pos; }
+    }
+    return true;
   }
   const Options &  opt_;
   ZSTD_DStream *   dctx_ = nullptr;
@@ -26866,6 +27072,8 @@ private:
   bool             saw_input_ = false;   // any compressed bytes at all?
   size_t           last_ret_ = 1;        // last ZSTD_decompressStream hint; 0 = frame complete
   std::atomic<bool> failed_{false};
+  bool             inline_ = false;      // no thread: note_output decodes (ROADMAP 46)
+  std::vector<char> inline_plain_;
   std::thread      th_;
 };
 
@@ -27736,7 +27944,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   // started and joined a thread per input all the same (see gzstd_main).
   std::thread progress_thr;
   if (progress_loop_needed(opt, total_in))
-    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
+    gz_try_thread(progress_thr, progress_loop, std::cref(opt), m, total_in, &progress_done);   // optional (46)
 
   ZSTD_CCtx * cctx = ZSTD_createCCtx();
   if (!cctx) die("failed to create ZSTD_CCtx");
@@ -27884,6 +28092,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
 #endif
   FrameBuf batch;
   size_t batch_used = 0;
+  bool sw_called = false;   // a compress call has been made (ROADMAP 46: see the retry)
   auto ship = [&]() {
     if (batch && batch_used > 0) {
       batch->resize(batch_used);
@@ -28075,8 +28284,32 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
       if (!batch) { batch = std::make_shared<FrameVec>(OUT_BATCH); batch_used = 0; }
       ZSTD_outBuffer output = { batch->data() + batch_used, OUT_BATCH - batch_used, 0 };
       size_t remaining = ZSTD_compressStream2(cctx, &output, &input, directive);
-      if (ZSTD_isError(remaining))
+      // ZSTD'S OWN WORKERS THAT CANNOT START (v0.18.62, ROADMAP 46).  The first
+      // call starts zstd's thread pool, and a PID or task limit that refuses it
+      // comes back as "Allocation error" -- reported as a DATA error (exit 4).
+      // Before any output: no workers, and the frame is the same frame on one
+      // thread.  That first call has already spent a --patch-from prefix (zstd
+      // clears it at the start of its setup), so it is referenced again.
+      if (ZSTD_isError(remaining) && sw_mt && !sw_called
+          && ZSTD_getErrorCode(remaining) == ZSTD_error_memory_allocation) {
+        sw_mt = false;
+        g_sw_pass_threads.store(1, std::memory_order_relaxed);
+        vlog(V_DEFAULT, opt, "warning: zstd could not start its worker threads (Resource temporarily "
+                             "unavailable -- a PID or task limit?); --sliding-window compresses on one thread\n");
+        if (opt.rsyncable)
+          vlog(V_DEFAULT, opt, "warning: --rsyncable needs zstd's worker threads, which this "
+                               "run does not have; the frame is written without it\n");
+        size_t r2 = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 0);
+        if (!ZSTD_isError(r2) && g_dict_patch) r2 = ZSTD_CCtx_refPrefix(cctx, g_dict_buf, g_dict_len);
+        if (ZSTD_isError(r2)) die(std::string("ZSTD_compressStream2: ") + ZSTD_getErrorName(r2));
+        remaining = ZSTD_compressStream2(cctx, &output, &input, directive);
+      }
+      sw_called = true;
+      if (ZSTD_isError(remaining)) {
+        if (ZSTD_getErrorCode(remaining) == ZSTD_error_memory_allocation)
+          die(std::string("ZSTD_compressStream2: ") + ZSTD_getErrorName(remaining));
         die_data(std::string("ZSTD_compressStream2: ") + ZSTD_getErrorName(remaining));
+      }
 
       if (output.pos > 0) {
         // Test hook: GZSTD_DEBUG_CORRUPT_FRAME=0 corrupts this path's ONE frame
@@ -28664,12 +28897,22 @@ static bool pooled_read_chunks(size_t host_chunk,
     const int spawn_n = rd_adaptive ? rd_ceil : n_readers;
     std::vector<std::thread> rthr;
     rthr.reserve((size_t)spawn_n - 1);
-    for (int i = 1; i < spawn_n; ++i) rthr.emplace_back([&, i] { read_loop(i); });
+    // Readers claim chunks from one counter, and this thread reads as reader 0,
+    // so the readers that start read everything (ROADMAP 46: a refused start
+    // unwound through this vector into std::terminate).  The supervisor only
+    // scales them: optional.
+    const int extra = gz_try_pool(rthr, spawn_n - 1, [&](int j) {
+      const int i = j + 1;
+      rthr.emplace_back([&, i] { read_loop(i); });
+    });
+    if (extra < spawn_n - 1 && optp)
+      vlog(V_VERBOSE, *optp, "[READ] thread allowance: " + std::to_string(extra + 1) + " of "
+           + std::to_string(spawn_n) + " reader threads\n");
 
     // Supervisor on its own thread so thread 0 keeps reading while it decides.
     std::thread rd_super;
     if (rd_adaptive)
-      rd_super = std::thread([&] {
+      gz_try_thread(rd_super, [&] {
         rd_ctl.supervise([&] { return done.load(std::memory_order_relaxed); });
       });
 
@@ -30961,8 +31204,11 @@ struct LayoutBuilder {
     };
     if (nthreads <= 1) worker();
     else {
+      // The workers that start share the entries (one counter); with none, this
+      // thread takes them all (ROADMAP 46: a refused start aborted the scan).
       std::vector<std::thread> ths;
-      for (int t = 0; t < nthreads; ++t) ths.emplace_back(worker);
+      ths.reserve((size_t)nthreads);
+      if (gz_try_pool(ths, nthreads, [&](int) { ths.emplace_back(worker); }) == 0) worker();
       for (auto & t : ths) t.join();
     }
   }
@@ -31150,8 +31396,11 @@ struct LayoutBuilder {
     };
     if (nthreads <= 1) worker();
     else {
+      // The workers that start share the entries (one counter); with none, this
+      // thread takes them all (ROADMAP 46: a refused start aborted the scan).
       std::vector<std::thread> ths;
-      for (int t = 0; t < nthreads; ++t) ths.emplace_back(worker);
+      ths.reserve((size_t)nthreads);
+      if (gz_try_pool(ths, nthreads, [&](int) { ths.emplace_back(worker); }) == 0) worker();
       for (auto & t : ths) t.join();
     }
     // Serial recompute: insert each entry's PAX block ahead of its header.
@@ -32360,19 +32609,69 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     }
   };
 
+  // A THREAD THE SYSTEM REFUSES (v0.18.62, ROADMAP 46) unwound through this
+  // vector into std::terminate.  The pusher starts first; the readers claim
+  // chunks from one counter, so those that start read them all; and this thread,
+  // which only joins, takes whichever role found no thread -- the pusher, or
+  // reader 0 when no reader started.  Both refused (the compress pool, started
+  // first, took the allowance): this thread assembles and pushes every chunk in
+  // order itself (serial_assemble).
   std::vector<std::thread> pool;
   pool.reserve((size_t)rd_ceil_t);
-  for (int i = 0; i < rd_ceil_t; ++i) pool.emplace_back([&, i] { reader(i); });
-  std::thread push_thr(pusher);
+  std::thread push_thr;
+  const bool push_started = gz_try_thread(push_thr, pusher);
+  const int readers_started = gz_try_pool(pool, rd_ceil_t, [&](int i) {
+    pool.emplace_back([&, i] { reader(i); });
+  });
+  const bool serial = !push_started && readers_started == 0;
+  if (readers_started < rd_ceil_t || !push_started)
+    vlog(V_VERBOSE, opt, "[TAR] thread allowance: " + std::to_string(readers_started) + " of "
+         + std::to_string(rd_ceil_t) + " reader threads started"
+         + (serial ? "; this thread reads and pushes every chunk in order\n"
+            : !push_started ? "; this thread pushes the chunks\n"
+            : readers_started == 0 ? "; this thread reads\n" : "\n"));
+  // No reader and no pusher: one chunk at a time, read, then pushed -- the
+  // reader's claim/assemble without the reorder buffer, which only a pusher
+  // drains.  The abort and staging checks are the reader's.
+  auto serial_assemble = [&] {
+    SrcCache sc;
+    auto run = [&] {
+      for (size_t ci = 0; ci < nchunks; ++ci) {
+        if (g_gpu_aborted.load(std::memory_order_relaxed)) break;
+        int staged_slot = -1;
+#ifdef HAVE_NVCOMP
+        GdsStagePool * stage = g_gds_stage_pool.load(std::memory_order_acquire);
+        if (stage) {
+          staged_slot = stage->acquire();
+          if (staged_slot < 0) break;
+          if (g_gpu_aborted.load(std::memory_order_relaxed)) { stage->release(staged_slot); break; }
+        }
+#endif
+        next_chunk.store(ci + 1, std::memory_order_relaxed);
+        Task t = assemble_chunk(ci, sc, staged_slot);
+        { std::lock_guard<std::mutex> lk(rb_mx); push_next = ci + 1; }   // the watchdog reads it
+        queue.push(std::move(t));
+      }
+    };
+#ifdef HAVE_NVCOMP
+    if (abort_throttle && abort_results) {
+      try { run(); }
+      catch (const std::exception & e) { abort_staged_reader(e.what()); }
+      catch (...) { abort_staged_reader("unknown reader exception"); }
+    } else
+#endif
+      run();
+    finish_src(sc);
+  };
   std::thread rd_super_t;
   if (rd_ad_t)
-    rd_super_t = std::thread([&] {
+    gz_try_thread(rd_super_t, [&] {   // optional: only scales the readers
       rd_ctl_t.supervise([&] { return rd_done_t.load(std::memory_order_relaxed); });
     });
   // Watchdog: the program reports its own deadlock, since gdb cannot attach.
   std::thread rd_wd;
   if (rd_trace)
-    rd_wd = std::thread([&] {
+    gz_try_thread(rd_wd, [&] {
       for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (rd_done_t.load(std::memory_order_relaxed)) return;
@@ -32400,8 +32699,11 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
           (void)!::write(STDERR_FILENO, ln.c_str(), ln.size());
       }
     });
+  if (serial) serial_assemble();
+  else if (!push_started) pusher();
+  else if (readers_started == 0) reader(0);
   for (auto & th : pool) th.join();
-  push_thr.join();
+  if (push_thr.joinable()) push_thr.join();
   rd_done_t.store(true, std::memory_order_relaxed);
   rd_ctl_t.stop();
   if (rd_super_t.joinable()) rd_super_t.join();
@@ -35508,13 +35810,33 @@ private:
   }
 
   bool make_special(const std::string & rel, uint32_t mode, char type,
-                    uint32_t major_, uint32_t minor_, int64_t mtime, int root = 0) {
+                    uint32_t major_, uint32_t minor_, int64_t mtime,
+                    uint64_t uid, uint64_t gid, int root = 0) {
     std::string leaf; int pfd = open_parent(rel, leaf, true, root);
     if (pfd < 0) return false;
     ::unlinkat(pfd, leaf.c_str(), 0);
     mode_t mt = (mode & 07777) | (type == '6' ? S_IFIFO : type == '3' ? S_IFCHR : S_IFBLK);
     dev_t dev = (type == '6') ? 0 : makedev(major_, minor_);
     bool ok = (::mknodat(pfd, leaf.c_str(), mt, dev) == 0);
+    // THE OWNER, THEN THE EXACT MODE (v0.18.62, ROADMAP 47).  mknodat's mode passes
+    // through the umask, and nothing set it or the owner afterwards: a FIFO stored
+    // 0666 came back 0664 under umask 002 (a regular file gets its exact stored
+    // mode, set_meta_fd), and a root extract left every FIFO and device node owned
+    // by root.  Through an O_PATH handle on the node itself -- never following a
+    // name that could have been swapped for a symlink -- in set_meta_fd's order:
+    // the owner first (the kernel clears set-id bits on a chown), then the mode,
+    // which a FIFO or device cannot take by fchmod on an O_PATH descriptor, so it
+    // goes through /proc/self/fd as apply_ext_path's xattrs do.  Best-effort, as
+    // set_meta_fd is.
+    if (ok) {
+      const int lfd = ::openat(pfd, leaf.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+      if (lfd >= 0) {
+        if (as_root_ && ::fchownat(lfd, "", (uid_t)uid, (gid_t)gid, AT_EMPTY_PATH) != 0) { /* best-effort */ }
+        const std::string pp = "/proc/self/fd/" + std::to_string(lfd);
+        (void)::chmod(pp.c_str(), mode & 07777);
+        ::close(lfd);
+      }
+    }
     // Same gap as the symlink above, same fix: opening a FIFO to get an fd would
     // BLOCK until the other end appears, and a device node must not be opened at
     // all during extraction, so both are stamped through the parent fd.
@@ -36794,7 +37116,8 @@ private:
       }
       case '3': case '4': case '6': {              // char/block device, fifo
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
-        if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, e.mtime, root)) {
+        if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, e.mtime,
+                          e.uid, e.gid, root)) {
           // EPERM = no CAP_MKNOD, so a device node in the archive was NOT
           // created.  That is a missing entry, and it must fail the extraction
           // like any other creation error.  Logging it at -v and continuing
@@ -38354,13 +38677,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 #endif
 
-  // Start progress bar and ordered-writer threads
+  // Progress bar and ordered-writer threads.  The bar starts last (below).
   std::atomic<bool> progress_done{false};
   // Only when it will draw (v0.18.24): it returned at once without a bar, but
   // started and joined a thread per input all the same (see gzstd_main).
   std::thread progress_thr;
-  if (progress_loop_needed(opt, total_in))
-    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   queue.on_last_pop([&opt] { gz_last_pop(opt); });   // v0.18.53
   // Byte-cap the input queue: a pipe/stdin producer that outruns the workers
@@ -38383,17 +38704,34 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   FrameThrottle throttle(compute_throttle_budget(host_chunk, threads, 0, opt));
   adapt_arm_throttle_grow(throttle, host_chunk, opt);
   queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
+  // THE WRITER, THEN THE WORKERS, THEN THE BAR (v0.18.62, ROADMAP 46): under a
+  // PID or task limit the essential thread starts first, the pool runs on the
+  // workers that start, and the bar is optional -- where a refused start used to
+  // unwind through joinable threads into std::terminate.
+  std::thread wthr;
+  if (!gz_try_thread(wthr, writer_thread, out, std::ref(results), std::cref(opt), m, &throttle))
+    die("cannot start the output writer thread: the system refused a thread "
+        "(Resource temporarily unavailable -- a PID or task limit?)");
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
   // A pointer to the caller's Options, not a copy of it: a copy carries every
   // input name (see decompress_cpu_mt, v0.18.23).  The workers are joined below.
-  for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m,
+  const int workers_started = gz_try_pool(pool, threads, [&](int i) {
+    pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m,
 #ifdef HAVE_NVCOMP
-    nullptr,
+      nullptr,
 #endif
-    &cpuagg, &throttle);
-  if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
+      &cpuagg, &throttle);
+  });
+  if (workers_started == 0)
+    die("cannot start a compression worker thread: the system refused a thread "
+        "(Resource temporarily unavailable -- a PID or task limit?)");
+  if (workers_started < threads)
+    vlog(V_VERBOSE, opt, "[CPU] thread allowance: " + std::to_string(workers_started) + " of "
+         + std::to_string(threads) + " worker threads started\n");
+  if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << workers_started << " worker threads online\n";
+  if (progress_loop_needed(opt, total_in))
+    gz_try_thread(progress_thr, progress_loop, std::cref(opt), m, total_in, &progress_done);
 #ifndef _WIN32
   gz_fifo_gate("GZSTD_DEBUG_POOL_GATE");   // the pool and the writer started, nothing read
 #endif
@@ -43088,9 +43426,16 @@ static void gpu_worker(
               ~RdJoin() { for (auto & t : w) if (t.joinable()) t.join(); }
             } rd_join{rd};
             rd.reserve(rd_threads > 0 ? rd_threads - 1 : 0);
-            for (size_t k = 1; k < rd_threads; ++k)
-              rd.emplace_back([&, k]{ issue(k, rd_threads); });
+            // A stripe whose thread the system refuses (ROADMAP 46) is issued
+            // here after stripe 0, not thrown into the fault path mid-batch.
+            std::vector<size_t> rd_left;
+            for (size_t k = 1; k < rd_threads; ++k) {
+              std::thread t;
+              if (gz_try_thread(t, [&, k]{ issue(k, rd_threads); })) rd.push_back(std::move(t));
+              else rd_left.push_back(k);
+            }
             issue(0, rd_threads);
+            for (size_t k : rd_left) issue(k, rd_threads);
           }
           if (h_tr) {
             h_ns_copy += now_ns() - h_t;
@@ -43130,12 +43475,18 @@ static void gpu_worker(
           } ck_join{ck_workers};
           if (ck_threads > 1) {
             ck_workers.reserve(ck_threads);
-            for (size_t k = 0; k < ck_threads; ++k)
-              ck_workers.emplace_back([&C, k, ck_threads]{
+            // A stripe whose thread the system refuses (ROADMAP 46) is hashed here,
+            // before the upload, rather than thrown into the fault path.
+            for (size_t k = 0; k < ck_threads; ++k) {
+              auto stripe = [&C, k, ck_threads]{
                 for (size_t j = k; j < C.filled; j += ck_threads)
                   C.h_checksums[j] = (uint32_t)xxh::hash(C.batch[j].ptr(),
                                                          C.batch[j].len(), 0);
-              });
+              };
+              std::thread t;
+              if (gz_try_thread(t, stripe)) ck_workers.push_back(std::move(t));
+              else stripe();
+            }
           }
 
           // Upload each subchunk to its slot in the device input buffer
@@ -43575,10 +43926,13 @@ static void warm_gpu_contexts(const std::vector<int> & ids)
   std::vector<std::thread> warm;
   warm.reserve(ids.size());
   for (int id : ids) {
-    warm.emplace_back([id]{
+    auto one = [id]{
       if (cudaSetDevice(id) == cudaSuccess)
         cudaFree(nullptr);  // forces primary-context creation
-    });
+    };
+    std::thread t;
+    if (gz_try_thread(t, one)) warm.push_back(std::move(t));
+    else one();   // a thread the system refuses (ROADMAP 46): warm it here, in turn
   }
   for (auto & t : warm) t.join();
 }
@@ -44681,12 +45035,19 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // started and joined a thread per input all the same (see gzstd_main).
   std::thread progress_thr;
   if (progress_loop_needed(opt, total_in))
-    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
+    gz_try_thread(progress_thr, progress_loop, std::cref(opt), m, total_in, &progress_done);   // optional (46)
   // The peer-to-peer path writes from the drain itself, so the ordered writer
   // would have nothing to do and its completion handshake would never fire.
+  // A THREAD THE SYSTEM REFUSES (v0.18.62, ROADMAP 46): the writer is essential
+  // (a clean error), the scheduler's tick and the stall guards optional, the CPU
+  // pool runs on the workers that start, a GPU worker that cannot start is a
+  // device whose bringup failed (skipped), and a deferred bringup that cannot
+  // start leaves the GPUs out, as a declined one does.
   std::thread writer_thr;
-  if (!g_gds_cout_active.load(std::memory_order_relaxed))
-    writer_thr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
+  if (!g_gds_cout_active.load(std::memory_order_relaxed)
+      && !gz_try_thread(writer_thr, writer_thread, out, std::ref(results), std::cref(opt), m, &throttle))
+    die("cannot start the output writer thread: the system refused a thread "
+        "(Resource temporarily unavailable -- a PID or task limit?)");
 
   // ---- Hybrid scheduler (adaptive CPU/GPU work-sharing) ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -44708,7 +45069,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // The ranked rule (--adapt) counts the frames not read yet as work left; 0 for a
     // pipe leaves that unknown.  The aggregate check ignores it on compress.
     sched->set_source_bytes(total_in);
-    tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
+    // Optional: without its tick the scheduler keeps its warm-up policy.
+    gz_try_thread(tick_thr, tick_loop_fn, std::ref(tick_done), sched);
 
     // Early banner in main() already printed mode + CPU share at -v.
     // Keep a -vv confirmation that the scheduler actually started.
@@ -44849,8 +45211,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
            << " threads (GPUs initializing in background)";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
-    for (int i = 0; i < cpu_threads; ++i)
+    cpu_pool.reserve((size_t)cpu_threads);
+    const int cpu_started = gz_try_pool(cpu_pool, cpu_threads, [&](int i) {
       cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &cpuagg, &throttle);
+    });
+    // With no CPU worker a declined or failed GPU would leave nobody to compress.
+    if (cpu_started == 0 && cpu_threads > 0)
+      die("cannot start a compression worker thread: the system refused a thread "
+          "(Resource temporarily unavailable -- a PID or task limit?)");
+    if (cpu_started < cpu_threads)
+      vlog(V_VERBOSE, opt, "[HYBRID] thread allowance: " + std::to_string(cpu_started) + " of "
+           + std::to_string(cpu_threads) + " CPU worker threads started\n");
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
@@ -45198,20 +45569,55 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       wd.streams     = std::vector<WdStream>((size_t)wd.n_workers * (size_t)wd.streams_per);
       wd.opt = &opt; wd.meter = m; wd.throttle = &throttle; wd.queue = &queue; wd.which = "compress";
       g_wd.store(&wd, std::memory_order_release);
-      if (want_diag)  watchdog_thr = std::thread(watchdog_loop, &watchdog_done, opt.watchdog_secs);
-      if (want_stall) stall_thr    = std::thread(gpu_stall_loop, &watchdog_done, gpu_stall_secs());
+      if (want_diag)  gz_try_thread(watchdog_thr, watchdog_loop, &watchdog_done, opt.watchdog_secs);
+      if (want_stall) gz_try_thread(stall_thr, gpu_stall_loop, &watchdog_done, gpu_stall_secs());
     }
 
+    int gpu_threads_ok = 0;
     for (int i = 0; i < gpu_count; ++i) {
-      workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
-                           &queue, &results,
-                           &per_dev[size_t(i)], json_sink.get(), m, sched,
-                           &any_gpu_failed, &abort_on_failure,
-                           &fatal_msgs[size_t(i)], &gpu_started, &gpu_ready_workers,
-                           &gpu_claimed_workers,
-                           &tunes[size_t(i)],
-                           &throttle, &gpu_failures, gpu_count);
+      std::thread t;
+      if (gz_try_thread(t, gpu_worker, gpu_ids[i], i, opt_for_workers,
+                        &queue, &results,
+                        &per_dev[size_t(i)], json_sink.get(), m, sched,
+                        &any_gpu_failed, &abort_on_failure,
+                        &fatal_msgs[size_t(i)], &gpu_started, &gpu_ready_workers,
+                        &gpu_claimed_workers,
+                        &tunes[size_t(i)],
+                        &throttle, &gpu_failures, gpu_count)) {
+        workers.push_back(std::move(t));
+        ++gpu_threads_ok;
+        continue;
+      }
+      // NO THREAD FOR THIS DEVICE: what gpu_worker does when its bringup fails
+      // before a batch -- say why, count it for the bringup barrier, wake the
+      // waiters -- so the other workers, or the CPU pool, carry the run.
+      const std::string why = std::string("[GPU") + std::to_string(gpu_ids[i])
+          + "] bringup failed (the system refused a thread); skipping device";
+      vlog(V_ERROR, opt, why + "\n");
+      any_gpu_failed = true;
+      fatal_msgs[size_t(i)] = why;
+      const int fails = gpu_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+      gpu_bringup_signal();
+      { std::lock_guard<std::mutex> lk(results.m); results.cv.notify_all(); }
+      queue.notify_cpu_waiters();
+      // A started worker may already have failed before this refused slot is
+      // counted.  If THIS increment is last, none of those workers can win
+      // their fails == gpu_worker_count rescue test.  Bringup runs on the
+      // producer here in --gpu-only, so running a rescue inline would wait for
+      // input this thread has not queued.  End cleanly with no consumer left.
+      if (opt.gpu_only && cpu_pool.empty() && fails == gpu_count
+          && !g_gpu_aborted.load(std::memory_order_relaxed))
+        die(gpu_threads_ok == 0
+            ? "cannot start a GPU worker thread: the system refused a thread "
+              "(Resource temporarily unavailable -- a PID or task limit?)"
+            : "no GPU compression worker remains: the system refused a thread "
+              "and every started device failed bringup; re-run with --cpu-only");
     }
+    // --gpu-only has no CPU pool, and a worker's last-GPU fallback runs on that
+    // worker's thread: with no worker at all there is no thread to run it on.
+    if (gpu_threads_ok == 0 && cpu_pool.empty())
+      die("cannot start a GPU worker thread: the system refused a thread "
+          "(Resource temporarily unavailable -- a PID or task limit?)");
     // NOT set here.  Spawning a worker is not engagement: a worker that starts
     // and then fails before delivering anything would still have been counted,
     // filing an all-CPU run's rate under `hybrid`.  The flag is raised where a
@@ -45219,15 +45625,26 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // is the first moment a GPU has demonstrably done work.
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "[GPU] " << gpu_count << " device worker"
-         << (gpu_count > 1 ? "s" : "") << " online";
+      os << "[GPU] " << gpu_threads_ok << " device worker"
+         << (gpu_threads_ok == 1 ? "" : "s") << " online";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   };
 
   std::thread gpu_bringup_thr;
-  if (defer_detect) gpu_bringup_thr = std::thread(gpu_bringup);
-  else              gpu_bringup();
+  if (defer_detect) {
+    // Optional: a deferred bringup the system refuses a thread leaves the GPUs
+    // out, as one that declines them does (it cannot run here: its sampling waits
+    // for progress this thread has not started yet).
+    if (!gz_try_thread(gpu_bringup_thr, gpu_bringup)) {
+      if (cpu_pool.empty())   // --gpu-only: nothing else would do the work
+        die("cannot start the GPU bringup thread: the system refused a thread "
+            "(Resource temporarily unavailable -- a PID or task limit?)");
+      vlog(V_VERBOSE, opt, "[GPU] thread allowance: no thread for the deferred bringup; CPU only\n");
+    }
+  } else {
+    gpu_bringup();
+  }
 
   // Fixed-share: wait for at least one GPU stream to register (or for all
   // GPUs to fail init) before streaming frames.  warm_gpu_contexts only
@@ -46449,7 +46866,10 @@ public:
   DStageAhead & operator=(const DStageAhead &) = delete;
 
   void start(int nthreads) {
-    for (int i = 0; i < nthreads; ++i) thr_.emplace_back([this] { reader(); });
+    // The readers that start read ahead; a frame none reached is a cache miss,
+    // the worker's own pread (ROADMAP 46: a refused start threw mid-bringup).
+    thr_.reserve((size_t)std::max(0, nthreads));
+    gz_try_pool(thr_, nthreads, [this](int) { thr_.emplace_back([this] { reader(); }); });
   }
 
   // Idempotent.  Joins every reader BEFORE the caller may close fd_: a reader still
@@ -49455,14 +49875,16 @@ static void gpu_decomp_worker(
         }
         if (!C.wb_jobs.empty()) {
           DecompStreamCtx * cp = &C;
-          C.wb_thr = std::thread([cp, vb = (opt.verbosity >= V_VERBOSE)]() {
+          // A thread the system refuses (ROADMAP 46): the same writes, here, now
+          // -- and the marker below stays silent, since no background writer ran.
+          auto write_behind = [cp, vb = (opt.verbosity >= V_VERBOSE)](bool threaded) {
             // PRINTED FROM INSIDE THE THREAD, once, because the "ENABLED" banner
             // above proves only that the switch was read.  When coalescing began
             // writing spans synchronously, wb_jobs stayed empty, no thread was
             // ever created, and the banner still appeared -- so the regression
             // test passed on a run that exercised nothing.  This marker cannot
             // appear unless a background writer actually ran.
-            if (vb) {
+            if (vb && threaded) {
               static std::atomic<bool> said{false};
               if (!said.exchange(true))
                 std::cerr << "[GDS] write-behind thread active\n";
@@ -49484,7 +49906,15 @@ static void gpu_decomp_worker(
                 return;
               }
             }
-          });
+          };
+          if (!gz_try_thread(C.wb_thr, write_behind, true)) {
+            write_behind(false);
+            // No joinable thread will retire these jobs at the next kernel.
+            // Replaying them then would write the NEW batch to OLD offsets;
+            // an inline I/O error must also be observed before reporting done.
+            C.wb_jobs.clear();
+            if (!C.wb_err.empty()) die(C.wb_err, EXIT_IO);
+          }
         }
         // Batch complete: retire the in-flight record and fold its duration into
         // the EMA the reclaim deadline scales from (same 1/4 weight as compress).
@@ -50695,8 +51125,14 @@ gds_out_declined:
       || g_gds_verify_active.load(std::memory_order_relaxed);
   if (discard_results)
     vlog(V_VERBOSE, opt, "[GPU] -t: device verification selected; no plaintext D2H\n");
-  if (!g_gds_out_active.load(std::memory_order_relaxed) && !discard_results)
-    writer_thr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
+  // A THREAD THE SYSTEM REFUSES (v0.18.62, ROADMAP 46), as in compress_nvcomp:
+  // the writer essential, the tick optional, the CPU pool on what starts, a GPU
+  // worker that cannot start a skipped device, a deferred bringup that cannot
+  // start no GPUs.
+  if (!g_gds_out_active.load(std::memory_order_relaxed) && !discard_results
+      && !gz_try_thread(writer_thr, writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr))
+    die("cannot start the output writer thread: the system refused a thread "
+        "(Resource temporarily unavailable -- a PID or task limit?)");
 
   // ---- Hybrid scheduler ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -50743,7 +51179,7 @@ gds_out_declined:
     // the last two be reached at all on decompress.
     if (queue_depth_ceiling)
       sched->set_queue_depth_cap(queue_depth_ceiling);
-    tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
+    gz_try_thread(tick_thr, tick_loop_fn, std::ref(tick_done), sched);   // optional (46)
   }
 
   // ---- CPU decompression pool ----
@@ -50774,9 +51210,18 @@ gds_out_declined:
       os << "[HYBRID] decompress: " << cpu_threads << " CPU threads";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
-    for (int i = 0; i < cpu_threads; ++i)
+    cpu_pool.reserve((size_t)cpu_threads);
+    const int cpu_started = gz_try_pool(cpu_pool, cpu_threads, [&](int i) {
       cpu_pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
                             (void*)sched, &cpuagg, bp_ptr, discard_results);
+    });
+    // With no CPU worker a declined or failed GPU would leave nobody to decode.
+    if (cpu_started == 0 && cpu_threads > 0)
+      die("cannot start a decompression worker thread: the system refused a thread "
+          "(Resource temporarily unavailable -- a PID or task limit?)");
+    if (cpu_started < cpu_threads)
+      vlog(V_VERBOSE, opt, "[HYBRID] thread allowance: " + std::to_string(cpu_started) + " of "
+           + std::to_string(cpu_threads) + " CPU decompression threads started\n");
   }
 
   // ---- GPU decompression workers ----
@@ -51257,21 +51702,64 @@ gds_out_declined:
                                           decomp_frames_est()),
                       decomp_frame_cap(opt), bp_ptr ? bp_ptr->max_permits() : 0,
                       /*by_device=*/false);
+    // Keep a slot for EVERY selected device, including refused starts.  Join /
+    // detach and tuner publication use the same indices as gpu_ids and tunes;
+    // compacting only the started threads would detach or join the wrong GPU.
+    gpu_workers.resize((size_t)gpu_count);
+    int gpu_threads_ok = 0;
     for (int i = 0; i < gpu_count; ++i) {
-      gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], i, opt,
-                               &queue, &results, m, sched,
-                               &any_gpu_failed, &abort_on_failure,
-                               &fatal_msgs[size_t(i)],
-                               &tunes_decomp[size_t(i)],
-                               bp_ptr, &gpu_failures, &gpu_exits, gpu_count,
-                               abandoned_at_start,
-                               discard_results);
+      if (gz_try_thread(gpu_workers[size_t(i)], gpu_decomp_worker, gpu_ids[i], i, opt,
+                        &queue, &results, m, sched,
+                        &any_gpu_failed, &abort_on_failure,
+                        &fatal_msgs[size_t(i)],
+                        &tunes_decomp[size_t(i)],
+                        bp_ptr, &gpu_failures, &gpu_exits, gpu_count,
+                        abandoned_at_start,
+                        discard_results)) {
+        ++gpu_threads_ok;
+        continue;
+      }
+      // NO THREAD FOR THIS DEVICE: what gpu_decomp_worker does when its bringup
+      // fails -- say why, count the failure AND the exit (the last worker out
+      // decides a --gpu-only rescue on those counts), wake every waiter.
+      const std::string why = std::string("[GPU") + std::to_string(gpu_ids[i])
+          + "] bringup failed (the system refused a thread); skipping device";
+      vlog(V_ERROR, opt, why + "\n");
+      any_gpu_failed = true;
+      fatal_msgs[size_t(i)] = why;
+      gpu_failures.fetch_add(1, std::memory_order_acq_rel);
+      gpu_bringup_signal();
+      const int out = gpu_exits.fetch_add(1, std::memory_order_acq_rel) + 1;
+      { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
+      g_decomp_exit_cv.notify_all();
+      { std::lock_guard<std::mutex> lk(results.m); results.cv.notify_all(); }
+      queue.notify_cpu_waiters();
+      // The last exit can be a refused slot after every started worker has
+      // already left.  It owns exactly the same rescue decision as the last
+      // worker or reclaimer increment.  --gpu-only bringup is on a background
+      // thread, so this can drain while the main thread keeps producing.
+      if (out == gpu_count && opt.gpu_only) {
+        if (gpu_threads_ok == 0)
+          die("cannot start a GPU worker thread: the system refused a thread "
+              "(Resource temporarily unavailable -- a PID or task limit?)");
+        if (!queue.drained())
+          gpu_only_cpu_fallback(true, &queue, &results, opt, m, bp_ptr, discard_results,
+              std::min(gpu_count, gpu_failures.load(std::memory_order_acquire)
+                  + __builtin_popcountll(g_decomp_abandoned.load(std::memory_order_relaxed)
+                                         & ~abandoned_at_start)),
+              gpu_count);
+      }
     }
+    // --gpu-only has no CPU pool, and the last-out rescue runs on a worker's own
+    // thread: with no worker at all there is no thread to run it on.
+    if (gpu_threads_ok == 0 && cpu_pool.empty())
+      die("cannot start a GPU worker thread: the system refused a thread "
+          "(Resource temporarily unavailable -- a PID or task limit?)");
     // NOT set here — spawning is not engagement.  Raised at the first DELIVERED
     // frame in gpu_decomp_worker, for the reason g_adapt_gpu_engaged documents.
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "[GPU] " << (int)gpu_ids.size() << " device(s) online";
+      os << "[GPU] " << gpu_threads_ok << " device(s) online";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   };
@@ -51281,7 +51769,14 @@ gds_out_declined:
     // Background bringup: main thread proceeds to the reader so cuInit +
     // context creation overlap with the CPU pool (hybrid) or the reader
     // filling the queue (gpu-only).
-    gpu_bringup_thr = std::thread(gpu_bringup);
+    // Optional: one the system refuses a thread leaves the GPUs out, as a
+    // declined bringup does (ROADMAP 46).
+    if (!gz_try_thread(gpu_bringup_thr, gpu_bringup)) {
+      if (cpu_pool.empty())   // --gpu-only: nothing else would do the work
+        die("cannot start the GPU bringup thread: the system refused a thread "
+            "(Resource temporarily unavailable -- a PID or task limit?)");
+      vlog(V_VERBOSE, opt, "[GPU] thread allowance: no thread for the deferred bringup; CPU only\n");
+    }
   } else if (device_count > 0) {
     // auto / fixed-share hybrid: bring up inline.
     gpu_bringup();
@@ -54352,7 +54847,7 @@ static int run_calibrate(Options opt)
     bool tk_done = false;
     std::thread tk;
     if (scr.tty)
-      tk = std::thread([&] {
+      gz_try_thread(tk, [&] {   // the screen's ticker: optional (ROADMAP 46)
         std::unique_lock<std::mutex> lk(tk_mx);
         while (!tk_cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return tk_done; })) {
           double frac = -1.0;
@@ -56764,8 +57259,8 @@ static int gzstd_main(int argc, char ** argv)
   if (opt.mode == Mode::TEST || opt.mode == Mode::DECOMPRESS) {
     total_in_for_progress = known_input_size(opt, in);
     if (progress_loop_needed(opt, total_in_for_progress))
-      prog_thr = std::thread(progress_loop, std::cref(opt), &meter,
-                             total_in_for_progress, &prog_done);
+      gz_try_thread(prog_thr, progress_loop, std::cref(opt), &meter,   // optional (ROADMAP 46)
+                    total_in_for_progress, &prog_done);
   }
   // AN EXCEPTION MUST NOT FIND THIS THREAD JOINABLE (v0.18.24).  One escaping a
   // coder unwinds through here to main()'s handler ("fatal", exit 1, the partial

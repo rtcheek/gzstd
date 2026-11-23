@@ -1,10 +1,123 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.61  
+**Covers:** v0.9.50 → v0.18.62  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
+
+---
+
+
+## v0.18.62 — a run whose threads cannot all start finishes on the ones that did, or says why, where compress and --tar create aborted and a frame with zstd's workers exited 4; and a FIFO or device node extracts with its exact mode and, as root, its owner (ROADMAP 46, 47; 64 CPUs under systemd TasksMax: --tar create aborted at every limit to 40, now completes from 6)
+
+**Found while closing 45e, logged as ROADMAP 46 and 47 on my recommendation -- the wrong call: a found
+defect is fixed when it is found.**
+
+**46: a thread the system refuses.**  A PID or task limit (systemd TasksMax, a container's pids.max,
+RLIMIT_NPROC) fails a thread start with EAGAIN, and std::thread throws.  v0.18.61 gave the -d --tar extractor
+a fallback for each of its threads; everything else still started its threads in loops that unwound through
+joinable std::threads into std::terminate, or let the exception reach a handler that ended the run.  An
+operation sweep (systemd-run --user --scope -p TasksMax=N, node-1 CPUs, a 114 MiB file, an 8-member 305 MiB
+tree, each output checked):
+
+| | before (v0.18.61) | after |
+|---|---|---|
+| compress (any) | abort at 3-8; exit 1 ("fatal") at 12; exit 4 "ZSTD error: Allocation error : not enough memory" at 18-40 | completes from 4 |
+| compress from a pipe | abort at every limit to 40 | completes from 4 |
+| -d, -t, -dc from stdin | exit 1 "CPU decompression failed: Resource temporarily unavailable" to 8; abort at 4 | completes from 4 |
+| --tar create | abort at every limit tried, 3 to 40 | completes from 5 (CPU-only) / 6 (GPU) |
+| -d --tar of a pipe, -t --tar | exit 1 at 3-40 ("cannot start parallel decompress reader threads" at 24 and 40) | completes from 5 |
+
+Below those floors each ends in a clean exit 1 naming the thread the system refused.  (The sweep's own timeout
+process counts against the limit, so TasksMax=3 leaves gzstd two threads.)
+
+Every thread start outside the extractor that had no handling now goes through gz_try_thread or gz_try_pool,
+which return what started and never throw (the rest already had theirs: DirectWriter's drain falls back to
+synchronous writes, the stuck-batch reclaimer and the CPU rescue pool catch a refused start, a GPU worker's
+drain thread fails inside its bringup boundary, the GDS decode fan-out joins and faults):
+
+- **Essential threads start first and fail cleanly:** the ordered writer (compress, decompress, both GPU
+  coders) starts before the pools, so the pools, not the writer, absorb a shortfall.
+- **Pools run on what starts:** the CPU workers (compress, decompress, both hybrid pools), the parallel decode
+  readers (with none, the caller's single-threaded reader, which existed for another reason), the pooled
+  readers (the calling thread is reader 0), the --tar scan workers (one counter; with none, this thread), the
+  --direct-stage read-ahead (a frame no reader reached is a cache miss, the worker's own pread).
+- **Optional threads are skipped:** the progress bar (now started after the pools), the hybrid scheduler's tick
+  (it keeps its warm-up policy), the stall guard and --watchdog, the reader supervisors, the --adapt governor
+  and writer probe, the NVML pump (NVML unavailable), the GPU monitor, the input retirer, --calibrate's ticker.
+- **What has no thread runs inline:** the write pool (AsyncWritePool's own inline mode), the read-ahead
+  (ChunkPrefetcher reads as each chunk is taken), the frame verifier (the writer verifies) and the stream
+  verifier (decoded as written), the --tar assembler (this thread pushes, or reads, or with neither reads and
+  pushes every chunk in order), refused GDS issue and checksum stripes, the GDS write-behind, the CUDA
+  context warm-up.
+- **GPUs:** a GPU worker that cannot start is recorded exactly as one whose bringup failed (skipped, counted for
+  the bringup barrier and, in decode, as an exit, so --gpu-only's last-out rescue still fires); a deferred
+  bringup that cannot start leaves the GPUs out, as a declined one does (it cannot run inline: its sampling
+  waits for progress the caller has not made); --gpu-only with no worker at all ends in a clean error, having
+  no CPU pool.  Decode keeps one thread slot per selected device, refused ones empty, so its teardown's
+  join-or-detach of a reclaimed device and its tuner publication keep the device's index.  When a refused
+  slot is the last of --gpu-only's devices out -- a started worker failed its own bringup first -- decode runs
+  the last-out CPU rescue from the bringup thread (the producer keeps reading), and compress, whose bringup
+  can be on the producer, ends in a clean error; the other order is the worker's own rescue (two cards, one
+  failed by GZSTD_DEBUG_FAIL_GPU_BRINGUP, the other refused: both orders measured, exit 0 or the clean error).
+- **zstd's own workers:** a frame that asks for them (fewer frames than CPUs) has libzstd start a pool inside
+  the first compress call, and a refused pool came back as "Allocation error : not enough memory", reported as
+  a DATA error (exit 4) on every frame.  The frame is compressed again without them and the run stops asking;
+  likewise the single-stream path and --sliding-window, whose first call has already spent a --patch-from
+  prefix (zstd clears it at the start of its setup), so it is referenced again -- measured, the patch stays
+  15.01 MB, not a whole frame.  An allocation error without workers is real memory: exit 1, not 4.
+
+GPU build, --gpu-only and engaged hybrid on 960 MB under TasksMax 8-80: no abort; at 8 and 12 CUDA itself
+cannot start its threads, and compress skips the device and finishes on the CPU, decompress reports no usable
+device (exit 2, --gpu-only's existing contract).
+
+**47: FIFOs and device nodes.**  make_special passed the stored mode to mknodat, which the umask filters, and
+nothing set the mode or the owner afterwards (a regular file's is set exactly by fchmod): a FIFO stored 0666
+extracted 0664 under umask 002, and a root extract left every FIFO and device node owned by root.  Now, through
+an O_PATH|O_NOFOLLOW handle on the node, the owner first (fchownat AT_EMPTY_PATH, root only), then the exact
+mode (chmod through /proc/self/fd, since an O_PATH descriptor takes no fchmod), then the times.  Measured: 0666
+and 0600 FIFOs under umask 002 extract 666 and 600 (v0.18.60: 664); under GZSTD_DEBUG_FAKE_ROOT a FIFO's
+supplementary group is restored (v0.18.60: the extractor's).
+
+**Unlimited, against v0.18.61** (GPU builds, 64 CPUs, a cached 4 GiB file to /dev/null, three rotated
+rounds, wall s): compress 0.48-0.54 against 0.46-0.56, --cpu-only 0.44-0.62 against 0.48-0.52, decompress
+0.39-0.41 against 0.37-0.39, --tar create of the same 4 GiB as four files 0.48-0.51 against 0.47-0.50 -- ties
+(the only ordering change, compress's progress bar after its pool, draws nothing without a terminal).
+
+**Tests.**  GZSTD_DEBUG_THREADS=N fails every start through the helpers after the first N (the extractor keeps
+GZSTD_DEBUG_EXTRACT_THREADS).  Three cells: compress, decompress, --tar create, --sliding-window --verify and
+-T 1 --verify each at N = 0..9 -- never an abort or a hang, exit 0 with exact output or exit 1 naming the
+refused thread, each fallback's -v line seen at some N, and with no thread at all the writer verifying all six
+frames -- plus, where a user systemd is there, zstd's own workers under a real TasksMax (frames and
+--sliding-window); FIFOs' exact modes under umask 027 and, under fake root with a supplementary group, the
+owner; and on a GPU, hybrid at a fixed share and --gpu-only at N = 2..12, a refused GPU worker skipped.
+Eleven mutants, each caught: the compress pool's start unguarded (abort at N = 1-5),
+no zstd-workers retry (exit 1, no fallback, wrong output under TasksMax), the serial --tar assembly replaced
+by an error (its fallback never completes -- the cell first passed this one, because the -v line prints before
+the error; a fallback now counts only from a run that finished with the right output), no synchronous
+read-ahead and no inline stream verify (hangs to the timeout), no inline frame verify (the writer never checks
+the frames), the write pool's start unguarded (aborts), the decode readers dying instead of handing the input
+on (the first cell's 6 MB never reached the parallel reader; an arm over 128 MiB of input does), no chmod and
+no chown on a FIFO, and on a GPU the worker start unguarded (aborts in both modes).  589 / -e 938 / CPU-only 420.
+
+**Codex (gpt-6.1-sol, xhigh), round 1: NOT SAFE TO STAGE, three blockers and one high, all taken as it
+wrote them.**  (1) The GDS write-behind's inline fallback left its written jobs queued, and their retirement
+(clear, then check the error) runs only for a joinable thread: the next batch would have written its bytes at
+the previous batch's offsets.  Now cleared and checked inline, as the retirement does.  (2) A refused slot
+recorded after a started worker had already failed its bringup took the last failure and exit, and did not
+do the last-out rescue: --gpu-only could be left with no consumer.  (3) Decode compacted its started threads,
+so a refused middle device shifted every later one: teardown could join a reclaimed (parked) worker instead of
+detaching it, a hang.  (4) VerifyPool started a thread into a temporary and then grew its vector; a failed
+growth destroyed a joinable thread.  Also from the review: the GPU cell now covers decode as well as compress,
+and "every start goes through the helpers" is now said as it is.  Round 2: SAFE TO STAGE -- the four closed, no other correctness finding, no new
+work on a run that every thread start succeeds in; left as a test gap, a refused middle device followed by a
+successful later start, which the fixed slots handle by construction but a monotonic hook cannot reach.
+
+**Suites.**  -e 937 / 0 / 1 of 938 (34 min; the skip is the host-timing trivial-skip GPU cell, as before);
+CPU-only 420 / 0 / 136 (3 min).  Its drift note had read one short since v0.18.60, whose GPU tuner cell never
+raised the no-GPU delta; with this release's GPU cell it read two short ("expected 422 ... 420 ran"): the delta
+is now 169 (-e 254), and the rerun prints no note.
 
 ---
 

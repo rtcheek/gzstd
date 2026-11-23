@@ -633,8 +633,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=586
-$EXTENSIVE && EXPECTED_TESTS=935
+EXPECTED_TESTS=589
+$EXTENSIVE && EXPECTED_TESTS=938
+# v0.18.62: +2 cells after the v0.18.61 ones (a run whose threads cannot all start
+# finishes on the ones that did, or says why; a FIFO extracts with its exact mode, and
+# as root its owner), no GPU needed, and +1 GPU cell after the bringup-skip one (a GPU
+# worker the system refuses a thread is skipped, not an abort): 586 -> 589, -e 935 ->
+# 938; the CPU-only run 418 -> 420 passed (+1 skip).
 # v0.18.61: +2 cells after the v0.18.60 cut cell (extract keeps setuid under root's
 # chown, and xattrs on read-only files and dirs; an extract whose threads cannot all
 # start finishes on the ones that did), no GPU needed: 584 -> 586, -e 933 -> 935; the
@@ -1048,8 +1053,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=167   # + one v0.18.58; + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=252   # + two v0.18.58; + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=169   # + one v0.18.62; + one v0.18.60 (its GPU tuner cell; missed then: the note said 417 for 416); + one v0.18.58; + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=254   # + one v0.18.62; + one v0.18.60; + two v0.18.58; + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -4931,6 +4936,50 @@ CFLPY
   [[ -z "$gb_why" ]] && pass "a GPU that fails bringup is skipped, not a fault (pipe and file)" \
     || fail "a GPU that fails bringup is skipped, not a fault (pipe and file)" "$gb_why"
 
+  # ...AND SO IS ONE THE SYSTEM REFUSES A THREAD (v0.18.62, ROADMAP 46).  A GPU
+  # worker that cannot start is a device whose bringup failed (skipped, the CPU
+  # pool carries the run); a deferred bringup that cannot start leaves the GPUs
+  # out; --gpu-only with no worker at all, which has no CPU pool to carry it, ends
+  # in a clean error.  Hybrid at a fixed share and --gpu-only, compress and decode, at
+  # N = 1..12: never an abort or a hang, exit 0 with exact output or exit 1 naming the
+  # refused thread, and in hybrid the skipped device seen at some N both ways.
+  gw_why=""; gw_skip=0; gw_dskip=0; gw_err="$TMPDIR/gputhr.err"; gw_out="$TMPDIR/gputhr.zst"
+  gw_dec="$TMPDIR/gputhr.dec"
+  "$GZSTD" -q -k -f --cpu-only --chunk-size 1 "$gf_src" -o "$TMPDIR/gputhr-src.zst" 2>/dev/null
+  for gw_mode in hybrid gpuonly hybrid-d gpuonly-d; do
+    case $gw_mode in
+      hybrid)    gw_a=(-T 4 --hybrid --cpu-share=0.5 --chunk-size 1 "$gf_src" -o "$gw_out") ;;
+      gpuonly)   gw_a=(--gpu-only --chunk-size 1 "$gf_src" -o "$gw_out") ;;
+      hybrid-d)  gw_a=(-T 4 --hybrid --cpu-share=0.5 -d "$TMPDIR/gputhr-src.zst" -o "$gw_dec") ;;
+      gpuonly-d) gw_a=(--gpu-only -d "$TMPDIR/gputhr-src.zst" -o "$gw_dec") ;;
+    esac
+    for gw_n in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      rm -f "$gw_out" "$gw_dec"; gw_rc=0
+      GZSTD_DEBUG_THREADS=$gw_n timeout --foreground -k 10 120 "$GZSTD" -v -k -f "${gw_a[@]}" \
+        2>"$gw_err" || gw_rc=$?
+      if (( gw_rc == 0 )); then
+        if [[ $gw_mode == *-d ]]; then
+          cmp -s "$gw_dec" "$gf_src" || gw_why+=" $gw_mode/$gw_n:output"
+        else
+          "$GZSTD" -d -c --cpu-only "$gw_out" 2>/dev/null | cmp -s - "$gf_src" || gw_why+=" $gw_mode/$gw_n:output"
+        fi
+        if grep -q 'bringup failed (the system refused a thread); skipping device' "$gw_err"; then
+          [[ $gw_mode == hybrid ]] && gw_skip=1
+          [[ $gw_mode == hybrid-d ]] && gw_dskip=1
+        fi
+      elif (( gw_rc == 1 )); then
+        grep -q 'the system refused a thread' "$gw_err" || gw_why+=" $gw_mode/$gw_n:rc=1"
+      else
+        gw_why+=" $gw_mode/$gw_n:rc=$gw_rc"
+      fi
+    done
+  done
+  (( gw_skip )) || gw_why+=" [hybrid never skipped a refused GPU worker]"
+  (( gw_dskip )) || gw_why+=" [hybrid decode never skipped a refused GPU worker]"
+  rm -f "$gw_err" "$gw_out" "$gw_dec" "$TMPDIR/gputhr-src.zst"
+  [[ -z "$gw_why" ]] && pass "a GPU worker the system refuses a thread is skipped, not an abort" \
+    || fail "a GPU worker the system refuses a thread is skipped, not an abort" "$gw_why"
+
   # GPU-side --verify (--verify-engine=gpu): decompress + raw byte-compare each
   # batch in VRAM on the GPU.  Tiny config (1 GPU/1 stream/batch 1/4 MiB chunks)
   # so the verify buffers fit a small card.
@@ -5050,6 +5099,7 @@ else
   skip "GPU fault -> CPU-only rebuild (--tar)" "no GPU"
   skip "GPU fault over a pipe dies loudly" "no GPU"
   skip "a GPU that fails bringup is skipped, not a fault (pipe and file)" "no GPU"
+  skip "a GPU worker the system refuses a thread is skipped, not an abort" "no GPU"
   skip "trivial skip parks, never retires a GPU" "no GPU"
 fi
 
@@ -19922,6 +19972,128 @@ rm -rf "$TH"
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$th_why" ]] && pass "an extract whose threads cannot all start finishes on the ones that did" \
   || fail "an extract whose threads cannot all start finishes on the ones that did" "$th_why"
+
+# ROADMAP 46 (v0.18.62): a thread the system refuses, outside the extractor.  A
+# PID or task limit (systemd TasksMax, a container's pids.max) fails a thread start
+# with EAGAIN, and a start unwinding through joinable threads was std::terminate:
+# every compress and --tar create aborted under such a limit (64 CPUs, TasksMax up
+# to 40), a frame that takes zstd's own workers exited 4 ("Allocation error"), and
+# the decoders stopped where the threads that started could carry the run.  Now a
+# pool runs on the threads that start, an optional thread is skipped, an essential
+# one starts first or ends in a clean error, and what has no thread runs inline.
+# GZSTD_DEBUG_THREADS=N fails every start after the first N.  Each operation runs at
+# N = 0..9 and must never abort or hang: exit 0 with exact output, or exit 1 naming
+# the refused thread; and each fallback's -v line must show in a run that finished
+# with the right output, at some N.  Where a
+# user systemd is there, zstd's own workers meet a real TasksMax too.
+t0=$(now_ms); tr_why=""; tr_seen=""
+TR="$TMPDIR/thr46"; rm -rf "$TR"; mkdir -p "$TR/src/d"
+for tr_i in 1 2 3; do head -c 1500000 /dev/urandom | base64 -w0 > "$TR/src/d/m$tr_i"; done
+cat "$TR/src/d/m1" "$TR/src/d/m2" "$TR/src/d/m3" > "$TR/in"        # 6 MB, 6 frames at 1 MiB
+"$GZSTD" -q -f --cpu-only --chunk-size 1 -o "$TR/in.zst" "$TR/in" 2>/dev/null || tr_why+=" fixture"
+tr_op() {  # tr_op LABEL CHECK GZSTD-ARGS...: N = 0..9; CHECK (eval'd) verifies an exit-0 output
+  local l=$1 chk=$2 n rc; shift 2
+  for n in 0 1 2 3 4 5 6 7 8 9; do
+    rm -rf "$TR/o" "$TR/o.zst" "$TR/o.tzst" "$TR/ox"; rc=0
+    GZSTD_DEBUG_THREADS=$n timeout --foreground -k 5 60 "$GZSTD" -v -f --cpu-only "$@" 2>"$TR/err" || rc=$?
+    if (( rc == 0 )); then
+      # A fallback counts only from a run that finished with the right output.
+      if eval "$chk"; then
+        tr_seen+=$'\n'"$(sed 's/\x1b\[K//g' "$TR/err" | tr '\r' '\n' | grep -a 'thread allowance')"
+      else
+        tr_why+=" $l/$n:output"
+      fi
+    elif (( rc == 1 )); then
+      grep -aq 'the system refused a thread' "$TR/err" \
+        || tr_why+=" $l/$n:rc=1[$(grep -a -m1 -E 'ERROR|fatal' "$TR/err" | cut -c1-60)]"
+    else
+      tr_why+=" $l/$n:rc=$rc"
+    fi
+  done
+}
+tr_op compress '"$GZSTD" -dc --cpu-only "$TR/o.zst" 2>/dev/null | cmp -s - "$TR/in"' \
+  -T 4 --chunk-size 1 -o "$TR/o.zst" "$TR/in"
+tr_op decompress 'cmp -s "$TR/o" "$TR/in"' -T 4 -d -o "$TR/o" "$TR/in.zst"
+# Over 128 MiB of compressed input the decoder reads with parallel readers; with
+# none started it hands the input to its single-threaded reader.
+head -c 142606336 /dev/urandom > "$TR/rnd"
+"$GZSTD" -q -f --cpu-only -o "$TR/rnd.zst" "$TR/rnd" 2>/dev/null || tr_why+=" fixture-rnd"
+tr_op bigdecode 'cmp -s "$TR/o" "$TR/rnd"' -T 4 -d -o "$TR/o" "$TR/rnd.zst"
+rm -f "$TR/rnd" "$TR/rnd.zst"
+tr_op tar 'mkdir -p "$TR/ox" && "$GZSTD" -q -d --cpu-only --tar -C "$TR/ox" "$TR/o.tzst" 2>/dev/null && diff -r "$TR/src/d" "$TR/ox/d" >/dev/null' \
+  -T 4 --chunk-size 1 --tar -C "$TR/src" -o "$TR/o.tzst" d
+tr_op sliding '"$GZSTD" -dc --cpu-only "$TR/o.zst" 2>/dev/null | cmp -s - "$TR/in"' \
+  --sliding-window --verify -o "$TR/o.zst" "$TR/in"
+tr_op serial '"$GZSTD" -dc --cpu-only "$TR/o.zst" 2>/dev/null | cmp -s - "$TR/in"' \
+  -T 1 --chunk-size 1 --verify -o "$TR/o.zst" "$TR/in"
+# -T 1 --verify with no thread at all: the writer verified all six frames itself.
+GZSTD_DEBUG_THREADS=0 timeout --foreground -k 5 60 "$GZSTD" -v -f --cpu-only -T 1 --chunk-size 1 --verify \
+  -o "$TR/o.zst" "$TR/in" 2>"$TR/err" || tr_why+=" serial0:rc=$?"
+grep -aq '6 frames' "$TR/err" || tr_why+=" serial0:[$(grep -a -m1 '\[VERIFY\]' "$TR/err" | cut -c1-70)]"
+for tr_line in "worker threads started" "decompression threads started" \
+               "no parallel reader started; reading on this thread" \
+               "this thread reads and pushes every chunk in order" \
+               "no read-ahead thread; reading as it is taken" \
+               "no verify thread; the stream is decoded as it is written" \
+               "no verify thread; the writer verifies each frame" \
+               "no write thread; writing each batch inline"; do
+  grep -qF -- "$tr_line" <<<"$tr_seen" || tr_why+=" [never: $tr_line]"
+done
+# zstd's own workers under a real limit: one 6 MB frame at -T 8 asks for them, and
+# TasksMax=4 leaves room for the run's own threads only.
+if command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --scope -q -p TasksMax=64 -- true 2>/dev/null; then
+  for tr_m in frame sliding; do
+    # One frame at the default thread count asks for zstd's workers when the host
+    # has CPUs to spare (the -v line says so); a one-CPU host has none to refuse.
+    tr_a=(--chunk-size 16); [[ $tr_m == sliding ]] && tr_a=(-T 8 --sliding-window)
+    if [[ $tr_m == frame ]] && ! "$GZSTD" -v -f --cpu-only "${tr_a[@]}" -o "$TR/o.zst" "$TR/in" 2>&1 \
+         | grep -aq 'zstd workers inside each frame'; then
+      continue
+    fi
+    rm -f "$TR/o.zst"; rc=0
+    systemd-run --user --scope -q -p TasksMax=4 -- timeout -k 5 60 "$GZSTD" -v -f --cpu-only \
+      "${tr_a[@]}" -o "$TR/o.zst" "$TR/in" 2>"$TR/err" || rc=$?
+    (( rc == 0 )) || tr_why+=" tasksmax-$tr_m:rc=$rc"
+    grep -aqE 'zstd could not start (its own workers inside a frame|its worker threads)' "$TR/err" \
+      || tr_why+=" tasksmax-$tr_m:no-fallback-line"
+    "$GZSTD" -dc --cpu-only "$TR/o.zst" 2>/dev/null | cmp -s - "$TR/in" || tr_why+=" tasksmax-$tr_m:output"
+  done
+  tr_n="a run whose threads cannot all start finishes on the ones that did, or says why"
+else
+  tr_n="a run whose threads cannot all start finishes on the ones that did, or says why (no user systemd: hook only)"
+fi
+rm -rf "$TR"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$tr_why" ]] && pass "$tr_n" || fail "$tr_n" "$tr_why"
+
+# ROADMAP 47 (v0.18.62): a FIFO or device node came back with the umask applied
+# (mknodat's mode passes through it, and nothing set the mode afterwards -- a FIFO
+# stored 0666 extracted 0664 under umask 002) and, as root, owned by the extractor.
+# Now its owner, then its exact mode, as a regular file's.  The owner is checked
+# under GZSTD_DEBUG_FAKE_ROOT with a supplementary group, as the name-first
+# ownership test does; without one, the mode alone.
+t0=$(now_ms); sp_why=""
+SPC="$TMPDIR/spec47"; rm -rf "$SPC"; mkdir -p "$SPC/src/d" "$SPC/x" "$SPC/y"
+mkfifo "$SPC/src/d/p" && chmod 0666 "$SPC/src/d/p"
+mkfifo "$SPC/src/d/q" && chmod 0640 "$SPC/src/d/q"
+sp_grp=$(id -Gn | tr ' ' '\n' | grep -v "^$(id -gn)$" | head -1)
+[[ -n "$sp_grp" ]] && chgrp "$sp_grp" "$SPC/src/d/p"
+"$GZSTD" -q -f --cpu-only --tar -C "$SPC/src" -o "$SPC/a.tzst" d 2>/dev/null || sp_why+=" create"
+( umask 027; "$GZSTD" -d -q -f --cpu-only --tar -C "$SPC/x" "$SPC/a.tzst" 2>/dev/null ) || sp_why+=" extract"
+[[ $(stat -c %a "$SPC/x/d/p" "$SPC/x/d/q" | tr '\n' ' ') == "666 640 " ]] \
+  || sp_why+=" modes[$(stat -c %a "$SPC/x/d/p" "$SPC/x/d/q" | tr '\n' ' ')]"
+if [[ -n "$sp_grp" ]]; then
+  ( umask 027; GZSTD_DEBUG_FAKE_ROOT=1 "$GZSTD" -d -q -f --cpu-only --tar -C "$SPC/y" "$SPC/a.tzst" 2>/dev/null ) \
+    || sp_why+=" extract-root"
+  [[ $(stat -c '%a %G' "$SPC/y/d/p") == "666 $sp_grp" ]] || sp_why+=" root[$(stat -c '%a %G' "$SPC/y/d/p")]"
+  sp_n="a FIFO extracts with its exact mode, and as root its owner"
+else
+  sp_n="a FIFO extracts with its exact mode (no supplementary group: owner unchecked)"
+fi
+rm -rf "$SPC"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$sp_why" ]] && pass "$sp_n" || fail "$sp_n" "$sp_why"
 
 # ============================================================
 # Selective extraction (-d --tar ARCHIVE MEMBER..., positional -C)
