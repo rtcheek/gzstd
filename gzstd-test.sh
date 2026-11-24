@@ -633,8 +633,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=589
-$EXTENSIVE && EXPECTED_TESTS=938
+EXPECTED_TESTS=593
+$EXTENSIVE && EXPECTED_TESTS=942
+# v0.18.63: +3 cells after the v0.18.62 ones (a parallel extract readies an existing
+# directory before its partitions write into it; the --adapt profile save replaces only
+# a profile; --keep-going refused by its own name), no GPU needed, and +1 GPU cell in
+# Stats JSON output (a decode's record lists its GPUs): 589 -> 593, -e 938 -> 942; the
+# CPU-only run 420 -> 423 passed (+1 skip).
 # v0.18.62: +2 cells after the v0.18.61 ones (a run whose threads cannot all start
 # finishes on the ones that did, or says why; a FIFO extracts with its exact mode, and
 # as root its owner), no GPU needed, and +1 GPU cell after the bringup-skip one (a GPU
@@ -1053,8 +1058,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=169   # + one v0.18.62; + one v0.18.60 (its GPU tuner cell; missed then: the note said 417 for 416); + one v0.18.58; + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=254   # + one v0.18.62; + one v0.18.60; + two v0.18.58; + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=170   # + one v0.18.63; + one v0.18.62; + one v0.18.60 (its GPU tuner cell; missed then: the note said 417 for 416); + one v0.18.58; + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=255   # + one v0.18.63; + one v0.18.62; + one v0.18.60; + two v0.18.58; + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -2411,6 +2416,81 @@ else
   skip "--stats-json on a GPU compress: written, with each device's share" "no GPU"
 fi
 
+# v0.18.63: a DECODE's record lists its GPUs too.  Only compress handed its
+# devices to --stats-json, so `-d --gpu-only` and a CPU-only decode wrote the
+# same record.  Each route that decodes on a card -- -d, -t, the serial -d --tar
+# (-O), -t --tar -- now lists the devices, and their decoded bytes are the record's;
+# the parallel extract's GPU pool lists its devices, never claiming more than that.
+if has_gpu 2>/dev/null; then
+  t0=$(now_ms); why=""
+  dsrc="$TMPDIR/stats-gpu-d.src"
+  head -c 12000000 /dev/urandom | base64 -w0 > "$dsrc"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dsrc" -o "$dsrc.zst" 2>/dev/null || why+=" fixture"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 --tar -C "$TMPDIR" -o "$dsrc.tzst" stats-gpu-d.src 2>/dev/null \
+    || why+=" fixture-tar"
+  dstat_check() {   # dstat_check LABEL: the record lists devices that decoded all of it
+    [[ -s "$json_file" ]] || { why+=" $1:no-stats-file"; return; }
+    local total sum
+    total=$(grep -o '^  "output_bytes": [0-9]*' "$json_file" | grep -o '[0-9]*$')
+    sum=$(grep '"device":' "$json_file" | grep -o '"output_bytes": [0-9]*' | awk '{s += $2} END {print s + 0}')
+    (( $(grep -c '"device":' "$json_file") >= 1 )) || why+=" $1:no-devices"
+    [[ -n "$total" && "$sum" == "$total" ]] || why+=" $1:device-output-$sum-of-${total:-?}"
+    grep -q '"uuid": "GPU-' "$json_file" || why+=" $1:no-uuid"
+  }
+  rm -f "$json_file"
+  "$GZSTD" -q -f --gpu-only -d --stats-json "$json_file" "$dsrc.zst" -o "$dsrc.out" 2>/dev/null \
+    || why+=" d:rc$?"
+  dstat_check d
+  rm -f "$json_file"
+  "$GZSTD" -q --gpu-only -t --stats-json "$json_file" "$dsrc.zst" 2>/dev/null || why+=" t:rc$?"
+  dstat_check t
+  rm -f "$json_file"
+  "$GZSTD" -q --gpu-only -dc --stats-json "$json_file" "$dsrc.zst" "$dsrc.zst" 2>/dev/null > /dev/null \
+    || why+=" two:rc$?"
+  dstat_check two
+  grep -q '"files": 2' "$json_file" 2>/dev/null || why+=" two:files"
+  rm -f "$json_file"
+  "$GZSTD" -q --gpu-only -d --tar "$dsrc.tzst" -O --stats-json "$json_file" 2>/dev/null > /dev/null \
+    || why+=" tar-O:rc$?"
+  dstat_check tar-O
+  rm -f "$json_file"
+  "$GZSTD" -q --gpu-only -t --tar "$dsrc.tzst" --stats-json "$json_file" 2>/dev/null || why+=" tar-t:rc$?"
+  dstat_check tar-t
+  # The parallel extract's GPU pool: two members whose boundary falls inside a
+  # frame, which both partitions decode.  Each charges only its own bytes, so
+  # the devices never claim more than the record holds (the pre-tag review: a
+  # GPU-decoded boundary frame was charged whole, twice -- 67 MB of 50).
+  mkdir -p "$TMPDIR/stats-gpu-p/src" "$TMPDIR/stats-gpu-p/x"
+  head -c 18874368 /dev/urandom | base64 -w0 > "$TMPDIR/stats-gpu-p/src/a"
+  cp "$TMPDIR/stats-gpu-p/src/a" "$TMPDIR/stats-gpu-p/src/b"
+  "$GZSTD" -q -f --cpu-only --chunk-size 16 --tar -C "$TMPDIR/stats-gpu-p/src" \
+    -o "$TMPDIR/stats-gpu-p/a.tzst" a b 2>/dev/null || why+=" pool:fixture"
+  rm -f "$json_file"
+  GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 GZSTD_DEBUG_POOL_GPU_FIRST=1 timeout --foreground -k 10 180 \
+    "$GZSTD" -q -f -d --gpu-only -T8 --tar "$TMPDIR/stats-gpu-p/a.tzst" -C "$TMPDIR/stats-gpu-p/x" \
+    --stats-json "$json_file" 2>/dev/null || why+=" pool:rc$?"
+  if [[ -s "$json_file" ]]; then
+    p_total=$(grep -o '^  "output_bytes": [0-9]*' "$json_file" | grep -o '[0-9]*$')
+    p_sum=$(grep '"device":' "$json_file" | grep -o '"output_bytes": [0-9]*' | awk '{s += $2} END {print s + 0}')
+    (( p_sum > 0 && p_sum <= ${p_total:-0} )) || why+=" pool:device-output-$p_sum-of-${p_total:-?}"
+  else
+    why+=" pool:no-stats-file"
+  fi
+  cmp -s "$TMPDIR/stats-gpu-p/src/a" "$TMPDIR/stats-gpu-p/x/a" && cmp -s "$TMPDIR/stats-gpu-p/src/b" "$TMPDIR/stats-gpu-p/x/b" \
+    || why+=" pool:content"
+  rm -rf "$TMPDIR/stats-gpu-p"
+  rm -f "$json_file"
+  "$GZSTD" -q -f --cpu-only -d --stats-json "$json_file" "$dsrc.zst" -o "$dsrc.out" 2>/dev/null
+  [[ -s "$json_file" ]] || why+=" cpu-only-no-stats-file"
+  grep -q '"gpu"' "$json_file" 2>/dev/null && why+=" cpu-only-has-gpu"
+  rm -f "$json_file" "$dsrc" "$dsrc.zst" "$dsrc.tzst" "$dsrc.out"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--stats-json on a GPU decode: each device that decoded, on -d, -t and -d --tar" \
+    || fail "--stats-json on a GPU decode: each device that decoded, on -d, -t and -d --tar" "got$why"
+else
+  skip "--stats-json on a GPU decode: each device that decoded, on -d, -t and -d --tar" "no GPU"
+fi
+
 # ============================================================
 # 14. Exit codes
 # ============================================================
@@ -3595,7 +3675,9 @@ GTPY
       # (v0.18.28; a frame short of the file's size before, the rescue counting
       # only the undelivered tail).
       if [[ $gt_name == clean || $gt_name == table || $gt_name == rescue ]]; then
-        [[ "$(grep -oE '"input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+        # The record's own totals, at line start: since v0.18.63 a decode record also
+        # lists each GPU device with its own input_bytes/output_bytes.
+        [[ "$(grep -oE '^  "input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
            == "$(stat -c %s "$gt$gt_suffix.zst")" ]] || gt_why+=" $gt_name:input_bytes"
       fi
       # No CPU decoded anything on a clean --gpu-only run (v0.18.28: cpu.threads 0).
@@ -3610,7 +3692,7 @@ GTPY
       --stats-json "$gt.json" "$gt.zst" 2>"$gt.err" | cmp -s - "$TMPDIR/large.bin" \
       || gt_why+=" rescue-d:bytes"
     grep -Fq 'simulated GPU decompress fault' "$gt.err" || gt_why+=" rescue-d:fault-did-not-fire"
-    [[ "$(grep -oE '"input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+    [[ "$(grep -oE '^  "input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
        == "$(stat -c %s "$gt.zst")" ]] || gt_why+=" rescue-d:input_bytes"
     # The CPU rescue pool decoded the tail: -T 3 of it (v0.18.28).
     grep -q '"cpu": { "threads": 3 }' "$gt.json" 2>/dev/null || gt_why+=" rescue-d:cpu.threads"
@@ -3674,9 +3756,9 @@ GTIDLE
         || gt_why+=" hop-$gt_hop:cpu.threads"
       grep -qE '\[GPU[0-9]+/S[0-9]+\] done batch=' "$gt.err" \
         || gt_why+=" hop-$gt_hop:no-GPU-batch"
-      [[ "$(grep -oE '"input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+      [[ "$(grep -oE '^  "input_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
          == "$(stat -c %s "$gt-hop.zst")" ]] || gt_why+=" hop-$gt_hop:input_bytes"
-      [[ "$(grep -oE '"output_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
+      [[ "$(grep -oE '^  "output_bytes": [0-9]+' "$gt.json" 2>/dev/null | grep -oE '[0-9]+$')" \
          == "$(stat -c %s "$gt-hop.tar")" ]] || gt_why+=" hop-$gt_hop:output_bytes"
     done
     # The A/B hook restores D2H, and /dev/null remains on that delivery path.
@@ -20094,6 +20176,149 @@ fi
 rm -rf "$SPC"
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$sp_why" ]] && pass "$sp_n" || fail "$sp_n" "$sp_why"
+
+# ROADMAP 45j (v0.18.63): the parallel extract's partitions run side by side, so
+# one could write d/f before the partition holding d/ had readied d, as the serial
+# walk's make_dir does: widen an existing directory without owner rwx (a second
+# extract of an archive that stores d read-only), replace a file or symlink where
+# d belongs.  Before: 4 of 5, 4 of 4 and 5 of 6 runs failed.  GZSTD_DEBUG_TAR_DIR_DELAY_MS
+# makes every partition write into d before d's entry is reached, so this is the
+# failing order every time, not a race.  The plan's directories are readied
+# before the partitions start, shallowest first, reversibly (the index is a
+# claim): the CLAIM_DIR hook names directories the stream does not hold, and what
+# was there comes back, deepest first.  "nested" sets a file aside inside r, which the archive
+# restores read-only, so the aside must go before directory modes are restored;
+# "foreign" is a GNU tar stream listing r/s/g before r/s/ and r/ (the header-hop
+# plan, and the depth order).
+t0=$(now_ms); pd_why=""
+PD="$TMPDIR/pd45j"; rm -rf "$PD"; mkdir -p "$PD/src/d" "$PD/src/r/s" "$PD/src/q/w"
+for i in 1 2 3 4 5 6 7 8; do head -c 2400000 /dev/urandom | base64 -w 76 > "$PD/src/d/f$i"; done
+echo r1 > "$PD/src/r/f1"; echo g > "$PD/src/r/s/g"
+chmod 0750 "$PD/src/d"; chmod 0755 "$PD/src/r/s"; chmod 0555 "$PD/src/r"; chmod 0500 "$PD/src/q/w"
+"$GZSTD" -q -f --cpu-only --chunk-size 1 --tar -C "$PD/src" -o "$PD/a.tzst" d r q/w 2>/dev/null || pd_why+=" create"
+pd_tar=false
+if command -v tar >/dev/null 2>&1; then
+  tar -cf - --no-recursion -C "$PD/src" d d/f1 d/f2 d/f3 d/f4 d/f5 d/f6 d/f7 d/f8 r/s/g r/s r r/f1 2>/dev/null \
+    | "$GZSTD" -q --cpu-only --chunk-size 1 -c > "$PD/f.tzst" 2>/dev/null && pd_tar=true
+fi
+chmod 0755 "$PD/src/r"
+pd_x() {   # pd_x ARCHIVE [ENV...]: extract into $PD/x, which the caller prepared
+  local arc="$1"; shift
+  env GZSTD_DEBUG_TAR_DIR_DELAY_MS=300 "$@" "$GZSTD" -v -d -f --cpu-only --tar "$arc" -C "$PD/x" \
+    >/dev/null 2>"$PD/err" || pd_why+=" $pd_l:exit$?"
+  tr '\r' '\n' < "$PD/err" | grep -aq 'parallel-extract: [0-9]* partitions' || pd_why+=" $pd_l:not-parallel"
+  [[ -z $(find "$PD/x" -name '.gzstd-aside-*' 2>/dev/null) ]] || pd_why+=" $pd_l:aside-left"
+}
+pd_ok() {  # the tree every case must end with
+  local i; for i in 1 2 3 4 5 6 7 8; do cmp -s "$PD/src/d/f$i" "$PD/x/d/f$i" || { pd_why+=" $pd_l:f$i"; break; }; done
+  [[ $(cat "$PD/x/r/f1" "$PD/x/r/s/g" 2>/dev/null | tr '\n' ' ') == "r1 g " ]] || pd_why+=" $pd_l:r-content"
+  [[ $(stat -c '%F %a' "$PD/x/d" "$PD/x/r" "$PD/x/r/s" 2>/dev/null | tr '\n' ' ') \
+       == "directory 750 directory 555 directory 755 " ]] \
+    || pd_why+=" $pd_l:modes[$(stat -c '%F %a' "$PD/x/d" "$PD/x/r" "$PD/x/r/s" 2>/dev/null | tr '\n' ' ')]"
+}
+pd_reset() { chmod -R u+rwx "$PD/x" 2>/dev/null; rm -rf "$PD/x" "$PD/el"; mkdir -p "$PD/x" "$PD/el"; }
+pd_l=ro;     pd_reset; mkdir "$PD/x/d"; chmod 0555 "$PD/x/d"; pd_x "$PD/a.tzst"; pd_ok
+pd_l=link;   pd_reset; ln -s ../el "$PD/x/d"; pd_x "$PD/a.tzst"; pd_ok
+[[ -z $(ls -A "$PD/el") ]] || pd_why+=" link:wrote-through"
+pd_l=file;   pd_reset; echo x > "$PD/x/d"; pd_x "$PD/a.tzst"; pd_ok
+pd_l=again;  pd_x "$PD/a.tzst"; pd_ok   # the same archive again: r is 0555 now
+pd_l=nested; pd_reset; mkdir "$PD/x/r"; echo x > "$PD/x/r/s"; pd_x "$PD/a.tzst"; pd_ok
+pd_l=claim;  pd_reset; echo precious > "$PD/x/y"
+pd_x "$PD/a.tzst" GZSTD_DEBUG_TAR_CLAIM_DIR=y; pd_ok
+[[ $(cat "$PD/x/y" 2>/dev/null) == precious ]] || pd_why+=" claim:file-not-restored"
+pd_l=claimdir; pd_reset; mkdir "$PD/x/z"; chmod 0500 "$PD/x/z"
+pd_x "$PD/a.tzst" GZSTD_DEBUG_TAR_CLAIM_DIR=z; pd_ok
+[[ $(stat -c %a "$PD/x/z") == 500 ]] || pd_why+=" claimdir:mode[$(stat -c %a "$PD/x/z")]"
+# Nested claims are undone deepest first: z restored to 0000 before z/e would
+# leave z/e unreachable and widened (the pre-tag review's L1).
+# Twice: through the handles settle holds, and with none held (UNDO_FDS=0: the
+# path walk, past the cap), where the order is what reaches z/e.
+for pd_fds in held 0; do
+  pd_l=claimnest-$pd_fds; pd_reset; mkdir -p "$PD/x/z/e"; chmod 0500 "$PD/x/z/e"; chmod 0000 "$PD/x/z"
+  if [[ $pd_fds == held ]]; then pd_x "$PD/a.tzst" GZSTD_DEBUG_TAR_CLAIM_DIR=z:z/e
+  else pd_x "$PD/a.tzst" GZSTD_DEBUG_TAR_CLAIM_DIR=z:z/e GZSTD_DEBUG_TAR_UNDO_FDS=0; fi
+  pd_ok
+  pd_m=$(stat -c %a "$PD/x/z"); chmod 0700 "$PD/x/z"
+  [[ "$pd_m $(stat -c %a "$PD/x/z/e")" == "0 500" ]] || pd_why+=" $pd_l:modes[$pd_m $(stat -c %a "$PD/x/z/e")]"
+done
+# A claimed parent's mode goes back AFTER directory metadata: the archive holds q/w/
+# (0500) but not q/, so q 0000 put back first hid q/w, which kept its scratch 0700.
+pd_l=claimchild; pd_reset; mkdir "$PD/x/q"; printf original > "$PD/x/q/w"; chmod 0000 "$PD/x/q"
+pd_x "$PD/a.tzst" GZSTD_DEBUG_TAR_CLAIM_DIR=q; pd_ok
+pd_m=$(stat -c %a "$PD/x/q"); chmod 0700 "$PD/x/q"
+[[ "$pd_m $(stat -c '%F %a' "$PD/x/q/w")" == "0 directory 500" ]] \
+  || pd_why+=" claimchild:modes[$pd_m $(stat -c '%F %a' "$PD/x/q/w")]"
+[[ -z $(find "$PD/x/q" -name '.gzstd-aside-*') ]] || pd_why+=" claimchild:aside-left"
+# ...and through a handle held from before directory metadata: the archive restores
+# p with mode 0000, so after it no path reaches p/u (claimed, not in the archive);
+# the undo used to report that (exit 4) and leave p/u at 0700.  The create skips
+# reading the unreadable p (exit 1, as GNU tar) but stores it, as the listing shows.
+mkdir -p "$PD/s2/p"; head -c 3000000 /dev/urandom | base64 > "$PD/s2/f1"; cp "$PD/s2/f1" "$PD/s2/f2"
+chmod 0000 "$PD/s2/p"
+"$GZSTD" -q -f --cpu-only --chunk-size 1 --tar -C "$PD/s2" -o "$PD/p.tzst" p f1 f2 2>/dev/null
+chmod 0755 "$PD/s2/p"
+"$GZSTD" -l --tar "$PD/p.tzst" 2>/dev/null | grep -q '^d--------- .* p/$' || pd_why+=" claimdeep:fixture"
+pd_l=claimdeep; pd_reset; mkdir -p "$PD/x/p/u"; chmod 0500 "$PD/x/p/u"
+pd_x "$PD/p.tzst" GZSTD_DEBUG_TAR_CLAIM_DIR=p/u
+pd_m=$(stat -c %a "$PD/x/p"); chmod 0700 "$PD/x/p"
+[[ "$pd_m $(stat -c %a "$PD/x/p/u")" == "0 500" ]] || pd_why+=" claimdeep:modes[$pd_m $(stat -c %a "$PD/x/p/u")]"
+pd_n="a parallel extract readies an existing directory before its partitions write into it, reversibly"
+if $pd_tar; then
+  pd_l=foreign; pd_reset; mkdir "$PD/x/r"; echo x > "$PD/x/r/s"; chmod 0555 "$PD/x/r"
+  pd_x "$PD/f.tzst"; pd_ok
+else
+  pd_n+=" (no tar: the foreign archive unchecked)"
+fi
+pd_reset; rm -rf "$PD"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$pd_why" ]] && pass "$pd_n" || fail "$pd_n" "$pd_why"
+
+# ROADMAP 7 (v0.18.63): the --adapt profile save renamed a new profile over
+# whatever the path held, so an output named there was destroyed at exit 0 --
+# with --rm, the source too.  Only a profile (a numeric gzstd_profile, any epoch,
+# or a damaged file that opens with that key), an empty file or a non-regular
+# entry is replaced now; anything else is left, and the save says so.
+t0=$(now_ms); ap_why=""
+AP="$TMPDIR/ap7"; rm -rf "$AP"; mkdir -p "$AP/x/gzstd"; APP="$AP/x/gzstd/profile.json"
+seq 1 300000 > "$AP/src"; cp "$AP/src" "$AP/victim"
+ap_run() { env XDG_CACHE_HOME="$AP/x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt --cpu-only -q "$@"; }
+ap_run --rm "$AP/victim" -o "$APP" 2>"$AP/err" || ap_why+=" rm-run:$?"
+[[ -e "$AP/victim" ]] && ap_why+=" rm-did-not-remove"
+"$GZSTD" -dc "$APP" 2>/dev/null | cmp -s - "$AP/src" || ap_why+=" archive-lost"
+grep -q 'is not a gzstd profile' "$AP/err" || ap_why+=" no-warning"
+rm -f "$APP"; ap_run -f "$AP/src" -o "$AP/o.zst" --stats-json "$APP" 2>/dev/null || ap_why+=" stats-run:$?"
+grep -q '"mode"' "$APP" && ! grep -q '"gzstd_profile"' "$APP" || ap_why+=" stats-lost"
+printf '{"gzstd_profile": 1, "entries": {}}\n' > "$APP"
+ap_run -f "$AP/src" -o "$AP/o.zst" 2>/dev/null || ap_why+=" stale-run:$?"
+grep -q '"gzstd_version"' "$APP" && ! grep -q '"gzstd_profile": 1,' "$APP" || ap_why+=" stale-not-replaced"
+: > "$APP"; ap_run -f "$AP/src" -o "$AP/o.zst" 2>/dev/null || ap_why+=" empty-run:$?"
+grep -q '"gzstd_version"' "$APP" || ap_why+=" empty-not-replaced"
+# A DAMAGED profile is still one (it opens with its key), and is rewritten; JSON
+# that is not one, even naming the key further in, is kept.
+printf '{"gzstd_profile": 3, "entries": {' > "$APP"
+ap_run -f "$AP/src" -o "$AP/o.zst" 2>/dev/null || ap_why+=" damaged-run:$?"
+grep -q '"gzstd_version"' "$APP" || ap_why+=" damaged-not-replaced"
+printf '{"note": "mine", "gzstd_profile": 3' > "$APP"
+ap_run -f "$AP/src" -o "$AP/o.zst" 2>/dev/null || ap_why+=" json-run:$?"
+[[ "$(cat "$APP")" == '{"note": "mine", "gzstd_profile": 3' ]] || ap_why+=" json-replaced"
+rm -rf "$AP"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+ap_n="the --adapt profile save replaces only a profile: an output named there survives"
+[[ -z "$ap_why" ]] && pass "$ap_n" || fail "$ap_n" "$ap_why"
+
+# v0.18.63: --keep-going implies --cpu-only, so `-d --hybrid --keep-going` is
+# refused -- and was refused as "--cpu-only cannot be combined with --hybrid",
+# naming a flag the user never typed.  The refusal names --keep-going now.
+t0=$(now_ms); kg_why=""
+printf 'keep-going naming\n' > "$TMPDIR/kgn.txt"
+"$GZSTD" -q -f --cpu-only "$TMPDIR/kgn.txt" -o "$TMPDIR/kgn.zst" 2>/dev/null || kg_why+=" fixture"
+kg_err=$("$GZSTD" -d -f -q --keep-going --hybrid "$TMPDIR/kgn.zst" -o "$TMPDIR/kgn.out" 2>&1); kg_rc=$?
+[[ $kg_rc -eq 2 ]] || kg_why+=" rc=$kg_rc"
+[[ "$kg_err" == *"--keep-going recovers on the CPU decoder"*"--hybrid"* ]] || kg_why+=" message[${kg_err:0:80}]"
+rm -f "$TMPDIR/kgn.txt" "$TMPDIR/kgn.zst" "$TMPDIR/kgn.out"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+kg_n="--keep-going with --hybrid is refused by --keep-going's name (exit 2)"
+[[ -z "$kg_why" ]] && pass "$kg_n" || fail "$kg_n" "$kg_why"
 
 # ============================================================
 # Selective extraction (-d --tar ARCHIVE MEMBER..., positional -C)

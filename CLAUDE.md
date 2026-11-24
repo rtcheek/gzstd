@@ -71,10 +71,13 @@ lower total (skips, not failures).
 
 ```bash
 ./gzstd-gendata.sh 512         # generate 2.5 GiB test data (5 compressibility profiles)
-./gzstd-benchmark.sh           # full sweep (batch size, streams, threads, levels)
+./gzstd-benchmark.sh           # baseline rows: default, cpu-only, gpu-only, hybrid, adapt
+./gzstd-benchmark.sh --cpus 4,8,16,all --tar --list   # CPU-allowance axis + --tar rows; --list prints, runs nothing
 ```
 
-Results written to `benchmark-results.json`.
+Results written to `benchmark-results.json`.  Every row records what the run DID (GPU share, cards,
+CPU threads, from `--stats-json`) and flags one that did not run as its label asks: a default or
+`--hybrid` run starts its GPUs only where they pay, so a label is a request, not a description.
 
 ## Architecture
 

@@ -158,11 +158,19 @@ silently compiled out.
   `--cpu-only` already sits at 98.5% of that ceiling. Benchmark the GPU path against RAM
   sources/sinks here. That is a property of this host, **not** a reason to stop optimising the GPU
   path: gzstd must be fast on machines we do not own.
-- Inline decode is the default for `-d --tar`; offload to the decode pool happens only
-  when writers starve. Free when write-bound, 1.8x when decode-bound.
+- `-d --tar` of an indexed archive decodes inline in each partition, EXCEPT where the partitions
+  cannot spread the decode (v0.18.59): when the threads inline would decode on (whole-frame work
+  over the largest partition's) are fewer by a quarter than the pool could run, the default takes a
+  shared pool of CPU decoders, at most 8 automatically.  `--adapt` keeps its older, opt-in pool:
+  when enabled, the pool starts engaged and its controller contracts readers and decoders.
 - The GPU decode pool spawns lazily (only when the CPU pool is maxed, still starved, and
   enough work remains to outlast ~4 s of `cuInit`) to avoid a speculative VRAM grab.
-- The tar parse is serial by design; large files become windowed part-jobs on the pool.
+- The tar parse is parallel only on an indexed archive (gzstd's member index, or a foreign seekable
+  one walked by header hops): up to 16 partitions on entry boundaries, and since v0.18.60 a member
+  over half the stream cut across them on the writers' part grid.  A pipe, `-O`, `--keep-going` and
+  an archive with no usable table walk serially.  Large files become windowed part-jobs on the
+  writer pool either way.  Partitions run side by side, so anything the serial walk does at a
+  directory entry for what follows it must be done before they start (v0.18.63: prepare_dirs).
 - **A truncated trailing SKIPPABLE frame is recoverable for `-d`, fatal for `-t` and `-l`**
   (v0.15.75; v0.15.73 tolerated it everywhere, which was wrong). A skippable frame carries no
   user data, so a clipped one at EOF cannot hide missing content, and gzstd's own index /

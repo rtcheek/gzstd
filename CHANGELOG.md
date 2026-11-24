@@ -1,12 +1,242 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.62  
+**Covers:** v0.9.50 → v0.18.63  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.63 — the --adapt profile save replaces only a profile, so an output named there survives, a parallel extract readies an existing directory before its partitions write into it, and its decode pool stops zero-filling a buffer per frame (ROADMAP 7, 45j)
+
+**Both were logged, not fixed: 7 as the caller's doing, 45j by the v0.18.60 review.  Asked which known bugs
+could lose data, both reproduced; the first lost it at exit 0.**
+
+**7: the profile save destroyed whatever the profile path held.**  adapt_profile_save loads the profile,
+merges this run, and renames a new file over the path.  A file it could not parse was read as a damaged
+profile and rewritten, and a JSON file without the gzstd_profile key read as an older schema, so it was
+rewritten too.  Measured on v0.18.62, with the save gate lowered by its test hook:
+
+| command | v0.18.62 | v0.18.63 |
+|---|---|---|
+| gzstd --adapt --rm f -o PROFILE | exit 0; f removed; PROFILE holds a profile, the archive is gone | exit 0; f removed; PROFILE holds the archive (round-trips), the save skipped with a warning |
+| --stats-json PROFILE | the record replaced by the profile | the record kept |
+| a profile of an older epoch, an empty file, a symlink at the path | replaced (the link as a name, its target untouched) | the same |
+| --calibrate onto a file that is not a profile | replaced | left; [CALIBRATE] says NOT recorded |
+
+The save now replaces only nothing, a profile (a numeric gzstd_profile: every profile written since v0.15.1
+carries one, or a damaged file that opens with that key), an empty file, or a non-regular entry (a symlink, a FIFO: the rename replaces the name, never
+data).  Anything else is someone's data: the save is skipped, the existing warning (--adapt could not
+persist its profile) names the path and says to move it aside, and every later --adapt run says the same
+until it is moved.  This is a test of content, not of which files this run wrote, so an output an earlier
+run left there (with or without --adapt) is kept as well.  A DAMAGED profile is still recognised and
+rewritten: a fresh profile is written opening with `{` and then the gzstd_profile key, so a regular file that
+does not parse but opens that way (truncated by a crash or a full disk) is replaced as before, while an archive,
+a --stats-json record (it opens with "version") or JSON naming the key further in is kept.  A reserved-prefix
+heuristic, not proof: data that happens to open with that key would be taken for a damaged profile, and a
+damaged profile that does not open so (reordered, or cut inside its first bytes) still needs moving aside.
+Only a regular file's first bytes are read (round 7: a FIFO's queued bytes would otherwise be consumed).  (The
+first form of this fix kept every unparseable file; the -e suite's "corrupt profile discarded and rewritten"
+cell caught that it no longer repaired a truncated profile.)
+The check is in the save, under its lock, because every writer of the profile (--adapt's runs and
+--calibrate) goes through it.  A stdout redirected onto the profile was already refused (v0.17.88).
+
+**45j: the parallel extract wrote into directories before their own entries had readied them.**  The serial
+walk reaches a directory's entry before its contents, and make_dir readies the path: an existing directory
+without owner rwx is widened (so a second extract of an archive that stores a read-only directory works,
+where GNU tar fails), and a file or symlink where the directory belongs is replaced.  run_parallel's
+partitions run side by side, so a partition could create d/f before the partition holding d/ had readied d.
+Measured on v0.18.62, 16 files of 30 MiB under d, eight partitions:
+
+| destination | default (parallel) | --keep-going (serial walk) |
+|---|---|---|
+| d exists, 0555 | 4 of 5 runs exit 1, 13-15 files ("Permission denied") | every run exit 0, 16 files (5) |
+| the same archive again, d stored 0555 | 4 of 4 exit 1 ("File exists": the old file cannot be unlinked) | every run exit 0 (4) |
+| a symlink at d | 2 of 3 exit 1 | every run exit 0 (3) |
+| a file at d | 3 of 3 exit 1 | every run exit 0 (3) |
+
+GNU tar fails the first two outright (exit 2, 0 files).  Every failure named its file and exited non-zero;
+nothing passed as a success, and nothing was written through the symlink.
+
+The plan already reads every entry's name and type, so it now hands run_parallel the directories, and
+Extractor::prepare_dirs readies the ones that exist, before any partition starts, shallowest first.  They come
+from the member index, which is a claim, so nothing done there is irreversible: an existing directory is
+widened and its mode remembered; a non-directory is renamed aside (renameat2 NOREPLACE, a random
+.gzstd-aside- name) and an empty directory made in its place.  After the partitions and their writers,
+before finish_deferred restores directory modes and times, settle_prepared_dirs keeps what the stream's own
+directory entries confirmed (the aside is unlinked, as make_dir would have unlinked the original) and undoes
+the rest: a widened directory gets its mode back; an empty directory goes and the original returns; if
+something was written into it, the original stays aside and the run says where (exit 4).  A directory that
+does not exist is left to the partitions as before, and so is everything beneath one: in a fresh destination
+the syscalls are one fstatat per top-level directory, beside the planning work (the plan's directory keys
+copied, sorted by depth, and the missing ones hashed: 20,000 each for 20,000 directories); onto an existing
+tree, one fstatat per directory.
+
+After: every case above, eight runs each, exit 0 with every file; the parallel tree equals the serial walk's
+in type, mode, mtime, size and link target (a nested archive, a FIFO at d too, four rounds each), including
+the restored mtime of the parent the aside was in.  Not equal by design: an archive that lists a directory
+after its contents (a GNU tar stream, foreign) now extracts in parallel where the serial walk fails the
+contents, because the directories are readied first whatever the order.  Cost, 60,205 entries in 20,000
+directories, 8 partitions, CPU-only build, five rotated rounds: fresh destination 0.75-0.83 s against
+v0.18.62's 0.77-0.91; extracting it again onto the tree 0.99-1.09 against 0.94-1.21.
+
+Three test hooks: GZSTD_DEBUG_TAR_DIR_DELAY_MS=N holds each directory entry N ms in a partition, so the
+other partitions write into it first (the failing order, forced rather than raced for); GZSTD_DEBUG_TAR_CLAIM_DIR=
+PATH[:PATH...] adds directories the index claims and the stream does not hold, which drives the undo;
+GZSTD_DEBUG_TAR_UNDO_FDS=N caps the handles the undo holds (0: the path walk alone).
+
+**The shared decode pool's wasted work (the review's count, v0.18.59's default path).**  Each pooled frame's
+compressed bytes went into a fresh std::vector<char>: allocated, zero-filled by resize, overwritten by the
+pread, and freed after the decode -- for two 6 GiB members of base64 (9.2 GiB archive, 780 frames) the whole
+archive zeroed once more.  They now go into a FrameVec, default-initialised (no zero-fill) and drawn from
+FrameMem, which hands a freed block to the next frame instead of faulting in a new one.  The compressed buffer
+is still dropped before its frame is published, so no slot owns more than its reservation; a freed block can
+stay resident in FrameMem's cache, outside the slots' charge but within FrameMem's one shared cap, as every
+frame buffer's does (under a known memory limit it is reused only at its own page-rounded size).  And
+each partition created an inline decoder context the pool never let it use; it is now made the first time a
+partition decodes a frame itself.  MEASURED, the GPU build, that archive extracted to /dev/shm, 8 CPUs of one
+node with its memory, eight rotated rounds (6 decoders, a 12-frame budget):
+
+| | before | after |
+|---|---|---|
+| wall | 3.66-4.08 s | 3.57-3.85 s |
+| user CPU, mean | 11.95 s | 11.30 s |
+| system CPU, mean | 13.37 s | 12.95 s |
+| peak RSS | 1,945 MB | 1,743 MB |
+| minor faults | 503K | 469K |
+
+Byte-identical on every pool route: the default CPU pool, --adapt's, the forced GPU pool (586 frames on the
+cards), and a GPU stall whose 64 reclaimed frames went back to the CPU (the rescue copies these buffers);
+and inline, where the context is now made lazily.
+
+**The pre-tag review (Codex, v0.18.50 -> v0.18.63, max effort): SAFE TO TAG, no blocker, in each of seven
+rounds** (the fourth on the held handles and the decode-pool changes below, all accepted; the fifth, at
+xhigh, on the decode records, the --keep-going message and the benchmark; the sixth on the fifth's patches as
+adopted, with one display fix: the benchmark's GPU overview printed an unknown share as 0.0; the seventh on
+the two -e failures' fixes, with the regular-file check above).  It
+found two LOWs in the undo, each reproduced with the claim hook before fixing.  Round 1: settle ran shallowest
+first, so with two nested claimed directories (z 0000 holding z/e 0500) z's mode came back first, z/e was then
+unreachable and kept the 0700 it was widened to, at exit 0.  Round 2: with a claimed z (0000) holding a
+directory the stream DID restore (z/e/, 0500, in an archive without z/), z's mode came back before
+finish_deferred, which then could not reach z/e and skipped its stored mode and times (0700, exit 0).  The
+undo is now two steps, each deepest first: settle_prepared_dirs handles the asides before finish_deferred
+(an aside removed later would move its parent's restored mtime), and restore_unconfirmed_modes puts back the
+modes after it.  With that step after finish_deferred, an unconfirmed directory beneath one whose restored
+mode stops it being reopened (open_parent opens each component O_RDONLY, so a 0100 ancestor stops it too) was
+out of reach: reported (exit 4), its mode left widened.  Round 3 accepted that trade as loud; it is closed
+instead (owner: fix it).  settle_prepared_dirs runs once the confirmations are known, so it opens an O_PATH
+handle on each UNCONFIRMED widened directory -- normally none -- and the mode goes back through
+/proc/self/fd, which no ancestor's mode stops.  At most min(256, RLIMIT_NOFILE / 8) are held (128 at the
+common soft limit of 1,024), so the undo cannot take the descriptors finish_deferred needs -- a bound on what it
+adds, not a promise of headroom; past it, or when an open is refused, the path walk, deepest first, is the
+fallback, and a directory it cannot reach is still reported.  MEASURED, an archive restoring p as 0000 over an existing p/u 0500 that it
+does not hold (claimed): exit 4 and p/u 0700 before, exit 0 and 0500 after, both builds.  A failed rename back
+after a failed mkdirat is recorded, so the original's place is reported too.
+It also found two AGENTS.md statements stale since v0.18.59/60 (rewritten), and counted wasted work on the
+v0.18.59 pool's default path (a compressed buffer allocated, zero-filled and freed per pooled frame; an
+inline decoder context per partition that a fully pooled extract never uses), left for a measured follow-up.
+
+**Suite:** +3 cells after the v0.18.62 ones, no GPU needed, and +1 GPU cell in Stats JSON output (589 -> 593,
+-e 938 -> 942; the CPU-only run 420 -> 423 passed, +1 skip).  The two later cells: a decode's record lists the
+devices that decoded all of it on -d, -t, two inputs, -d --tar -O and -t --tar, and none on --cpu-only;
+--keep-going --hybrid is refused by --keep-going's name.  Their mutants, GPU builds: 7 of 7 caught (each decode
+record write passed nothing, in turn; no frame credited; no device registered; the old message; the boundary
+frame charged whole) -- the -t --tar one only after the cell gained that route.  The extract cell covers an existing 0555 directory, a symlink and a file where it belongs, a second
+extract onto the tree, a file set aside inside a directory the archive restores read-only, both undo paths,
+a foreign GNU tar archive listing children before their directories, nested claims undone through held
+handles and through the path walk (deepest first), a claimed parent whose restored child keeps its stored
+mode, and a claimed directory beneath one the archive restores as 0000.  Mutants, CPU-only builds: 17 of 17
+caught, each by the check written for it -- the profile guard removed (archive and record lost, no
+warning), a stale or an empty profile kept; no preparation, no widening, no aside (the forced-order cases);
+no undo of a mode or of an aside; an aside kept, or settled after finish_deferred (the nested and foreign
+cases, whose aside sits in a directory restored read-only); no depth order and the foreign plan's
+directories dropped (the foreign case); nothing counted as confirmed; the undo walked shallowest first
+(the nested claims, by the path walk); the claimed modes put back before finish_deferred (the claimed
+parent); no handles held (the 0000 parent); no inline decoder context made (every inline decode).  The
+decode-pool changes are measured above, not mutation-tested: they change cost, not output.
+Suites on the code before the two items below (8-H100 server): default 590 passed, 0 failed, 1 skipped of
+591; CPU-only build 422 passed, 0 failed, 136 skipped (169 GPU cells).  Suites on the final code: -e (GPU
+build) 941 passed, 0 failed, 1 skipped of 942 (32m38s); CPU-only 423 passed, 0 failed, 137 skipped (170 GPU
+cells).  An earlier -e run on this release had failed two cells, both from its own changes: the corrupt-profile
+cell (the profile guard, then too strict: see ROADMAP 7 above) and the gpu-only -t integrity cell, whose byte
+checks read the first "input_bytes" in a decode record that now also lists each device's (anchored to the
+record's top level; test-only).  RELEASING.md section 3, real data on the 8-H100 server (two 13 GB base64 files,
+a 16 GiB seq file, a 100,000-file tree): 21 of 21 round trips byte-identical, GPU workers online on each step
+built to engage them (-T 1 hybrid, --gpu-only, the pipe, -T 2 on the seq archive, --tar of the huge files).
+
+**A decode's --stats-json record lists its GPUs (found by the reworked benchmark, below).**  Only compress handed
+its devices to write_stats_json; every decode route passed none, so `-d --gpu-only` and a CPU-only decode wrote
+the same record -- the record's own comment says the gpu object is how a reader tells GPU work from a silent
+CPU fallback, and for a decode it could not.  Every GPU decoder now registers its device when it is up and
+credits each frame it delivers, with the commit that delivers it (so a batch that faults part way counts what it
+handed over): gpu_decomp_worker, which every -d, -t and serial -d --tar route runs, and the parallel extract's
+GPU pool.  Per CUDA ordinal, in atomics; each decode record write (plain -d/-t, -d --tar, -t --tar) takes the
+totals and clears them for the next input, and a CPU-only build only ever takes empty ones.  MEASURED, 8-H100
+server: -d, -t and --direct-stage --gpu-only list one device whose decoded bytes equal the record's (12 of 12
+frames); two inputs sum (24); -d --tar -O --gpu-only 8 devices, all 779 frames; the forced GPU extract pool 8
+devices, 607 of 780 frames (78% of the bytes; the CPU decoders took the rest); --cpu-only, a hybrid decode
+that declined its GPUs, and a default CPU-pool extract write no gpu object.  The pre-tag review's fifth round
+found one composition error, reproduced before fixing: a frame across a partition boundary is decoded by both
+partitions, and the pool charged its whole decoded size to each -- two 24 MiB members in 16 MiB frames, all on
+the cards: devices 67,117,056 bytes against the record's 50,339,840.  Each delivery now charges only its
+partition's share of the frame, as the partition's own byte count does: 50,339,840 of 50,339,840.  (Frames and
+compressed bytes still count physical work, the duplicated boundary decode included.)
+
+**--keep-going's refusal says --keep-going.**  --keep-going implies --cpu-only, so `-d --gpu-only --keep-going`
+and `-d --hybrid --keep-going` are refused (exit 2, as before) -- as "--gpu-only cannot be combined with
+--cpu-only or --hybrid" and "--cpu-only cannot be combined with --hybrid", naming a flag the user never typed.
+Now: "--keep-going recovers on the CPU decoder (it implies --cpu-only), so it cannot be combined with --gpu-only"
+(or --hybrid).  Same exit codes on both builds; --gds-only and --direct-stage keep their recovery as before.
+
+**gzstd-benchmark.sh, reworked (tooling, no code change).**  Since the GPU startup guards, a default or
+--hybrid run starts its cards only where they are expected to pay, and on the 8-H100 server at 256 CPUs that
+is almost never -- so the benchmark's hybrid row and every hyb-* knob sweep (batch, streams, throttle,
+batch x streams, the matrix's hybrid rows) had been timing the same CPU-only run under different labels, and
+nothing recorded it.  Its timings were also rounded up by as much as 0.3 s each (the end was taken after a
+0.3 s polling loop; every 192 MiB row read ~0.31 s).  Now:
+- every gzstd run writes --stats-json, and the tables show the GPU share of the uncompressed bytes, the
+  cards used and the CPU threads; a compress row that names the GPU and moved nothing on a card, or a
+  --gpu-only decode that ran CPU decoders, is flagged as not having run as labelled;
+- a no-flags default row is the headline again (dropped in v0.13.42 as a duplicate of hybrid; it is the only
+  row that can stage), and the hyb-* knob sweeps are gone (the --gpu-only sweeps measure the knobs);
+- --cpus 4,8,16,all runs the baseline rows under a taskset CPU mask, the input the GPU decision reads;
+- --cold evict (the default) evicts each input with scripts/drop_cache before every run, so no row is handed
+  --direct-read (the old method, kept as --cold direct-read, changed the read path a default run chooses);
+- --tar adds create, extract and one-member seek rows on two corpora -- the test files as large members, and
+  many small files sampled across one of them (generated once into DATA_DIR/tar-many) -- beside GNU tar +
+  zstd; extract times include a sync of the destination (the ROADMAP's tooling gap: items 1, 3 and 4, and
+  2's parallel path);
+- --calibrated runs --calibrate under each allowance first, into the run's private cache, so default and
+  hybrid rows can start their cards at a measured price; without it they run on the flat 4.0 s guard;
+- --list prints the rows without running them; the end of each run is stamped when it exits.
+The pre-tag review's fifth round (Codex, xhigh) read the whole script: SAFE TO TAG, and eight tooling findings,
+each checked here and fixed (its patch, then run end to end):
+- it could delete or truncate the user's files: an existing DEST/x under --tar-dest was rm -rf'd each
+  iteration, an existing DATA_DIR/tar-many without the stamp was replaced, and a calibration log name could
+  truncate an existing file.  Extraction and archives now use private children of the given directories
+  (removed at exit, the rest kept: checked with DEST/x/keep and an older archive in --tar-work), logs go to a
+  new directory, and tar-many is replaced only when it carries the benchmark's ownership marker (an
+  unmarked one is refused: "move it aside");
+- reused archives and a stamped tar-many could measure data other than the row's: archives are built per
+  run, and the stamp records the source's path, device, inode, size and mtime;
+- the GPU decode sweeps never passed their batch or stream setting to the decode, and every level and ultra
+  row decoded the same archive (both inherited from the old script): the settings reach the decode, and the
+  level rows are compress-only;
+- an extraction's sync ran after the polling loop, so writeback in that gap was charged to nothing: the
+  command, its sync and the end stamp now run in one timed child, and a failed sync fails the run;
+- --cold direct-read left the tar rows warm, and a failed eviction was ignored: tar rows evict (recorded per
+  row as "cold"), and a failed eviction stops the benchmark;
+- a 0.1% GPU share rounded to 0 and was flagged "not engaged", a --gpu-only decode at 50% was not flagged,
+  and a median hid one declined iteration in three: engagement is read from the cards that delivered frames,
+  partial and excess shares are compared in bytes, each iteration is checked, flagged rows are counted in
+  the tables and JSON, and the fastest-config summary skips them;
+- --iterations 2 reported the lower sample, not the median; symlinked inputs were sized by the link.
+Checked on a 5 x 192 MiB corpus with both builds and every mode.  It showed two things about gzstd: every
+--gpu-only -d --tar parallel extract and seek decoded on the CPUs (ROADMAP 45(g), as documented), and a
+decode's --stats-json record carried no GPU devices on any route -- fixed above; with an older binary the
+benchmark reports a decode row's GPU share as n/a.
 
 
 ## v0.18.62 — a run whose threads cannot all start finishes on the ones that did, or says why, where compress and --tar create aborted and a frame with zstd's workers exited 4; and a FIFO or device node extracts with its exact mode and, as root, its owner (ROADMAP 46, 47; 64 CPUs under systemd TasksMax: --tar create aborted at every limit to 40, now completes from 6)

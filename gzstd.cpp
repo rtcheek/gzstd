@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.62";
+static constexpr const char * GZSTD_VERSION = "0.18.63";
 //
 // Architecture overview:
 //
@@ -115,6 +115,7 @@ static constexpr const char * GZSTD_VERSION = "0.18.62";
 #ifndef _WIN32
 #include <sys/syscall.h>   // SYS_memfd_create (--calibrate's RAM-backed corpus file)
 #include <sys/wait.h>      // waitpid (--calibrate's per-device-count children)
+#include <sys/resource.h>  // getrlimit: the descriptors a -d --tar undo may hold
 #ifdef __linux__
 #include <sys/prctl.h>     // PR_SET_PDEATHSIG (a --calibrate child ends with its parent)
 #endif
@@ -10781,6 +10782,53 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
   AdaptJv root;
   const AdaptProfileRead rd = adapt_profile_load_at(profile_dir.fd, profile_dir.base, root);
   if (rd != AdaptProfileRead::OK) {
+    // ONLY A PROFILE IS REPLACED (v0.18.63, ROADMAP 7).  The rename below put a
+    // new profile over whatever the path held, so a file that was NOT a profile
+    // was destroyed: `gzstd --adapt --rm f -o ~/.cache/gzstd/profile.json`
+    // removed f, wrote its archive there, and then renamed the profile over the
+    // archive, exit 0; a --stats-json record or -d output named there went the
+    // same way, as would any file an earlier run put at the path.  Every profile
+    // any version wrote (from v0.15.1) carries a numeric gzstd_profile, and a
+    // stale one is still replaced; so is an empty file (nothing to lose), and a
+    // symlink, FIFO or other non-regular entry, which the rename replaces as a
+    // NAME without touching any data.  A DAMAGED profile is still ours: a fresh
+    // profile opens `{` then the gzstd_profile key, so a file that
+    // does not parse but opens that way (truncated by a crash or a full disk) is
+    // replaced as before.  Archives and --stats-json ("version" first) do not
+    // match; arbitrary decoded data can, so this is a reserved-prefix heuristic.
+    // Any other non-empty regular
+    // file is someone's data: left in place, the save skipped, and the warning
+    // names it.  Checked here, under the lock, because every writer of the
+    // profile (--adapt's runs and --calibrate) comes through this one save.
+    bool ours = rd == AdaptProfileRead::STALE && root.t == AdaptJv::OBJ
+                && root.get("gzstd_profile")
+                && root.get("gzstd_profile")->t == AdaptJv::NUM;
+    if (!ours && rd == AdaptProfileRead::UNUSABLE) {
+      const int hfd = ::openat(profile_dir.fd, profile_dir.base.c_str(),
+                               O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+      if (hfd >= 0) {
+        // Nonblocking FIFO reads can still consume queued bytes.  Only inspect
+        // a regular file, as adapt_profile_read_fd does; other entries are
+        // replaced as names below, without reading their data.
+        struct stat hst {};
+        if (::fstat(hfd, &hst) == 0 && S_ISREG(hst.st_mode)) {
+          char head[64];
+          ssize_t n;
+          do n = ::read(hfd, head, sizeof head); while (n < 0 && errno == EINTR);
+          size_t i = 0;
+          auto skip_ws = [&] { while (i < (size_t)std::max<ssize_t>(n, 0)
+                                      && std::isspace((unsigned char)head[i])) ++i; };
+          static const char key[] = "\"gzstd_profile\"";
+          skip_ws();
+          if (n > 0 && i < (size_t)n && head[i] == '{') {
+            ++i; skip_ws();
+            ours = (size_t)n - i >= sizeof key - 1
+                   && std::memcmp(head + i, key, sizeof key - 1) == 0;
+          }
+        }
+        ::close(hfd);
+      }
+    }
     root = AdaptJv{};
     root.t = AdaptJv::OBJ;
     struct stat pst;
@@ -10789,6 +10837,11 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
                    AT_SYMLINK_NOFOLLOW) == 0);
     if (!profile_present && errno != ENOENT) {
       adapt_warn_save_failed(opt, "cannot identify " + path);
+      return;
+    }
+    if (profile_present && S_ISREG(pst.st_mode) && pst.st_size > 0 && !ours) {
+      adapt_warn_save_failed(opt, path + " is not a gzstd profile, so it was left as it "
+                                  "is; move it aside and --adapt records again");
       return;
     }
     if (profile_present)
@@ -21892,6 +21945,76 @@ struct CompressPassStats {
   std::vector<GpuPassDevice> devices;   // each GPU worker that finished
 };
 
+// A DECODE'S GPU WORK, FOR --stats-json (v0.18.63).  Only compress handed its
+// devices to the record, so a decode's record had no "gpu" object whether or
+// not its cards ran: `-d --gpu-only` and a CPU-only decode wrote the same
+// record, and a benchmark could not tell them apart.  Every GPU decoder -- the
+// plain/hybrid decode's workers (gpu_decomp_worker, which every -d, -t and
+// serial -d --tar route runs) and the parallel extract pool's -- registers its
+// device when it is up and credits each frame it DELIVERS (with the commit
+// that delivers it, so a batch that faults part way counts what it handed
+// over); the record's write takes the totals and clears them for the next
+// input.  Per CUDA ordinal, in atomics: several streams share a device, and a
+// worker's frames must count however it exits.  Compress keeps its own path.
+struct DecodePassSlot {
+  std::atomic<uint64_t> batches{0}, frames{0}, in_bytes{0}, out_bytes{0};
+  std::atomic<bool> up{false};
+};
+static constexpr int GZ_DPASS_DEVICES = 64;
+static DecodePassSlot g_dpass[GZ_DPASS_DEVICES];
+static std::atomic<bool> g_dpass_pipeline{false};
+static std::mutex g_dpass_m;                               // the UUIDs
+static std::string g_dpass_uuid[GZ_DPASS_DEVICES];
+
+#ifdef HAVE_NVCOMP   // the GPU decoders' side; a CPU-only build only takes (empty) totals
+// Has `dev` no UUID yet?  (The caller asks CUDA for one only then.)
+static bool gz_dpass_wants_uuid(int dev) {
+  if (dev < 0 || dev >= GZ_DPASS_DEVICES) return false;
+  std::lock_guard<std::mutex> lk(g_dpass_m);
+  return g_dpass_uuid[dev].empty();
+}
+// A GPU decoder on `dev` is up: the pass ran a GPU pipeline, even if it ends
+// up decoding nothing (the record then lists the device with zero frames).
+static void gz_dpass_up(int dev, const std::string & uuid) {
+  g_dpass_pipeline.store(true, std::memory_order_relaxed);
+  if (dev < 0 || dev >= GZ_DPASS_DEVICES) return;
+  g_dpass[dev].up.store(true, std::memory_order_relaxed);
+  if (!uuid.empty()) {
+    std::lock_guard<std::mutex> lk(g_dpass_m);
+    if (g_dpass_uuid[dev].empty()) g_dpass_uuid[dev] = uuid;
+  }
+}
+// One delivered frame: `in` compressed bytes, `out` its decoded contribution
+// (a tar partition clips a boundary frame); `new_batch` on its first delivery.
+static void gz_dpass_frame(int dev, uint64_t in, uint64_t out, bool new_batch) {
+  if (dev < 0 || dev >= GZ_DPASS_DEVICES) return;
+  DecodePassSlot & s = g_dpass[dev];
+  if (new_batch) s.batches.fetch_add(1, std::memory_order_relaxed);
+  s.frames.fetch_add(1, std::memory_order_relaxed);
+  s.in_bytes.fetch_add(in, std::memory_order_relaxed);
+  s.out_bytes.fetch_add(out, std::memory_order_relaxed);
+}
+#endif  // HAVE_NVCOMP
+// The pass so far, for the record, and cleared for the next input.
+static CompressPassStats gz_dpass_take() {
+  CompressPassStats p;
+  p.pipeline = g_dpass_pipeline.exchange(false, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(g_dpass_m);
+  for (int dev = 0; dev < GZ_DPASS_DEVICES; ++dev) {
+    DecodePassSlot & s = g_dpass[dev];
+    const bool up = s.up.exchange(false, std::memory_order_relaxed);
+    GpuPassDevice d;
+    d.device = dev;
+    d.uuid = g_dpass_uuid[dev];
+    d.batches   = s.batches.exchange(0, std::memory_order_relaxed);
+    d.frames    = s.frames.exchange(0, std::memory_order_relaxed);
+    d.in_bytes  = s.in_bytes.exchange(0, std::memory_order_relaxed);
+    d.out_bytes = s.out_bytes.exchange(0, std::memory_order_relaxed);
+    if (up || d.frames) p.devices.push_back(std::move(d));
+  }
+  return p;
+}
+
 #ifdef HAVE_NVCOMP
 /*======================================================================
  Hybrid scheduler  GPU-priority semaphore model
@@ -32970,6 +33093,23 @@ static std::string norm_member_name(const std::string & raw) {
   return s;
 }
 
+// The path a member name lands on, as open_parent walks it: empty and "."
+// components dropped, so "a//b/./c/" and "a/b/c" are one key.  Used where two
+// spellings must compare equal (the parallel plan's collision checks, and the
+// directories run_parallel prepares).
+static std::string tar_path_key(const std::string & name) {
+  const std::string nm = norm_member_name(name);
+  std::string out; size_t i = 0;
+  while (i < nm.size()) {
+    const size_t j = nm.find('/', i);
+    const std::string c = nm.substr(i, j == std::string::npos ? std::string::npos : j - i);
+    if (!c.empty() && c != ".") { if (!out.empty()) out.push_back('/'); out += c; }
+    if (j == std::string::npos) break;
+    i = j + 1;
+  }
+  return out;   // trailing slash is gone with the empty last component
+}
+
 // GNU tar name matching: a selector picks the entry with exactly that name
 // and, when it is a directory, everything beneath it.  Trailing slashes are
 // ignored on both sides.  `members` hold normalized selector → root index
@@ -33055,6 +33195,8 @@ static int par_extract_mem_fit(const std::vector<uint64_t> & c_off,
 static void pread_seek_frame(int fd, const std::vector<uint64_t> & c_off,
                              size_t k, std::vector<char> & comp,
                              Meter * m, bool count_read = true);
+static void pread_seek_into(int fd, const std::vector<uint64_t> & c_off,
+                            size_t k, char * dst, Meter * m, bool count_read);
 static FrameBuf decompress_seek_frame(const char * comp, size_t csz, size_t usz,
                                       size_t k, ZSTD_DCtx * dctx);
 static FrameBuf decode_seek_frame(int fd,
@@ -33605,9 +33747,29 @@ public:
                     const std::vector<TarSplitCand> & splits,
                     const std::vector<uint64_t> & c_off,
                     const std::vector<uint64_t> & u_off,
-                    const Options & dopt, Meter * feed_meter) {
+                    const Options & dopt, Meter * feed_meter,
+                    const std::vector<std::string> & dirs = {}) {
     uint64_t t0 = now_ns();
     par_mode_ = true;
+    {
+      // Before any partition can write into one (ROADMAP 45j).  Test hook
+      // GZSTD_DEBUG_TAR_CLAIM_DIR=PATH[:PATH...]: more directories the index
+      // claims and the stream does not restore, as a damaged or forged index
+      // would; it drives settle_prepared_dirs' undo.
+      const char * claim = std::getenv("GZSTD_DEBUG_TAR_CLAIM_DIR");
+      if (claim && *claim) {
+        std::vector<std::string> pd = dirs;
+        const std::string cl(claim);
+        for (size_t i = 0; i <= cl.size(); ) {
+          const size_t j = std::min(cl.find(':', i), cl.size());
+          if (j > i) pd.push_back(tar_path_key(cl.substr(i, j - i)));
+          i = j + 1;
+        }
+        prepare_dirs(pd);
+      } else {
+        prepare_dirs(dirs);
+      }
+    }
     // Classify the archive BEFORE the pool starts: mean bytes per entry decides
     // whether this extract is metadata-bound (wants many writers) or
     // bandwidth-bound (wants few), and start_pool seeds from the profile entry
@@ -34018,7 +34180,13 @@ public:
     // assemble) already separates I/O from compute.  In flight frames stay
     // bounded by the same permit budget (a permit spans dispatch->consume across
     // BOTH queues), so ddq cannot grow past the budget.
-    struct RItem { int pi; size_t k; std::vector<char> comp; };
+    // The compressed bytes are a FrameVec (v0.18.63, the pre-tag review's wasted
+    // work): a std::vector<char> per frame was allocated, ZERO-FILLED by resize
+    // and then overwritten by the pread, and freed after the decode -- 780 times
+    // for two 6 GiB members of base64, the whole 9.2 GiB archive zeroed once.  A
+    // FrameVec is default-initialised and its blocks come from FrameMem, which
+    // hands a freed block to the next frame instead of faulting in a new one.
+    struct RItem { int pi; size_t k; FrameVec comp; };
     std::mutex ddmx; std::condition_variable ddcv;
     std::deque<RItem> ddq; bool ddqdone = false;
     struct PartSync { std::mutex mx; std::condition_variable cv; std::map<size_t, FrameBuf> ready; };
@@ -34040,8 +34208,8 @@ public:
           if (dq.empty()) break;                                 // qdone, nothing left
           it = dq.front(); dq.pop_front();
         }
-        std::vector<char> comp;
-        pread_seek_frame(fd, c_off, it.k, comp, feed_meter, it.count_read);
+        FrameVec comp((size_t)(c_off[it.k + 1] - c_off[it.k]));
+        pread_seek_into(fd, c_off, it.k, comp.data(), feed_meter, it.count_read);
         {
           std::lock_guard<std::mutex> lk(ddmx);
           ddq.push_back(RItem{ it.pi, it.k, std::move(comp) });
@@ -34081,7 +34249,7 @@ public:
         // take_pool may immediately release/reuse this slot after publication.
         // Drop its compressed allocation first so the new default's byte
         // reservation cannot overlap a successor's compressed buffer.
-        if (auto_pool) std::vector<char>().swap(it.comp);
+        if (auto_pool) FrameVec().swap(it.comp);
         {
           std::lock_guard<std::mutex> lk(psync[it.pi].mx);
           psync[it.pi].ready.emplace(it.k, std::move(fb));
@@ -34460,6 +34628,15 @@ public:
                 vlog(V_DEBUG, dopt, b);
               }
               gpu_dev_up.fetch_add(1, std::memory_order_relaxed);
+              {   // the extract's --stats-json record lists this device (gz_dpass_take)
+                std::string uuid;
+                if (!dopt.stats_json.empty() && gz_dpass_wants_uuid(dev)) {
+                  cudaDeviceProp p {};
+                  if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) uuid = gz_cuda_uuid_str(p);
+                  else (void)cudaGetLastError();
+                }
+                gz_dpass_up(dev, uuid);
+              }
               // Per-worker CPU rescue context, used only when nvCOMP fails a frame
               // or a claimed frame is too large for the GPU (> GPU_SUBCHUNK_MAX).
               ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
@@ -34511,12 +34688,24 @@ public:
                                 dev, comps.size(), double(b_ns) / 1e6);
                   vlog(V_DEBUG, dopt, b);
                 }
+                bool dpass_counted = false;
                 for (size_t j = 0; j < claimed.size(); ++j) {
                   const size_t k = claimed[j].k;
                   FrameBuf fb;
                   if (pos[j] != npos && !resc[pos[j]] && out[pos[j]]) {
                     fb = std::move(out[pos[j]]);
                     gpu_dec_frames.fetch_add(1, std::memory_order_relaxed);
+                    // A boundary frame is decoded by both owning partitions.
+                    // Charge only this partition's tar bytes, as its producer's
+                    // wrote_bytes does; full frames here could exceed the record's
+                    // logical output and conceal CPU work in a mixed decode.
+                    const PG & part = parts[(size_t)claimed[j].pi];
+                    const uint64_t delivered_begin = std::max(u_off[k], part.start);
+                    const uint64_t delivered_end = std::min(u_off[k + 1], part.end);
+                    const uint64_t delivered_bytes = delivered_end > delivered_begin
+                                                   ? delivered_end - delivered_begin : 0;
+                    gz_dpass_frame(dev, claimed[j].comp.size(), delivered_bytes, !dpass_counted);
+                    dpass_counted = true;
                   } else {
                     // Ineligible (huge) or nvCOMP-failed frame: decompress the
                     // ALREADY-READ buffer on CPU (authoritative -- succeeds on a
@@ -34777,13 +34966,21 @@ public:
           g.cont->cv.wait(lk, [&] { return g.cont->published; });
           cont_big = g.cont->big;
         }
-        // Each parse thread owns an inline DCtx (used whenever it decodes a frame
-        // itself).  next_dispatch = first frame not yet decoded-inline or
-        // dispatched-to-the-pool; frames in [next_consume, next_dispatch) are in
-        // the pool awaiting in-order consumption.  Both cursors are thread-local.
-        auto in_dctx = std::shared_ptr<ZSTD_DCtx>(ZSTD_createDCtx(), ZSTD_freeDCtx);
-        if (!in_dctx) die("failed to create ZSTD_DCtx");
-        apply_decode_options(in_dctx.get(), dopt);
+        // Each parse thread owns an inline DCtx, made the first time it decodes a
+        // frame itself (v0.18.63, the pre-tag review's wasted work: a pool that
+        // decodes every frame left one per partition unused).  next_dispatch =
+        // first frame not yet decoded-inline or dispatched-to-the-pool; frames in
+        // [next_consume, next_dispatch) are in the pool awaiting in-order
+        // consumption.  Both cursors are thread-local.
+        std::shared_ptr<ZSTD_DCtx> in_dctx_own;
+        auto in_dctx = [&]() -> ZSTD_DCtx * {
+          if (!in_dctx_own) {
+            in_dctx_own.reset(ZSTD_createDCtx(), ZSTD_freeDCtx);
+            if (!in_dctx_own) die("failed to create ZSTD_DCtx");
+            apply_decode_options(in_dctx_own.get(), dopt);
+          }
+          return in_dctx_own.get();
+        };
         std::vector<char> in_comp;
         size_t next_dispatch = g.f0, next_consume = g.f0;
         // Hoisted to worker scope so the post-parse drain below can reclaim
@@ -34804,7 +35001,7 @@ public:
           const bool count_read = !(k == g.f0 && g.start > u_off[g.f0]);
           FrameBuf fb;
           if (!use_pool) {                              // pure inline (no pool: see auto_pool)
-            fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
+            fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx(), feed_meter, count_read);
             inline_decoded.store(true, std::memory_order_relaxed);
             next_dispatch = k + 1;
           } else {
@@ -34822,7 +35019,7 @@ public:
               while (next_dispatch <= g.f1 && budget.try_acquire()) dispatch(next_dispatch++);
               fb = take_pool(k); budget.release();
             } else {                                    // inline (writers not decode-starved)
-              fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
+              fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx(), feed_meter, count_read);
               inline_decoded.store(true, std::memory_order_relaxed);
               next_dispatch = k + 1;
             }
@@ -34995,7 +35192,9 @@ public:
     // added here, unread).
     ex_wall_ns_ = now_ns() - t0;
     stop_pool();
+    settle_prepared_dirs(dirmeta_);   // the asides: before directory times are restored
     finish_deferred();
+    restore_unconfirmed_modes();      // after: a restored parent must not hide a child
     par_mode_ = false;
   }
 
@@ -35781,6 +35980,221 @@ private:
     }
     ::close(pfd);
     return ok;
+  }
+
+  // THE DIRECTORIES THE PARTITIONS WRITE INTO, READIED BEFORE ANY OF THEM STARTS
+  // (v0.18.63, ROADMAP 45j).  The serial walk meets a directory's entry before
+  // what is in it, and make_dir readies the path: an existing directory without
+  // owner rwx is widened (a second extract of an archive that stores a read-only
+  // directory), and a file or symlink where the directory belongs is replaced.
+  // run_parallel's partitions run side by side, so one could create d/f before
+  // the partition holding d/ had readied d, and the member failed.  MEASURED, 16
+  // files under d: an existing 0555 d, 4 of 5 runs exit 1 with 1-3 files missing
+  // ("Permission denied"); re-extracting an archive that stores d as 0555, 4 of 4
+  // ("File exists": the old file could not be unlinked); a symlink or a file at
+  // d, 5 of 6.  The serial walk (--keep-going) restored all 16 every time.
+  //
+  // So the plan's directories are readied here, on the calling thread, before
+  // the partitions start, shallowest first.  They come from the member index,
+  // which is a CLAIM (build_full_parallel_plan), so nothing here is
+  // irreversible: an existing directory is widened and its mode remembered; a
+  // non-directory is renamed aside, never unlinked, and an empty directory made
+  // in its place.  settle_prepared_dirs, once the partitions and their writers
+  // are done, keeps what the stream's own directory entries confirmed (an aside
+  // is unlinked, as make_dir would have unlinked the original; the stored mode is
+  // finish_deferred's, as ever) and undoes the rest.  A directory that does not
+  // exist is left to the partitions, as before, and so is everything beneath
+  // one: a fresh destination pays one fstatat per top-level directory.
+  struct PreparedDir { std::string rel; dev_t dev; ino_t ino; mode_t mode; std::string aside; };
+  std::vector<PreparedDir> prepared_dirs_;
+
+  void prepare_dirs(const std::vector<std::string> & dirs) {
+    if (dirs.empty() || roots_.empty()) return;
+    // Shallowest first, so a parent is readied (or found missing) before what
+    // is in it, whatever order the archive lists them in.  Depths counted once.
+    std::vector<std::pair<size_t, size_t>> order;   // (depth, index)
+    order.reserve(dirs.size());
+    for (size_t i = 0; i < dirs.size(); ++i)
+      order.emplace_back((size_t)std::count(dirs[i].begin(), dirs[i].end(), '/'), i);
+    std::stable_sort(order.begin(), order.end(),
+                     [](const std::pair<size_t, size_t> & a, const std::pair<size_t, size_t> & b) {
+                       return a.first < b.first; });
+    std::unordered_set<std::string> missing;
+    for (const auto & o : order) {
+      const std::string & rel = dirs[o.second];
+      if (rel.empty() || has_dotdot(rel)) continue;
+      const size_t sl = rel.rfind('/');
+      if (sl != std::string::npos && missing.count(rel.substr(0, sl))) { missing.insert(rel); continue; }
+      // A quick look, which a symlinked parent may redirect: it only decides
+      // whether to look properly, through open_parent's O_NOFOLLOW walk.
+      struct stat st;
+      if (::fstatat(roots_[0], rel.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) missing.insert(rel);
+        continue;
+      }
+      if (S_ISDIR(st.st_mode) && (st.st_mode & 0700) == 0700) continue;   // ready
+      std::string leaf;
+      const int pfd = open_parent(rel, leaf, /*create=*/false, 0);
+      if (pfd < 0) continue;   // a symlinked parent: its members fail, as on the serial walk
+      prepare_one_dir(pfd, rel, leaf);
+      ::close(pfd);
+    }
+  }
+
+  void prepare_one_dir(int pfd, const std::string & rel, const std::string & leaf) {
+    struct stat st;
+    if (::fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+      if ((st.st_mode & 0700) == 0700) return;
+      // Through an O_PATH handle on the directory itself, chmod by /proc/self/fd
+      // as make_special does, so one without owner read is widened too.
+      const int lfd = ::openat(pfd, leaf.c_str(), O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+      if (lfd < 0) return;
+      struct stat dst;
+      const std::string pp = "/proc/self/fd/" + std::to_string(lfd);
+      if (::fstat(lfd, &dst) == 0 && S_ISDIR(dst.st_mode)
+          && ::chmod(pp.c_str(), (dst.st_mode & 07777) | 0700) == 0)
+        prepared_dirs_.push_back({rel, dst.st_dev, dst.st_ino, (mode_t)(dst.st_mode & 07777), {}});
+      ::close(lfd);
+      return;
+    }
+    // A file, symlink, FIFO or device node where the archive has a directory.
+    uint64_t nonce = 0;
+    if (!random_u64(nonce)) nonce = ((uint64_t)::getpid() << 32) ^ now_ns();
+    char aside[48];
+    std::snprintf(aside, sizeof aside, ".gzstd-aside-%016llx", (unsigned long long)nonce);
+    if (renameat_noreplace(pfd, leaf.c_str(), pfd, aside) != 0) return;
+    if (::mkdirat(pfd, leaf.c_str(), 0700) != 0) {
+      // Put it back.  If even that fails, the original is under the aside name:
+      // record it, so settle_prepared_dirs reports where it is (or, should the
+      // stream restore the directory after all, unlinks it as make_dir would).
+      if (renameat_noreplace(pfd, aside, pfd, leaf.c_str()) != 0)
+        prepared_dirs_.push_back({rel, 0, 0, 0, aside});
+      return;
+    }
+    struct stat dst {};
+    (void)::fstatat(pfd, leaf.c_str(), &dst, AT_SYMLINK_NOFOLLOW);
+    prepared_dirs_.push_back({rel, dst.st_dev, dst.st_ino, 0, aside});
+  }
+
+  // In two steps, each DEEPEST FIRST (the reverse of prepare_dirs' order), and an
+  // undo that cannot finish is reported.  `dm` holds the directory entries the
+  // stream itself restored.
+  //
+  //  settle_prepared_dirs   after every partition and writer, BEFORE
+  //                         finish_deferred: the asides.  One unlinked or put back
+  //                         later would change its parent's restored mtime, or
+  //                         fail in a parent restored read-only.
+  //  restore_unconfirmed_modes  AFTER finish_deferred: the modes of widened
+  //                         directories the stream did not restore.  Before it, a
+  //                         parent put back to 0000 hid a directory the stream DID
+  //                         restore beneath it, and finish_deferred skipped that
+  //                         one's stored mode and times (exit 0, 0700 for 0500).
+  //
+  // Deepest first because shallowest first, d's original mode came back before
+  // d/e's: d at 0000 left d/e unreachable, still at the 0700 it was widened to,
+  // at exit 0.  (Both found by the pre-tag review, reproduced with the claim hook.)
+  //
+  // THROUGH A HANDLE HELD FROM SETTLE TIME.  After finish_deferred a directory the
+  // stream restored can have a mode that stops open_parent reopening it (no owner
+  // read or search), and an unconfirmed directory beneath it was then out of reach:
+  // it kept its widened mode and the run said so (exit 4).  settle_prepared_dirs
+  // runs once every partition is done and the confirmations are known, so it opens
+  // an O_PATH handle on each UNCONFIRMED widened directory (normally none) and the
+  // mode goes back through /proc/self/fd, which no ancestor's mode can stop.  At
+  // most unconfirmed_fd_cap() are held, so finish_deferred keeps descriptors for its
+  // own opens; past that, or if the open fails, the path walk is the fallback and an
+  // unreachable directory is reported as before.
+  struct UnconfirmedDir { std::string rel; dev_t dev; ino_t ino; mode_t mode; int fd; };
+  std::vector<UnconfirmedDir> unconfirmed_dirs_;   // deepest first
+
+  static size_t unconfirmed_fd_cap() {
+    // Test hook GZSTD_DEBUG_TAR_UNDO_FDS=N: hold at most N (0: the path walk only).
+    if (const char * e = std::getenv("GZSTD_DEBUG_TAR_UNDO_FDS")) return (size_t)std::strtoul(e, nullptr, 10);
+    struct rlimit rl {};
+    const rlim_t soft = (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+                      ? rl.rlim_cur : 1024;
+    return (size_t)std::min<rlim_t>(256, soft / 8);
+  }
+
+  void settle_prepared_dirs(const std::vector<DirMeta> & dm) {
+    if (prepared_dirs_.empty()) return;
+    std::unordered_set<std::string> confirmed;
+    for (const DirMeta & d : dm) confirmed.insert(tar_path_key(d.path));
+    for (auto it = prepared_dirs_.rbegin(); it != prepared_dirs_.rend(); ++it) {
+      const PreparedDir & p = *it;
+      const bool ok = confirmed.count(p.rel) != 0;
+      if (p.aside.empty()) {
+        // Widened.  Confirmed: finish_deferred applies the stored mode.  Not: the
+        // index named a directory the stream did not restore; its mode goes back
+        // after finish_deferred (restore_unconfirmed_modes).
+        if (!ok) {
+          int hfd = -1;
+          if (unconfirmed_dirs_.size() < unconfirmed_fd_cap()) {
+            std::string leaf;
+            const int pfd = open_parent(p.rel, leaf, /*create=*/false, 0);
+            if (pfd >= 0) {
+              hfd = ::openat(pfd, leaf.c_str(), O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+              struct stat st;
+              if (hfd >= 0 && !(::fstat(hfd, &st) == 0 && S_ISDIR(st.st_mode)
+                                && st.st_dev == p.dev && st.st_ino == p.ino)) {
+                ::close(hfd); hfd = -1;
+              }
+              ::close(pfd);
+            }
+          }
+          unconfirmed_dirs_.push_back({p.rel, p.dev, p.ino, p.mode, hfd});
+        }
+        continue;
+      }
+      std::string leaf;
+      const int pfd = open_parent(p.rel, leaf, /*create=*/false, 0);
+      struct stat st;
+      const bool same = pfd >= 0 && ::fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0
+                     && S_ISDIR(st.st_mode) && st.st_dev == p.dev && st.st_ino == p.ino;
+      if (ok) {
+        if (pfd < 0 || ::unlinkat(pfd, p.aside.c_str(), 0) != 0)
+          fail(p.rel, "replaced by the archive's directory; what was here is still at "
+                      + p.aside + " beside it (" + std::strerror(errno) + ")");
+      } else {
+        // Not confirmed: take the empty directory away and put the original back.
+        // If anything was written into it, the original stays aside, and says so.
+        if (!(same && ::unlinkat(pfd, leaf.c_str(), AT_REMOVEDIR) == 0
+              && renameat_noreplace(pfd, p.aside.c_str(), pfd, leaf.c_str()) == 0))
+          fail_data(p.rel, "the member index names a directory the archive does not "
+                           "restore; what was here is kept at " + p.aside + " beside it");
+      }
+      if (pfd >= 0) ::close(pfd);
+    }
+    prepared_dirs_.clear();
+  }
+
+  void restore_unconfirmed_modes() {
+    for (UnconfirmedDir & u : unconfirmed_dirs_) {
+      bool undone = false;
+      if (u.fd >= 0) {
+        undone = ::chmod(("/proc/self/fd/" + std::to_string(u.fd)).c_str(), u.mode) == 0;
+        ::close(u.fd);
+        u.fd = -1;
+      }
+      std::string leaf;
+      const int pfd = undone ? -1 : open_parent(u.rel, leaf, /*create=*/false, 0);
+      if (pfd >= 0) {
+        const int lfd = ::openat(pfd, leaf.c_str(), O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+        struct stat st;
+        if (lfd >= 0 && ::fstat(lfd, &st) == 0 && S_ISDIR(st.st_mode)
+            && st.st_dev == u.dev && st.st_ino == u.ino)
+          undone = ::chmod(("/proc/self/fd/" + std::to_string(lfd)).c_str(), u.mode) == 0;
+        if (lfd >= 0) ::close(lfd);
+        ::close(pfd);
+      }
+      if (!undone) {
+        char m[8]; std::snprintf(m, sizeof m, "%04o", (unsigned)u.mode);
+        fail_data(u.rel, std::string("the member index names a directory the archive does not "
+                                     "restore; its mode could not be put back to ") + m);
+      }
+    }
+    unconfirmed_dirs_.clear();
   }
 
   // Restore mtime on something that has no fd we can hold: a symlink, a FIFO or a
@@ -37092,6 +37506,17 @@ private:
         break;
       }
       case '5': {                                  // directory
+        if (par) {
+          // Test hook GZSTD_DEBUG_TAR_DIR_DELAY_MS=N: a partition reaches each
+          // directory entry N ms late, so the other partitions write into the
+          // directory first -- the order that failed before prepare_dirs
+          // (ROADMAP 45j), forced rather than raced for.
+          static const long dir_delay_ms = [] {
+            const char * d = std::getenv("GZSTD_DEBUG_TAR_DIR_DELAY_MS");
+            return d ? std::strtol(d, nullptr, 10) : 0L;
+          }();
+          if (dir_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(dir_delay_ms));
+        }
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_dir(rel, e.mode, root)) fail(rel, "cannot create directory");
         else {
@@ -38040,13 +38465,21 @@ static bool build_foreign_seek_plan(FILE * in,
 static void pread_seek_frame(int fd, const std::vector<uint64_t> & c_off,
                              size_t k, std::vector<char> & comp,
                              Meter * m, bool count_read) {
+  comp.resize((size_t)(c_off[k + 1] - c_off[k]));
+  pread_seek_into(fd, c_off, k, comp.data(), m, count_read);
+}
+
+// The same read into memory the caller sized (frame k's csz bytes): the decode
+// pool's readers hand it a FrameVec, which is neither zero-filled first nor
+// faulted in afresh for every frame (FrameMem recycles it).
+static void pread_seek_into(int fd, const std::vector<uint64_t> & c_off,
+                            size_t k, char * dst, Meter * m, bool count_read) {
   const uint64_t coff = c_off[k];
   const size_t csz = (size_t)(c_off[k + 1] - coff);
-  comp.resize(csz);
   const bool count = (m != nullptr) && count_read;
   const uint64_t t0 = count ? now_ns() : 0;
   for (size_t got = 0; got < csz;) {
-    ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
+    ssize_t r = ::pread(fd, dst + got, csz - got, (off_t)(coff + got));
     if (r < 0 && errno == EINTR) continue;
     if (r <= 0) die_io("seek-extract: pread failed at frame " + std::to_string(k)
                        + ": " + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
@@ -38259,12 +38692,26 @@ static bool tar_output_alias_collision(
   return false;
 }
 
+// The directories a parallel plan's index CLAIMS, in archive order, for
+// Extractor::prepare_dirs (ROADMAP 45j).  A claim only: prepare_dirs widens or
+// sets aside, and settle_prepared_dirs undoes whatever the stream's own
+// directory entries did not confirm.
+static void tar_plan_dirs(const std::vector<std::pair<std::string, char>> & nt,
+                          std::vector<std::string> * dirs)
+{
+  if (!dirs) return;
+  for (const auto & k : nt)
+    if (k.second == '5' && !k.first.empty()) dirs->push_back(k.first);
+}
+
 static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt,
                                      TarSeekTable & st, std::vector<uint64_t> & bounds,
                                      bool * decoded_cpu = nullptr,
-                                     std::vector<TarSplitCand> * splits = nullptr) {
+                                     std::vector<TarSplitCand> * splits = nullptr,
+                                     std::vector<std::string> * dirs = nullptr) {
   bounds.clear();
   if (splits) splits->clear();
+  if (dirs) dirs->clear();
   // DUPLICATES ARE REJECTED ON THE FILESYSTEM SPELLING, NOT THE ARCHIVE'S.  This
   // planner exists to partition members across workers, which is only safe when
   // no two members name one output file -- and `a//b`, `a/./b` and `a/b` are one
@@ -38272,18 +38719,7 @@ static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt
   // where nothing orders them and the later member could lose.  The serial
   // parser (which this falls back to) handles duplicates correctly via
   // claim_path(); the planner's job is only to recognise them.
-  auto fs_key = [](const std::string & name) {
-    const std::string nm = norm_member_name(name);
-    std::string out; size_t i = 0;
-    while (i < nm.size()) {
-      const size_t j = nm.find('/', i);
-      const std::string c = nm.substr(i, j == std::string::npos ? std::string::npos : j - i);
-      if (!c.empty() && c != ".") { if (!out.empty()) out.push_back('/'); out += c; }
-      if (j == std::string::npos) break;
-      i = j + 1;
-    }
-    return out;   // trailing slash is gone with the empty last component
-  };
+  auto fs_key = [](const std::string & name) { return tar_path_key(name); };
   auto no_dup = [&fs_key](std::unordered_map<std::string, char> & seen, const std::string & name) {
     std::string nm = fs_key(name);
     return nm.empty() || seen.emplace(nm, 1).second;   // empty names never collide
@@ -38322,7 +38758,7 @@ static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt
       }
       if (ok && (tar_leaf_dir_collision(nt)
                  || tar_output_alias_collision(dest_fd, nt))) ok = false;
-      if (ok) { st = std::move(s2); have = true; }
+      if (ok) { st = std::move(s2); have = true; tar_plan_dirs(nt, dirs); }
       else { bounds.clear(); if (splits) splits->clear(); }
     }
   }
@@ -38347,7 +38783,7 @@ static bool build_full_parallel_plan(FILE * in, int dest_fd, const Options & opt
       }
       if (ok && (tar_leaf_dir_collision(nt)
                  || tar_output_alias_collision(dest_fd, nt))) ok = false;
-      if (ok) { st = std::move(s2); have = true; } else bounds.clear();
+      if (ok) { st = std::move(s2); have = true; tar_plan_dirs(nt, dirs); } else bounds.clear();
     }
   }
 
@@ -47599,6 +48035,17 @@ static void gpu_decomp_worker(
       checkCuda(cudaFree(0), "cudaFree(0) [force context]");
     }
     if (nothing_left()) return;
+    // Up: the decode's --stats-json record lists this device (gz_dpass_take).
+    // The UUID only when a record is asked for: the query is ~1.5 ms a device.
+    {
+      std::string uuid;
+      if (!opt.stats_json.empty() && gz_dpass_wants_uuid(device_id)) {
+        cudaDeviceProp p {};
+        if (cudaGetDeviceProperties(&p, device_id) == cudaSuccess) uuid = gz_cuda_uuid_str(p);
+        else (void)cudaGetLastError();
+      }
+      gz_dpass_up(device_id, uuid);
+    }
 
     // For decompress, gpu_batch_cap is PER STREAM (not divided across streams).
     // Kernel launch overhead dominates, so each stream needs large batches.
@@ -49543,8 +49990,13 @@ static void gpu_decomp_worker(
         // re-enqueues only the undelivered tail, whose rescuer counts that tail.
         // --stats-json reported a 203 MB archive 12.6 MB short with
         // GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST.  Every commit below credits its frame.
-        auto credit_input = [&](size_t i) {
+        // And the record's per-device totals: the frame, its bytes, and the batch
+        // once (gz_dpass_frame).  `decoded` is 0 only for the test hook's dropped frame.
+        bool dpass_counted = false;
+        auto credit_input = [&](size_t i, size_t decoded) {
           if (m) m->read_bytes.fetch_add(batch_comp_sizes[i], std::memory_order_relaxed);
+          gz_dpass_frame(device_id, batch_comp_sizes[i], decoded, !dpass_counted);
+          dpass_counted = true;
         };
         for (size_t i = 0; i < C.filled; ++i) {
           if (discard_results && gz_debug_drop_test_frame(batch_seqs[i])) {
@@ -49554,7 +50006,7 @@ static void gpu_decomp_worker(
             rc_commit_delivery([&] {
               if (results->drop_discard_frame_for_test(batch_seqs[i], opt)) {
                 if (bp) bp->release(1);
-                credit_input(i);
+                credit_input(i, 0);
                 C.batch[i].release_input();
                 C.delivered = i + 1;
                 dropped = true;
@@ -49600,7 +50052,7 @@ static void gpu_decomp_worker(
               if (!opt.gds_only)
                 g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
               // Mirrors the loop tail below, which this branch skips.
-              credit_input(i);
+              credit_input(i, actual);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -49779,7 +50231,7 @@ static void gpu_decomp_worker(
               // queue-time release so its next batch can overlap the write.
               if (bp) bp->release(1);
               g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
-              credit_input(i);
+              credit_input(i, actual);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -49839,7 +50291,7 @@ static void gpu_decomp_worker(
               results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
               // See the compress site: engagement means a DELIVERED frame.
               g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
-              credit_input(i);
+              credit_input(i, actual);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -49851,7 +50303,7 @@ static void gpu_decomp_worker(
           // undelivered tail, whose inputs are still intact.
           if (!delivery_committed)
             rc_commit_delivery([&] {
-              credit_input(i);
+              credit_input(i, actual);
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
@@ -53012,8 +53464,10 @@ static int extract_tar(const Options & opt, Meter * m)
     if (!stats_at.unchanged()) { stats_moved = true; return; }
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m->t0).count();
+    const CompressPassStats dpass = gz_dpass_take();   // this archive's GPU decode, if any
     stats_err = write_stats_json(stats_at.dir.base, opt, *m, elapsed,
-                                 m->cpu_decode_threads.load(std::memory_order_relaxed), nullptr,
+                                 m->cpu_decode_threads.load(std::memory_order_relaxed),
+                                 dpass.pipeline ? &dpass : nullptr,
                                  std::chrono::steady_clock::now(), &since, stats_at.dir.fd);
     stats_at.capture();     // this write changed the file; compare from here
   };
@@ -53126,9 +53580,10 @@ static int extract_tar(const Options & opt, Meter * m)
     if (members.empty() && arc != "-" && !opt.keep_going && !opt.tar_to_stdout) {
       tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
       std::vector<tarx::TarSplitCand> psplits;
+      std::vector<std::string> pdirs;
       bool decoded_cpu = false;
       const bool planned = tarx::build_full_parallel_plan(in, dest_fd, opt, pst, pbounds,
-                                                          &decoded_cpu, &psplits);
+                                                          &decoded_cpu, &psplits, &pdirs);
       if (decoded_cpu) m->note_cpu_decode_threads(1);
       if (planned) {
         // The slices the plan can make: one per entry, and one more per part
@@ -53153,7 +53608,7 @@ static int extract_tar(const Options & opt, Meter * m)
 #endif
           tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
           ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
-          ex.run_parallel(in, pbounds, psplits, pst.c_off, pst.u_off, opt, m);
+          ex.run_parallel(in, pbounds, psplits, pst.c_off, pst.u_off, opt, m, pdirs);
           // The data frames were counted as they were read; the index and seek
           // table the plan was built from are the archive's skippable frames.
           m->skipped_input_bytes.fetch_add(pst.skippable_bytes, std::memory_order_relaxed);
@@ -53543,12 +53998,15 @@ static int verify_tar(const Options & opt, Meter * m)
                     ex.validated_files(), ex.stream_bytes(), comp, secs});
     // The same counters plain -t records (this test writes no files, so there
     // is nothing for the record to collide with).
-    if (!opt.stats_json.empty())
+    if (!opt.stats_json.empty()) {
+      const CompressPassStats dpass = gz_dpass_take();   // this archive's GPU decode, if any
       stats_err = write_stats_json(opt.stats_json, opt, *m,
                                    std::chrono::duration<double>(
                                        std::chrono::steady_clock::now() - m->t0).count(),
                                    m->cpu_decode_threads.load(std::memory_order_relaxed),
-                                   nullptr, std::chrono::steady_clock::now(), &arc_mark);
+                                   dpass.pipeline ? &dpass : nullptr,
+                                   std::chrono::steady_clock::now(), &arc_mark);
+    }
   }
 
   // Stop the progress bar, then print the per-archive results on clean lines.
@@ -57828,8 +58286,10 @@ static int gzstd_main(int argc, char ** argv)
     if (!opt.stats_json.empty()) {
       double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
           std::chrono::steady_clock::now() - t0).count();
+      const CompressPassStats dpass = gz_dpass_take();   // this input's GPU decode, if any
       stats_json_errno = write_stats_json(opt.stats_json, opt, meter, elapsed,
-                                          meter.cpu_decode_threads.load(std::memory_order_relaxed));
+                                          meter.cpu_decode_threads.load(std::memory_order_relaxed),
+                                          dpass.pipeline ? &dpass : nullptr);
       stats_json_failed = stats_json_errno != 0;
     }
 
@@ -63257,6 +63717,13 @@ static Options parse_args(int argc, char ** argv)
              "table only;\n  recovering past a CORRUPT FRAME needs the CPU "
              "decoder — re-run without\n  --gds-only/--direct-stage for that.\n");
       }
+      // REFUSED BY ITS OWN NAME (v0.18.63).  The --cpu-only forced below made the
+      // backend check further down refuse `-d --gpu-only --keep-going` as
+      // "--gpu-only cannot be combined with --cpu-only or --hybrid": a flag the
+      // user never typed.  The refusal stands (see above); the message says why.
+      if ((opt.gpu_only || opt.hybrid) && !opt.gds_only && !opt.direct_stage)
+        die_usage(std::string("--keep-going recovers on the CPU decoder (it implies --cpu-only), "
+                              "so it cannot be combined with ") + (opt.gpu_only ? "--gpu-only" : "--hybrid"));
       if (!opt.cpu_only && !opt.gds_only && !opt.direct_stage) {
         // The CPU decoder is the authoritative checksum validator and the recovery
         // path lives there; recovery is rare and not perf-critical, so route the

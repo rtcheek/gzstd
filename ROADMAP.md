@@ -121,8 +121,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
 5. ~~**zstd spellings**~~ CLOSED v0.18.8: `--zstd=...`, the `--train -c -o` order, and a bare `-M`
    number counting bytes as zstd's does.
 6. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
-7. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
-    The caller's doing; left.
+7. ~~**`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
+    The caller's doing; left.~~ **FIXED v0.18.63**: it was a data loss at exit 0, and with `--rm` the source
+    went too (`gzstd --adapt --rm f -o ~/.cache/gzstd/profile.json`: f removed, its archive renamed over by
+    the profile).  The save now replaces only a profile (a numeric gzstd_profile, any epoch, or a damaged
+    file that opens with that key), an empty file or a non-regular entry; any other file is left in place and
+    the save is skipped, with a warning.
 8. **Move to zstd 1.6.0 once it is tagged.** Checked 2026-10-06: 1.5.7 (February 2025) is still the
    newest release; zstd's development branch calls itself 1.6.0, with a CHANGELOG entry dated December
    2025, but is untagged, 419 commits ahead. Stay on 1.5.7 until the tag: an untagged commit has no
@@ -1185,10 +1189,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
     Only a member over half the stream is cut (two 12 GiB halves cut lost up to 3%; 48 x 512 MiB and /usr tied),
     and never in a trivial-decode archive (8 GiB of random bytes cut: 2.89-3.15 s against 2.54-2.81 at 64 CPUs);
     one member among 47 small ones runs 9.18-9.38 -> 8.45-8.77 s at 4 CPUs but 8.00-8.08 -> 8.16-8.26 at 64.
-    (j) PRE-EXISTING, raised by the review: the parallel extract may create a file before another partition
+    (j) ~~PRE-EXISTING, raised by the review: the parallel extract may create a file before another partition
     processes its parent's directory entry, so a destination directory that already exists without owner write
     (which make_dir would widen) can refuse the file; v0.18.59's partitions of a [d/] [d/big] archive race the
-    same way.  **What binds one large file now is its writes**: 16 threads writing 24 GiB into
+    same way.~~ **FIXED v0.18.63**, and wider than found: a file or symlink where the archive has a directory
+    raced too (5 of 6 runs failed), and re-extracting an archive that stores a read-only directory failed 4
+    of 4.  The plan's directories are readied before the partitions start, reversibly (Extractor::prepare_dirs).  **What binds one large file now is its writes**: 16 threads writing 24 GiB into
     /dev/shm ran 2.55 GiB/s into one file and 29 into sixteen (the kernel serialises buffered writes to one
     inode), and O_DIRECT to this NVMe ~3.1 GiB/s either way (the drive).  So a fast buffered sink holds one big
     member to ~2.5 GiB/s whatever the extractor does: 24 GiB to /dev/shm took 9.6-10.7 s as one file and 3.0 as
@@ -2245,7 +2251,14 @@ counter, which is the only trustworthy proof `--gds-only` really used peer-to-pe
 mutation-disproven as routing evidence at v0.17.8. The preload workaround makes the counter
 usable; revisit it if a future libcufile fixes the destructor.
 
-## Tooling gap: `gzstd-benchmark.sh` has NO `--tar` coverage
+## Tooling gap: `gzstd-benchmark.sh` has NO `--tar` coverage -- MOSTLY CLOSED v0.18.63
+
+**v0.18.63:** `--tar` adds create, extract and one-member seek-extract rows on two corpora (the test files
+as a few large members; many small files sampled across one of them), beside GNU tar + zstd, for the
+baseline rows at every `--cpus` allowance.  Extract times include a sync of the destination.  Covered:
+items 1, 3 and 4 below, and item 2's parallel path.  **Left:** the serial extract (a piped archive,
+`--keep-going`).  (A decode's GPU share needed gzstd's `--stats-json` to record decode devices, which it
+did for compress only; fixed in v0.18.63.)  The section as written:
 
 The benchmark sweeps plain compress/decompress across batch sizes, streams, threads and levels.
 It does not invoke `--tar` **at all** — zero occurrences in the script. So the entire tar path is
