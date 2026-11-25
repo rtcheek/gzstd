@@ -1783,10 +1783,14 @@ input simply grew. Also fixed: stuck-GPU reclaim ownership and `--direct-stage` 
 staged failures exiting 2, and resource-failure paths into `std::terminate` (CHANGELOG v0.17.62).
 
 **Follow-ups recorded by the review, deliberately not done:**
-- No hook stalls `cuFileWrite`, so the reclaim/GDS-write ownership fix is inspection-only; experimental
-  `GZSTD_DEBUG_GDS_WRITE_BEHIND` is not covered by stuck-write reclaim.
-- The reclaimer covers only the published, post-launch interval; a CUDA call that never returns during bringup or
-  pre-publication H2D still hangs the run.
+- ~~No hook stalls `cuFileWrite`, so the reclaim/GDS-write ownership fix is inspection-only; experimental
+  `GZSTD_DEBUG_GDS_WRITE_BEHIND` is not covered by stuck-write reclaim.~~ **FIXED v0.18.64**: the -d write-behind
+  is removed (it never paid, and its join was a driver call nothing could give up on), and compress
+  `--gds-only`'s last output write is timed (`GZSTD_DEBUG_GPU_HANG=write` stalls it; a cell holds it to exit 5).
+- ~~The reclaimer covers only the published, post-launch interval; a CUDA call that never returns during bringup or
+  pre-publication H2D still hangs the run.~~ **FIXED v0.18.64**: a -d batch is published from the moment it is
+  taken (a 60 s PREP limit before its launch), and bringup, a worker's context, setup and release are watched
+  calls teardown gives up on (GzGpuCallWatch; the 2026-11-24 driver-wedge hang).
 - The resource-failure hardening (allocation and thread-creation failures) has no rlimit/cgroup test.
 - A compress input that grows under the chunked (mmap/pread) readers yields a valid archive of the captured snapshot,
   not an error; only `--sliding-window`, which pledges a size, refuses it.

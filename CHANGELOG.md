@@ -1,12 +1,172 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.63  
+**Covers:** v0.9.50 → v0.18.64  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
 
 ---
+
+
+## v0.18.64 — a GPU driver that stops answering costs the run its GPU, not its output: teardown gives up on a GPU call that holds no frames, a -d batch stuck before its launch is reclaimed for the CPU, a GPU-only run fails after 60 s of GPU initialization with no answer, a fixed-share run hands it to the CPUs, and the unused -d GDS write-behind is gone
+
+**MEASURED 2026-11-24 on the 8-GPU server.**  One card's GSP firmware crashed and the driver held its global
+lock; every NVML and CUDA call on every card blocked.  A default `gzstd -df` of a 70 GB archive (v0.18.63)
+decoded every frame on the CPU pool in ~22 s and then never finished.  /proc showed the deferred GPU bringup
+thread in `ioctl(/dev/nvidiactl, NV_ESC_RM_CONTROL)` waiting for that lock, right after cuInit, and main in
+pthread_join on it -- the teardown's `gpu_bringup_thr.join()`, which comes before the writer's join and
+close().  16,430 of 16,686 frames were on disk; the last 10.31 MiB sat in the DirectWriter's bounce buffer,
+flushed only at close(), and the temporary output was never renamed.  Ctrl-C removed it and left a zombie
+holding the shell until the driver recovered (unload, PCI reset, reload; no reboot).  The archive was fine.
+
+**The gap was older than v0.18.63.**  A stuck BATCH was covered (GzDecompInflight's reclaim, the --tar pool's
+GpuWatch, compress's stall guard).  The GPU calls that hold no frames were watched by nothing: starting CUDA
+and ranking the devices, a worker creating its device context, its setup up to its first batch, freeing its
+buffers at the end, and the --tar extract controller's own bringup.  Such a call delays nothing until
+something waits for its thread -- then it delays everything.
+
+**The mechanism (GzGpuCallWatch).**  Each of those calls runs as a WATCHED call, or a watched phase that
+steps out for every touch of the run (a worker's setup: the tuner, -vvv's counters, a failure's accounting,
+the registration that ends it).  A thread given up on is ABANDONED and detached; should its call ever return,
+it parks without touching the run, which may be gone by then.  Main leaves by _Exit (g_gpu_thread_parked)
+rather than run CUDA's own teardown, which the stuck call would block, and every later input of the
+invocation runs as on a host without GPUs (gz_cuda_usable_count returns 0: another call would only queue
+behind the stuck one).  Code inside a watched call touches only its own thread's locals and process-lifetime
+state; a bringup lambda passes copies in, and the --adapt UUID and L2 queries the tuner made inside
+tune_init_devices are now read beforehand, as one watched call.  What gives up, by mode (rtcheek's rules):
+
+| run | a GPU call that never returns | result |
+|---|---|---|
+| default hybrid | given up on at teardown, after 6 s of waiting for it | exit 0, the CPUs did the work; WARNING |
+| --gpu-only, --gds-only, --direct-stage | GPU INITIALIZATION (bringup, context, setup, cuFile's driver and handles, staging pools, the device check of the CPU routes): the GPU initialization timer, 60 s in one call | exit 5, the partial output removed: "GPU initialization failed: no answer from the GPU driver for 60 s while starting CUDA.  --gpu-only runs on the GPU only, so the run stops here" |
+| GPU-only, a small input that reaches teardown first | given up on after 6 s | exit 5 too if frames are left for it (it no longer finishes on the CPU); exit 0 if other GPUs did them |
+| fixed share (--cpu-share) | the device count (now on a helper thread), the inline bringup (now on its own thread) and the wait for a GPU to register each give up after the same 60 s | exit 0, the CPUs finish: "WARNING: GPU initialization failed: ... the CPUs finish the run without the GPU", with a pointer to nvidia-smi and journalctl -k |
+| any, the final release of a worker's buffers | given up on at teardown, after 6 s | exit 0 even GPU-only: the work is done |
+| -d, a batch's buffers, pinned memory or upload (before its launch) | reclaimed like a stuck kernel: the batch is published from the moment it is taken, with a 60 s limit before the launch (GZSTD_DEBUG_GPU_PREP_SEC), the batch deadline after it | exit 0, its frames finished on the CPU (--gpu-only's rescue); --gds-only exit 5, as any reclaimed --gds-only batch |
+| compress --gds-only, the last output write (the bytes exist only in VRAM) | never given up on: the stall guard's limit (10 min, GZSTD_DEBUG_GPU_STALL_SEC) ends the run | exit 5, the partial output removed: "GPU output stalled: ..." |
+| --gds-only, a cuFile file handle's release at the end | given up on after 6 s; its descriptor is kept open, so a late release cannot reach a reused number | exit 0 |
+| --tar extract, the forced GPU start (GZSTD_POOL_GPU) | now on its own thread, given up on after 60 s | exit 0, the CPU decoders finish |
+
+The 6 s is counted from when teardown starts waiting, so a slow but healthy cuInit (~1 s plus ~0.25 s a
+device here) still has all of it.  The 60 s timer is a thread of its own that only GPU-only runs arm; it
+watches calls on any thread, the main one included, and ends the run with die().
+
+**What moved for it.**  A worker frees its device buffers LAST, after its exit is accounted for and its streams
+are unregistered (-d) or after the abort is published and everything woken (compress's fault path): what
+follows touches nothing of the run, so a device that just faulted -- the likeliest to stop answering -- costs
+teardown at most its wait, and a rescue owed by that exit has already started.  A -d worker waits for its
+context turn between looks at the queue (the lock is now a timed_mutex), so a device stuck creating its
+context does not hold the others forever.  An abandoned -d worker's exit is accounted for by whoever gave up on
+it, as the reclaimer does for a reclaimed batch.  The --tar pool spawns its GPU once through an atomic flag,
+not a call_once: the first caller may park for good and must not do so inside a once_flag in its frame.
+
+**A -d batch before its launch.**  The reclaimer used to see a batch only from its kernel launch; its buffers,
+pinned memory and upload -- the --direct-stage staging lanes and read-ahead copies, --gds-only's cuFile reads
+-- ran before that, holding popped frames nothing could take back.  The batch is now published when it is taken.
+Every hand-back (a VRAM shrink, a temp buffer that will not grow) unpublishes first or parks; after each group of
+calls that can block, and before every touch of the run (the read-ahead cache, the archive-defect die, -vvv's
+counters), the thread checks it was not taken; the launch turns it into the in-flight batch under the lock.  A
+staging lane taken mid-copy parks before releasing its read-ahead claim, and the cache then keeps its buffers
+(freed memory under a copy that returns late is a crash).  The batch's metadata -- which reads the archive's
+checksum table, reloaded by the next input -- is now computed before any of its uploads.  The PREP limit is 60
+s, not the batch deadline: a first batch can pin gigabytes (~6 s measured) and --direct-stage reads its frames
+from the drive there.
+
+**Removed: the -d GDS write-behind (GZSTD_DEBUG_GDS_WRITE_BEHIND).**  Off by default since it was built, and
+never a gain here: off 67.90-69.05 s, on 67.65-68.42 s at 130 GiB, 3.5% slower at 4 GiB, because reads and
+writes share one drive.  Its join before the next batch's kernel was a driver call nothing could give up on, and
+covering it would have cost more than an experiment that never paid.  The measurements stay at the write site.
+Compress's pack write-behind (the default for --gds-only output since v0.18.34) stays.
+
+**Verified.**  A test hook, GZSTD_DEBUG_GPU_HANG=bringup|context|setup|release, stalls the first thread into
+that call until it is given up on (60 s at most), then returns as a late call would; a context stall holds the
+one-device-at-a-time lock, as a context that never comes does.  GZSTD_DEBUG_GPU_INIT_SEC shortens the timer;
+GZSTD_DEBUG_POOL_GPU_LAZY brings the --tar controller's GPU in at its first window.  On the 8-GPU server:
+- teardown: every site at exit 0 with the output byte-identical (or round-tripped), 6.0-6.4 s after the work
+  was done: -d and compress with the bringup stalled (hybrid, --adapt, -t, --tar create and extract,
+  --stats-json, two inputs in one invocation -- the second started no CUDA); a worker's context (2 devices,
+  both left behind when the first held the lock), its setup, and its release (hybrid and --gpu-only);
+- GPU-only, a 2 GiB input with the timer at 4 s: -d, compress and --direct-stage with the bringup (compress:
+  on the main thread), a context or a setup stalled, all exit 5 in 4.0-5.5 s with no output left; a
+  --gpu-only --tar extract whose device check stalls, exit 5;
+- fixed share, --cpu-share=0.5: -d and compress with the device count, a context or a setup stalled, all exit
+  0 with the output right, 4.6-8.3 s;
+- a -d batch stalled in its upload (GZSTD_DEBUG_DECOMP_STALL=-1:60:upload, PREP limit 3 s): --gpu-only (host
+  frames), --direct-stage on a read-ahead copy and, with the cache off, on a staging lane's copy, and hybrid,
+  all reclaimed and exit 0 with the output right; --gds-only (on a cuFile read) exit 5, as v0.18.63 gives a
+  reclaimed --gds-only batch;
+- compress --gds-only with its last write stalled: exit 5, no output; -d and compress --gds-only with a cuFile
+  handle's release stalled: exit 0 after 6 s, output right; a --tar extract whose forced GPU start stalls (also
+  with GZSTD_DEBUG_POOL_GPU_FIRST): exit 0, the extract right;
+- healthy runs in every mode (default, --gpu-only, --cpu-share, --direct-stage, --gds-only, -t, a pipe, --tar
+  with and without the forced GPU): exit 0, output right, no warning; A/B against v0.18.63, arms rotated:
+  compress --gpu-only medians 2.02 s both (8 pairs); -d --gpu-only 1.74 vs 1.77 s, --direct-stage 2.05 vs 2.14,
+  --gds-only 2.82 vs 2.91 (8 pairs; one outlier each way, from the shared host).  Both builds compile without
+  warnings.
+
+One defect the matrix found in this work itself: compress's context call passed a null site, so the test hook
+called strcmp(NULL) and the timer would not have counted that call as initialization.  Fixed before any cell
+was written.
+
+**Tests.**  +16 cells in a new default section, "A GPU driver that stops answering" (14 GPU, 2 GDS): -d (two
+inputs) and compress finish when the bringup never returns; -d --gpu-only finishes when freeing a GPU's buffers
+never returns; GPU-only runs fail, exit 5 with no output left, when no context comes (-d, compress: inputs the
+queue holds whole, so teardown ends them), when the bringup or CUDA's start never returns and when a -d GPU's setup
+never returns (the timer: its error must name its own limit), and when a compress GPU's setup never returns; the
+fixed share's CPUs finish when CUDA never starts and when a GPU's setup never returns; -d --gpu-only and
+--direct-stage reclaim a batch stuck before its launch; a --tar extract's forced GPU start is given up on; compress
+--gds-only fails when its last output write never returns (at a 10 s limit, past teardown's 6 s, so a teardown
+that left the write behind would show as a short output at exit 0); -d --gds-only finishes when a cuFile handle's
+release never returns.  Each is a hang guard first (45 s).  The test limit is 3 s only where the stall is the
+first GPU call: a real cuInit took over 3 s on the 8-GPU host, and a 3 s limit gave up on that healthy start once
+in five runs.  Mutants of the fix, each caught by its cell (TIMED OUT, or the wrong exit or error): never giving up
+at teardown, a plain join on the -d bringup, an abandoned -d worker's exit not accounted for, compress not counting
+it a failed bringup, the timer never firing, the fixed-share barrier never giving up, the bounded device count
+never timing out, GPU-only teardown not failing, compress's setup not watched, a -d batch published only at its
+launch, teardown free to leave a write behind, the --tar forced start back on the main thread, a cuFile release
+unbounded.  Suites, on the final tree: -e 957/0/1 of 958 in 27m43s (the one skip is the cell this host cannot exercise;
+-e is a strict superset of the default 609), and the CPU-only build 423/0/153 of 576, as expected (609 less the
+186 GPU cells).
+
+**Codex (gpt-6.1-sol, xhigh), round 1: NOT SAFE TO TAG, six findings, all verified real.**  (1) The GPU
+initialization timer sampled its clock before locking a watch, so a call entered after the sample wrapped
+`now - since` and failed a healthy GPU-only run: sampled under the lock now.  (2) A -d batch handed back after a
+failed allocation was unpublished BEFORE its device buffers were freed, and that free could wedge holding the
+frames: freed first now.  (3) A compress bringup failure stuck in its final free was counted a failure twice
+at teardown, and the -d reclaimer's last-out rescue ignored an earlier abandoned initialization: both fixed
+(exit_noted; the same fatal rule as the other last-out paths).  (4) A cuFile handle given up on was still the
+shared GdsFile, so a later input could deregister it again or a late return could clobber the next input's
+handle; and a later --gds-only input's preflight reached cuFile without the device count's check: the helper
+now owns the moved-out handle, and the preflight refuses after an abandoned call.  (5) Both setup phases read
+g_perf before stepping out, and PREP read the checksum table and -vvv's counters after only a check, not under
+the lock: fenced.  (6) Main-thread driver calls before any watch existed -- GPU verification's probe, the NVML
+PCIe fallback, the default staging's device count -- were untimed: the first two are GPU-only init steps or
+bounded; the default staging's count is BOUNDED with the CPU fallback (not the GPU-only timer Codex proposed: a
+default chose that staging, and a driver that never answers must not end a default run).  Codex's lock around
+the read-ahead cache's claim and release was replaced: claim() can wait for a disk read, which would have held
+the reclaim lock every staging lane and the reclaimer need; instead a run that reclaimed a batch keeps the
+cache OBJECT as well as its buffers, so a late claim or release lands on a stopped, live cache.
+
+**Round 2: NOT SAFE TO TAG, one finding, real.**  Keeping a reclaimed run's cache object did not protect the
+NEXT input's: a staging lane of input A that passed its check and paused before loading the global cache
+pointer could resume after A's batch was reclaimed and load input B's cache, which B's teardown destroys.  Each
+batch now freezes its cache pointer under the ownership lock; each staged worker holds its own copy of the
+input descriptor, so a late cache miss cannot pread through a number a later input reuses.  Codex's version
+took that copy for any batch of a --direct-stage stream; when --direct-stage stands down to the ordinary reader
+(no usable seek table) the descriptor is already closed, and every batch would have thrown into the rescue --
+the copy is taken only for a batch that holds staged frames (measured: a 512-frame archive with its seek table
+cut off, exit 0, byte-identical, as v0.18.63).  A --gds-only lane now also parks right after its cuFile read,
+before a next read through the global handle a later input may be reopening.
+
+**Round 3: SAFE TO TAG.**  Both corrections confirmed; no remaining blocker in the change or its fixes.  The
+final tree measured against v0.18.63, arms rotated (6 pairs each, -d of 2 GiB): --gpu-only medians 1.82 vs
+1.77 s, --direct-stage 1.99 vs 1.96, --gds-only 2.85 vs 2.85 -- inside this shared host's spread (1.39-2.10 s
+for the same command).
+
+**What the tests cannot show.**  A call that returns AFTER it was given up on -- the thread then parks, or checks
+it was taken, before touching the run.  Every cell's run is over before its stalled call returns (the hooks wait up
+to 60 s), so those fences were checked by reading, and by Codex, not by a test.
 
 
 ## v0.18.63 — the --adapt profile save replaces only a profile, so an output named there survives, a parallel extract readies an existing directory before its partitions write into it, and its decode pool stops zero-filling a buffer per frame (ROADMAP 7, 45j)

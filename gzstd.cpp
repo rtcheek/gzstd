@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.63";
+static constexpr const char * GZSTD_VERSION = "0.18.64";
 //
 // Architecture overview:
 //
@@ -1191,6 +1191,9 @@ private:
 // registration is the expensive part, so one handle for all devices and streams
 // is both correct and the cheap arrangement.  Only ever touched by --gds-only.
 static GdsFile g_gds_input;
+#ifdef HAVE_NVCOMP
+static bool gz_gds_close_bounded(GdsFile & f, int verbosity);   // with GzGpuCallWatch
+#endif
 // --gds-only -t: verify an archive with the payload never entering host memory.
 // NVMe -> VRAM (cuFileRead) -> nvCOMP decompress in VRAM -> device-side XXH64
 // against the frame trailer -> report.  Nothing is written, so unlike
@@ -1371,7 +1374,7 @@ static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
 // offsets, wrong file, no error.  The two descriptors also leaked per input.
 //
 // Deregister before closing: the cuFile handle refers to the descriptor.
-static void gds_decomp_read_close()
+static void gds_decomp_read_close(int verbosity)
 {
   // PER-INPUT DIAGNOSTICS, reset with the transaction they describe.  These were
   // process-lifetime counters, so `-vv -t --gds-only A.zst B.zst` printed B's
@@ -1391,7 +1394,8 @@ static void gds_decomp_read_close()
   // reordering declarations to reset counters no report consumes.)
   g_gds_read_active.store(false, std::memory_order_release);
   g_gds_verify_active.store(false, std::memory_order_release);
-  g_gds_input.close();
+  // Bounded (gz_gds_close_bounded): given up on, its descriptor stays open.
+  if (!gz_gds_close_bounded(g_gds_input, verbosity)) g_gds_verify_fd = -1;
   if (g_gds_verify_fd >= 0)       { ::close(g_gds_verify_fd);       g_gds_verify_fd = -1; }
   if (g_gds_verify_plain_fd >= 0) { ::close(g_gds_verify_plain_fd); g_gds_verify_plain_fd = -1; }
 }
@@ -29604,6 +29608,480 @@ static std::atomic<uint64_t> g_decomp_abandoned{0};
 // thread is parked inside CUDA, so main must leave by _Exit rather than run
 // CUDA's teardown, which the stuck call can block.
 static std::atomic<bool> g_gpu_thread_parked{false};
+
+// A GPU CALL THAT HOLDS NO FRAMES, AND THE TEARDOWN THAT STOPS WAITING FOR IT
+// (v0.18.64).  MEASURED 2026-11-24, 8-GPU server, one card's firmware crashed and
+// the driver held its global lock: a default -d of a 70 GB archive decoded every
+// frame on the CPU pool in ~22 s, then hung for good.  The deferred bringup thread
+// had started CUDA and sat in an ioctl waiting for that lock; teardown joined it
+// before the writer and close(), so the last 10 MiB sat in a bounce buffer and the
+// output was never renamed.  Nothing ended it: Ctrl-C removed the temporary output
+// and left a zombie.
+//
+// A stuck BATCH was already covered (GzDecompInflight, the --tar pool's GpuWatch,
+// compress's stall guard).  The calls nothing watched hold no frames: starting
+// CUDA and ranking the devices on the bringup thread, a worker creating its device
+// context, a worker freeing its buffers at the end.  Such a call delays nothing
+// until teardown waits for its thread, so that is where it is given up on: after
+// GPU_FRAMELESS_LIMIT_SECS of waiting for a thread that is inside one, teardown
+// ABANDONS it and detaches it, the run finishes on what it has, and main leaves by
+// _Exit (g_gpu_thread_parked) rather than run CUDA's teardown, which the stuck
+// call would block.  If the call ever returns, the thread PARKS without touching
+// the run, which may be gone by then.
+//
+// THE RULE INSIDE A WATCHED CALL: touch the thread's own locals and process-
+// lifetime state only, never the run's (the frame that started the thread).  A
+// bringup thread is a lambda in that frame, so it passes copies in.  The watch is
+// shared by the thread and teardown, so a parked thread keeps it alive.
+struct GzGpuCallWatch {
+  std::mutex m;
+  std::condition_variable cv;    // finished, abandoned
+  uint64_t since = 0;            // when the current watched call began; 0 = in none
+  const char * what = "";        // that call, for the warning
+  // Which call: "bringup", "context" and "setup" are GPU INITIALIZATION (the
+  // timer below fails a --gpu-only run stuck in one); "release" (a worker's
+  // buffers) and "handle" (a cuFile file handle at the end) are not.  "write"
+  // holds OUTPUT that exists nowhere else (a --gds-only pack in VRAM): nothing
+  // ever gives up on it, and the timer ends the run after the stall guard's limit.
+  const char * site = "";
+  // Set for a GPU-only run (the flag that made it one): the GPU initialization
+  // timer watches it, and a stuck initialization fails the run (gz_gpu_init_timer_add).
+  const char * fail_flag = nullptr;
+  int dev = -1;                  // its device; -1 = the bringup (no one device)
+  int streams = 0;               // streams the worker registered with the scheduler
+  bool abandoned = false;        // one-way, set by teardown
+  bool exit_noted = false;       // the worker has accounted for its exit/failure
+  bool finished = false;         // the thread has returned, or nearly: join it
+  void finish() {
+    { std::lock_guard<std::mutex> lk(m); finished = true; }
+    cv.notify_all();
+  }
+  bool given_up() {
+    std::lock_guard<std::mutex> lk(m);
+    return abandoned;
+  }
+  [[noreturn]] void park() {
+    std::unique_lock<std::mutex> lk(m);
+    for (;;) cv.wait(lk);
+  }
+};
+using GzGpuCallWatchP = std::shared_ptr<GzGpuCallWatch>;
+// Set once any watched call has been given up on.  The driver is not answering, so
+// every later input of this invocation runs without the GPU: another CUDA call
+// would only queue behind the stuck one.
+static std::atomic<bool> g_gpu_call_abandoned{false};
+// The wait, counted from when teardown starts waiting, so a slow but healthy call
+// still has all of it.  MEASURED: cuInit ~1 s plus ~0.25 s a device, serialised
+// context creation ~0.25 s a device, both on the 8-GPU server; a run that reaches
+// teardown before them waits for them as before.
+static constexpr int GPU_FRAMELESS_LIMIT_SECS = 6;
+
+// GZSTD_DEBUG_GPU_HANG=bringup|context|release: the first thread to enter that
+// watched call stalls in it, as a call into a hung driver would, until teardown
+// gives up on it (60 s at most), then returns as that call returning late would.
+// Test-only.
+static void gz_gpu_hang_hook(GzGpuCallWatch & w, const char * site)
+{
+  static const char * const want = ::getenv("GZSTD_DEBUG_GPU_HANG");
+  static std::atomic<bool> fired{false};
+  if (!want || !site || std::strcmp(want, site) != 0 || fired.exchange(true)) return;
+  if (g_verbosity >= V_VERBOSE) {
+    char l[128];
+    std::snprintf(l, sizeof l, "[STALL] GPU %s: stalling until it is given up on\n", site);
+    if (g_progress_active.load(std::memory_order_relaxed)) std::fputs("\r\033[K", stderr);
+    std::fputs(l, stderr);
+  }
+  std::unique_lock<std::mutex> lk(w.m);
+  w.cv.wait_for(lk, std::chrono::seconds(60), [&] { return w.abandoned; });
+}
+
+static bool gz_gpu_site_is_write(const char * site)
+{
+  return site && std::strcmp(site, "write") == 0;
+}
+static bool gz_gpu_site_is_init(const char * site)
+{
+  return site && (std::strcmp(site, "bringup") == 0 || std::strcmp(site, "context") == 0
+                  || std::strcmp(site, "setup") == 0);
+}
+
+// Enter a watched phase explicitly, for one too long to pass as a lambda: a
+// worker's setup between its context and its first batch.  The same rule holds
+// inside; to touch the run, LEAVE first (and enter again after).
+static void gz_gpu_watch_enter(GzGpuCallWatch * w, const char * what, const char * site)
+{
+  if (!w) return;
+  std::lock_guard<std::mutex> lk(w->m);
+  w->since = std::max<uint64_t>(1, now_ns());
+  w->what = what;
+  w->site = site;
+}
+// Leave it: parks for good if teardown gave up on this thread meanwhile, so the
+// touch of the run that follows can never reach a run that is gone.  Harmless
+// outside a phase.
+static void gz_gpu_watch_leave(GzGpuCallWatch * w)
+{
+  if (!w) return;
+  std::unique_lock<std::mutex> lk(w->m);
+  if (w->abandoned) { lk.unlock(); w->park(); }
+  w->since = 0;
+}
+
+// Run f() as a watched call; with no watch, plainly.  f keeps to the rule above.
+// Returns or throws what f does -- or never returns, once teardown has given up
+// on this thread.  `hook`: false when f calls the test stall itself, where it
+// belongs.
+template <class F>
+static auto gz_gpu_watched(GzGpuCallWatch * w, const char * what, const char * site, F && f,
+                           bool hook = true) -> decltype(f())
+{
+  if (!w) return f();
+  gz_gpu_watch_enter(w, what, site);
+  struct Leave {               // on return and on a throw alike
+    GzGpuCallWatch * w;
+    ~Leave() { gz_gpu_watch_leave(w); }
+  } leave{w};
+  if (hook) gz_gpu_hang_hook(*w, site);
+  return f();
+}
+
+// Set once a GPU INITIALIZATION call (gz_gpu_site_is_init) has been given up on:
+// a --gpu-only run then has no GPU for what is left, and must not finish on the
+// CPU instead (gz_gpu_init_fail_msg).
+static std::atomic<bool> g_gpu_init_abandoned{false};
+
+// The GPU-only runs' failure, from the timer or from teardown: exit 5, the
+// partial output removed (die).
+static std::string gz_gpu_init_fail_msg(const char * flag, int dev, double secs, const char * what)
+{
+  char b[320];
+  std::snprintf(b, sizeof b, "GPU initialization failed: no answer from the GPU driver for %.0f s "
+                "while %s%s%s.  %s runs on the GPU only, so the run stops here; check nvidia-smi "
+                "and the kernel log (journalctl -k) for Xid errors", secs, what,
+                dev >= 0 ? " on GPU" : "", dev >= 0 ? std::to_string(dev).c_str() : "",
+                flag ? flag : "--gpu-only");
+  return b;
+}
+
+// The same, where the call given up on is not at hand: the warning before it
+// named the device and the call.
+static std::string gz_gpu_init_fail_generic(const char * flag)
+{
+  return std::string("GPU initialization failed: a GPU stopped answering while it was "
+                     "brought up (see the warning above).  ") + (flag ? flag : "--gpu-only")
+         + " runs on the GPU only, so the run stops here; check nvidia-smi and the kernel "
+           "log (journalctl -k) for Xid errors";
+}
+
+// How a caller gives up (gz_gpu_watch_give_up).
+struct GzGiveUp {
+  int  limit_s = GPU_FRAMELESS_LIMIT_SECS;
+  bool before_exit_only = false;  // skip a -d worker that has accounted for its exit
+  bool init_only = false;         // only a GPU initialization call
+};
+
+// Without blocking: give up on a thread that has sat in one watched call for the
+// limit, counted from `t0` (when the caller began waiting) or the call's start,
+// whichever is later.  True: abandoned now -- detach it, and account for anything
+// it would have done on its way out.  Allocation-free: this runs where an
+// exception would unwind through live threads.
+static bool gz_gpu_watch_give_up(GzGpuCallWatch & w, uint64_t t0, int verbosity,
+                                 const GzGiveUp & g = {})
+{
+  uint64_t in_call = 0;
+  const char * what = "";
+  int dev = -1;
+  bool init = false;
+  {
+    std::lock_guard<std::mutex> lk(w.m);
+    if (w.finished || w.abandoned || !w.since) return false;
+    if (g.before_exit_only && w.exit_noted) return false;   // the caller accounts only for these
+    // Output that exists nowhere else is never left behind: only the GPU-only
+    // timer, which ends the run, acts on a stuck write.
+    if (gz_gpu_site_is_write(w.site)) return false;
+    init = gz_gpu_site_is_init(w.site);
+    if (g.init_only && !init) return false;
+    const uint64_t now = now_ns();
+    if (now - std::max(w.since, t0) <= uint64_t(g.limit_s) * 1000000000ull)
+      return false;
+    w.abandoned = true;
+    in_call = now - w.since;
+    what = w.what;
+    dev = w.dev;
+  }
+  w.cv.notify_all();             // the hang hook
+  g_gpu_call_abandoned.store(true, std::memory_order_relaxed);
+  if (init) g_gpu_init_abandoned.store(true, std::memory_order_relaxed);
+  g_gpu_thread_parked.store(true, std::memory_order_relaxed);
+  g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);   // see its note
+  if (dev >= 0 && dev < ADAPT_DL_MAX)
+    g_decomp_abandoned.fetch_or(1ull << dev, std::memory_order_relaxed);
+  if (verbosity >= V_ERROR) {
+    char l[400];
+    char who[16] = "[GPU]";
+    if (dev >= 0) std::snprintf(who, sizeof who, "[GPU%d]", dev);
+    // A GPU INITIALIZATION call is reported as a failed one, however it was
+    // given up on: the run goes on without that device (the CPUs carry what it
+    // would have done).  Only the final release is a call merely not waited for.
+    if (init)
+      std::snprintf(l, sizeof l, "WARNING: GPU initialization failed: %s no answer from the GPU "
+                    "driver for %.1f s while %s; %s\n  Check nvidia-smi and the kernel log "
+                    "(journalctl -k) for Xid errors.\n", who, double(in_call) / 1e9, what,
+                    dev >= 0 ? "the run goes on without that device."
+                             : "the CPUs finish the run without the GPU.");
+    else
+      std::snprintf(l, sizeof l, "WARNING: %s no answer from the GPU driver for %.1f s "
+                    "while %s; %s  The output does not depend on it.\n", who,
+                    double(in_call) / 1e9, what,
+                    dev >= 0 ? "leaving that device behind." : "continuing without the GPU.");
+    if (g_progress_active.load(std::memory_order_relaxed)) std::fputs("\r\033[K", stderr);
+    std::fputs(l, stderr);
+  }
+  return true;
+}
+
+// A caller's wait for one such thread: true once it has finished (join it), false
+// once it has been given up on, now or before (detach it).
+static bool gz_gpu_watch_settle(GzGpuCallWatch & w, uint64_t t0, int verbosity,
+                                const GzGiveUp & g = {})
+{
+  const auto tick = std::chrono::milliseconds(250);
+  uint64_t last = now_ns();
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(w.m);
+      if (w.cv.wait_for(lk, tick, [&] { return w.finished || w.abandoned; }))
+        return w.finished;
+    }
+    // SIGSTOP or a debugger stopped this wait along with the call it is waiting
+    // for: nothing was seen during that gap, so restart the clock.
+    const uint64_t now = now_ns();
+    if (now - last > 3 * 250000000ull) t0 = now;
+    last = now;
+    if (gz_gpu_watch_give_up(w, t0, verbosity, g)) return false;
+  }
+}
+
+// THE GPU INITIALIZATION TIMER (v0.18.64; rtcheek: "in --gpu-only mode start a 60
+// sec timer on GPU init, if it fails to respond terminate with an error").  A
+// GPU-only run (--gpu-only, --gds-only, --direct-stage) has no CPU pool to carry
+// it, so a GPU initialization call that never returns -- starting CUDA, ranking
+// the devices, a context, a worker's setup, cuFile's driver -- left it blocked
+// before teardown could give up on anything: the reader waits for a consumer that
+// never comes, or the stuck call is on the main thread itself.  This timer runs
+// beside the run and ends it, exit 5 with the partial output removed, once one has
+// gone GPU_INIT_TIMEOUT_SECS without returning.  Only watches registered here are
+// timed, and only a GPU-only run registers any.  Process lifetime: the timer
+// thread and what it reads are never destroyed, so an exit cannot pull them out
+// from under it.
+static constexpr int GPU_INIT_TIMEOUT_SECS = 60;
+// The limit, also the fixed-share hybrid's (it gives the CPUs the run instead).
+// GZSTD_DEBUG_GPU_INIT_SEC overrides it, for the suite.
+static int gz_gpu_init_timeout_secs()
+{
+  static const int v = [] {
+    if (const char * e = std::getenv("GZSTD_DEBUG_GPU_INIT_SEC")) {
+      const int n = std::atoi(e);
+      if (n > 0) return n;
+    }
+    return GPU_INIT_TIMEOUT_SECS;
+  }();
+  return v;
+}
+// The stall guard's limit (compress, a batch stuck in the driver): also the limit
+// of a stuck write of output, whose healthy time is the storage's, not the driver's.
+static int gpu_stall_secs();
+static std::mutex & g_gpu_init_reg_mx = *new std::mutex;
+static std::vector<std::weak_ptr<GzGpuCallWatch>> & g_gpu_init_reg =
+    *new std::vector<std::weak_ptr<GzGpuCallWatch>>;
+static void gz_gpu_init_timer_loop()
+{
+  static std::mutex & tm = *new std::mutex;
+  static std::condition_variable & tcv = *new std::condition_variable;   // a clock: never notified
+  const uint64_t limit = uint64_t(gz_gpu_init_timeout_secs()) * 1000000000ull;
+  uint64_t last = now_ns();
+  std::vector<GzGpuCallWatchP> live;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(tm);
+      tcv.wait_for(lk, std::chrono::milliseconds(250));
+    }
+    const uint64_t now = now_ns();
+    // SIGSTOP or a debugger: nothing was seen during the gap; restart the clocks.
+    const bool gap = now - last > 3 * 250000000ull;
+    last = now;
+    live.clear();
+    try {
+      std::lock_guard<std::mutex> lk(g_gpu_init_reg_mx);
+      for (const auto & wp : g_gpu_init_reg)
+        if (GzGpuCallWatchP p = wp.lock()) live.push_back(std::move(p));
+    } catch (const std::bad_alloc &) {
+      continue;                  // next tick; an exception here would be std::terminate
+    }
+    for (const GzGpuCallWatchP & w : live) {
+      int dev = -1;
+      const char * what = "";
+      const char * flag = nullptr;
+      bool write = false;
+      uint64_t lim = limit;
+      {
+        std::lock_guard<std::mutex> lk(w->m);
+        write = gz_gpu_site_is_write(w->site);
+        if (w->abandoned || w->finished || !w->since || !w->fail_flag
+            || !(write || gz_gpu_site_is_init(w->site)))
+          continue;
+        if (gap) { w->since = now; continue; }
+        if (write) {
+          const int st = gpu_stall_secs();
+          if (st <= 0) continue;                 // the stall guard is off
+          lim = uint64_t(st) * 1000000000ull;
+        }
+        // A worker may have entered a new phase since this tick sampled `now`.
+        // Sample under the same lock as `since`: subtracting that later start
+        // from the tick's earlier time would wrap and fail a healthy run.
+        const uint64_t observed_now = now_ns();
+        if (observed_now - w->since <= lim) continue;
+        dev = w->dev; what = w->what; flag = w->fail_flag;
+      }
+      if (write) {
+        char b[360];
+        std::snprintf(b, sizeof b, "GPU output stalled: no answer from the GPU driver for %.0f s "
+                      "while %s%s%s.  %s writes the output from the GPU, so the run stops here; "
+                      "check nvidia-smi and the kernel log (journalctl -k) for Xid errors",
+                      double(lim) / 1e9, what, dev >= 0 ? " on GPU" : "",
+                      dev >= 0 ? std::to_string(dev).c_str() : "", flag);
+        die(b, EXIT_GPU_FAIL);
+      }
+      die(gz_gpu_init_fail_msg(flag, dev, double(lim) / 1e9, what), EXIT_GPU_FAIL);
+    }
+  }
+}
+// Time this watch's GPU initialization calls (a GPU-only run's: `fail_flag` set).
+static void gz_gpu_init_timer_add(const GzGpuCallWatchP & w)
+{
+  if (!w || !w->fail_flag) return;
+  {
+    std::lock_guard<std::mutex> lk(g_gpu_init_reg_mx);
+    g_gpu_init_reg.erase(std::remove_if(g_gpu_init_reg.begin(), g_gpu_init_reg.end(),
+                           [](const std::weak_ptr<GzGpuCallWatch> & p) { return p.expired(); }),
+                         g_gpu_init_reg.end());
+    g_gpu_init_reg.push_back(w);
+  }
+  static std::atomic<bool> started{false};
+  if (started.exchange(true)) return;
+  try {
+    std::thread(gz_gpu_init_timer_loop).detach();
+  } catch (const std::system_error &) {
+    started.store(false);        // no timer this time: the next registration tries again
+    if (g_verbosity >= V_VERBOSE)
+      std::fputs("[GPU] could not start the GPU initialization timer; a stuck GPU "
+                 "initialization will not be timed\n", stderr);
+  }
+}
+// The flag that makes `opt` a GPU-only run, or nullptr.
+static const char * gz_gpu_only_flag(const Options & opt)
+{
+  if (!opt.gpu_only) return nullptr;
+  if (opt.direct_stage_auto) return "the default's GPU staging (--hybrid or --cpu-only avoids it)";
+  return opt.gds_only ? "--gds-only" : opt.direct_stage ? "--direct-stage" : "--gpu-only";
+}
+// A new watch for this run: a GPU-only run's is timed (gz_gpu_init_timer_add).
+static GzGpuCallWatchP gz_gpu_watch_new(const Options & opt, int dev = -1)
+{
+  GzGpuCallWatchP w = std::make_shared<GzGpuCallWatch>();
+  w->dev = dev;
+  w->fail_flag = gz_gpu_only_flag(opt);
+  gz_gpu_init_timer_add(w);
+  return w;
+}
+
+// Run a GPU initialization call that would otherwise run on the CALLING thread on a
+// helper instead, and wait for it at most the GPU initialization timeout: where
+// the caller can carry on without the GPU (the fixed-share hybrid's synchronous
+// device count), a driver that never answers must not hold it.  f keeps to the
+// watched-call rule.  True with f's result; false when it was given up on (the
+// helper left behind) or f threw.  No thread for the helper: f runs here, untimed.
+template <class R, class F>
+static bool gz_gpu_call_bounded(const Options & opt, const char * what, F f, R & out)
+{
+  struct Slot { R r{}; bool threw = false; };
+  const GzGpuCallWatchP w = std::make_shared<GzGpuCallWatch>();
+  const std::shared_ptr<Slot> slot = std::make_shared<Slot>();
+  std::thread t;
+  if (!gz_try_thread(t, [w, slot, f, what]() {
+        try { slot->r = gz_gpu_watched(w.get(), what, "bringup", f); }
+        catch (...) { slot->threw = true; }
+        w->finish();
+      })) {
+    out = f();
+    return true;
+  }
+  GzGiveUp g;
+  g.limit_s = gz_gpu_init_timeout_secs();
+  if (!gz_gpu_watch_settle(*w, now_ns(), opt.verbosity, g)) {
+    t.detach();
+    return false;
+  }
+  t.join();
+  if (slot->threw) return false;
+  out = slot->r;
+  return true;
+}
+
+// A GPU initialization step a GPU-only run takes on its own thread -- cuFile's
+// driver and file handles, the device count, a staging pool -- timed by the GPU
+// initialization timer, which ends the run if it never returns.  Nothing gives up
+// on it (the timer fails the run instead), so f may touch anything.  Any other run
+// takes the step plainly.
+template <class F>
+static auto gz_gpu_only_init_step(const Options & opt, const char * what, const char * site,
+                                  bool hook, F && f) -> decltype(f())
+{
+  if (!opt.gpu_only) return f();
+  const GzGpuCallWatchP w = gz_gpu_watch_new(opt);
+  return gz_gpu_watched(w.get(), what, site, std::forward<F>(f), hook);
+}
+// The same as a scope, for a step too long to pass as a lambda.
+struct GzGpuOnlyInitScope {
+  GzGpuCallWatchP w;
+  GzGpuOnlyInitScope(const Options & opt, const char * what) {
+    if (!opt.gpu_only) return;
+    w = gz_gpu_watch_new(opt);
+    gz_gpu_watch_enter(w.get(), what, "setup");
+  }
+  ~GzGpuOnlyInitScope() { gz_gpu_watch_leave(w.get()); }
+  GzGpuOnlyInitScope(const GzGpuOnlyInitScope &) = delete;
+  GzGpuOnlyInitScope & operator=(const GzGpuOnlyInitScope &) = delete;
+};
+
+// A cuFile file handle's deregistration at the end of a --gds-only run, on the
+// main thread.  The output is complete by then, so a driver that never answers
+// must not hold the run: the call runs on a helper, waited for teardown's limit.
+// Given up on, the helper is left behind -- it owns the handle, moved out of f
+// before it starts -- and false comes back: the caller then KEEPS the descriptor open
+// (forgets it), so a deregistration that returns late can never reach a reused
+// descriptor number.  A handle never registered: true, at once.  No thread for
+// the helper: here, untimed.
+static bool gz_gds_close_bounded(GdsFile & f, int verbosity)
+{
+  if (!f.valid()) return true;
+  const GzGpuCallWatchP w = std::make_shared<GzGpuCallWatch>();
+  // A later input can close/reuse f while this helper is still in the driver.
+  // Keep the pending handle private: neither a second deregistration nor a
+  // late store to f may race the next input's handle.
+  const auto held = std::make_shared<GdsFile>(std::move(f));
+  std::thread t;
+  if (!gz_try_thread(t, [w, held] {
+        gz_gpu_watched(w.get(), "releasing a cuFile file handle", "handle", [held] { held->close(); });
+        w->finish();
+      })) {
+    held->close();
+    return true;
+  }
+  if (gz_gpu_watch_settle(*w, now_ns(), verbosity)) { t.join(); return true; }
+  t.detach();
+  return false;
+}
 #endif
 
 #ifdef HAVE_NVCOMP
@@ -30538,7 +31016,9 @@ static std::string gz_no_gpu_usage_msg(const Options & opt)
 {
   const char * flag = opt.gds_only ? "--gds-only" : opt.direct_stage ? "--direct-stage"
                                                                      : "--gpu-only";
-  const std::string why = gz_gpu_floor_note();
+  const std::string why = g_gpu_call_abandoned.load(std::memory_order_relaxed)
+      ? std::string("the GPU driver stopped answering earlier in this run")
+      : gz_gpu_floor_note();
   return std::string("GPU requested (") + flag + ") but "
          + (why.empty() ? std::string("no CUDA devices available") : why);
 }
@@ -30559,6 +31039,17 @@ static void gz_require_usable_gpu(const Options & opt, const char * who);
 static int gz_cuda_usable_count(const Options & opt, const char * who)
 {
   static std::once_flag said;
+  // A call an earlier input made never returned (GzGpuCallWatch).  The driver is
+  // not answering, and any call made now -- this count included, whose first
+  // caller may be the one still stuck in it -- would queue behind that one.  Every
+  // first-CUDA site opens here, so every later input runs as on a host without GPUs.
+  if (g_gpu_call_abandoned.load(std::memory_order_relaxed)) {
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+      vlog(V_VERBOSE, opt, "[GPU] the GPU driver stopped answering earlier in this run; "
+                           "not starting CUDA again\n");
+    return 0;
+  }
   const GzFloorPre & pre = gz_floor_precuda();
   if (pre.all_old) {
     std::call_once(said, [&]{
@@ -30586,7 +31077,10 @@ static int gz_cuda_usable_count(const Options & opt, const char * who)
 
 static void gz_require_usable_gpu(const Options & opt, const char * who)
 {
-  if (opt.gpu_only && gz_cuda_usable_count(opt, who) <= 0)
+  // GPU initialization on this thread: timed (gz_gpu_only_init_step, v0.18.64).
+  if (opt.gpu_only
+      && gz_gpu_only_init_step(opt, "starting CUDA", "bringup", true,
+                               [&] { return gz_cuda_usable_count(opt, who); }) <= 0)
     die_usage(gz_no_gpu_usage_msg(opt));
 }
 
@@ -34376,7 +34870,14 @@ public:
     // Target GPU batch, capped by the host-RAM ceiling (no point buffering more
     // frames than could ever be in flight).
     const size_t gpu_batch = std::min<size_t>(ram_cap_frames, 64);
-    std::once_flag gpu_spawn_once;
+    // Once only (the controller asks again and again).  Not a call_once: the
+    // first caller can sit for good in a call teardown gives up on
+    // (GzGpuCallWatch), and must not park inside a once_flag in this frame.
+    std::atomic<bool> gpu_spawn_started{false};
+    // The controller's calls into the driver when it brings the GPU in: teardown
+    // may give up on them, so they read a copy of the options.
+    const GzGpuCallWatchP ctl_watch = std::make_shared<GzGpuCallWatch>();
+    const std::shared_ptr<const Options> sopt = std::make_shared<const Options>(dopt);
     // THE STALL GUARD (v0.18.0).  A CUDA or nvCOMP call that never returns used to
     // hang the whole extraction: the batch's frames never reached their partitions,
     // so every parse thread waited in take_pool forever, and teardown joined the
@@ -34400,7 +34901,8 @@ public:
     // MEASURED: bringup took 1.1-1.2 s on six devices at once, so a slow but
     // healthy bringup still helps the run instead of being written off mid-way.
     // cuInit and device ranking (gz_cuda_usable_count, select_best_gpus) run
-    // before any worker exists and are NOT watched, as on every other GPU path.
+    // before any worker exists; on the controller they are watched calls that
+    // teardown can give up on (GzGpuCallWatch, v0.18.64).
     //
     // Giving up on a healthy-but-slow worker costs that device for the rest of the
     // run, never correctness: its frames are decoded by the CPU like any other.
@@ -34426,16 +34928,25 @@ public:
     std::thread gpu_watch_thr;
     std::mutex gw_mx; std::condition_variable gw_cv; bool gw_stop = false;
     std::atomic<bool> gw_teardown{false};   // teardown is waiting on the GPU workers
-    auto spawn_gpu_workers = [&] {
-      std::call_once(gpu_spawn_once, [&] {
-        const int dc = gz_cuda_usable_count(dopt, "tar decode pool");
+    // `sw`: the watch of the thread it runs on (the controller's, or the eager
+    // start's own thread), whose driver calls teardown or the eager wait can give
+    // up on; null runs them plainly.
+    auto spawn_gpu_workers_on = [&](GzGpuCallWatch * sw) {
+      if (gpu_spawn_started.exchange(true)) return;
+      {
+        const int dc = gz_gpu_watched(sw, "starting CUDA", "bringup", [sopt] {
+          return gz_cuda_usable_count(*sopt, "tar decode pool");
+        });
         const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
         if (ndev < 1) {   // no usable GPU (absent, or CUDA_VISIBLE_DEVICES-masked)
           vlog(V_VERBOSE, dopt, "[TAR] decode pool: no GPU available; CPU decoders only\n");
           gf_release();
           return;
         }
-        std::vector<int> pool_ids = select_best_gpus(dc, ndev, dopt);
+        std::vector<int> pool_ids = gz_gpu_watched(sw, "ranking the devices", "bringup",
+                                                   [sopt, dc, ndev] {
+                                                     return select_best_gpus(dc, ndev, *sopt);
+                                                   });
         // A device an earlier reclaim gave up on (an earlier input in this
         // invocation) still has a thread parked inside CUDA on it.
         if (const uint64_t gone = g_decomp_abandoned.load(std::memory_order_relaxed))
@@ -34736,11 +35247,16 @@ public:
             break;
           }
         }
-      });
+      }
     };
+    auto spawn_gpu_workers = [&](bool on_controller) {
+      spawn_gpu_workers_on(on_controller ? ctl_watch.get() : nullptr);
+    };
+    // The eager start's own thread and watch (GZSTD_POOL_GPU, below).
+    const GzGpuCallWatchP eager_watch = std::make_shared<GzGpuCallWatch>();
 #else
     const bool gpu_force = false, gpu_lazy = false;
-    auto spawn_gpu_workers = [] {};
+    auto spawn_gpu_workers = [](bool) {};
     (void)gpu_capable; (void)g_csz;
 #endif // HAVE_NVCOMP
 
@@ -34756,7 +35272,13 @@ public:
     auto start_controller = [&](std::function<void()> body) {
       try {
         gz_extract_thread_gate();
+#ifdef HAVE_NVCOMP
+        // Finished when its body returns: teardown joins it only then, or gives
+        // up on it in a driver call (spawn_gpu_workers).
+        controller = std::thread([b = std::move(body), w = ctl_watch] { b(); w->finish(); });
+#else
         controller = std::thread(std::move(body));
+#endif
       } catch (const std::system_error &) {
       } catch (const std::bad_alloc &) {
       }
@@ -34918,11 +35440,14 @@ public:
           // speculative VRAM grab).  A sink-bound run keeps ddq empty, so this
           // never fires there.  spawn_gpu_workers is idempotent.
           ddq_back = (ddq_sz > 0 && ad >= n_dec_max) ? ddq_back + 1 : 0;
-          if (ddq_back >= 3 && gpu_lazy) {
+          // Test-only (GZSTD_DEBUG_POOL_GPU_LAZY): bring the GPU in at the first
+          // window, so a cell reaches the controller's own bringup (v0.18.64).
+          static const bool lazy_now = ::getenv("GZSTD_DEBUG_POOL_GPU_LAZY") != nullptr;
+          if ((ddq_back >= 3 || lazy_now) && gpu_lazy) {
             uint64_t done = feed_meter ? feed_meter->wrote_bytes.load(std::memory_order_relaxed) : 0;
             double p = stream_total ? (double)done / (double)stream_total : 1.0;
             double remaining_s = (p > 0.02) ? (double)(now_ns() - t0) / 1e9 * (1.0 - p) / p : 1e9;
-            if (remaining_s > 4.0) spawn_gpu_workers();
+            if (remaining_s > 4.0 || lazy_now) spawn_gpu_workers(/*on_controller=*/true);
           }
         }
       });
@@ -34932,7 +35457,34 @@ public:
     // force/test path).  Under plain --adapt they are spawned lazily instead, by
     // the controller above, only once the CPU pool is maxed and still starved --
     // so a CPU-rich or write-bound run never pays cuInit or VRAM.
-    if (gpu_force) spawn_gpu_workers();
+#ifdef HAVE_NVCOMP
+    // On a thread of its own, waited for at most the GPU initialization timeout
+    // (v0.18.64): a driver that never answers starting CUDA or ranking the devices
+    // is given up on, loudly, and the CPU decoders carry the extract -- the
+    // fixed-share hybrid's rule.  Given up on, it started no GPU worker, and the
+    // GZSTD_DEBUG_POOL_GPU_FIRST gate it would have opened is opened here.  No
+    // thread for it: here, as before.
+    if (gpu_force) {
+      std::thread eager;
+      if (gz_try_thread(eager, [&spawn_gpu_workers_on, w = eager_watch] {
+            spawn_gpu_workers_on(w.get());
+            w->finish();
+          })) {
+        GzGiveUp g;
+        g.limit_s = gz_gpu_init_timeout_secs();
+        if (gz_gpu_watch_settle(*eager_watch, now_ns(), dopt.verbosity, g)) {
+          eager.join();
+        } else {
+          eager.detach();
+          gf_release();
+        }
+      } else {
+        spawn_gpu_workers_on(nullptr);
+      }
+    }
+#else
+    if (gpu_force) spawn_gpu_workers(/*on_controller=*/false);
+#endif
 
     std::vector<ParCtx> pctx(parts.size());
     // Reserve the essential parse threads BEFORE the writers and an automatic
@@ -35118,7 +35670,15 @@ public:
       if (controller.joinable()) {
         { std::lock_guard<std::mutex> lk(ctl_mx); ctl_stop = true; }
         ctl_cv.notify_all();
+#ifdef HAVE_NVCOMP
+        // It may sit in a call the driver never returns from, bringing the GPU
+        // in (GzGpuCallWatch).  Left behind, it started no GPU worker; the CPU
+        // decoders carry the extract.
+        if (gz_gpu_watch_settle(*ctl_watch, now_ns(), dopt.verbosity)) controller.join();
+        else controller.detach();
+#else
         controller.join();
+#endif
       }
       // Drain the pipeline stage by stage: readers finish first (draining dq into
       // ddq), THEN close the decode queue so no reader pushes after ddqdone, THEN
@@ -40113,10 +40673,45 @@ static size_t tune_decomp_start(size_t frame_bytes, uint64_t input_bytes, int de
 static constexpr uint64_t TUNE_L2_REF_BYTES = uint64_t(48) << 20;
 // Test-only (GZSTD_DEBUG_TUNE_L2=BYTES): every device reports this L2 size, so a
 // cell can assert the lowered start on any card.
-static size_t tune_device_start(size_t start, size_t frame_bytes, int device, int * l2_out) {
+//
+// WHAT THE TUNER ASKS EACH DEVICE, READ BEFOREHAND (v0.18.64).  Its queries -- the
+// L2 size here, the UUID under --adapt -- run on the bringup thread, and a driver
+// that stops answering stops them for good.  Read as one watched call
+// (GzGpuCallWatch) before the tuners are built, a stuck query is one teardown can
+// give up on; inside tune_init_devices it would hold run state the whole time.
+struct GzTuneDevFacts {
+  std::string uuid;              // empty = not asked, or the query failed
+  int l2 = 0;
+  bool l2_ok = false;            // asked, and answered
+};
+static std::vector<GzTuneDevFacts> gz_tune_dev_facts(const std::vector<int> & ids, bool uuids,
+                                                     bool l2s)
+{
+  std::vector<GzTuneDevFacts> f(ids.size());
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (uuids) {
+      cudaDeviceProp p {};
+      if (cudaGetDeviceProperties(&p, ids[i]) == cudaSuccess) f[i].uuid = gz_cuda_uuid_str(p);
+      else (void)cudaGetLastError();
+    }
+    if (l2s && !::getenv("GZSTD_DEBUG_TUNE_L2")) {
+      if (cudaDeviceGetAttribute(&f[i].l2, cudaDevAttrL2CacheSize, ids[i]) == cudaSuccess)
+        f[i].l2_ok = true;
+      else
+        (void)cudaGetLastError();
+    }
+  }
+  return f;
+}
+
+static size_t tune_device_start(size_t start, size_t frame_bytes, int device, int * l2_out,
+                                const GzTuneDevFacts * facts = nullptr) {
   int l2 = 0;
   if (const char * e = ::getenv("GZSTD_DEBUG_TUNE_L2")) {
     l2 = std::atoi(e);
+  } else if (facts) {
+    if (!facts->l2_ok) return start;
+    l2 = facts->l2;
   } else if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess) {
     (void)cudaGetLastError();
     return start;
@@ -40136,10 +40731,12 @@ static size_t tune_device_start(size_t start, size_t frame_bytes, int device, in
 // permits bound exploration (see EXPLORE_MAX in the header; <= 0 = disabled).
 // `by_device`: `start` is compress's default byte target, which each device
 // lowers to its own (tune_device_start); false for a pin, --gpu-batch, an
-// unknown size, or decompress.
+// unknown size, or decompress.  `facts`: what each device answered beforehand
+// (gz_tune_dev_facts, the same order as `ids`); without it the devices are asked here.
 static void tune_init_devices(DeviceTune * tunes, int n, const std::vector<int> & ids,
                               TuneRun & run, const Options & opt, size_t start,
-                              size_t frame_bytes, int throttle_permits, bool by_device) {
+                              size_t frame_bytes, int throttle_permits, bool by_device,
+                              const std::vector<GzTuneDevFacts> * facts = nullptr) {
   const size_t streams = std::max<size_t>(1, opt.gpu_streams);
   const size_t total = std::max<size_t>(1, size_t(std::max(1, n)) * streams);
   run.devices = std::max(1, n);
@@ -40155,13 +40752,18 @@ static void tune_init_devices(DeviceTune * tunes, int n, const std::vector<int> 
     T.fclass = fc;
     size_t b = std::min(start, runnable);
     int l2 = 0;
-    if (by_device) b = std::min(tune_device_start(start, frame_bytes, ids[i], &l2), runnable);
+    const GzTuneDevFacts * fi = facts && size_t(i) < facts->size() ? &(*facts)[size_t(i)] : nullptr;
+    if (by_device) b = std::min(tune_device_start(start, frame_bytes, ids[i], &l2, fi), runnable);
     // The UUID is needed only to read or write the profile: one properties query
     // per device (~1.5 ms, uncached), and only under --adapt.
     if (opt.adapt) {
-      cudaDeviceProp p {};
-      if (cudaGetDeviceProperties(&p, ids[i]) == cudaSuccess) T.uuid = gz_cuda_uuid_str(p);
-      else (void)cudaGetLastError();
+      if (fi) {
+        T.uuid = fi->uuid;
+      } else {
+        cudaDeviceProp p {};
+        if (cudaGetDeviceProperties(&p, ids[i]) == cudaSuccess) T.uuid = gz_cuda_uuid_str(p);
+        else (void)cudaGetLastError();
+      }
       const TunePrior * pr = run.locked.load() ? nullptr : tune_prior_for(T.uuid, fc);
       if (pr && pr->batch) {
         b = std::min(pr->batch, runnable);
@@ -41461,7 +42063,9 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
  Only context creation is held: VRAM probing and cudaMalloc stay concurrent, so
  a device finishes its own setup while the next one takes the lock.
 ======================================================================*/
-static std::mutex g_gpu_ctx_init_m;
+// Timed (v0.18.64): a decompress worker waits for its turn between looks at the
+// queue, since the device ahead may never finish (GzGpuCallWatch).
+static std::timed_mutex g_gpu_ctx_init_m;
 
 // THE WRITE-BEHIND THREAD (v0.18.34).  The pack used to be written on the drain
 // thread, synchronously: MEASURED, 64.84 GiB cold to a file on the same NVMe at
@@ -42700,8 +43304,17 @@ static void gpu_worker(
   DeviceTune * tune,                 // this device's batch tuner (its TuneRun is run-wide)
   FrameThrottle * bp,
   std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
-  int gpu_worker_count)              // total GPU workers spawned (for last-failure detection)
+  int gpu_worker_count,              // total GPU workers spawned (for last-failure detection)
+  // This worker's calls that hold no frames: creating its device context and
+  // freeing its buffers (GzGpuCallWatch).  Teardown may give up on either.
+  GzGpuCallWatchP watch)
 {
+  // Marked finished on EVERY way out, after every other local is gone: teardown
+  // joins a worker only once it is.  Declared first, so destroyed last.
+  struct WatchFinish {
+    GzGpuCallWatch * w;
+    ~WatchFinish() { if (w) w->finish(); }
+  } watch_finish{watch.get()};
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
   size_t vram_reserve_bytes = 0;
@@ -42761,17 +43374,32 @@ static void gpu_worker(
       // outlives the lock, so everything after this stays concurrent — holding
       // the nvCOMP query in here too pushed the last device from 1.35 s to
       // 1.68 s for no reason.
-      std::lock_guard<std::mutex> ctx_lk(g_gpu_ctx_init_m);
-      checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
-      // GZSTD_DEBUG_FAIL_GPU_BRINGUP=<CUDA index>|all: this device's bringup
-      // fails the way a card another process has filled does ("cudaSetDevice:
-      // out of memory"), so the suite can hold a full card to its contract
-      // (skipped, not a fault) without filling one.
-      if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_GPU_BRINGUP"))
-        if (std::strcmp(fb, "all") == 0 || std::atoi(fb) == device_id)
-          throw std::runtime_error("cudaSetDevice: out of memory (GZSTD_DEBUG_FAIL_GPU_BRINGUP)");
-      checkCuda(cudaFree(0), "cudaFree(0) [force context]");
+      //
+      // A WATCHED CALL, THE WAIT FOR THE TURN INCLUDED (v0.18.64, GzGpuCallWatch):
+      // the device ahead can be stuck creating its context for good, and this
+      // worker then waits behind it holding nothing.  Teardown gives up on both.
+      // The lock is taken and released inside, so one that returns after that
+      // releases it before it parks.
+      gz_gpu_watched(watch.get(), "creating its device context", "context", [&] {
+        std::lock_guard<std::timed_mutex> ctx_lk(g_gpu_ctx_init_m);
+        // The test stall holds the turn, as a context that never comes does.
+        if (watch) gz_gpu_hang_hook(*watch, "context");
+        checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+        // GZSTD_DEBUG_FAIL_GPU_BRINGUP=<CUDA index>|all: this device's bringup
+        // fails the way a card another process has filled does ("cudaSetDevice:
+        // out of memory"), so the suite can hold a full card to its contract
+        // (skipped, not a fault) without filling one.
+        if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_GPU_BRINGUP"))
+          if (std::strcmp(fb, "all") == 0 || std::atoi(fb) == device_id)
+            throw std::runtime_error("cudaSetDevice: out of memory (GZSTD_DEBUG_FAIL_GPU_BRINGUP)");
+        checkCuda(cudaFree(0), "cudaFree(0) [force context]");
+      }, /*hook=*/false);   // the stall is taken inside, holding the turn
     }
+    // THE SETUP, WATCHED (v0.18.64): see the decompress worker's.  Steps out for
+    // each touch of the run, and for the registration that ends it.
+    const size_t tune_alloc_want = tune ? tune->alloc_want : size_t(0);
+    gz_gpu_watch_enter(watch.get(), "setting up its buffers and streams", "setup");
+    if (watch) gz_gpu_hang_hook(*watch, "setup");
     checkNvcomp(nvcompBatchedZstdCompressGetMaxOutputChunkSize(gpu_chunk, comp_opts, &max_out_chunk), "nvcompBatchedZstdCompressGetMaxOutputChunkSize");
     const uint64_t ctx_done_ns = now_ns();  // cudaSetDevice forced context creation
     size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
@@ -42836,7 +43464,7 @@ static void gpu_worker(
     // this is how it explores past 256 -- one run at a time.
     size_t per_stream_cap = opt.gpu_batch_user_set
         ? std::max<size_t>(1, std::min(opt.gpu_batch_cap, HARD_BATCH_CAP))
-        : std::max(AUTO_TUNE_BATCH_CEILING, tune ? tune->alloc_want : size_t(0));
+        : std::max(AUTO_TUNE_BATCH_CEILING, tune_alloc_want);
     // --gds-only sizes this differently, because here the batch slab is not just
     // VRAM — it is BAR1-REGISTERED VRAM, and registering it is expensive:
     // cuFileBufRegister MEASURED ~950 ms for the 4 GiB slab the auto ceiling
@@ -42864,7 +43492,9 @@ static void gpu_worker(
     // FLOOR, not a cap: more frames only raise that kernel's throughput.
     if (opt.gds_only && !opt.gpu_batch_user_set)
       per_stream_cap = std::min<size_t>(per_stream_cap, 64);
+    gz_gpu_watch_leave(watch.get());   // the tuner is the run's: step out of the setup
     per_stream_cap = device_tune_limit_alloc(tune, per_stream_cap, opt, device_id);
+    gz_gpu_watch_enter(watch.get(), "setting up its buffers and streams", "setup");
     // NO BATCH LARGER THAN THE INPUT (v0.18.8, ROADMAP 9) -- decompress's cap,
     // mirrored.  A 600 MiB input (38 frames) sized slabs and an nvCOMP workspace
     // for 256 (est. 15.9 GiB on an H100), and 8 jobs started together on one card
@@ -43082,8 +43712,10 @@ static void gpu_worker(
               + (opt.gds_only ? "  (under --gds-only this is usually the BAR1"
                                 " aperture, not VRAM)" : "");
           vlog(V_ERROR, opt, skip_msg + "\n");
+          gz_gpu_watch_leave(watch.get());   // out of the setup: the run is touched below
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
+          if (watch) { std::lock_guard<std::mutex> lk(watch->m); watch->exit_noted = true; }
           int fails = gpu_failures
               ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
           gpu_bringup_signal();   // one fewer GPU that could satisfy the barrier
@@ -43091,14 +43723,18 @@ static void gpu_worker(
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
           queue->notify_cpu_waiters();
           // Last GPU standing just failed in --gpu-only: finish on CPU
-          // instead of stranding the queue (data safety over mode purity).
-          if (opt.gpu_only && fails == gpu_worker_count)
+          // instead of stranding the queue (data safety over mode purity) --
+          // unless another GPU never came up at all, which fails the run.
+          if (opt.gpu_only && fails == gpu_worker_count) {
+            if (g_gpu_init_abandoned.load(std::memory_order_relaxed))
+              die(gz_gpu_init_fail_generic(gz_gpu_only_flag(opt)), EXIT_GPU_FAIL);
             // Compress: this pool is cpu_worker, which never consults the flag,
             // and this pipeline always has a writer.  Stated explicitly rather
             // than defaulted.
             gpu_only_cpu_fallback(false, queue, results, opt, m, bp,
                                   /*discard_results=*/false,
                                   /*gpus_lost=*/fails, /*gpus_total=*/gpu_worker_count);
+          }
           return;
         }
         // At least one stream is usable — shrink ctxs and continue.
@@ -43149,7 +43785,12 @@ static void gpu_worker(
       int cur = g_gpu_streams_created.load(std::memory_order_relaxed);
       while (made > cur && !g_gpu_streams_created.compare_exchange_weak(cur, made)) {}
     }
-    if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+    // Even reading g_perf must follow the fence: a later run can replace it.
+    gz_gpu_watch_leave(watch.get());
+    if (g_perf) {
+      uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt));
+    }
+    gz_gpu_watch_enter(watch.get(), "setting up its buffers and streams", "setup");
     if (opt.verbosity >= V_DEBUG) {
       std::ostringstream os;
       os << "[GPU" << device_id << "] init phases: ctx="
@@ -43200,6 +43841,7 @@ static void gpu_worker(
       return true;
     };
 
+    gz_gpu_watch_leave(watch.get());   // set up: out of the watched phase, into the run
     if (sched) {
       sched->set_gpu_ready(device_id);
       // Register each successfully-initialized stream so the scheduler
@@ -43207,6 +43849,8 @@ static void gpu_worker(
       for (size_t s = 0; s < ctxs.size(); ++s)
         sched->register_gpu_stream(device_id);
     }
+    // Set up: from here a call teardown gives up on is no failed bringup.
+    if (watch) { std::lock_guard<std::mutex> lk(watch->m); watch->streams = (int)ctxs.size(); }
     wd_dev(slot_index, device_id);   // diagnostic watchdog
     // This device's ceiling: the smallest batch any of its streams allocated
     // (the fit search and its retries), not an estimate of free VRAM.
@@ -44194,20 +44838,17 @@ static void gpu_worker(
     // Here, not in compress_nvcomp: this is the last point at which the stream
     // and the registered pack buffer are both still alive.  Every batch for this
     // device has drained by now.
+    //
+    // A WATCHED WRITE (v0.18.64): the sync, the wait for the write-behind and the
+    // last writes hold output that exists only in VRAM.  Nothing gives up on it;
+    // a driver that never answers ends the run after the stall guard's limit
+    // (GzGpuCallWatch, site "write"), exit 5 with the partial output removed.
     if (g_gds_cout_active.load(std::memory_order_relaxed)) {
-      std::lock_guard<std::mutex> lk(g_gds_cout_m);
-      for (auto & C : ctxs) gds_cout_flush(C, true);
+      gz_gpu_watched(watch.get(), "writing the last of the output (cuFile)", "write", [&] {
+        std::lock_guard<std::mutex> lk(g_gds_cout_m);
+        for (auto & C : ctxs) gds_cout_flush(C, true);
+      });
     }
-    // Free all GPU resources for this device
-    if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
-    for (auto & C : ctxs) {
-      free_stream_buffers_only(C, opt);
-      if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
-      if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
-      if (C.stream) cudaStreamDestroy(C.stream);
-      C.stream = nullptr;
-    }
-
     // Deregister streams so queue floor drops and CPU workers aren't blocked
     if (sched) {
       for (size_t s = 0; s < ctxs.size(); ++s)
@@ -44218,8 +44859,26 @@ static void gpu_worker(
     // were sleeping when this GPU exited might never get another wakeup.
     // This ensures all stragglers see the drain condition and exit.
     queue->notify_cpu_waiters();
+
+    // Free all GPU resources for this device -- LAST (v0.18.64): every batch is
+    // delivered and nothing below touches the run, so a driver that never returns
+    // from these calls costs teardown at most its wait for this thread
+    // (GzGpuCallWatch).
+    gz_gpu_watched(watch.get(), "freeing its buffers", "release", [&] {
+      if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+      for (auto & C : ctxs) {
+        free_stream_buffers_only(C, opt);
+        if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+        if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
+        if (C.stream) cudaStreamDestroy(C.stream);
+        C.stream = nullptr;
+      }
+    });
   }
   catch (const std::exception & e) {
+    // Out of the setup's watched phase first, if the throw came from inside it:
+    // parks here if teardown gave up on this worker meanwhile.
+    gz_gpu_watch_leave(watch.get());
     // A FAILED BRINGUP IS NOT A FAULT (v0.18.7, ROADMAP 14).  A card another
     // process has filled cannot even create a context: cudaSetDevice fails "out
     // of memory".  That landed in the fault path below, which discards the whole
@@ -44246,20 +44905,10 @@ static void gpu_worker(
       vlog(V_ERROR, opt, why + "\n");
       *any_gpu_failed = true;
       *fatal_msg = why;
+      if (watch) { std::lock_guard<std::mutex> lk(watch->m); watch->exit_noted = true; }
       const int fails = gpu_failures
           ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
       gpu_bringup_signal();
-      try {
-        if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
-        if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
-          for (auto & C : *sp) {
-            free_stream_buffers_only(C, opt);
-            if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
-            if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
-            if (C.stream) cudaStreamDestroy(C.stream);
-          }
-        }
-      } catch (...) {}
       if (sched && ctxs_ptr) {
         for (size_t s = 0; s < ctxs_ptr->size(); ++s)
           sched->unregister_gpu_stream(device_id);
@@ -44267,12 +44916,31 @@ static void gpu_worker(
       { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
       queue->notify_cpu_waiters();
       // The bringup skip's own rule, unchanged: the last GPU of a --gpu-only run
-      // to fail finishes the run on the CPU.
+      // to fail finishes the run on the CPU -- unless another GPU never came up
+      // at all, which fails the run (gz_gpu_init_fail_msg).
       if (opt.gpu_only && fails == gpu_worker_count
-          && !g_gpu_aborted.load(std::memory_order_relaxed))
+          && !g_gpu_aborted.load(std::memory_order_relaxed)) {
+        if (g_gpu_init_abandoned.load(std::memory_order_relaxed))
+          die(gz_gpu_init_fail_generic(gz_gpu_only_flag(opt)), EXIT_GPU_FAIL);
         gpu_only_cpu_fallback(false, queue, results, opt, m, bp,
                               /*discard_results=*/false,
                               /*gpus_lost=*/fails, /*gpus_total=*/gpu_worker_count);
+      }
+      // The buffers LAST (v0.18.64), touching nothing of the run: a card that
+      // failed its bringup is the likeliest to stop answering (GzGpuCallWatch).
+      try {
+        gz_gpu_watched(watch.get(), "freeing its buffers after a failed bringup", "release", [&] {
+          if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+          if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
+            for (auto & C : *sp) {
+              free_stream_buffers_only(C, opt);
+              if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+              if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
+              if (C.stream) cudaStreamDestroy(C.stream);
+            }
+          }
+        });
+      } catch (...) {}
       return;
     }
     // GPU fault — a faulted GPU is an unreliable narrator: we cannot trust any
@@ -44298,6 +44966,7 @@ static void gpu_worker(
     // cudaSetDevice, a stream/event creation error — left the main thread parked
     // on that barrier forever.  Decompress's catch has always counted; this is
     // the same bookkeeping, and gpu_bringup_signal() re-runs the predicate.
+    if (watch) { std::lock_guard<std::mutex> lk(watch->m); watch->exit_noted = true; }
     if (gpu_failures) gpu_failures->fetch_add(1, std::memory_order_acq_rel);
     gpu_bringup_signal();
 
@@ -44310,7 +44979,6 @@ static void gpu_worker(
     if (drainer.joinable()) drainer.join();
 
     try {
-      if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
         for (auto & C : *sp) {
           // Recycle any popped-but-undelivered (or mid-delivery) inputs so pooled
@@ -44318,10 +44986,6 @@ static void gpu_worker(
           // way, so nothing here is recompressed.
           for (auto & t : C.batch) t.release_input();
           C.batch.clear();
-          free_stream_buffers_only(C, opt);
-          if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
-          if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
-          if (C.stream) cudaStreamDestroy(C.stream);
         }
       }
     } catch (...) {}
@@ -44342,6 +45006,32 @@ static void gpu_worker(
     queue->set_done();
     if (bp) bp->set_done();
     gz_direct_read_abort();
+
+    // The --gds-only pack's write-behind may still be writing: a WRITE, never
+    // left behind -- a late cuFileWrite must not land in a file the run goes on
+    // to use (GzGpuCallWatch).  Its join comes out of the frees below, which can
+    // be given up on.  Not started: returns at once.
+    try {
+      gz_gpu_watched(watch.get(), "waiting for an output write (cuFile)", "write",
+                     [] { gds_cout_wb_stop(false); });
+    } catch (...) {}
+
+    // The buffers LAST (v0.18.64), after everything above has been woken and
+    // touching nothing of the run: a device that just faulted is the likeliest
+    // to stop answering, and the abort must not wait on it (GzGpuCallWatch).
+    try {
+      gz_gpu_watched(watch.get(), "freeing its buffers after a fault", "release", [&] {
+        if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+        if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
+          for (auto & C : *sp) {
+            free_stream_buffers_only(C, opt);
+            if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+            if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
+            if (C.stream) cudaStreamDestroy(C.stream);
+          }
+        }
+      });
+    } catch (...) {}
   }
 }
 
@@ -44948,7 +45638,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   FrameMem::get().set_draining(false);   // until this run's last read (gz_last_read)
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
-  gds_preflight_or_die(opt, in);
+  // GPU initialization on this thread (cuFile's driver starts CUDA): timed in a
+  // GPU-only run (gz_gpu_only_init_step).
+  if (opt.gds_only && g_gpu_call_abandoned.load(std::memory_order_relaxed))
+    die_usage(gz_no_gpu_usage_msg(opt));   // no new cuFile/CUDA probe after an abandoned call
+  gz_gpu_only_init_step(opt, "opening GPUDirect Storage", "bringup", false,
+                        [&] { gds_preflight_or_die(opt, in); });
   // Reset UNCONDITIONALLY, not under a backend gate: these are process globals
   // and a multi-file run would otherwise let one file's staged-read failure
   // relabel the next file's genuine GPU fault.
@@ -45066,7 +45761,21 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   int device_count = 0;
   int total_hw_devices = 0;
   if (!defer_detect) {
-    device_count = gz_cuda_usable_count(opt, "compress, synchronous");
+    // A GPU-only run counts on this thread, timed (gz_gpu_only_init_step).  Any
+    // other counts on a helper, waited for at most the GPU initialization timeout
+    // (v0.18.64): a count that never comes is no device, said loudly, and the CPU
+    // compresses (the fixed-share hybrid's rule).
+    if (opt.gpu_only) {
+      device_count = gz_gpu_only_init_step(opt, "starting CUDA", "bringup", true, [&] {
+        return gz_cuda_usable_count(opt, "compress, synchronous");
+      });
+    } else {
+      const std::shared_ptr<const Options> sopt = std::make_shared<const Options>(opt);
+      if (!gz_gpu_call_bounded(opt, "starting CUDA", [sopt] {
+            return gz_cuda_usable_count(*sopt, "compress, synchronous");
+          }, device_count))
+        device_count = 0;
+    }
     if (device_count <= 0) {
       if (opt.gpu_only)
         die_usage(gz_no_gpu_usage_msg(opt));
@@ -45669,6 +46378,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // claim it would deadlock the pool).
   int gpu_count = 0;
   std::vector<std::thread> workers;
+  // Paired with `workers` by index: each one's calls that hold no frames
+  // (GzGpuCallWatch).  Filled by the bringup before it starts a worker.
+  std::vector<GzGpuCallWatchP> worker_watch;
   Options opt_for_workers = opt;
   opt_for_workers.chunk_mib = chosen_mib;
   opt_for_workers.input_frames_hint = total_in ? (total_in + host_chunk - 1) / host_chunk : 0;
@@ -45730,6 +46442,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // stall being removed.
   std::mutex bringup_mx;
   std::condition_variable bringup_cv;
+  // The bringup's calls into the driver are watched on its own thread, and read a
+  // copy of the options: see decompress_nvcomp and GzGpuCallWatch.
+  // Inline (GPU-only, the fixed share) too: a GPU-only run's are timed, and the
+  // fixed share's runs on a thread of its own (below).
+  const GzGpuCallWatchP bringup_watch = gz_gpu_watch_new(opt);
+  GzGpuCallWatch * const bw = bringup_watch.get();
+  const std::shared_ptr<const Options> bopt = std::make_shared<const Options>(opt);
   auto gpu_bringup = [&]() {
     if (defer_detect) {
       // Is the GPU still worth starting?  Asked BEFORE the first CUDA call, so a
@@ -45888,9 +46607,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           return;
         }
       }
-      const int dc = gz_cuda_usable_count(opt, "hybrid bringup thread");
+      const int dc = gz_gpu_watched(bw, "starting CUDA", "bringup", [bopt] {
+        return gz_cuda_usable_count(*bopt, "hybrid bringup thread");
+      });
       if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old)
-        vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
+        vlog(V_DEBUG, opt, "[GPU] CUDA sees "
+             + gz_gpu_watched(bw, "listing the devices", "bringup",
+                              [] { return gz_cuda_visible_uuids(); })
+             + "\n");
       if (dc <= 0) {
         // No GPU after all.  The CPU pool is already running and owns the queue,
         // so there is nothing to repair — hybrid simply runs CPU-only.
@@ -45930,11 +46654,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (device_count <= 0) return;
 
     const uint64_t gpu_sel_t0 = now_ns();
-    gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+    gpu_ids = gz_gpu_watched(bw, "ranking the devices", "bringup",
+                             [bopt, t = total_hw_devices, n = device_count] {
+                               return select_best_gpus(t, n, *bopt);
+                             });
     // Fixed-share mode: warm GPU contexts before the pipeline so a small input
     // isn't drained to CPU before the GPU registers (see warm_gpu_contexts).
     // Adaptive mode defers for fastest startup.
-    if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
+    if (opt.cpu_share >= 0.0)
+      gz_gpu_watched(bw, "creating the device contexts", "bringup",
+                     [ids = gpu_ids] { warm_gpu_contexts(ids); });
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] device selection: " << std::fixed << std::setprecision(1)
@@ -45961,10 +46690,15 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // known and no worker exists yet to race the construction.
     per_dev.reset(new DevStats[(size_t)gpu_count]);
     json_sink = std::make_unique<StatsSink>(gpu_count);
+    const std::vector<GzTuneDevFacts> dev_facts =
+        gz_gpu_watched(bw, "reading the devices' properties", "bringup",
+                       [ids = gpu_ids, adapt = opt.adapt, l2 = compress_start_by_device] {
+                         return gz_tune_dev_facts(ids, adapt, l2);
+                       });
     tunes.reset(new DeviceTune[(size_t)gpu_count]);
     tune_init_devices(tunes.get(), gpu_count, gpu_ids, tune_run, opt,
                       compress_tune_start, tune_frame_bytes, throttle.max_permits(),
-                      compress_start_by_device);
+                      compress_start_by_device, &dev_facts);
     if (gpu_joins_later) {
       // Priors are resolved now, and no GPU worker has started.  Use the largest
       // initial proposal conservatively for every requested stream; bringup may
@@ -45992,6 +46726,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       results.init_slots(gpu_count);
     }
     workers.reserve((size_t)gpu_count);
+    worker_watch.reserve((size_t)gpu_count);
 
     // The per-worker state is set up for EVERY GPU run now: the stall guard reads
     // it by default.  The --watchdog thread (diagnostic: JSON dump, exit 70) is
@@ -46012,6 +46747,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     int gpu_threads_ok = 0;
     for (int i = 0; i < gpu_count; ++i) {
       std::thread t;
+      GzGpuCallWatchP wch = gz_gpu_watch_new(opt, gpu_ids[i]);   // GPU-only: timed
       if (gz_try_thread(t, gpu_worker, gpu_ids[i], i, opt_for_workers,
                         &queue, &results,
                         &per_dev[size_t(i)], json_sink.get(), m, sched,
@@ -46019,8 +46755,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                         &fatal_msgs[size_t(i)], &gpu_started, &gpu_ready_workers,
                         &gpu_claimed_workers,
                         &tunes[size_t(i)],
-                        &throttle, &gpu_failures, gpu_count)) {
+                        &throttle, &gpu_failures, gpu_count, wch)) {
         workers.push_back(std::move(t));
+        worker_watch.push_back(std::move(wch));
         ++gpu_threads_ok;
         continue;
       }
@@ -46072,14 +46809,34 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // Optional: a deferred bringup the system refuses a thread leaves the GPUs
     // out, as one that declines them does (it cannot run here: its sampling waits
     // for progress this thread has not started yet).
-    if (!gz_try_thread(gpu_bringup_thr, gpu_bringup)) {
+    if (!gz_try_thread(gpu_bringup_thr, [&gpu_bringup, w = bringup_watch] {
+          gpu_bringup();
+          w->finish();
+        })) {
       if (cpu_pool.empty())   // --gpu-only: nothing else would do the work
         die("cannot start the GPU bringup thread: the system refused a thread "
             "(Resource temporarily unavailable -- a PID or task limit?)");
       vlog(V_VERBOSE, opt, "[GPU] thread allowance: no thread for the deferred bringup; CPU only\n");
     }
+  } else if (opt.gpu_only) {
+    gpu_bringup();               // timed: the GPU initialization timer fails the run
   } else {
-    gpu_bringup();
+    // The fixed share (and any other inline bringup): before the reader, as
+    // before, but on a thread of its own, waited for at most the GPU
+    // initialization timeout (rtcheek: it fails on the timer and lets the CPU take
+    // over, loudly).  Given up on, it started no worker, and the CPU pool takes
+    // every frame (should_cpu_take: no GPU stream is active).
+    if (gz_try_thread(gpu_bringup_thr, [&gpu_bringup, w = bringup_watch] {
+          gpu_bringup();
+          w->finish();
+        })) {
+      GzGiveUp g;
+      g.limit_s = gz_gpu_init_timeout_secs();
+      if (gz_gpu_watch_settle(*bringup_watch, now_ns(), opt.verbosity, g)) gpu_bringup_thr.join();
+      else gpu_bringup_thr.detach();
+    } else {
+      gpu_bringup();
+    }
   }
 
   // Fixed-share: wait for at least one GPU stream to register (or for all
@@ -46091,9 +46848,18 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // before any GPU registers, silently collapsing the requested CPU/GPU
   // split to all-CPU.  Adaptive mode skips this — it promises no exact
   // split and wants the fastest possible start.  v0.13.14.
+  //
+  // A worker that never finishes its context or setup would hold it for good
+  // (GzGpuCallWatch): one stuck past the GPU initialization timeout is given up
+  // on, loudly, and counted failed, and the CPU pool takes its share (rtcheek: the
+  // fixed share fails on the timer and the CPU finishes).
   if (sched && opt.cpu_share >= 0.0 && gpu_count > 0) {
+    GzGiveUp g;
+    g.limit_s = gz_gpu_init_timeout_secs();
+    g.init_only = true;
+    const uint64_t t0 = now_ns();
     std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
-    g_gpu_bringup_cv.wait(lk, [&] {
+    while (!g_gpu_bringup_cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
       // g_gpu_aborted is a safety net, not the primary exit: a counted failure
       // is the correct representation and the catch above now provides one.  But
       // this barrier's failure mode is a PERMANENT HANG, so any abort releases it
@@ -46102,7 +46868,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       return sched->any_gpu_active()
           || gpu_failures.load(std::memory_order_acquire) >= gpu_count
           || g_gpu_aborted.load(std::memory_order_relaxed);
-    });
+    })) {
+      lk.unlock();
+      for (const GzGpuCallWatchP & w : worker_watch)
+        if (w && gz_gpu_watch_give_up(*w, t0, opt.verbosity, g)) {
+          any_gpu_failed = true;
+          gpu_failures.fetch_add(1, std::memory_order_acq_rel);
+          gpu_bringup_signal();
+        }
+      lk.lock();
+    }
   }
   perf_mark(PerfCounters::HM_GPU_READY);
 
@@ -46285,7 +47060,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           + std::strerror(errno));
     if (opt.gds_only) {
       std::string why;
-      if (!g_gds_input.open(fd, &why)) {
+      if (!gz_gpu_only_init_step(opt, "registering the input with cuFile", "setup", false,
+                                 [&] { return g_gds_input.open(fd, &why); })) {
         ::close(fd);
         // Exit 2: the input's filesystem cannot do GDS, which --help lists among
         // the requirements whose absence is a usage error.  It exited 1 (v0.17.87).
@@ -46321,7 +47097,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (opt.direct_stage) {
       size_t stage_bufs = 0;
       double pin_ms = 0.0;
-      stage_bufs = pin_dstage_host_pool(FLAG, &pin_ms);
+      stage_bufs = gz_gpu_only_init_step(opt, "pinning the staging pool", "setup", false,
+                                         [&] { return pin_dstage_host_pool(FLAG, &pin_ms); });
       {
         const uint64_t nframes = gpu_chunk ? (file_size + gpu_chunk - 1) / gpu_chunk : 0;
         // Reserve the whole run's sequence numbers up front: readers claim
@@ -46393,6 +47170,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // cross devices without peer access.
       if (gpu_ids.empty())
         throw std::runtime_error("--gds-only --tar: no selected GPU for the staging pool");
+      GzGpuOnlyInitScope init_step(opt, "registering the staging pool");   // timed
       gds_cu_or_throw(cudaSetDevice(gpu_ids.front()), "select the staging device");
       stage_pool = std::make_unique<GdsStagePool>();
       std::string swhy;
@@ -46429,7 +47207,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // --tar --direct-stage: the same slots in PAGE-LOCKED HOST memory (see
       // GdsStagePool's HOST MODE and pin_dstage_host_pool above).
       double pin_ms = 0.0;
-      const size_t stage_bufs = pin_dstage_host_pool("--direct-stage --tar", &pin_ms);
+      const size_t stage_bufs = gz_gpu_only_init_step(
+          opt, "pinning the staging pool", "setup", false,
+          [&] { return pin_dstage_host_pool("--direct-stage --tar", &pin_ms); });
       if (opt.verbosity >= V_VERBOSE) {
         char b[192];
         std::snprintf(b, sizeof(b),
@@ -46784,10 +47564,58 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // that happens almost immediately while the CPU workers still have work.
   // For an unknown-size input, producer_done ends the gate wait on its next
   // timed wake; if a batch arrived first, bringup may already be running.
-  if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+  //
+  // It can also sit in a call the driver never returns from (GzGpuCallWatch).
+  // Left behind, it started no worker, and the CPU pool has done the work: a
+  // deferred bringup always has one.
+  if (gpu_bringup_thr.joinable()) {
+    if (gz_gpu_watch_settle(*bringup_watch, now_ns(), opt.verbosity)) gpu_bringup_thr.join();
+    else gpu_bringup_thr.detach();
+  }
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
-  for (auto & th : workers) th.join();
+  //
+  // A worker can likewise sit in a call that holds no frames -- creating its
+  // context, freeing its buffers -- and is given up on after the same wait.  A
+  // batch stuck in the driver is the stall guard's (gpu_stall_secs), not this.
+  //
+  // One given up on before it was set up (no stream registered) is a failed
+  // bringup, counted as gpu_worker counts one.  If that leaves a GPU-only run's
+  // frames with no consumer, its GPUs never came up: the run fails, as the GPU
+  // initialization timer would have failed it (it does not finish on the CPU).
+  // Only an input the queue held whole reaches teardown so.  One the fixed-share
+  // barrier gave up on was counted there.
+  {
+    const uint64_t t0 = now_ns();
+    for (size_t i = 0; i < workers.size(); ++i) {
+      GzGpuCallWatch * const w = i < worker_watch.size() ? worker_watch[i].get() : nullptr;
+      const bool given_up_before = w && w->given_up();
+      if (!w || (!given_up_before && gz_gpu_watch_settle(*w, t0, opt.verbosity))) {
+        workers[i].join();
+        continue;
+      }
+      workers[i].detach();
+      if (given_up_before) continue;
+      int streams = 0;
+      bool exit_noted = false;
+      { std::lock_guard<std::mutex> lk(w->m); streams = w->streams; exit_noted = w->exit_noted; }
+      // A failed bringup can also be stuck in its final free, with no streams.
+      // Its catch already counted the failure; count an abandoned init only once.
+      if (streams > 0 || exit_noted) continue;
+      any_gpu_failed = true;
+      const int fails = gpu_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+      gpu_bringup_signal();
+      { std::lock_guard<std::mutex> lk(results.m); results.cv.notify_all(); }
+      queue.notify_cpu_waiters();
+      if (opt.gpu_only && fails == gpu_count && !g_gpu_aborted.load(std::memory_order_relaxed)
+          && !queue.drained()) {
+        double secs = 0;
+        const char * what = "";
+        { std::lock_guard<std::mutex> lk(w->m); secs = double(now_ns() - w->since) / 1e9; what = w->what; }
+        die(gz_gpu_init_fail_msg(gz_gpu_only_flag(opt), w->dev, secs, what), EXIT_GPU_FAIL);
+      }
+    }
+  }
   if (tunes) tune_publish_devices(tunes.get(), gpu_count, opt);
   // THE DEFAULT'S STAGING JOINS ITS CPU POOL HERE (v0.18.38, stage_cpu): its
   // workers compress out of the staging slots, so they must be gone before the
@@ -46824,7 +47652,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // degraded run is indistinguishable from a healthy one.
   if (opt.gds_only) {
     const unsigned long long b1 = gz_nvfs_bar1_ok();
-    g_gds_input.close();
+    if (!gz_gds_close_bounded(g_gds_input, opt.verbosity)) g_stage_input_fd = -1;   // kept open
     if (g_stage_input_fd >= 0) { ::close(g_stage_input_fd); g_stage_input_fd = -1; }
     // REPORTED AT DEFAULT VERBOSITY WHEN ANYTHING DEGRADED.  Asking for
     // --gds-only and silently getting something else is this feature's worst
@@ -47029,7 +47857,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                         "the peer-to-peer prefix: ") + std::strerror(errno), EXIT_IO);
       }
     }
-    g_gds_cout.close();
+    if (!gz_gds_close_bounded(g_gds_cout, opt.verbosity)) g_gds_cout_fd = -1;   // kept open
     if (g_gds_cout_fd >= 0) { ::close(g_gds_cout_fd); g_gds_cout_fd = -1; }
     g_gds_cout_active.store(false, std::memory_order_relaxed);
     if (opt.verbosity >= V_VERBOSE) {
@@ -47172,7 +48000,9 @@ static size_t gds_decomp_temp_for(size_t nb, size_t max_decomp)
 // releases its throttle permits and retires the device.
 // Each worker publishes its in-flight batch here for that post-launch interval.
 // Bringup and pre-publication H2D/setup calls are outside this registry; do not
-// describe this as a watchdog for every CUDA call in the worker.
+// describe this as a watchdog for every CUDA call in the worker.  Since v0.18.64
+// context creation and the final release of a worker's buffers are watched by
+// GzGpuCallWatch instead; the setup between them is watched by neither.
 //
 // THIS REGISTRY OUTLIVES decompress_nvcomp ON PURPOSE (leaked, never destroyed).
 // An abandoned worker may return from CUDA at any later time -- after the queue,
@@ -47185,6 +48015,13 @@ struct GzDecompInflight {
   size_t                registered_streams = 0; // streams this worker actually registered
   uint64_t              submit_ns = 0;         // when this batch went to the device
   uint64_t              ema_ns    = 0;         // EMA of completed batch durations
+  // THE BATCH BEFORE ITS LAUNCH (v0.18.64): published from the moment it is
+  // taken, not from the kernel launch, so its buffers, pinned memory and upload
+  // -- calls a driver that stops answering never returns from -- are reclaimable
+  // too.  While `prep`, the deadline is gz_gpu_prep_limit_secs() from `prep_ns`;
+  // at the launch it becomes the batch deadline from submit_ns, as before.
+  bool                  prep      = false;
+  uint64_t              prep_ns   = 0;
   bool                  active    = false;
   bool                  reclaimed = false;     // set by the reclaimer; one-way
 };
@@ -47226,7 +48063,27 @@ static bool gz_decomp_unpublish(int device_id)
   R.delivered = nullptr;
   R.registered_streams = 0;
   R.submit_ns = 0;
+  R.prep      = false;
+  R.prep_ns   = 0;
   return true;
+}
+
+// How long a -d batch may take from being taken to its launch -- its buffers,
+// pinned memory and upload -- before the reclaimer takes it (GzDecompInflight).
+// Not the batch deadline: a first batch can pin gigabytes (measured ~6 s), and
+// --direct-stage reads its frames from the drive here.  GZSTD_DEBUG_GPU_PREP_SEC
+// overrides it, for the suite.
+static constexpr int GPU_PREP_LIMIT_SECS = 60;
+static int gz_gpu_prep_limit_secs()
+{
+  static const int v = [] {
+    if (const char * e = std::getenv("GZSTD_DEBUG_GPU_PREP_SEC")) {
+      const int n = std::atoi(e);
+      if (n > 0) return n;
+    }
+    return GPU_PREP_LIMIT_SECS;
+  }();
+  return v;
 }
 
 // ===========================================================================
@@ -47310,7 +48167,10 @@ public:
 
   // Idempotent.  Joins every reader BEFORE the caller may close fd_: a reader still
   // in pread on a closed-and-reused descriptor number would read another file.
-  void stop() {
+  // `free_buffers` false KEEPS the buffers (leaks them, v0.18.64): a batch the
+  // reclaimer took may have left a thread inside an upload copying out of one,
+  // and freed memory under a copy that returns late is a crash.
+  void stop(bool free_buffers = true) {
     stop_.store(true, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(m_); }
     cv_.notify_all();
@@ -47318,7 +48178,8 @@ public:
     for (auto & t : thr_) if (t.joinable()) t.join();
     thr_.clear();
     std::lock_guard<std::mutex> lk(m_);
-    for (void * b : bufs_) if (b) { if (pinned_) cudaFreeHost(b); else std::free(b); }
+    if (free_buffers)
+      for (void * b : bufs_) if (b) { if (pinned_) cudaFreeHost(b); else std::free(b); }
     bufs_.clear(); free_.clear(); ents_.clear();
   }
 
@@ -47577,8 +48438,17 @@ static void gpu_decomp_worker(
   // name.  Used for BOTH this worker's own delivery and the CPU
   // rescue it may start, so the two cannot disagree about whether a writer
   // exists.
-  bool discard_results)
+  bool discard_results,
+  // This worker's calls that hold no frames: creating its device context and
+  // freeing its buffers (GzGpuCallWatch).  Teardown may give up on either.
+  GzGpuCallWatchP watch)
 {
+  // Marked finished on EVERY way out, after every other local is gone: teardown
+  // joins a worker only once it is.  Declared first, so destroyed last.
+  struct WatchFinish {
+    GzGpuCallWatch * w;
+    ~WatchFinish() { if (w) w->finish(); }
+  } watch_finish{watch.get()};
   (void)m;
   // Called on EVERY exit from this worker: clean drain, init skip, or fault.
   // The LAST one out is the only thread that can decide whether frames are
@@ -47594,6 +48464,8 @@ static void gpu_decomp_worker(
     // Before anything else: this thread is leaving, so its published batch (if
     // any) must stop being reclaimable.  See gz_decomp_unpublish.
     if (!gz_decomp_unpublish(device_id)) gz_decomp_park_forever();
+    // From here teardown never accounts for this exit itself (GzGpuCallWatch).
+    if (watch) { std::lock_guard<std::mutex> lk(watch->m); watch->exit_noted = true; }
     if (!gpu_exits) return;
     const int out = gpu_exits->fetch_add(1, std::memory_order_acq_rel) + 1;
     { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
@@ -47601,6 +48473,10 @@ static void gpu_decomp_worker(
     if (out != gpu_worker_count) return;    // not the last worker out
     if (!opt.gpu_only || !queue) return;    // hybrid: its CPU pool outlasts every GPU stream (v0.18.13)
     if (queue->drained()) return;           // empty AND producer done: nothing owed
+    // A GPU that never came up (a GPU initialization call given up on): a
+    // GPU-only run fails rather than finish on the CPU (gz_gpu_init_fail_msg).
+    if (g_gpu_init_abandoned.load(std::memory_order_relaxed))
+      die(gz_gpu_init_fail_generic(gz_gpu_only_flag(opt)), EXIT_GPU_FAIL);
     const int lost = std::min(gpu_worker_count,
         (gpu_failures ? gpu_failures->load(std::memory_order_acquire) : 0)
         + __builtin_popcountll(g_decomp_abandoned.load(std::memory_order_relaxed)
@@ -47622,7 +48498,7 @@ static void gpu_decomp_worker(
     }
     gz_decomp_park_forever();
   };
-  // Linearise a frame's delivery with reclaim.  The old code pushed the result
+  // Linearise run accesses and a frame's delivery with reclaim.  The old code pushed the result
   // and released its zero-copy input before taking R.m to advance `delivered`.
   // A deadline scan in that gap copied the same frame from a released block and
   // re-enqueued it, racing a use-after-free and a duplicate sequence number.
@@ -47659,14 +48535,6 @@ static void gpu_decomp_worker(
     size_t alloc_decomp = 0;    // bytes per decompressed slot
     void * d_comp_buf = nullptr;
     void * d_decomp_buf = nullptr;
-    // WRITE-BEHIND, OFF BY DEFAULT (GZSTD_DEBUG_GDS_WRITE_BEHIND=1).  This
-    // batch's writes run on a background thread so the NEXT batch's reads overlap
-    // them.  Kept as an experiment hook, not because it pays here -- see the
-    // measurements at the write site.  Joined before anything can touch
-    // d_decomp_buf again: the kernel, a realloc, teardown, or a fault.
-    std::thread              wb_thr;
-    std::vector<std::array<uint64_t,3>> wb_jobs;   // {dev_off, file_off, len}
-    std::string              wb_err;
     GdsBuf gds_in_reg;           // --gds-only -t: d_comp_buf mapped into BAR1
     bool   ptrs_shifted = false;  // last batch rewrote the comp pointer table
     GdsBuf gds_out_reg;          // --gds-only: d_decomp_buf mapped into BAR1
@@ -47846,18 +48714,6 @@ static void gpu_decomp_worker(
       max_decomp  = std::max(max_decomp,  alloc_decomp);
       needed_temp = std::max(needed_temp, temp_bytes);
 
-      // Need to reallocate -- but a write-behind thread may still be DMAing out
-      // of the very buffer free_device() is about to release.
-      //
-      // AND ITS ERROR MUST BE OBSERVED HERE.  The thread cannot throw (an
-      // exception crossing a std::thread boundary calls std::terminate), so it
-      // records a failed cuFileWrite in wb_err.  The pre-kernel join checks
-      // that; this one used to join and clear the jobs without looking, which
-      // silently discards a write failure -- the frames are gone, the output is
-      // short, and nothing reports it.
-      if (wb_thr.joinable()) wb_thr.join();
-      wb_jobs.clear();
-      if (!wb_err.empty()) die(wb_err, EXIT_IO);   // see write_span: I/O, not a GPU fault
       free_device();
       alloc_batch  = batch_n;
       alloc_comp   = max_comp;
@@ -47968,6 +48824,13 @@ static void gpu_decomp_worker(
   };
 
   std::vector<DecompStreamCtx> ctxs;  // declared here so catch block can rescue frames
+  // A late cache miss must not pread through the next input's descriptor number.
+  // Acquired once under batch ownership below; a reclaimed worker keeps this
+  // descriptor along with its stack and staging lanes.
+  struct StageInputFd {
+    int fd = -1;
+    ~StageInputFd() { if (fd >= 0) ::close(fd); }
+  } stage_input;
   void * vram_reserve = nullptr;
   size_t vram_reserve_bytes = 0;
   // Re-arm state for a surrendered reserve (see gz_retake_vram_reserve).
@@ -48022,19 +48885,53 @@ static void gpu_decomp_worker(
       // One device at a time — see g_gpu_ctx_init_m.  Same defect as the
       // compress worker: concurrent creation makes the driver finish every
       // device together, so none is usable until the last one is.
-      std::unique_lock<std::mutex> ctx_lk(g_gpu_ctx_init_m);
+      //
+      // THE TURN IS WAITED FOR BETWEEN LOOKS AT THE QUEUE (v0.18.64).  The device
+      // ahead can be stuck creating its context for good (GzGpuCallWatch), and
+      // this wait, which touches the run, is no call teardown could give up on.
+      // A lock that frees is taken at once; a queue that drains meanwhile sends
+      // this worker home unstarted, as reaching its turn would have.
+      //
+      // Nor can the turn come once teardown has given up on a call (the one
+      // ahead, as a rule): the driver is not answering.  This device then fails
+      // its bringup -- under --gpu-only the last one out finishes on the CPU.
+      std::unique_lock<std::timed_mutex> ctx_lk(g_gpu_ctx_init_m, std::defer_lock);
+      while (!ctx_lk.try_lock_for(std::chrono::milliseconds(100))) {
+        if (nothing_left()) return;
+        if (g_gpu_call_abandoned.load(std::memory_order_relaxed))
+          throw std::runtime_error("the GPU driver stopped answering before this device's turn "
+                                   "to create its context");
+      }
       // Asked again on this device's turn: the queue it waited behind can have
       // drained, and a context made now is only torn down again at exit.
       if (queue && queue->drained()) { ctx_lk.unlock(); leave_unstarted(); return; }
-      checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
-      // The cached-archive cap's no-GPU regression uses the same bringup hook
-      // as compress.  Without it that arm silently ran on a healthy GPU.
-      if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_GPU_BRINGUP"))
-        if (std::strcmp(fb, "all") == 0 || std::atoi(fb) == device_id)
-          throw std::runtime_error("cudaSetDevice: out of memory (GZSTD_DEBUG_FAIL_GPU_BRINGUP)");
-      checkCuda(cudaFree(0), "cudaFree(0) [force context]");
+      gz_gpu_watched(watch.get(), "creating its device context", "context", [&] {
+        // This worker's own state only.  The turn ends in here, so a call that
+        // returns after teardown gave up on it does not park holding the lock.
+        struct Unlock {
+          std::unique_lock<std::timed_mutex> & l;
+          ~Unlock() { if (l.owns_lock()) l.unlock(); }
+        } unlock{ctx_lk};
+        checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+        // The cached-archive cap's no-GPU regression uses the same bringup hook
+        // as compress.  Without it that arm silently ran on a healthy GPU.
+        if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_GPU_BRINGUP"))
+          if (std::strcmp(fb, "all") == 0 || std::atoi(fb) == device_id)
+            throw std::runtime_error("cudaSetDevice: out of memory (GZSTD_DEBUG_FAIL_GPU_BRINGUP)");
+        checkCuda(cudaFree(0), "cudaFree(0) [force context]");
+      });
     }
     if (nothing_left()) return;
+    // THE SETUP, WATCHED (v0.18.64).  From here to the scheduler's registration the
+    // worker holds no frames and makes its device's buffers, streams and pinned
+    // memory: calls a driver that stops answering never returns from.  A watched
+    // phase (GzGpuCallWatch) that steps OUT for each touch of the run (the tuner,
+    // -vvv's counters, a failure's accounting) and for the registration that ends
+    // it; the catch steps out first.  Given up on -- by teardown, the fixed-share
+    // barrier, or a GPU-only run's timer -- the worker parks at its next step out.
+    const size_t tune_alloc_want = tune ? tune->alloc_want : size_t(0);
+    gz_gpu_watch_enter(watch.get(), "setting up its buffers and streams", "setup");
+    if (watch) gz_gpu_hang_hook(*watch, "setup");
     // Up: the decode's --stats-json record lists this device (gz_dpass_take).
     // The UUID only when a record is asked for: the query is ~1.5 ms a device.
     {
@@ -48061,8 +48958,7 @@ static void gpu_decomp_worker(
     // Same fix as compress in v0.12.32 — see CHANGELOG.
     size_t per_stream_cap = opt.gpu_batch_user_set
         ? std::min(opt.gpu_batch_cap, HARD_BATCH_CAP)
-        : std::max({opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING,
-                    tune ? tune->alloc_want : size_t(0)});
+        : std::max({opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING, tune_alloc_want});
 
     // --gds-only -t: BOUND THE REGISTERED BYTES, and derive the batch from that.
     //
@@ -48116,7 +49012,9 @@ static void gpu_decomp_worker(
              + std::to_string(reg_slot / 1048576) + " MiB); registering one frame "
                "anyway -- the budget is a target, and one frame is the floor\n");
     }
+    gz_gpu_watch_leave(watch.get());   // the tuner is the run's: step out of the setup
     per_stream_cap = device_tune_limit_alloc(tune, per_stream_cap, opt, device_id);
+    gz_gpu_watch_enter(watch.get(), "setting up its buffers and streams", "setup");
     // NO BATCH LARGER THAN THE ARCHIVE (v0.18.8, ROADMAP 9).  The tuner's 256-frame
     // headroom was allocated whatever the archive held: a 16-frame archive took
     // slabs and an nvCOMP workspace for 256 frames on every card, and six such
@@ -48320,6 +49218,7 @@ static void gpu_decomp_worker(
           if (opt.gds_only)
             skip_msg += "  (under --gds-only this is usually the BAR1 aperture, not VRAM)";
           vlog(V_ERROR, opt, skip_msg + "\n");
+          gz_gpu_watch_leave(watch.get());   // out of the setup: the run is touched below
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
           (void)(gpu_failures
@@ -48353,7 +49252,12 @@ static void gpu_decomp_worker(
     }
 
     bool producer_done_seen = false;
-    if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+    // Even reading g_perf must follow the fence: a later run can replace it.
+    gz_gpu_watch_leave(watch.get());
+    if (g_perf) {
+      uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt));
+    }
+    gz_gpu_watch_enter(watch.get(), "setting up its buffers and streams", "setup");
 
     // VRAM reserve: hold enough memory to process half the batch size.
     // If another user grabs VRAM mid-run and a cudaMalloc fails (e.g., temp
@@ -48505,6 +49409,7 @@ static void gpu_decomp_worker(
               + "] lost VRAM while reducing batch to " + std::to_string(reduced)
               + "  skipping device";
           vlog(V_ERROR, opt, lost_msg + "\n");
+          gz_gpu_watch_leave(watch.get());   // out of the setup: the run is touched below
           *any_gpu_failed = true;
           *fatal_msg = lost_msg;
           (void)(gpu_failures
@@ -48549,11 +49454,15 @@ static void gpu_decomp_worker(
       return true;
     };
 
+    // Set up: out of the watched phase, into the run.
+    gz_gpu_watch_leave(watch.get());
     // Signal scheduler that this GPU is ready for work
     if (sched) {
       sched->set_gpu_ready(device_id);
       for (size_t s = 0; s < ctxs.size(); ++s)
         sched->register_gpu_stream(device_id);
+      // What teardown unregisters for this worker should it give up on it later.
+      if (watch) { std::lock_guard<std::mutex> lk(watch->m); watch->streams = (int)ctxs.size(); }
       vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id) + "] decode ready: "
            + std::to_string(ctxs.size()) + " stream(s) registered with the scheduler\n");
     }
@@ -48853,6 +49762,22 @@ static void gpu_decomp_worker(
         }
         if (sched) sched->mark_gpu_take(C.batch.size());
         C.filled = C.batch.size();
+        // PUBLISHED FROM HERE (v0.18.64), in its PREP phase (GzDecompInflight):
+        // the buffers, pinned memory and upload below are calls a driver that
+        // stops answering never returns from, and this batch's frames have no other
+        // owner.  From here every touch of the run follows rc_bail_if_reclaimed,
+        // every hand-back unpublishes first, and the launch turns it into the
+        // ordinary in-flight batch.
+        if (rc_slot) {
+          std::lock_guard<std::mutex> lk(rc_slot->m);
+          rc_slot->batch     = &C.batch;
+          rc_slot->delivered = &C.delivered;
+          rc_slot->registered_streams = ctxs.size();
+          rc_slot->prep      = true;
+          rc_slot->prep_ns   = now_ns();
+          rc_slot->submit_ns = 0;
+          rc_slot->active    = true;
+        }
         uint64_t batch_t0 = now_ns();  // always record for auto-tuner (not just -vvv)
         if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_start(batch_t0);
 
@@ -49005,6 +49930,11 @@ static void gpu_decomp_worker(
             if (per_stream_cap <= 1)
               throw std::runtime_error(
                   "GPU decomp: failed to allocate device buffers for a single frame");
+            // Keep the batch reclaimable through the last driver call.  A
+            // free after unpublishing could wedge while still holding its frames.
+            C.free_device();
+            // Handing the batch back: unpublish first, or park if it was taken.
+            if (!gz_decomp_unpublish(device_id)) gz_decomp_park_forever();
             per_stream_cap = std::max<size_t>(1, per_stream_cap / 2);
             // Tell the tuner; if this ends an exploration, stop the regrow from
             // climbing back into the size that just failed.
@@ -49021,7 +49951,6 @@ static void gpu_decomp_worker(
             // device to the CPU rescue over a transient dip.  free_device() is
             // idempotent and zeroes those maxima, which is what makes the next
             // call allocate at the cap we just chose.
-            C.free_device();
             // Pressure is live: restart the regrow streak, and stiffen the
             // cadence only if this dip FOLLOWED a recovery — several failures
             // inside one pressure episode are one event, not several.
@@ -49092,6 +50021,7 @@ static void gpu_decomp_worker(
           // whole archive at exit 0 -- [DSTAGE] 0 frames was the only sign.
           for (void *& hp : C.h_dstage)
             if (hp) { cudaFreeHost(hp); hp = nullptr; }
+          rc_bail_if_reclaimed();   // a refusal below would die() for the run
           const size_t slot = (max_comp + 4095) & ~size_t(4095);
           // As many lanes as an eighth of the memory left pins (v0.18.31): eight
           // 16 MiB lanes are 128 MiB of page-locked memory, which a container
@@ -49137,15 +50067,96 @@ static void gpu_decomp_worker(
         // internally in the stream  no host-side blocking between transfers.
         // A single large memcpy would require packing a contiguous host buffer
         // first, which is slower than letting CUDA handle the scatter.
-        uint64_t h2d_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
+        // g_perf belongs to the run; allocations above may have been reclaimed.
+        // Its instrumentation is enabled only at V_TRACE, already above V_DEBUG.
+        uint64_t h2d_t0 = opt.verbosity >= V_DEBUG ? now_ns() : 0;
         uint64_t h2d_bytes_batch = 0;
         cudaEventRecord(C.ev_begin, C.stream);
-        static const bool wb_on = []{
-          const bool on = ::getenv("GZSTD_DEBUG_GDS_WRITE_BEHIND") != nullptr;
-          if (on) std::cerr << "[GDS] write-behind ENABLED (experimental): this "
-                               "batch's writes overlap the next batch's reads\n";
-          return on;
-        }();
+        // Test hook (GZSTD_DEBUG_DECOMP_STALL=DEV:SECS:upload): stall this
+        // batch's upload, as a wedged H2D would, so a cell can watch the
+        // reclaimer take a batch before its launch (v0.18.64).  A staged frame
+        // stalls where its copy would wedge -- on its staging lane, holding its
+        // read-ahead claim (place_frame) -- and a host-backed batch here.
+        auto upload_stall = [&](const char * where) {
+          static const char * const e = std::getenv("GZSTD_DEBUG_DECOMP_STALL");
+          if (!e) return;
+          static std::atomic<bool> stalled_up{false};
+          int sd = -1, ss = 0;
+          char ph[16] = "";
+          if (std::sscanf(e, "%d:%d:%15s", &sd, &ss, ph) == 3 && std::strcmp(ph, "upload") == 0
+              && (sd == device_id || sd == -1) && !stalled_up.exchange(true)) {
+            vlog(V_VERBOSE, opt, "[STALL] decompress GPU" + std::to_string(device_id)
+                 + " sleeping " + std::to_string(ss) + " s in its batch's upload (" + where + ")\n");
+            std::this_thread::sleep_for(std::chrono::seconds(ss));
+          }
+        };
+        {
+          bool any_staged = false;
+          for (size_t i = 0; i < C.filled && !any_staged; ++i) any_staged = C.batch[i].src_off >= 0;
+          if (!any_staged) upload_stall("host frames");
+        }
+        // THE BATCH'S METADATA, before any of its uploads (v0.18.64): it reads the
+        // frames and the archive's checksum table (process state the next input
+        // reloads).  The lock both checks ownership after the allocations above
+        // and keeps reclaim from handing the run back while this table is read.
+        DStageAhead * batch_ahead = nullptr;
+        rc_commit_delivery([&] {   // the checksum table belongs to this input
+          // Freeze THIS input's cache while ownership still pins the run.  A
+          // reclaimed lane can resume during a later input: loading the global
+          // then could reach that input's cache, which its teardown may destroy.
+          batch_ahead = g_dstage_ahead.load(std::memory_order_acquire);
+          bool batch_staged = false;
+          for (size_t i = 0; i < C.filled && !batch_staged; ++i) batch_staged = C.batch[i].src_off >= 0;
+          // Only a batch that HOLDS staged frames: a --direct-stage that stood
+          // down to the ordinary reader (no usable seek table) has closed the
+          // descriptor, and its host-backed batches must not trip over that.
+          if (C.dstage && batch_staged && stage_input.fd < 0) {
+            stage_input.fd = ::fcntl(g_gds_verify_fd, F_DUPFD_CLOEXEC, 0);
+            if (stage_input.fd < 0)
+              throw std::runtime_error("--direct-stage: cannot retain the input descriptor: "
+                                       + std::string(std::strerror(errno)));
+          }
+          for (size_t i = 0; i < C.filled; ++i) {
+            h2d_bytes_batch += C.batch[i].len();
+            C.h_comp_sizes[i]   = C.batch[i].len();
+            if (C.batch[i].src_off >= 0) {
+              C.h_decomp_sizes[i] = C.batch[i].decomp_size;
+              C.h_has_ck[i]    = C.batch[i].stg_has_ck;
+              C.h_expect_ck[i] = C.batch[i].stg_expect_ck;
+              continue;
+            }
+            C.h_decomp_sizes[i] = C.batch[i].decomp_size;
+            // The expected content checksum, read off the frame while it is still
+            // on the host.  Byte 4 of a zstd frame header is the Frame Header
+            // Descriptor; bit 2 (0x04) is Content_Checksum_flag, and when it is set
+            // the frame's last four bytes are XXH64(content) truncated to 32 bits,
+            // little-endian.  A frame without the flag cannot be verified this way.
+            {
+              const unsigned char * fp = (const unsigned char *)C.batch[i].ptr();
+              const size_t fl = C.batch[i].len();
+              C.h_has_ck[i] = 0; C.h_expect_ck[i] = 0;
+              if (g_no_check) {
+                // --no-check: verify nothing on the device either.
+              } else if (fp && fl >= 9 && (fp[4] & 0x04)) {
+                C.h_has_ck[i] = 1;
+                C.h_expect_ck[i] = (unsigned int)fp[fl-4]
+                                 | ((unsigned int)fp[fl-3] << 8)
+                                 | ((unsigned int)fp[fl-2] << 16)
+                                 | ((unsigned int)fp[fl-1] << 24);
+              } else {
+                // No checksum in the frame: fall back to the seek table's, which
+                // for a `zstd --no-check` archive is the only integrity evidence
+                // in the file.  Without this the device verifier was handed
+                // has_ck = 0 and wrong bytes decoded to exit 0.
+                uint32_t tck = 0;
+                if (table_checksum_for((uint64_t)C.batch[i].out_off, &tck)) {
+                  C.h_has_ck[i]    = 1;
+                  C.h_expect_ck[i] = (unsigned int)tck;
+                }
+              }
+            }
+          }
+        });
         bool staged_batch = false;
         bool staged_prefetched = false;   // fan-out already read this batch
         std::mutex rd_err_m;
@@ -49183,6 +50194,7 @@ static void gpu_decomp_worker(
         };
         auto check_table_extent = [&] {
           if (tab_err.empty()) return;
+          rc_bail_if_reclaimed();   // a taken batch is the CPU's now: no die() from here
           gds_table_defect(opt, tab_err);
           die(tab_err, EXIT_DATA);
         };
@@ -49211,13 +50223,25 @@ static void gpu_decomp_worker(
               if (rd_err.empty()) rd_err = std::move(why);
             };
             // Already read ahead?  Then only the upload is left.
-            if (DStageAhead * ah = g_dstage_ahead.load(std::memory_order_acquire)) {
+            // NOT under the reclaim lock: claim() can wait for this frame's
+            // read, and every lane and the reclaimer need that lock.  A thread
+            // that loses its batch between its check and the cache is safe
+            // anyway -- a run that reclaimed a batch keeps its cache object
+            // (stop_dstage_ahead).  The batch froze that pointer while it still
+            // owned the run, so even across later inputs a late claim/release
+            // reaches only this run's stopped, live cache.
+            if (DStageAhead * ah = batch_ahead) {
               if (const char * fp = ah->claim(C.batch[i].seq, raw, flen)) {
                 if (!dstage_one_frame(fp, flen, C.batch[i].seq)) {
                   ah->release(C.batch[i].seq);
                   return;
                 }
+                upload_stall("a read-ahead copy");
                 const cudaError_t cs = cudaMemcpy(d_dst, fp, flen, cudaMemcpyHostToDevice);
+                // The copy can block for good; taken meanwhile, this thread (a
+                // lane or the worker) parks before touching the cache, which the
+                // run owns -- and the cache keeps the buffer (stop_dstage_ahead).
+                rc_bail_if_reclaimed();
                 ah->release(C.batch[i].seq);
                 if (cs != cudaSuccess) {
                   fail(std::string("cudaMemcpy(--direct-stage read-ahead -> slab): ")
@@ -49242,7 +50266,7 @@ static void gpu_decomp_worker(
             int    rerrno = 0;
             const uint64_t rd_t0 = now_ns();
             while (hgot < pad + flen) {
-              const ssize_t r = ::pread(g_gds_verify_fd, hp + hgot, want - hgot,
+              const ssize_t r = ::pread(stage_input.fd, hp + hgot, want - hgot,
                                         fo + (off_t)hgot);
               if (r < 0) { if (errno == EINTR) continue; rerrno = errno; break; }
               if (r == 0) break;                 // EOF: the rounded tail window
@@ -49264,7 +50288,9 @@ static void gpu_decomp_worker(
               return;
             }
             if (!dstage_one_frame(hp + pad, flen, C.batch[i].seq)) return;
+            upload_stall("a staging lane's copy");
             const cudaError_t cs = cudaMemcpy(d_dst, hp + pad, flen, cudaMemcpyHostToDevice);
+            rc_bail_if_reclaimed();   // taken meanwhile: park before the run's counters
             if (cs != cudaSuccess) {
               fail(std::string("cudaMemcpy(--direct-stage lane -> slab): ")
                    + cudaGetErrorString(cs));
@@ -49315,7 +50341,12 @@ static void gpu_decomp_worker(
             // the constraint on this path; the lanes exist to keep them from
             // becoming one on slower storage.
             const uint64_t rd_t0 = now_ns();
+            upload_stall("a cuFile read");
             const ssize_t got = g_gds_input.read_dev(C.d_comp_buf, want, fo, dv);
+            // The read can block for good; taken meanwhile, this thread parks
+            // here -- before its next frame's read through the global handle,
+            // which a later input may be reopening.
+            rc_bail_if_reclaimed();
             g_gdsv_read_ns.fetch_add(now_ns() - rd_t0, std::memory_order_relaxed);
             g_gdsv_read_bytes.fetch_add(want, std::memory_order_relaxed);
             g_gdsv_reads.fetch_add(1, std::memory_order_relaxed);
@@ -49389,6 +50420,7 @@ static void gpu_decomp_worker(
                            + cudaGetErrorString(ds);
                   return;
                 }
+                rc_bail_if_reclaimed();   // before the run's read-ahead cache
               }
               for (size_t i = k; i < C.filled; i += step)
                 if (C.batch[i].src_off >= 0) place_frame(i, k);
@@ -49431,44 +50463,6 @@ static void gpu_decomp_worker(
           // h_comp_ptrs for null would be wrong: it persists across batches, so
           // every staged frame after the first batch would be silently skipped.
           if (!(staged_prefetched && C.batch[i].src_off >= 0)) place_frame(i);
-          h2d_bytes_batch += C.batch[i].len();
-          C.h_comp_sizes[i]   = C.batch[i].len();
-          if (C.batch[i].src_off >= 0) {
-            C.h_decomp_sizes[i] = C.batch[i].decomp_size;
-            C.h_has_ck[i]    = C.batch[i].stg_has_ck;
-            C.h_expect_ck[i] = C.batch[i].stg_expect_ck;
-            continue;
-          }
-          C.h_decomp_sizes[i] = C.batch[i].decomp_size;
-          // The expected content checksum, read off the frame while it is still
-          // on the host.  Byte 4 of a zstd frame header is the Frame Header
-          // Descriptor; bit 2 (0x04) is Content_Checksum_flag, and when it is set
-          // the frame's last four bytes are XXH64(content) truncated to 32 bits,
-          // little-endian.  A frame without the flag cannot be verified this way.
-          {
-            const unsigned char * fp = (const unsigned char *)C.batch[i].ptr();
-            const size_t fl = C.batch[i].len();
-            C.h_has_ck[i] = 0; C.h_expect_ck[i] = 0;
-            if (g_no_check) {
-              // --no-check: verify nothing on the device either.
-            } else if (fp && fl >= 9 && (fp[4] & 0x04)) {
-              C.h_has_ck[i] = 1;
-              C.h_expect_ck[i] = (unsigned int)fp[fl-4]
-                               | ((unsigned int)fp[fl-3] << 8)
-                               | ((unsigned int)fp[fl-2] << 16)
-                               | ((unsigned int)fp[fl-1] << 24);
-            } else {
-              // No checksum in the frame: fall back to the seek table's, which
-              // for a `zstd --no-check` archive is the only integrity evidence
-              // in the file.  Without this the device verifier was handed
-              // has_ck = 0 and wrong bytes decoded to exit 0.
-              uint32_t tck = 0;
-              if (table_checksum_for((uint64_t)C.batch[i].out_off, &tck)) {
-                C.h_has_ck[i]    = 1;
-                C.h_expect_ck[i] = (unsigned int)tck;
-              }
-            }
-          }
         }
 
         // THE OTHER ERROR BOUNDARY.  place_frame() cannot throw from a fan-out
@@ -49519,15 +50513,16 @@ static void gpu_decomp_worker(
         const bool temp_preallocated = (C.temp_bytes >= temp_bound && temp_bound > 0);
         if (!temp_preallocated) {
           checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(pre-temp)");
-          rc_bail_if_reclaimed();
         }
         uint64_t h2d_elapsed_ns = (h2d_t0 > 0) ? now_ns() - h2d_t0 : 0;
         double h2d_ms_v = double(h2d_elapsed_ns) / 1e6;
-        if (g_perf) {
-          g_perf->h2d_ns.fetch_add(h2d_elapsed_ns);
-          g_perf->h2d_bytes.fetch_add(h2d_bytes_batch);
-          g_perf->h2d_count.fetch_add(1);
-        }
+        rc_commit_delivery([&] {   // ownership after the uploads; counters belong to the run
+          if (g_perf) {
+            g_perf->h2d_ns.fetch_add(h2d_elapsed_ns);
+            g_perf->h2d_bytes.fetch_add(h2d_bytes_batch);
+            g_perf->h2d_count.fetch_add(1);
+          }
+        });
         if (!temp_preallocated) {
           nvcompStatus_t tst = nvcompBatchedZstdDecompressGetTempSizeSync(
               (const void * const *)C.d_comp_ptrs,
@@ -49574,6 +50569,10 @@ static void gpu_decomp_worker(
             if (per_stream_cap <= 1)
               throw std::runtime_error(
                   "GPU decomp: failed to grow temp buffer for a single frame");
+            // Still published while the last driver call can block.
+            C.free_device();
+            // Handing the batch back: unpublish first, or park if it was taken.
+            if (!gz_decomp_unpublish(device_id)) gz_decomp_park_forever();
             per_stream_cap = std::max<size_t>(1, per_stream_cap / 2);
             // Tell the tuner; if this ends an exploration, stop the regrow from
             // climbing back into the size that just failed.
@@ -49581,7 +50580,6 @@ static void gpu_decomp_worker(
               batch_cap_ceiling = std::min(batch_cap_ceiling, back);
             // Same failed-allocation reset and cadence accounting as the
             // buffer-growth shrink above.
-            C.free_device();
             batch_regrow_streak = 0;
             if (batch_regrew_since_pressure
                 && batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2)
@@ -49620,7 +50618,7 @@ static void gpu_decomp_worker(
         }
 
         // Launch batched decompression
-        uint64_t kern_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
+        uint64_t kern_t0 = opt.verbosity >= V_DEBUG ? now_ns() : 0;
 
         // Save per-frame metadata needed by completion paths.
         //
@@ -49639,17 +50637,6 @@ static void gpu_decomp_worker(
         }
         // (C.delivered was zeroed at intake -- see the comment there.)
 
-        // JOIN THE PREVIOUS BATCH'S WRITE-BEHIND, as late as possible.  Those
-        // writes DMA out of d_decomp_buf, which this kernel is about to
-        // overwrite; the reads above filled d_comp_buf, a DIFFERENT slab, so they
-        // were free to run alongside.  That gap is the entire overlap, and
-        // joining any earlier gives all of it back.
-        if (C.wb_thr.joinable()) {
-          C.wb_thr.join();
-          C.wb_jobs.clear();
-          if (!C.wb_err.empty()) die(C.wb_err, EXIT_IO);   // see write_span
-        }
-
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
             (const void * const *)C.d_comp_ptrs,
             C.d_comp_sizes,
@@ -49665,24 +50652,27 @@ static void gpu_decomp_worker(
 
         cudaEventRecord(C.ev_end, C.stream);
 
-        // Publish this batch so the reclaimer can take it if the sync below never
-        // returns.  Cleared at batch completion, which also feeds the EMA the
-        // deadline is scaled from.
+        // Launched: the batch, published since it was taken (PREP), is now the
+        // in-flight batch the reclaimer times from here (v0.18.64; until then it
+        // was published only here).  Taken during PREP, this worker parks instead.
+        // Cleared at batch completion, which also feeds the EMA the deadline is
+        // scaled from.
         if (rc_slot) {
-          std::lock_guard<std::mutex> lk(rc_slot->m);
-          rc_slot->batch     = &C.batch;
-          rc_slot->delivered = &C.delivered;
-          rc_slot->registered_streams = ctxs.size();
+          std::unique_lock<std::mutex> lk(rc_slot->m);
+          if (rc_slot->reclaimed) { lk.unlock(); gz_decomp_park_forever(); }
+          rc_slot->prep      = false;
           rc_slot->submit_ns = now_ns();
-          rc_slot->active    = true;
         }
         // Fault-injection test hook: stall this device's batch before its sync,
         // simulating a wedged CUDA call, so the suite can watch the reclaim.
         // Same shape as the compress side's GZSTD_DEBUG_ADAPT_STALL.
+        // DEV:SECS, or DEV:SECS:sync; DEV:SECS:upload is the PREP stall's (above).
         if (const char * e = std::getenv("GZSTD_DEBUG_DECOMP_STALL")) {
           static std::atomic<bool> stalled_once{false};
           int sd = -1, ss = 0;
-          if (std::sscanf(e, "%d:%d", &sd, &ss) == 2
+          char ph[16] = "";
+          const int nf = std::sscanf(e, "%d:%d:%15s", &sd, &ss, ph);
+          if ((nf == 2 || (nf == 3 && std::strcmp(ph, "sync") == 0))
               && (sd == device_id || sd == -1)
               && !stalled_once.exchange(true)) {
             vlog(V_VERBOSE, opt, "[STALL] decompress GPU" + std::to_string(device_id)
@@ -49886,28 +50876,14 @@ static void gpu_decomp_worker(
         // NOT the write fan-out that was rejected earlier: this issues FEWER and
         // LARGER requests, where that issued more concurrent ones and lost to
         // read/write contention.  Combining it with write-behind was also tried
-        // and adds nothing (60.69 s vs 60.77 s).
+        // and adds nothing (60.69 s vs 60.77 s); write-behind itself is gone
+        // (v0.18.64, see the per-frame write below).
         //
         // GZSTD_DEBUG_GDS_NO_COALESCE_WRITES=1 restores the per-frame path.
         static const bool coalesce_writes =
             ::getenv("GZSTD_DEBUG_GDS_NO_COALESCE_WRITES") == nullptr;
         auto write_span = [&](uint64_t dev_off, uint64_t file_off, uint64_t len) {
           if (!len) return;
-          // WRITE-BEHIND APPLIES HERE TOO.  Coalescing runs as a pre-pass and
-          // used to write synchronously, so once it became the default a batch
-          // that formed a single run never populated wb_jobs -- no background
-          // thread was ever created, and GZSTD_DEBUG_GDS_WRITE_BEHIND=1 silently
-          // did nothing on ordinary archives (which always coalesce).  Queuing
-          // the span instead makes the two compose, and the composed shape is
-          // the better one for the hosts the switch exists for: ONE large write
-          // overlapping the next batch's reads, rather than thousands of small
-          // ones.  The slab's lifetime is already covered -- the joins before
-          // the kernel, before a realloc, at teardown and on the fault path do
-          // not care how many spans are outstanding.
-          if (wb_on) {
-            C.wb_jobs.push_back({dev_off, file_off, len});
-            return;
-          }
           const uint64_t wt0 = now_ns();
           const ssize_t w = g_gds_output.write_dev(
               C.d_decomp_buf, (size_t)len, (off_t)file_off, (off_t)dev_off);
@@ -50171,23 +51147,21 @@ static void gpu_decomp_worker(
             // still loses decisively; the coalescing experiment above asks a
             // different question by REDUCING requests without adding overlap.
             //
-            // OVERLAPPED (GZSTD_DEBUG_GDS_WRITE_BEHIND=1, this batch's writes
-            // against the NEXT batch's reads): KEPT, OFF BY DEFAULT.  No result on
-            // this hardware -- off 67.90-69.05 s, on 67.65-68.42 s, overlapping
-            // ranges -- and 3.5% slower back at 4 GiB.  Hiding the 13.25 s read
-            // phase inside the 45.62 s write phase should have been worth ~19%; it
-            // is not, because the two contend on one drive and the writes slow by
-            // about what the overlap saves.
-            //
-            // It is kept because the code is correct when enabled (byte-identical
-            // output, md5-verified at 130 GiB) and the reason it does not pay is a
-            // property of THIS BOX, not of the design.  On a host that reads and
-            // writes on SEPARATE devices -- or a RAID/NVMe array with real
-            // concurrent bandwidth -- the contention that cancels it disappears
-            // and the ~19% should be there.  What to watch when trying it: the
-            // -vvv "D2H transfers" rate.  If it drops from 2.86 GiB/s when the
-            // switch is on, the drive is the limit and the overlap is a wash; if
-            // it holds, the read phase is genuinely being hidden.
+            // OVERLAPPED (this batch's writes against the NEXT batch's reads, on a
+            // thread per stream): REMOVED in v0.18.64, after it sat off by default
+            // behind a debug switch.  No result on this hardware -- off
+            // 67.90-69.05 s, on 67.65-68.42 s, overlapping ranges -- and 3.5%
+            // slower back at 4 GiB.  Hiding the 13.25 s read phase inside the
+            // 45.62 s write phase should have been worth ~19%; it was not, because
+            // the two contend on one drive and the writes slow by about what the
+            // overlap saves.  It was correct (byte-identical at 130 GiB), and a
+            // host with separate read and write devices might see the ~19%; it went
+            // because its join, before the next batch's kernel, was a call into
+            // the driver that nothing could give up on (GzGpuCallWatch), and
+            // covering that cost more than an experiment that never paid.  What to
+            // watch if it is ever rebuilt: the -vvv "D2H transfers" rate -- if it
+            // drops from 2.86 GiB/s, the drive is the limit and the overlap is a
+            // wash.
             //
             // THE READ SIDE IS THE ASYMMETRY: a single thread could NOT saturate
             // reads (3.97 vs 4.9 GiB/s), so fanning those out IS the default and
@@ -50198,10 +51172,6 @@ static void gpu_decomp_worker(
             if (batch_coalesced) {
               // The pre-pass above already wrote this frame as part of a
               // validated contiguous run.
-            } else if (wb_on) {
-              // Deferred to the write-behind thread launched after this loop.
-              C.wb_jobs.push_back({(uint64_t)(i * C.alloc_decomp), (uint64_t)ooff,
-                                   (uint64_t)wlen});
             } else {
               write_span((uint64_t)i * C.alloc_decomp, ooff, wlen);
             }
@@ -50226,9 +51196,7 @@ static void gpu_decomp_worker(
                 m->tasks_done.fetch_add(1, std::memory_order_relaxed);
               }
               // The ordinary writer releases one permit after a frame is
-              // physically written.  The synchronous GDS default has reached
-              // that point; experimental write-behind retains its established
-              // queue-time release so its next batch can overlap the write.
+              // physically written; the GDS write has reached that point.
               if (bp) bp->release(1);
               g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
               credit_input(i, actual);
@@ -50323,49 +51291,6 @@ static void gpu_decomp_worker(
             if (!dbg_dec_fired.exchange(true))
               throw std::runtime_error(
                   "simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)");
-          }
-        }
-        if (!C.wb_jobs.empty()) {
-          DecompStreamCtx * cp = &C;
-          // A thread the system refuses (ROADMAP 46): the same writes, here, now
-          // -- and the marker below stays silent, since no background writer ran.
-          auto write_behind = [cp, vb = (opt.verbosity >= V_VERBOSE)](bool threaded) {
-            // PRINTED FROM INSIDE THE THREAD, once, because the "ENABLED" banner
-            // above proves only that the switch was read.  When coalescing began
-            // writing spans synchronously, wb_jobs stayed empty, no thread was
-            // ever created, and the banner still appeared -- so the regression
-            // test passed on a run that exercised nothing.  This marker cannot
-            // appear unless a background writer actually ran.
-            if (vb && threaded) {
-              static std::atomic<bool> said{false};
-              if (!said.exchange(true))
-                std::cerr << "[GDS] write-behind thread active\n";
-            }
-            for (const auto & w : cp->wb_jobs) {
-              const uint64_t wt0 = now_ns();
-              const ssize_t got = g_gds_output.write_dev(cp->d_decomp_buf, (size_t)w[2],
-                                                         (off_t)w[1], (off_t)w[0]);
-              g_gdsd_write_ns.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
-              g_gdsd_writes.fetch_add(1, std::memory_order_relaxed);
-              if (got != (ssize_t)w[2]) {
-                // Recorded, not thrown: an exception crossing a std::thread
-                // boundary calls std::terminate before gpu_decomp_worker's
-                // recovery boundary could turn it into an ordinary failed pass.
-                if (cp->wb_err.empty())
-                  cp->wb_err = "--gds-only: cuFileWrite returned "
-                             + std::to_string((long long)got) + " at offset "
-                             + std::to_string((long long)w[1]);
-                return;
-              }
-            }
-          };
-          if (!gz_try_thread(C.wb_thr, write_behind, true)) {
-            write_behind(false);
-            // No joinable thread will retire these jobs at the next kernel.
-            // Replaying them then would write the NEW batch to OLD offsets;
-            // an inline I/O error must also be observed before reporting done.
-            C.wb_jobs.clear();
-            if (!C.wb_err.empty()) die(C.wb_err, EXIT_IO);
           }
         }
         // Batch complete: retire the in-flight record and fold its duration into
@@ -50480,14 +51405,7 @@ static void gpu_decomp_worker(
     if (!g_adapt_gpu_engaged.load(std::memory_order_relaxed))
       g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
 
-    // Cleanup.  Writers first: free_device() below releases the very slab they
-    // are reading from, so a pending write would DMA out of freed VRAM.
-    for (auto & C : ctxs)
-      if (C.wb_thr.joinable()) {
-        C.wb_thr.join();
-        if (!C.wb_err.empty()) die(C.wb_err, EXIT_IO);   // see write_span
-      }
-    if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+    // Cleanup.
     for (auto & C : ctxs) {
       // How many host output buffers this stream allocated (v0.18.48): the pool
       // plus its overdrafts.  A writer woken for each frame it waits on keeps this
@@ -50497,13 +51415,9 @@ static void gpu_decomp_worker(
         vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id) + "/S" + std::to_string(C.stream_index)
              + "] output buffers: " + std::to_string(C.out_pool.size() + C.out_pool_waits)
              + " allocated\n");
-      C.free_device();
-      size_t freed = C.free_host_pinned();
-      if (freed) release_pinned(freed, opt);
-      if (C.ev_begin) cudaEventDestroy(C.ev_begin);
-      if (C.ev_end)   cudaEventDestroy(C.ev_end);
-      if (C.stream)   cudaStreamDestroy(C.stream);
     }
+    // The device's buffers are freed at the end, after this worker's exit is
+    // accounted for (GzGpuCallWatch).
 
     // Deregister streams so queue floor drops and CPU workers aren't blocked
     if (sched) {
@@ -50515,6 +51429,9 @@ static void gpu_decomp_worker(
     queue->notify_cpu_waiters();
   }
   catch (const std::exception & e) {
+    // Out of the setup's watched phase first, if the throw came from inside it:
+    // parks here if teardown gave up on this worker meanwhile.
+    gz_gpu_watch_leave(watch.get());
     // Decide ownership before dereferencing ANY pointer into decompress_nvcomp's
     // stack.  In particular, cudaStreamSynchronize may return an error after the
     // deadline reclaimer detached this worker; checkCuda throws before the normal
@@ -50534,11 +51451,6 @@ static void gpu_decomp_worker(
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
     // The batch was popped from the queue but not (fully) decompressed.
     try {
-      // Writers first, same ordering rule as the clean path.  Errors are
-      // swallowed: we are already unwinding a fault and the output is discarded.
-      for (auto & C : ctxs)
-        if (C.wb_thr.joinable()) { try { C.wb_thr.join(); } catch (...) {} }
-      if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       for (auto & C : ctxs) {
         // Frames [0, delivered) already reached the ResultStore (and had
         // their inputs released) — re-enqueueing them would push empty,
@@ -50567,13 +51479,8 @@ static void gpu_decomp_worker(
           }
           if (bp) bp->release(held);
         }
-        C.free_device();
-        size_t freed = C.free_host_pinned();
-        if (freed) release_pinned(freed, opt);
-        if (C.ev_begin) { cudaEventDestroy(C.ev_begin); C.ev_begin = nullptr; }
-        if (C.ev_end)   { cudaEventDestroy(C.ev_end);   C.ev_end = nullptr; }
-        if (C.stream)   { cudaStreamDestroy(C.stream);   C.stream = nullptr; }
       }
+      // Its buffers are freed at the end, as on a clean exit.
     } catch (...) {}
 
     // Deregister streams so queue floor drops and CPU workers aren't blocked
@@ -50597,6 +51504,26 @@ static void gpu_decomp_worker(
   // Normal drain also has to be counted, and it is the case the old
   // failure-keyed trigger could never see.
   note_exit_and_rescue();
+
+  // FREE THE DEVICE'S BUFFERS LAST (v0.18.64), after the exit is accounted for:
+  // nothing below touches the run, so a driver that never returns from these
+  // calls costs teardown at most its wait for this thread (GzGpuCallWatch), and a
+  // --gpu-only rescue owed by this exit has already started.  A device that just
+  // faulted is the likeliest to stop answering here.  On either path every frame
+  // this worker held is delivered or back on the queue.
+  try {
+    gz_gpu_watched(watch.get(), "freeing its buffers", "release", [&] {
+      if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+      for (auto & C : ctxs) {
+        C.free_device();
+        size_t freed = C.free_host_pinned();
+        if (freed) release_pinned(freed, opt);
+        if (C.ev_begin) { cudaEventDestroy(C.ev_begin); C.ev_begin = nullptr; }
+        if (C.ev_end)   { cudaEventDestroy(C.ev_end);   C.ev_end = nullptr; }
+        if (C.stream)   { cudaStreamDestroy(C.stream);   C.stream = nullptr; }
+      }
+    });
+  } catch (...) {}
 }
 
 /*======================================================================
@@ -51025,7 +51952,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // that actually closes the hole: it runs first, so it does not matter how the
   // previous file's run ended -- cleanly, by demotion, or by a fault that
   // unwound past the exit cleanup below.
-  gds_decomp_read_close();
+  gds_decomp_read_close(opt.verbosity);
   // Per INPUT, like everything above: `gzstd -t A.zst B.zst` must report B's
   // bad table even though A already reported one.  Not inside
   // gds_decomp_read_close(), whose own note explains that these counters are
@@ -51033,7 +51960,12 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   g_gds_defect_said.store(false, std::memory_order_relaxed);
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
-  gds_preflight_or_die(opt, in);
+  // GPU initialization on this thread (cuFile's driver starts CUDA): timed in a
+  // GPU-only run (gz_gpu_only_init_step).
+  if (opt.gds_only && g_gpu_call_abandoned.load(std::memory_order_relaxed))
+    die_usage(gz_no_gpu_usage_msg(opt));   // no new cuFile/CUDA probe after an abandoned call
+  gz_gpu_only_init_step(opt, "opening GPUDirect Storage", "bringup", false,
+                        [&] { gds_preflight_or_die(opt, in); });
   // All of these are process globals; settle a fresh per-file baseline even if
   // this file later declines GDS.  Leaving active=true from the previous file
   // suppresses the ordinary writer and sends workers through a closed handle.
@@ -51076,7 +52008,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   int device_count = 0;
   int total_hw_devices = 0;
   if (!defer_detect) {
-    device_count = gz_cuda_usable_count(opt, "decompress, synchronous");
+    // On a helper, waited for at most the GPU initialization timeout (v0.18.64): a
+    // count that never comes is no device, said loudly, and the CPU decodes.
+    {
+      const std::shared_ptr<const Options> sopt = std::make_shared<const Options>(opt);
+      if (!gz_gpu_call_bounded(opt, "starting CUDA", [sopt] {
+            return gz_cuda_usable_count(*sopt, "decompress, synchronous");
+          }, device_count))
+        device_count = 0;
+    }
     if (device_count <= 0) {
       if (opt.gpu_only)
         die_usage(gz_no_gpu_usage_msg(opt));
@@ -51306,7 +52246,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         why = "the archive has no descriptor to read by offset";
       }
       // --direct-stage makes NO cuFile call: its workers pread this descriptor.
-      if (dfd >= 0 && opt.gds_only && !g_gds_input.open(dfd, &why)) { ::close(dfd); dfd = -1; }
+      if (dfd >= 0 && opt.gds_only
+          && !gz_gpu_only_init_step(opt, "registering the archive with cuFile", "setup", false,
+                                    [&] { return g_gds_input.open(dfd, &why); })) {
+        ::close(dfd); dfd = -1;
+      }
       int plain_fd = -1;
       if (dfd >= 0) plain_fd = gz_reopen_input(cur, O_RDONLY);
       if (dfd < 0) {
@@ -51534,7 +52478,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       goto gds_out_declined;
     }
     std::string why;
-    if (!g_gds_output.open(ofd, &why)) {
+    if (!gz_gpu_only_init_step(opt, "registering the output with cuFile", "setup", false,
+                               [&] { return g_gds_output.open(ofd, &why); })) {
       // DEMOTE, DON'T FAIL -- the same rule the alignment preflight follows.
       // cuFile refuses some perfectly good destinations: writing over an existing
       // file goes through an atomic `<out>.gzstd.*.tmp`, and cuFile rejects that
@@ -51746,10 +52691,15 @@ gds_out_declined:
   // and the writer waits forever for its sequence numbers.  If this watchdog's
   // thread cannot be created, the catch at its start reports that recovery is
   // unavailable and ordinary decoding continues.  Bringup and the pre-publication
-  // H2D/setup calls are not covered.  MEASURED at v0.17.52 with
+  // H2D/setup calls are not covered here; the bringup thread, a worker's context
+  // creation and its final release are (GzGpuCallWatch, given up on at teardown,
+  // v0.18.64).  MEASURED at v0.17.52 with
   // a stall injected before the batch sync: an 8 s stall cost the run 8 s, and a
   // 120 s stall was still stuck when the harness killed it at 45 s.
   std::atomic<int>         gpu_spawned_total{0};   // published by the bringup lambda
+  // One per gpu_workers slot, filled by the bringup lambda before any worker
+  // starts: a worker's calls that hold no frames (GzGpuCallWatch).
+  std::vector<GzGpuCallWatchP> worker_watch;
   std::thread              reclaim_thr;
   std::atomic<bool>        reclaim_done{false};
   std::mutex               reclaim_mx;
@@ -51763,28 +52713,85 @@ gds_out_declined:
   };
   // Wait until every spawned worker has accounted for its exit.  The reclaimer
   // does that accounting for a worker it abandons, so this returns even when one
-  // is wedged forever.
+  // is wedged forever in a batch.  A worker stuck in a call that holds no frames
+  // -- creating its device context, freeing its buffers (GzGpuCallWatch) -- is
+  // given up on HERE, and its exit accounted for as the reclaimer would: its
+  // streams, its exit, and the --gpu-only rescue if it was the last one out.
+  // What a worker given up on before it accounted for its exit would have done on
+  // its way out: its streams, its exit, the wake-ups.  Returns the exit count.
+  auto account_abandoned_worker = [&](GzGpuCallWatch & w) -> int {
+    int streams = 0;
+    { std::lock_guard<std::mutex> lk(w.m); streams = w.streams; }
+    if (sched)
+      for (int si = 0; si < streams; ++si) sched->unregister_gpu_stream(w.dev);
+    queue.notify_cpu_waiters();
+    queue.notify_gpu_yield_waiters();
+    const int out = gpu_exits.fetch_add(1, std::memory_order_acq_rel) + 1;
+    { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
+    g_decomp_exit_cv.notify_all();
+    { std::lock_guard<std::mutex> lk(results.m); results.cv.notify_all(); }
+    gpu_bringup_signal();
+    return out;
+  };
   auto gz_wait_for_worker_exits = [&]() {
     const int total = gpu_spawned_total.load(std::memory_order_relaxed);
     if (total <= 0) return;
-    std::unique_lock<std::mutex> lk(g_decomp_exit_mx);
-    g_decomp_exit_cv.wait(lk, [&] {
-      return gpu_exits.load(std::memory_order_acquire) >= total;
-    });
+    uint64_t t0 = now_ns(), last = t0;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(g_decomp_exit_mx);
+        if (g_decomp_exit_cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
+              return gpu_exits.load(std::memory_order_acquire) >= total;
+            }))
+          return;
+      }
+      const uint64_t now = now_ns();
+      if (now - last > 3 * 250000000ull) t0 = now;   // stopped with the call: see gz_gpu_watch_settle
+      last = now;
+      for (const GzGpuCallWatchP & w : worker_watch) {
+        // Only a worker that has not accounted for its exit: one freeing its
+        // buffers has, and is waited for at its join.
+        GzGiveUp g;
+        g.before_exit_only = true;
+        if (!w || !gz_gpu_watch_give_up(*w, t0, opt.verbosity, g)) continue;
+        const int out = account_abandoned_worker(*w);
+        // The last one out of a GPU-only run with frames left: its GPU never came
+        // up, so the run fails as the GPU initialization timer would have failed
+        // it (rtcheek: a GPU-only run does not finish on the CPU then).
+        if (out == total && opt.gpu_only && !queue.drained()) {
+          double secs = 0;
+          const char * what = "";
+          { std::lock_guard<std::mutex> lk(w->m); secs = double(now_ns() - w->since) / 1e9; what = w->what; }
+          die(gz_gpu_init_fail_msg(gz_gpu_only_flag(opt), w->dev, secs, what), EXIT_GPU_FAIL);
+        }
+      }
+    }
   };
   // A worker whose batch was reclaimed is parked in gz_decomp_park_forever, or
   // still inside the CUDA call that wedged.  Joining it would hang the run its
   // own rescue just saved, so detach it and let main _Exit once the output is
   // complete.
+  //
+  // Every other worker has accounted for its exit by now, and may still be
+  // freeing its buffers: a call that can be given up on here (GzGpuCallWatch).
   auto gz_join_or_detach_workers = [&]() {
     bool detached = false;
+    const uint64_t t0 = now_ns();
     for (size_t i = 0; i < gpu_workers.size(); ++i) {
       if (!gpu_workers[i].joinable()) continue;
       const int dev = (i < gpu_ids.size()) ? gpu_ids[i] : -1;
-      const bool abandoned = dev >= 0 && dev < ADAPT_DL_MAX
-          && (g_decomp_abandoned.load(std::memory_order_relaxed) & (1ull << dev));
-      if (abandoned) { gpu_workers[i].detach(); detached = true; }
-      else gpu_workers[i].join();
+      GzGpuCallWatch * const w = i < worker_watch.size() ? worker_watch[i].get() : nullptr;
+      // Or given up on already, in a call that holds no frames (on a device past
+      // the mask's reach too).
+      const bool abandoned = (dev >= 0 && dev < ADAPT_DL_MAX
+          && (g_decomp_abandoned.load(std::memory_order_relaxed) & (1ull << dev)))
+          || (w && w->given_up());
+      if (abandoned || (w && !gz_gpu_watch_settle(*w, t0, opt.verbosity))) {
+        gpu_workers[i].detach();
+        detached = true;
+      } else {
+        gpu_workers[i].join();
+      }
     }
     if (tunes_decomp) {
       tune_publish_devices(tunes_decomp.get(), (int)gpu_workers.size(), opt);
@@ -51946,6 +52953,17 @@ gds_out_declined:
   if (!hp_recs.empty() || hprice_child().mode || opt.verbosity >= V_DEBUG)
     decode_price = hprice_for_decode;
 
+  // The bringup's calls into the driver are watched (GzGpuCallWatch) when it runs
+  // on its own thread; inline, on this one, nothing could give up on them.  They
+  // read a COPY of the options: one teardown gave up on may return after this
+  // frame is gone.
+  //
+  // A GPU-only run's are also timed (gz_gpu_init_timer_add).  The inline bringup
+  // runs on a thread of its own too (below), so it is watched as well.
+  const GzGpuCallWatchP bringup_watch = gz_gpu_watch_new(opt);
+  GzGpuCallWatch * const bw = bringup_watch.get();
+  const std::shared_ptr<const Options> bopt = std::make_shared<const Options>(opt);
+
   auto gpu_bringup = [&]() {
     if (defer_detect) {
       // Is there still enough work left to outlast cuInit?  Asked BEFORE the
@@ -52010,14 +53028,20 @@ gds_out_declined:
           return;
         }
       }
-      // Deferred device detection (the ~2s cuInit, off the critical path).
-      const int dc = gz_cuda_usable_count(opt, "decompress bringup thread");
+      // Deferred device detection (the ~2s cuInit, off the critical path) -- and
+      // the call the 2026-11-24 hang never returned from (GzGpuCallWatch).
+      const int dc = gz_gpu_watched(bw, "starting CUDA", "bringup", [bopt] {
+        return gz_cuda_usable_count(*bopt, "decompress bringup thread");
+      });
       // A prior input may have left a worker stuck on one card.  The optional
       // UUID trace queries every card, including that one, before selection
       // can skip it; omit the trace after any reclaim.
       if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old
           && !g_decomp_abandoned.load(std::memory_order_relaxed))
-        vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
+        vlog(V_DEBUG, opt, "[GPU] CUDA sees "
+             + gz_gpu_watched(bw, "listing the devices", "bringup",
+                              [] { return gz_cuda_visible_uuids(); })
+             + "\n");
       if (dc <= 0) {
         if (opt.gpu_only) {
           // gpu-only with no GPU: tell the reader to stop so main can error
@@ -52076,7 +53100,10 @@ gds_out_declined:
     if (device_count <= 0) return;
 
     const uint64_t gpu_sel_t0 = now_ns();
-    gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+    gpu_ids = gz_gpu_watched(bw, "ranking the devices", "bringup",
+                             [bopt, t = total_hw_devices, n = device_count] {
+                               return select_best_gpus(t, n, *bopt);
+                             });
     // A device whose batch was reclaimed still has a thread parked inside CUDA
     // on it (this invocation may be decompressing several files).  Never hand it
     // more work; if that leaves nothing, this file runs without a GPU.
@@ -52102,7 +53129,9 @@ gds_out_declined:
         }
       }
     }
-    if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
+    if (opt.cpu_share >= 0.0)
+      gz_gpu_watched(bw, "creating the device contexts", "bringup",
+                     [ids = gpu_ids] { warm_gpu_contexts(ids); });
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] device selection: " << std::fixed << std::setprecision(1)
@@ -52144,6 +53173,9 @@ gds_out_declined:
         nf = std::max(nf, (uint64_t)(double(decomp_src_bytes) * double(qf) / double(qb)));
       return nf;
     };
+    const std::vector<GzTuneDevFacts> dev_facts =
+        gz_gpu_watched(bw, "reading the devices' properties", "bringup",
+                       [ids = gpu_ids, adapt = opt.adapt] { return gz_tune_dev_facts(ids, adapt, false); });
     tunes_decomp.reset(new DeviceTune[(size_t)gpu_count]);
     tune_init_devices(tunes_decomp.get(), gpu_count, gpu_ids, tune_run_decomp, opt,
                       tune_pinned_decomp ? tune_pinned_decomp
@@ -52153,11 +53185,14 @@ gds_out_declined:
                       : tune_decomp_start(decomp_frame_cap(opt), decomp_src_bytes, gpu_count,
                                           decomp_frames_est()),
                       decomp_frame_cap(opt), bp_ptr ? bp_ptr->max_permits() : 0,
-                      /*by_device=*/false);
+                      /*by_device=*/false, &dev_facts);
     // Keep a slot for EVERY selected device, including refused starts.  Join /
     // detach and tuner publication use the same indices as gpu_ids and tunes;
     // compacting only the started threads would detach or join the wrong GPU.
     gpu_workers.resize((size_t)gpu_count);
+    worker_watch.resize((size_t)gpu_count);
+    for (int i = 0; i < gpu_count; ++i)
+      worker_watch[size_t(i)] = gz_gpu_watch_new(opt, gpu_ids[i]);   // GPU-only: timed
     int gpu_threads_ok = 0;
     for (int i = 0; i < gpu_count; ++i) {
       if (gz_try_thread(gpu_workers[size_t(i)], gpu_decomp_worker, gpu_ids[i], i, opt,
@@ -52167,7 +53202,7 @@ gds_out_declined:
                         &tunes_decomp[size_t(i)],
                         bp_ptr, &gpu_failures, &gpu_exits, gpu_count,
                         abandoned_at_start,
-                        discard_results)) {
+                        discard_results, worker_watch[size_t(i)])) {
         ++gpu_threads_ok;
         continue;
       }
@@ -52223,16 +53258,58 @@ gds_out_declined:
     // filling the queue (gpu-only).
     // Optional: one the system refuses a thread leaves the GPUs out, as a
     // declined bringup does (ROADMAP 46).
-    if (!gz_try_thread(gpu_bringup_thr, gpu_bringup)) {
+    if (!gz_try_thread(gpu_bringup_thr, [&gpu_bringup, w = bringup_watch] {
+          gpu_bringup();
+          w->finish();
+        })) {
       if (cpu_pool.empty())   // --gpu-only: nothing else would do the work
         die("cannot start the GPU bringup thread: the system refused a thread "
             "(Resource temporarily unavailable -- a PID or task limit?)");
       vlog(V_VERBOSE, opt, "[GPU] thread allowance: no thread for the deferred bringup; CPU only\n");
     }
   } else if (device_count > 0) {
-    // auto / fixed-share hybrid: bring up inline.
-    gpu_bringup();
+    // auto / fixed-share hybrid: brought up before the reader starts, as before --
+    // but on a thread of its own, waited for at most the GPU initialization
+    // timeout (rtcheek: the fixed-share hybrid fails on the timer and lets the
+    // CPU take over, loudly).  Given up on, it started no worker, so the CPU pool
+    // decodes everything (should_cpu_take: no GPU stream is active).  No thread:
+    // inline, as before.
+    if (gz_try_thread(gpu_bringup_thr, [&gpu_bringup, w = bringup_watch] {
+          gpu_bringup();
+          w->finish();
+        })) {
+      GzGiveUp g;
+      g.limit_s = gz_gpu_init_timeout_secs();
+      if (gz_gpu_watch_settle(*bringup_watch, now_ns(), opt.verbosity, g)) gpu_bringup_thr.join();
+      else gpu_bringup_thr.detach();
+    } else {
+      gpu_bringup();
+    }
   }
+  // Teardown's join of the bringup thread, which may sit in a call the driver never
+  // returns from (GzGpuCallWatch).  False: it was left behind, having started no
+  // worker.  A hybrid run's CPU pool has done the work; --gpu-only has nothing that
+  // decoded, and refuses as it does with no usable device -- at exit 5, since the
+  // device exists and its driver failed.
+  auto join_bringup = [&]() -> bool {
+    if (!gpu_bringup_thr.joinable()) return true;
+    if (gz_gpu_watch_settle(*bringup_watch, now_ns(), opt.verbosity)) {
+      gpu_bringup_thr.join();
+      return true;
+    }
+    gpu_bringup_thr.detach();
+    if (opt.gpu_only) {
+      double secs = 0;
+      const char * what = "";
+      {
+        std::lock_guard<std::mutex> lk(bringup_watch->m);
+        secs = double(now_ns() - bringup_watch->since) / 1e9;
+        what = bringup_watch->what;
+      }
+      die(gz_gpu_init_fail_msg(gz_gpu_only_flag(opt), -1, secs, what), EXIT_GPU_FAIL);
+    }
+    return false;
+  };
 
   // Deadlines mirror the compress deadline action, scaled by each device's own
   // batch EMA: stop new intake at max(4x EMA, 2 s), take the batch away at
@@ -52256,6 +53333,7 @@ gds_out_declined:
         GzDecompInflight & R = g_decomp_inflight[dev];
         std::vector<Task> rescued;
         uint64_t age = 0, d1 = 0, d2 = 0;
+        bool in_prep = false;
         size_t registered_streams = 0;
         bool uncopyable_stage = false;
         bool rescue_alloc_failed = false;
@@ -52266,11 +53344,19 @@ gds_out_declined:
           // Batch-completion bookkeeping may not have cleared the record yet,
           // but there is nothing to rescue and this worker must not be retired.
           if (*R.delivered >= R.batch->size()) continue;
-          age = now_ns() - R.submit_ns;
-          d1  = std::max<uint64_t>(4 * R.ema_ns, 2000000000ull);
-          d2  = std::max<uint64_t>(2 * d1,       6000000000ull);
+          // Before its launch (PREP, v0.18.64): one limit, and no demotion -- a
+          // batch stuck in its own buffers or upload takes no more intake anyway.
+          in_prep = R.prep;
+          if (in_prep) {
+            age = now_ns() - R.prep_ns;
+            d1 = d2 = uint64_t(gz_gpu_prep_limit_secs()) * 1000000000ull;
+          } else {
+            age = now_ns() - R.submit_ns;
+            d1  = std::max<uint64_t>(4 * R.ema_ns, 2000000000ull);
+            d2  = std::max<uint64_t>(2 * d1,       6000000000ull);
+          }
           if (age <= d1) continue;
-          if (!(g_decomp_demoted.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+          if (!in_prep && !(g_decomp_demoted.fetch_or(bit, std::memory_order_relaxed) & bit)) {
             char l[176];
             std::snprintf(l, sizeof(l),
               "[GPU%d] batch in flight %.1f s (limit %.1f s) - no new intake\n",
@@ -52334,11 +53420,12 @@ gds_out_declined:
           die("a GPU decompress batch wedged while holding a transient staged "
               "buffer that cannot be transferred to another worker", EXIT_GPU_FAIL);
         const int n = (int)rescued.size();
-        char l[208];
+        char l[240];
         std::snprintf(l, sizeof(l),
-          "WARNING: [GPU%d] batch wedged %.1f s past its deadline (limit %.1f s); "
+          "WARNING: [GPU%d] batch wedged %.1f s %s (limit %.1f s); "
           "reclaiming %d frame(s) for retry and retiring the device\n",
-          dev, age / 1e9, d2 / 1e9, n);
+          dev, age / 1e9, in_prep ? "before its launch (buffers or upload)" : "past its deadline",
+          d2 / 1e9, n);
         // Allocation-free for the same reason as the demotion line above, and in
         // particular because ownership has moved to the reclaimer by this point:
         // an exception here would strand the frames before re_enqueue().
@@ -52376,13 +53463,19 @@ gds_out_declined:
         const int out   = gpu_exits.fetch_add(1, std::memory_order_acq_rel) + 1;
         { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
         g_decomp_exit_cv.notify_all();
-        if (total > 0 && out == total && opt.gpu_only && !queue.drained())
+        if (total > 0 && out == total && opt.gpu_only && !queue.drained()) {
+          // The last exit can be a reclaim after teardown counted a different
+          // worker's abandoned initialization.  Apply the same rule as the
+          // worker's own last-out path: that initialization failure is fatal.
+          if (g_gpu_init_abandoned.load(std::memory_order_relaxed))
+            die(gz_gpu_init_fail_generic(gz_gpu_only_flag(opt)), EXIT_GPU_FAIL);
           gpu_only_cpu_fallback(true, &queue, &results, opt, m, bp_ptr, discard_results,
               std::min(total, gpu_failures.load(std::memory_order_acquire)
                               + __builtin_popcountll(
                                   g_decomp_abandoned.load(std::memory_order_relaxed)
                                   & ~abandoned_at_start)),
               total);
+        }
         }
       }
     });
@@ -52404,13 +53497,31 @@ gds_out_declined:
   // registers and the explicit split is ignored.  Only applies to the
   // inline (fixed-share) path — adaptive runs hybrid_overlap with gpu
   // workers spawned on the background thread and promises no exact split.
+  //
+  // A worker that never finishes its context or setup would hold this barrier for
+  // good (GzGpuCallWatch).  One stuck past the GPU initialization timeout is given
+  // up on, loudly, counted failed with its exit accounted for, and the CPU pool
+  // takes its share (rtcheek: the fixed share fails on the timer, the CPU finishes).
   if (sched && opt.cpu_share >= 0.0 && !gpu_workers.empty()) {
+    GzGiveUp g;
+    g.limit_s = gz_gpu_init_timeout_secs();
+    g.init_only = true;
+    const uint64_t t0 = now_ns();
     std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
-    g_gpu_bringup_cv.wait(lk, [&] {   // see the compress barrier for the abort term
-      return sched->any_gpu_active()
-          || gpu_failures.load(std::memory_order_acquire) >= (int)gpu_workers.size()
-          || g_gpu_aborted.load(std::memory_order_relaxed);
-    });
+    while (!g_gpu_bringup_cv.wait_for(lk, std::chrono::milliseconds(250), [&] {   // see the compress barrier for the abort term
+             return sched->any_gpu_active()
+                 || gpu_failures.load(std::memory_order_acquire) >= (int)gpu_workers.size()
+                 || g_gpu_aborted.load(std::memory_order_relaxed);
+           })) {
+      lk.unlock();
+      for (const GzGpuCallWatchP & w : worker_watch)
+        if (w && gz_gpu_watch_give_up(*w, t0, opt.verbosity, g)) {
+          any_gpu_failed = true;
+          gpu_failures.fetch_add(1, std::memory_order_acq_rel);
+          account_abandoned_worker(*w);
+        }
+      lk.lock();
+    }
   }
 
   // ---- Producer: stream frames into the queue while workers consume ----
@@ -52427,7 +53538,14 @@ gds_out_declined:
   std::unique_ptr<DStageAhead> dstage_ahead;
   auto stop_dstage_ahead = [&]() {
     g_dstage_ahead.store(nullptr, std::memory_order_release);
-    if (dstage_ahead) dstage_ahead->stop();
+    // A batch reclaimed in this run may have left a thread copying out of a
+    // cache buffer, or about to claim or release one (GzDecompInflight's PREP):
+    // keep the buffers AND the cache object then -- stopped, so a late claim
+    // finds nothing and a late release does nothing.
+    if (!dstage_ahead) return;
+    const bool reclaimed = (g_decomp_abandoned.load(std::memory_order_relaxed) & ~abandoned_at_start) != 0;
+    dstage_ahead->stop(!reclaimed);
+    if (reclaimed) (void)dstage_ahead.release();
   };
   // -d ONLY.  -t downloads nothing, so its reads never waited behind a download
   // and there is nothing to overlap: MEASURED (16 GiB cold, x3) -t wall 6.15-6.17 s
@@ -52498,7 +53616,7 @@ gds_out_declined:
       // leaving it set while the ordinary producer pushes host-backed Tasks
       // would have them read from a slab nobody filled.
       stop_dstage_ahead();          // before the descriptor its readers use closes
-      gds_decomp_read_close();
+      gds_decomp_read_close(opt.verbosity);
       const std::string SF = gz_stage_name(opt);
       vlog(gz_stage_notice_level(opt), opt,
            g_gds_table_rejected.load(std::memory_order_relaxed)
@@ -52524,7 +53642,7 @@ gds_out_declined:
   // old synchronous path did, now that the reader has stopped streaming.
   if (gpu_only_no_device.load(std::memory_order_acquire)) {
     stop_bringup_sample();
-    if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+    join_bringup();
     die_usage(gz_no_gpu_usage_msg(opt));
   }
 
@@ -52568,7 +53686,7 @@ gds_out_declined:
     const bool stream_now = stream_rest && !opt.gpu_only
                             && !g_gds_out_active.load(std::memory_order_relaxed);
     if (stream_now) gz_stream_rest(in, out, opt, m, raw_data, max_frame_decomp);
-    if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+    join_bringup();
     if (gpu_only_no_device.load(std::memory_order_acquire))
       die_usage(gz_no_gpu_usage_msg(opt));
     gz_wait_for_worker_exits();          // see the teardown site for the ordering
@@ -52586,7 +53704,7 @@ gds_out_declined:
     // teardown below, leaking both the cuFile handle and its descriptor (and
     // leaving active=true for the next input in a multi-file process).
     if (g_gds_out_active.load(std::memory_order_relaxed)) {
-      g_gds_output.close();
+      if (!gz_gds_close_bounded(g_gds_output, opt.verbosity)) g_gds_output_fd = -1;   // kept open
       if (g_gds_output_fd >= 0) {
         ::close(g_gds_output_fd);
         g_gds_output_fd = -1;
@@ -52644,7 +53762,7 @@ gds_out_declined:
   // unknown size, producer_done ends the gate wait at its next timed wake;
   // bringup may already be running if a batch arrived first.
   bringup_cv.notify_all();
-  if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+  join_bringup();
   // THE SECOND CHECK, now that the bringup's answer is final.  An archive small
   // enough to stream before CUDA answers passed the first check (right after the
   // reader) with the flag still clear; the teardown below then published
@@ -52859,14 +53977,18 @@ gds_out_declined:
   if (g_gds_out_active.load(std::memory_order_relaxed) && g_gds_output_fd >= 0) {
     const uint64_t total = g_gds_out_total.load(std::memory_order_relaxed);
     const unsigned long long b1 = gz_nvfs_bar1_ok();
-    g_gds_output.close();                       // deregister before the fd goes
+    // Deregister before the fd goes -- bounded (gz_gds_close_bounded): given up
+    // on, the descriptor still sets the length, then stays open.
+    const bool dereg_done = gz_gds_close_bounded(g_gds_output, opt.verbosity);
     if (::ftruncate(g_gds_output_fd, (off_t)total) != 0) {
       const int e = errno;
-      ::close(g_gds_output_fd); g_gds_output_fd = -1;
+      if (dereg_done) ::close(g_gds_output_fd);
+      g_gds_output_fd = -1;
       die_io("--gds-only: cannot set the output length of " + opt.output + ": "
              + std::strerror(e));
     }
-    ::close(g_gds_output_fd); g_gds_output_fd = -1;
+    if (dereg_done) ::close(g_gds_output_fd);
+    g_gds_output_fd = -1;
     g_gds_out_active.store(false, std::memory_order_relaxed);
     // Teach the still-live ordinary sink where the positional GDS prefix ends.
     // DirectWriter uses pwrite offsets derived from its own logical cursor; a
@@ -52916,7 +54038,7 @@ gds_out_declined:
   // later input routed to decompress_cpu_mt (which never calls the entry
   // teardown) would otherwise inherit a stale true and silently produce an empty
   // file.
-  gds_decomp_read_close();
+  gds_decomp_read_close(opt.verbosity);
 
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "decompress-hybrid" :
@@ -59247,8 +60369,9 @@ static int pcie_gen_of_speed_file(const fs::path & p)
 // Where the last detect_min_pcie_gen() found its answer, for -vv and the suite.
 static const char * g_pcie_gen_source = "nothing";
 
-static int detect_min_pcie_gen()
+static int detect_min_pcie_gen(const Options & opt)
 {
+  (void)opt;   // the NVML fallback is optional at build time
   int min_gen = -1;
   g_pcie_gen_source = "nothing";
   // sysfs FIRST, NVML only as a fallback.  This runs on every GPU-capable run
@@ -59330,26 +60453,36 @@ static int detect_min_pcie_gen()
 
 #ifdef HAVE_NVML
   // Fallback: no usable sysfs (a container without /sys/bus/pci, or an
-  // unrecognised link-speed string).
-  if (nvmlInit_v2() == NVML_SUCCESS) {
-    unsigned dev_count = 0;
-    if (nvmlDeviceGetCount_v2(&dev_count) == NVML_SUCCESS) {
-      for (unsigned i = 0; i < dev_count; ++i) {
-        nvmlDevice_t dev;
-        if (nvmlDeviceGetHandleByIndex_v2(i, &dev) != NVML_SUCCESS) continue;
-        // Use Max not Curr: idle GPUs drop their link to Gen1 for power
-        // management, so Curr would lie about a Gen3 GPU at rest.  Max
-        // reports the negotiated hardware ceiling (factoring in slot too:
-        // a Gen3 card in a Gen2 slot reports Max=Gen2, which is correct).
-        unsigned int gen = 0;
-        if (nvmlDeviceGetMaxPcieLinkGeneration(dev, &gen) == NVML_SUCCESS) {
-          int g = (int)gen;
-          if (min_gen < 0 || g < min_gen) min_gen = g;
+  // unrecognised link-speed string).  NVML can stop answering too.  Keep this
+  // optional probe off the main thread in hybrid; GPU-only initialization is timed.
+  if (g_gpu_call_abandoned.load(std::memory_order_relaxed)) return 0;
+  auto probe = [] {
+    int found = -1;
+    if (nvmlInit_v2() == NVML_SUCCESS) {
+      unsigned dev_count = 0;
+      if (nvmlDeviceGetCount_v2(&dev_count) == NVML_SUCCESS) {
+        for (unsigned i = 0; i < dev_count; ++i) {
+          nvmlDevice_t dev;
+          if (nvmlDeviceGetHandleByIndex_v2(i, &dev) != NVML_SUCCESS) continue;
+          // Use Max not Curr: idle GPUs drop their link to Gen1 for power
+          // management, so Curr would lie about a Gen3 GPU at rest.  Max
+          // reports the negotiated hardware ceiling (factoring in slot too:
+          // a Gen3 card in a Gen2 slot reports Max=Gen2, which is correct).
+          unsigned int gen = 0;
+          if (nvmlDeviceGetMaxPcieLinkGeneration(dev, &gen) == NVML_SUCCESS) {
+            int g = (int)gen;
+            if (found < 0 || g < found) found = g;
+          }
         }
       }
+      nvmlShutdown();
     }
-    nvmlShutdown();
-  }
+    return found;
+  };
+  if (opt.gpu_only)
+    min_gen = gz_gpu_only_init_step(opt, "reading PCIe link speeds with NVML", "bringup", false, probe);
+  else if (!gz_gpu_call_bounded(opt, "reading PCIe link speeds with NVML", probe, min_gen))
+    min_gen = -1;
   if (min_gen > 0) g_pcie_gen_source = "NVML";
 #endif
   return (min_gen > 0) ? min_gen : 0;
@@ -59821,7 +60954,7 @@ static const char * gz_auto_stage_decline(const Options & opt, unsigned * cpus_o
     }
   }
   if (gz_floor_precuda().all_old) return "every GPU is older than this build supports";
-  if (detect_min_pcie_gen() < 4) return "the GPUs' PCIe link is older than Gen4, or unknown";
+  if (detect_min_pcie_gen(opt) < 4) return "the GPUs' PCIe link is older than Gen4, or unknown";
   // The staged reader opens O_DIRECT and dies when it cannot: find out here.
   // Some filesystems accept the open and refuse the read, so read one block --
   // of every input (one 4 KiB read each), or of a --tar's largest file (its
@@ -60803,8 +61936,18 @@ static void apply_backend_defaults(Options & opt)
   // staged compress would not pay anyway: it starts CUDA before its first
   // read (its pinned pool needs a context), and the answer is cached for every
   // later first-CUDA site.  The mask above already names the one device.
+  //
+  // Bounded (v0.18.64): a count that never comes is no usable GPU -- said loudly
+  // -- and the default backend runs instead.  A default chose this staging, so
+  // a driver that does not answer must not end the run.
   if (opt.direct_stage_auto) {
-    if (gz_cuda_usable_count(opt, "default staging") <= 0) {
+    int stage_count = 0;
+    const std::shared_ptr<const Options> sopt = std::make_shared<const Options>(opt);
+    if (!gz_gpu_call_bounded(opt, "starting CUDA for the default staging", [sopt] {
+          return gz_cuda_usable_count(*sopt, "default staging");
+        }, stage_count))
+      stage_count = 0;
+    if (stage_count <= 0) {
       opt.direct_stage = false;
       opt.direct_stage_auto = false;
       opt.stage_cpu = false;
@@ -60880,7 +62023,7 @@ static void apply_backend_defaults(Options & opt)
 
   // PCIe-gen probe — drives the --direct default (compress + decompress) and
   // remains useful in the backend-selection diagnostic below.
-  int gen = detect_min_pcie_gen();
+  int gen = detect_min_pcie_gen(opt);
   vlog(V_DEBUG, opt, "[PCIe] Gen" + std::to_string(gen) + " from " + g_pcie_gen_source + "\n");
 
   // Resolve the --verify engine (compress only).  GPU verify (decompress + raw
@@ -60925,8 +62068,9 @@ static void apply_backend_defaults(Options & opt)
     // In the common homogeneous-GPU box that device is
     // representative, and the embedded PTX makes the answer identical across
     // same-or-newer cards.
-    if (opt.gpu_verify) order_all_gpus_before_cuda(opt, /*eager=*/true);
     if (opt.gpu_verify) {
+      GzGpuOnlyInitScope init_step(opt, "checking GPU verification");
+      order_all_gpus_before_cuda(opt, /*eager=*/true);
       // Probe a device this build can run on (v0.17.77): on a box mixing card
       // generations, CUDA's device 0 can be one the run will never use.  With
       // none usable there is nothing to probe; the compress refuses --gpu-only

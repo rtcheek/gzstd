@@ -633,8 +633,21 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=593
-$EXTENSIVE && EXPECTED_TESTS=942
+EXPECTED_TESTS=609
+$EXTENSIVE && EXPECTED_TESTS=958
+# v0.18.64: +11 GPU cells in a new default section after the GPU decompress reclaim
+# (a GPU driver that stops answering: -d and compress finish when the bringup never
+# returns, -d --gpu-only when freeing a GPU's buffers never returns; GPU-only runs
+# fail, exit 5, when no context comes (-d, compress), when the bringup or CUDA's
+# start never returns and when a GPU's setup never returns (-d, compress); the fixed
+# share's CPUs finish when CUDA never starts and when a GPU's setup never returns):
+# 593 -> 604, -e 942 -> 953; the no-GPU deltas +11, so the CPU-only run is unchanged
+# at 423 passed (+11 skips).  Then +5 more in the same section: -d --gpu-only and
+# --direct-stage reclaim a batch stuck before its launch; a --tar extract's forced
+# GPU start is given up on; and two GDS cells (compress --gds-only fails when its last
+# output write never returns, -d --gds-only finishes when a cuFile handle's release
+# never returns): 604 -> 609, -e 953 -> 958; no-GPU deltas +5, GDS deltas +2.
+# DERIVED.
 # v0.18.63: +3 cells after the v0.18.62 ones (a parallel extract readies an existing
 # directory before its partitions write into it; the --adapt profile save replaces only
 # a profile; --keep-going refused by its own name), no GPU needed, and +1 GPU cell in
@@ -1058,8 +1071,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=170   # + one v0.18.63; + one v0.18.62; + one v0.18.60 (its GPU tuner cell; missed then: the note said 417 for 416); + one v0.18.58; + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=255   # + one v0.18.63; + one v0.18.62; + one v0.18.60; + two v0.18.58; + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
+EXPECTED_NOGPU_DELTA=186   # + sixteen v0.18.64; + one v0.18.63; + one v0.18.62; + one v0.18.60 (its GPU tuner cell; missed then: the note said 417 for 416); + one v0.18.58; + one v0.18.57; + one v0.18.54; + one v0.18.46; + one v0.18.44; + two v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + one v0.18.36 (not three: two are -e only); 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, - twelve moved to -e in v0.18.32, + ten v0.18.33, + four v0.18.34
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=271   # + sixteen v0.18.64; + one v0.18.63; + one v0.18.62; + one v0.18.60; + two v0.18.58; + two v0.18.57; + one v0.18.54; + one v0.18.48; + one v0.18.46; + one v0.18.44; + four v0.18.43; + one v0.18.40; + one v0.18.39; + two v0.18.37; + three v0.18.36; 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14, + one v0.18.25, + one v0.18.26, + two v0.18.30, + three v0.18.31, + ten v0.18.33, + four v0.18.34
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1077,8 +1090,8 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=255   # + one v0.18.63; + one v0.18.62; + one
 # one of the 607 cells has now been exercised.
 # v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
 # cell that exists only under --extensive.
-EXPECTED_NOGDS_DELTA=17   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7, two seek-table-section cells in v0.18.32; + two v0.18.34
-$EXTENSIVE && EXPECTED_NOGDS_DELTA=21   # + the v0.17.83 --extensive cell
+EXPECTED_NOGDS_DELTA=19   # + two v0.18.64; 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89 + 1 v0.18.31, derived; the v0.17.82 cell moved to -e in v0.18.7, two seek-table-section cells in v0.18.32; + two v0.18.34
+$EXTENSIVE && EXPECTED_NOGDS_DELTA=23   # + the v0.17.83 --extensive cell; + two v0.18.64
 
 # ============================================================
 # Banner & system info
@@ -12372,6 +12385,261 @@ else
 fi
 
 fi  # $EXTENSIVE (--adapt GPU deadline demote/escalate + GPU decompress stuck-batch reclaim: moved to -e in v0.18.7 -- stable, untouched, and slow)
+
+# ────────────────────────────────────────────────────────────
+section "A GPU driver that stops answering (v0.18.64)"
+
+# 2026-11-24, 8-GPU server: one card's firmware crashed and the driver held its
+# global lock.  A default -d of a 70 GB archive decoded every frame on the CPU pool
+# in ~22 s, then hung for good: teardown joined the bringup thread, asleep in
+# cuInit's ioctl, before the writer's join and close(), so the output was never
+# finished or renamed.  The GPU calls that hold no frames are now watched
+# (GzGpuCallWatch): starting CUDA and ranking the devices, a worker's context and
+# its setup up to its first batch (GPU INITIALIZATION), and its final release.
+#   * Teardown gives up on one after 6 s; the CPUs have done the work.
+#   * A GPU-only run (--gpu-only, --gds-only, --direct-stage) has no CPU to fall
+#     back on: an initialization that does not return within 60 s
+#     (GZSTD_DEBUG_GPU_INIT_SEC here) fails the run, exit 5, the output removed --
+#     and so does one teardown gives up on with frames left for it.
+#   * The fixed-share hybrid (--cpu-share) gives up on it after the same 60 s,
+#     loudly, and the CPUs finish.
+# GZSTD_DEBUG_GPU_HANG=bringup|context|setup|release stalls the first thread into
+# that call until it is given up on.  Every cell is a HANG GUARD first (v0.18.63
+# sits in the stall until the 45 s timeout), then the exit and the output.
+# GZSTD_DEBUG_GPU_GUARD_SEC=0 starts a hybrid run's bringup at once, so the stall
+# is reached whatever the CPU pool's pace; --gpu-only and the fixed share always
+# reach it (the fixed share waits for a GPU to register before reading).  A
+# context stall holds the one-device-at-a-time lock, as a context that never comes
+# does.  The hybrid cells take 320 MiB: under one GPU batch (256 MiB) a hybrid run
+# never starts the GPU at all, and the cell would test nothing.
+if has_gpu 2>/dev/null; then
+  dh_src="$TMPDIR/dhang.bin"; dh_zst="$TMPDIR/dhang.zst"; dh_out="$TMPDIR/dhang.out"
+  dh_log="$TMPDIR/dhang.log"; dh_c="$TMPDIR/dhang.c.zst"
+  dh_sm="$TMPDIR/dhang.small"; dh_smz="$TMPDIR/dhang.small.zst"
+  dh_big="$TMPDIR/dhang.big"; dh_bigz="$TMPDIR/dhang.big.zst"
+  head -c $((24*1048576)) /dev/urandom | base64 -w0 | head -c $((32*1048576)) > "$dh_src"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dh_src" -o "$dh_zst" 2>/dev/null
+  head -c $((8*1048576)) "$dh_src" > "$dh_sm"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dh_sm" -o "$dh_smz" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do cat "$dh_src"; done > "$dh_big"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dh_big" -o "$dh_bigz" 2>/dev/null
+
+  # A cell that must finish: hang guard, exit 0, the announcement, then the output.
+  #   dh_finishes NAME ANNOUNCED VERIFY-CMD -- ENV... GZSTD-ARGS...
+  dh_finishes() {
+    local name=$1 announced=$2 verify=$3; shift 4
+    local rc=0
+    timeout --foreground -k 10 45 env "$@" >"$dh_log" 2>&1 || rc=$?
+    if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+      fail "$name" "TIMED OUT -- something waited on the stalled GPU call"
+    elif [[ $rc -ne 0 ]]; then
+      fail "$name" "exit $rc"
+    elif ! grep -aqE "$announced" "$dh_log"; then
+      fail "$name" "no give-up announced: NOT TESTED"
+    elif eval "$verify"; then
+      pass "$name"
+    else
+      fail "$name" "output differs"
+    fi
+  }
+  # A GPU-only cell that must FAIL: hang guard, exit 5, the error, no output left.
+  # ERROR is a regex the error must match: the timer's names its own limit ("for 3
+  # s"), teardown's the time the call took, so a cell can tell which one ended it.
+  #   dh_fails NAME OUTPUT ERROR -- ENV... GZSTD-ARGS...
+  dh_fails() {
+    local name=$1 out=$2 err=$3; shift 4
+    local rc=0
+    rm -f "$out"
+    timeout --foreground -k 10 45 env "$@" >"$dh_log" 2>&1 || rc=$?
+    if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+      fail "$name" "TIMED OUT -- nothing timed the GPU initialization"
+    elif [[ $rc -ne 5 ]]; then
+      fail "$name" "exit $rc, not 5"
+    elif ! grep -aqE "(GPU initialization failed|GPU output stalled): $err" "$dh_log"; then
+      fail "$name" "exit 5 without the expected GPU error ($err)"
+    elif [[ -e "$out" ]]; then
+      fail "$name" "the partial output was left behind"
+    else
+      pass "$name"
+    fi
+  }
+
+  # 1. The incident: a hybrid -d whose bringup never returns from starting CUDA.
+  # Two inputs: the second must not start CUDA again -- it would queue behind the
+  # stuck call -- and still decodes, on the CPU.
+  rc=0
+  cp "$dh_bigz" "$TMPDIR/dhang1.zst"; cp "$dh_bigz" "$TMPDIR/dhang2.zst"
+  rm -f "$TMPDIR/dhang1" "$TMPDIR/dhang2"
+  timeout --foreground -k 10 45 env GZSTD_DEBUG_GPU_GUARD_SEC=0 GZSTD_DEBUG_GPU_HANG=bringup \
+    "$GZSTD" -d -v -f "$TMPDIR/dhang1.zst" "$TMPDIR/dhang2.zst" >"$dh_log" 2>&1 || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "-d finishes when the GPU bringup never returns" "TIMED OUT -- teardown waited on the bringup"
+  elif [[ $rc -ne 0 ]]; then
+    fail "-d finishes when the GPU bringup never returns" "exit $rc"
+  elif ! grep -aq 'no answer from the GPU driver .* while starting CUDA' "$dh_log"; then
+    fail "-d finishes when the GPU bringup never returns" "no give-up announced: NOT TESTED"
+  elif ! grep -aq 'no devices found; hybrid running CPU-only' "$dh_log"; then
+    fail "-d finishes when the GPU bringup never returns" "the second input started CUDA again"
+  elif files_match "$dh_big" "$TMPDIR/dhang1" && files_match "$dh_big" "$TMPDIR/dhang2"; then
+    pass "-d finishes when the GPU bringup never returns"
+  else
+    fail "-d finishes when the GPU bringup never returns" "output differs"
+  fi
+  rm -f "$TMPDIR/dhang1" "$TMPDIR/dhang2" "$TMPDIR/dhang1.zst" "$TMPDIR/dhang2.zst"
+
+  # 2. The same in compress.  1 MiB frames: fewer frames than CPU workers are all
+  # compressed on the CPU before a GPU could be ready, and no GPU is started.
+  rc=0
+  timeout --foreground -k 10 45 env GZSTD_DEBUG_GPU_GUARD_SEC=0 GZSTD_DEBUG_GPU_HANG=bringup \
+    "$GZSTD" -v --chunk-size=1 -f "$dh_big" -o "$dh_c" >"$dh_log" 2>&1 || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "compress finishes when the GPU bringup never returns" "TIMED OUT"
+  elif [[ $rc -ne 0 ]]; then
+    fail "compress finishes when the GPU bringup never returns" "exit $rc"
+  elif ! grep -aq 'no answer from the GPU driver .* while starting CUDA' "$dh_log"; then
+    fail "compress finishes when the GPU bringup never returns" "no give-up announced: NOT TESTED"
+  elif "$GZSTD" -q -d --cpu-only -f "$dh_c" -o "$dh_out" 2>/dev/null && files_match "$dh_big" "$dh_out"; then
+    pass "compress finishes when the GPU bringup never returns"
+  else
+    fail "compress finishes when the GPU bringup never returns" "round trip differs"
+  fi
+
+  # 3. A worker that decoded everything, then never returns from freeing its
+  # buffers.  Not initialization: its exit is accounted for, and even a GPU-only
+  # run finishes, leaving it behind.
+  dh_finishes "-d --gpu-only finishes when freeing a GPU's buffers never returns" \
+    'no answer from the GPU driver .* while freeing its buffers' \
+    'files_match "$dh_src" "$dh_out"' -- \
+    GZSTD_DEBUG_GPU_HANG=release "$GZSTD" -d --gpu-only -v -f "$dh_zst" -o "$dh_out"
+
+  # 4 and 5. GPU-only whose only GPU never gets a context, on an input the queue
+  # holds whole, so the run reaches teardown before the timer: nothing else takes
+  # the frames, and the run FAILS rather than finish on the CPU (rtcheek) -- the
+  # same outcome the timer gives a larger input (6).
+  dh_fails "compress --gpu-only fails when no GPU context comes" "$dh_c" \
+    '.* while creating its device context' -- \
+    GZSTD_DEBUG_GPU_HANG=context "$GZSTD" --gpu-only -v --chunk-size=1 -f "$dh_sm" -o "$dh_c"
+  dh_fails "-d --gpu-only fails when no GPU context comes" "$dh_out" \
+    '.* while creating its device context' -- \
+    GZSTD_DEBUG_GPU_HANG=context "$GZSTD" -d --gpu-only -v -f "$dh_smz" -o "$dh_out"
+
+  # 6-8. THE TIMER: GPU-only runs that never reach teardown -- v0.18.64's first
+  # form waited for good.  The bringup thread (-d: 320 MiB is more than its queue
+  # holds, so the reader waits), the main thread itself (compress counts its GPUs
+  # there), and a worker's setup between its context and its first batch.  The
+  # error must name the TIMER's limit.  3 s where the stall is the first GPU call;
+  # 10 s where a real cuInit comes first, which took over 3 s on the 8-GPU host --
+  # a short limit gives up on a healthy start.
+  dh_fails "-d --gpu-only fails when the GPU bringup never returns" "$dh_out" \
+    'no answer from the GPU driver for 3 s while starting CUDA' -- \
+    GZSTD_DEBUG_GPU_INIT_SEC=3 GZSTD_DEBUG_GPU_HANG=bringup \
+    "$GZSTD" -d --gpu-only -v -f "$dh_bigz" -o "$dh_out"
+  dh_fails "compress --gpu-only fails when CUDA never starts" "$dh_c" \
+    'no answer from the GPU driver for 3 s while starting CUDA' -- \
+    GZSTD_DEBUG_GPU_INIT_SEC=3 GZSTD_DEBUG_GPU_HANG=bringup \
+    "$GZSTD" --gpu-only -v --chunk-size=1 -f "$dh_big" -o "$dh_c"
+  dh_fails "-d --gpu-only fails when a GPU's setup never returns" "$dh_out" \
+    'no answer from the GPU driver for 10 s while setting up its buffers' -- \
+    GZSTD_DEBUG_GPU_INIT_SEC=10 GZSTD_DEBUG_GPU_HANG=setup \
+    "$GZSTD" -d --gpu-only -v -f "$dh_bigz" -o "$dh_out"
+  # 8b. Compress's setup, which teardown gives up on: its queue holds 320 MiB
+  # whole on a big host, so this run reaches teardown before the 60 s timer.
+  dh_fails "compress --gpu-only fails when a GPU's setup never returns" "$dh_c" \
+    '.* while setting up its buffers' -- \
+    GZSTD_DEBUG_GPU_HANG=setup \
+    "$GZSTD" --gpu-only -v --chunk-size=1 -f "$dh_big" -o "$dh_c"
+
+  # 9 and 10. THE FIXED SHARE: it counts its GPUs and brings them up before it
+  # reads, and waits for one to register -- each now for the same timer, after
+  # which it gives up loudly and the CPUs finish.  The device count (on a helper
+  # thread), and a worker's setup (the barrier).  One device: with a second, it
+  # registers and the barrier passes without the timer.  10 s for the setup: a
+  # real device count comes first (see 6-8).
+  dh_finishes "fixed share: the CPUs finish when CUDA never starts" \
+    'GPU initialization failed: .* while starting CUDA' \
+    '"$GZSTD" -q -d --cpu-only -f "$dh_c" -o "$dh_out" 2>/dev/null && files_match "$dh_big" "$dh_out"' -- \
+    GZSTD_DEBUG_GPU_INIT_SEC=3 GZSTD_DEBUG_GPU_HANG=bringup \
+    "$GZSTD" -v --cpu-share=0.5 --gpu-devices=1 --chunk-size=1 -f "$dh_big" -o "$dh_c"
+  dh_finishes "fixed share: the CPUs finish when a GPU's setup never returns" \
+    'GPU initialization failed: .* for 10\.0 s while setting up its buffers' \
+    'files_match "$dh_big" "$dh_out"' -- \
+    GZSTD_DEBUG_GPU_INIT_SEC=10 GZSTD_DEBUG_GPU_HANG=setup \
+    "$GZSTD" -d -v --cpu-share=0.5 --gpu-devices=1 -f "$dh_bigz" -o "$dh_out"
+  # 11 and 12. A -d BATCH STUCK BEFORE ITS LAUNCH -- in its buffers, pinned
+  # memory or upload -- is reclaimed like a stuck kernel: it is published from
+  # the moment it is taken, and GZSTD_DEBUG_GPU_PREP_SEC shortens its 60 s.  Its
+  # frames finish on the CPU (the --gpu-only rescue).  Host-backed frames stall
+  # after the batch's buffers; --direct-stage's stall on a staging copy holding a
+  # read-ahead claim, the path whose thread must park before touching the cache.
+  dh_finishes "-d --gpu-only: a batch stuck in its upload is reclaimed for the CPU" \
+    'batch wedged .* before its launch .*reclaiming [0-9]+ frame' \
+    'files_match "$dh_big" "$dh_out"' -- \
+    GZSTD_DEBUG_GPU_PREP_SEC=3 GZSTD_DEBUG_DECOMP_STALL=-1:60:upload \
+    "$GZSTD" -d --gpu-only -v -f "$dh_bigz" -o "$dh_out"
+  dh_finishes "-d --direct-stage: a batch stuck in its staged upload is reclaimed for the CPU" \
+    'batch wedged .* before its launch .*reclaiming [0-9]+ frame' \
+    'files_match "$dh_big" "$dh_out"' -- \
+    GZSTD_DEBUG_GPU_PREP_SEC=3 GZSTD_DEBUG_DECOMP_STALL=-1:60:upload \
+    "$GZSTD" -d --direct-stage -v -f "$dh_bigz" -o "$dh_out"
+
+  # 13. The --tar decode pool's FORCED GPU start (GZSTD_POOL_GPU, the suite's
+  # own way in) used to start CUDA on the main thread: now on its own thread,
+  # given up on after the GPU initialization timeout, and the CPU decoders finish
+  # the extract.
+  dh_tdir="$TMPDIR/dhang.tdir"; dh_tx="$TMPDIR/dhang.tx"
+  mkdir -p "$dh_tdir" "$dh_tx"
+  # 320 MiB of members: under one GPU batch (256 MiB) the extract is CPU-only.
+  for _k in 1 2 3 4 5 6 7 8; do head -c $((40*1048576)) "$dh_big" > "$dh_tdir/f$_k"; done
+  ( cd "$TMPDIR" && "$GZSTD" -q -f --cpu-only --tar --chunk-size=1 dhang.tdir -o dhang.tar.zst 2>/dev/null )
+  dh_finishes "--tar extract: the CPU decoders finish when the forced GPU start never answers" \
+    'GPU initialization failed: .* while starting CUDA' \
+    'diff -r "$dh_tdir" "$dh_tx/dhang.tdir" >/dev/null 2>&1' -- \
+    GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 GZSTD_DEBUG_GPU_INIT_SEC=3 GZSTD_DEBUG_GPU_HANG=bringup \
+    "$GZSTD" -d --tar -v "$TMPDIR/dhang.tar.zst" -C "$dh_tx"
+  rm -rf "$dh_tdir" "$dh_tx"; rm -f "$TMPDIR/dhang.tar.zst"
+
+  # 14 and 15. GPUDirect Storage, where peer-to-peer really runs.  Compress's
+  # last output write holds bytes that exist only in VRAM: nothing gives up on
+  # it, and the stall guard's limit (GZSTD_DEBUG_GPU_STALL_SEC) ends the run --
+  # exit 5, no output left.  A cuFile file handle's release at the end holds
+  # nothing: teardown gives up on it after 6 s and the run finishes.
+  if [[ "$(gds_host_status)" == engaged ]]; then
+    # 10 s: past teardown's 6 s, so a teardown that left the write behind would
+    # finish a short output at exit 0 -- the cell's discriminator.
+    dh_fails "compress --gds-only fails when its last output write never returns" "$dh_c" \
+      'no answer from the GPU driver for 10 s while writing the last of the output' -- \
+      GZSTD_DEBUG_GPU_STALL_SEC=10 GZSTD_DEBUG_GPU_HANG=write \
+      "$GZSTD" --gds-only -v -f "$dh_big" -o "$dh_c"
+    dh_finishes "-d --gds-only finishes when releasing a cuFile handle never returns" \
+      'no answer from the GPU driver .* while releasing a cuFile file handle' \
+      'files_match "$dh_big" "$dh_out"' -- \
+      GZSTD_DEBUG_GPU_HANG=handle "$GZSTD" -d --gds-only -v -f "$dh_bigz" -o "$dh_out"
+  elif gds_testable; then
+    skip_host "compress --gds-only fails when its last output write never returns" "GDS demoted"
+    skip_host "-d --gds-only finishes when releasing a cuFile handle never returns" "GDS demoted"
+  else
+    skip "compress --gds-only fails when its last output write never returns" "GDS unavailable ($(gds_host_status))"
+    skip "-d --gds-only finishes when releasing a cuFile handle never returns" "GDS unavailable ($(gds_host_status))"
+  fi
+  rm -f "$dh_src" "$dh_zst" "$dh_out" "$dh_log" "$dh_c" "$dh_sm" "$dh_smz" "$dh_big" "$dh_bigz"
+else
+  skip "-d finishes when the GPU bringup never returns" "no GPU"
+  skip "compress finishes when the GPU bringup never returns" "no GPU"
+  skip "-d --gpu-only finishes when freeing a GPU's buffers never returns" "no GPU"
+  skip "compress --gpu-only fails when no GPU context comes" "no GPU"
+  skip "-d --gpu-only fails when no GPU context comes" "no GPU"
+  skip "-d --gpu-only fails when the GPU bringup never returns" "no GPU"
+  skip "compress --gpu-only fails when CUDA never starts" "no GPU"
+  skip "-d --gpu-only fails when a GPU's setup never returns" "no GPU"
+  skip "compress --gpu-only fails when a GPU's setup never returns" "no GPU"
+  skip "fixed share: the CPUs finish when CUDA never starts" "no GPU"
+  skip "fixed share: the CPUs finish when a GPU's setup never returns" "no GPU"
+  skip "-d --gpu-only: a batch stuck in its upload is reclaimed for the CPU" "no GPU"
+  skip "-d --direct-stage: a batch stuck in its staged upload is reclaimed for the CPU" "no GPU"
+  skip "--tar extract: the CPU decoders finish when the forced GPU start never answers" "no GPU"
+  skip "compress --gds-only fails when its last output write never returns" "no GPU"
+  skip "-d --gds-only finishes when releasing a cuFile handle never returns" "no GPU"
+fi
 
 # ────────────────────────────────────────────────────────────
 section "Exit, signal and cleanup paths (v0.17.87 review)"
