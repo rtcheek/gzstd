@@ -33,7 +33,7 @@ defects, including four versions where it did not compile at all.
 
 ```bash
 ./gzstd-test.sh ./build/gzstd         # the default run
-./gzstd-test.sh ./build-cpu/gzstd     # CPU-only build (USE_NVCOMP=OFF) — cheap, ~1.4 min
+./gzstd-test.sh ./build-cpu/gzstd     # CPU-only build (USE_NVCOMP=OFF) — cheap, ~2-3 min
 ./gzstd-test.sh -e ./build/gzstd      # OPT-IN, see below
 ```
 
@@ -53,11 +53,13 @@ expected. Ask before bumping.
 **The default run is the normal one** when one is called for. Reach for `-e` only when the change is substantial
 enough to warrant it — always for `parse_args`, argument parsing, bundled-flag expansion or
 the zstd-compat flag layer, whose test sections are `$EXTENSIVE`-gated and therefore never
-run by default. The extensive run costs ~14 min against ~9.5 min for the default.
+run by default. On the 8-GPU server the extensive run costs ~20-30 min (958 cells in 27m43s,
+2026-11-25) against ~10-20 min for the default (591 cells in 19m21s down to 581 in 10m32s);
+both swing with the shared host's load.
 
 **When you do run `-e`, do not also run the default** — `-e` is a strict superset. Every
 extensive gate is `if $EXTENSIVE; then … fi` and none exclude, so running both repeats the
-default's tests for ~9.5 min of nothing.
+default's tests for another 10-20 min of nothing.
 
 **The CPU-only run is orthogonal to both** — a different *binary*, not a smaller test
 selection. `USE_NVCOMP=OFF` compiles ~50 conditional regions the other way, which no number
