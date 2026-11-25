@@ -186,8 +186,16 @@ jobs:
         run: |
           # gzstd.cpp is the source of truth for the version string.
           version=$(grep -oP 'GZSTD_VERSION = "\K[0-9.]+' gzstd.cpp)
-          # Use the pushed tag when triggered by tag, else synthesize from version.
-          tag="${GITHUB_REF_NAME:-v$version}"
+          # Use the pushed tag when triggered by a tag, else synthesize from the
+          # version.  Test the ref TYPE: GITHUB_REF_NAME is never empty (a manual
+          # run sets it to the branch), so the old ${GITHUB_REF_NAME:-v$version}
+          # never fell back and every manual run warned "tag main does not match".
+          # The check below is for a tag push, where a mismatch is real.
+          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$version"
+          fi
           if [[ "$tag" != "v$version" ]]; then
             echo "::warning::tag $tag does not match source version $version"
           fi
