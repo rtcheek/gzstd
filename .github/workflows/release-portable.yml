@@ -18,8 +18,19 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
+      # The action majors below are the first on the Node 24 runtime (checkout
+      # v5, cache v5, upload-artifact v6, action-gh-release v3) or newer.  Their
+      # Node 20 majors made every run end on a deprecation annotation, and on
+      # Node 24 their bundled dependencies printed DEP0040/DEP0169 warnings.
+      #
+      # checkout runs git init with no init.defaultBranch, which prints a
+      # twelve-line hint on every run; it copies the global config into the
+      # temporary HOME it runs git under, so setting the name here is enough.
+      - name: Quiet git init
+        run: git config --global init.defaultBranch main
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Fail the release BEFORE building if any on-disk integer is read in host
       # order.  Cheap, and it is the one defect class that cannot be caught by
@@ -33,7 +44,7 @@ jobs:
       # from NVIDIA's CDN every time.  Key includes the version so a bump
       # invalidates the cache automatically.
       - name: Cache nvCOMP tarball
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/gzstd-build
           key: nvcomp-5.2.0.10-cuda12-${{ runner.os }}
@@ -54,7 +65,7 @@ jobs:
       # so a zstd bump never invalidates the nvCOMP cache or the other way round.
       # The build script verifies the checksum whether or not this hits.
       - name: Cache zstd source
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/gzstd-zstd
           key: zstd-${{ steps.zstd.outputs.version }}-${{ steps.zstd.outputs.sha }}-${{ runner.os }}
@@ -215,14 +226,14 @@ jobs:
 
       - name: Upload as workflow artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: release/
 
       - name: Attach to GitHub release (tag push)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           files: |

@@ -1,10 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.64  
+**Covers:** v0.9.50 → v0.18.65  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 - **Workstation 2 (from v0.18.36):** 61 GiB RAM, 16-core / 32-thread CPU, 1× NVIDIA RTX 5090 (32 GiB VRAM, PCIe Gen5), Gen4 NVMe ~5.9 GiB/s O_DIRECT read
+
+---
+
+
+## v0.18.65 — the release build is warning-free: the --gds-only degraded-run warning fits its buffer, and the release workflow runs on Node 24 actions
+
+**The v0.18.64 release log (Actions, 3m3s, green) carried seven kinds of warning, and one was ours.**
+gcc 9 in the build container flagged `-Wformat-truncation` on the --gds-only degraded-run message in
+compress_nvcomp: formatted into 320 bytes, its worst case (both transfer counts and the refused-member
+count at 20 digits, the Bar1 clause present) is 340 with the NUL, so it would have lost its second line,
+the one that says the output is correct either way.  Reaching that needs counts in the billions, so no run is
+known to have; the buffer is now 512.  The local gcc 13 builds of both configurations compile with no warnings.
+
+The other six were the workflow's:
+
+| warning | source | fix |
+|---|---|---|
+| Node.js 20 is deprecated (the run's annotation) | checkout@v4, cache@v4, action-gh-release@v2 | checkout@v7, cache@v6, action-gh-release@v3; upload-artifact@v7 too (manual runs only, so it was not named) |
+| DEP0040 punycode, DEP0169 url.parse() | the same actions' bundled dependencies, forced onto Node 24 | the same bumps; upload-artifact v6 names the punycode fix, cache v6 rebuilt on current packages |
+| git init: Using 'master' as the name for the initial branch | checkout runs git init with no init.defaultBranch | a step before checkout sets it globally; checkout copies the global config into the temporary HOME it runs git under |
+| WARNING: The NVIDIA Driver was not detected | the CUDA image's entrypoint, before our script | `docker run --entrypoint bash`: that entrypoint only prints (banner, license, driver check) and exports NVIDIA_CPU_ONLY=1, which nothing in the build reads; PATH and the library paths are image ENV either way |
+| rehash: warning: skipping ca-certificates.crt | the ca-certificates package script, which -qq does not quiet | apt-get install logs to a file and prints its tail only on failure, as the zstd build already did |
+
+Every input the workflow passes (tag_name, files, generate_release_notes, fail_on_unmatched_files; path
+and key; name and path) is unchanged in the new majors, read from each action.yml at the pinned release.
+
+**Verified:** both local builds clean; `bash -n` on build-portable.sh and on the script it runs in the
+container; the workflow's indentation.  **Not yet verified:** a run on Actions.  A manual run
+(workflow_dispatch) exercises everything but the release upload, which only a tag push reaches.
 
 ---
 

@@ -145,7 +145,12 @@ fi
 
 # -------- build --------
 echo "Building inside $BASE_IMAGE ..."
+# --entrypoint bash: the CUDA image's own entrypoint prints its banner, license
+# text and, with no GPU passed in (none is needed to build), "WARNING: The NVIDIA
+# Driver was not detected" before it runs the command.  It only prints, so the
+# build skips it and the release log carries no warning that is not ours.
 docker run --rm \
+  --entrypoint bash \
   -v "$REPO_ROOT":/src \
   -v "$NVCOMP_DIR":/nvcomp:ro \
   -v "$ZSTD_SRC":/zstd-src:ro \
@@ -155,7 +160,7 @@ docker run --rm \
   -e DEBIAN_FRONTEND=noninteractive \
   -e TZ=Etc/UTC \
   "$BASE_IMAGE" \
-  bash -c '
+  -c '
     # The configure/version checks below use tee; a failed producer must fail
     # the build even when tee succeeds (including on a reused build directory).
     set -euo pipefail
@@ -173,9 +178,14 @@ docker run --rm \
     # test asserts ACL support is actually present.
     # No libzstd-dev: Ubuntu 20.04 ships zstd 1.4.4 and its static archive is
     # single-threaded.  The zstd built below is the only one in the container.
+    # Logged like the zstd build below and shown only on failure: -qq does not
+    # quiet package scripts, and two of them print a warning on every build
+    # that is not one (ca-certificates: rehash skipping its own bundle file;
+    # debconf: apt-utils not installed).
     apt-get install -y -qq --no-install-recommends \
       build-essential libacl1-dev libattr1-dev \
-      pkg-config xz-utils ca-certificates curl
+      pkg-config xz-utils ca-certificates curl >/tmp/apt-install.log 2>&1 || {
+      tail -40 /tmp/apt-install.log; echo "ERROR: apt-get install failed"; exit 1; }
     # zstd, static and MULTITHREADED: libzstd.a-mt, not libzstd.a.
     cp -a /zstd-src /tmp/zstd
     make -C /tmp/zstd/lib -j"$(nproc)" libzstd.a-mt >/tmp/zstd-build.log 2>&1 || {

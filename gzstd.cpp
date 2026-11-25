@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.64";
+static constexpr const char * GZSTD_VERSION = "0.18.65";
 //
 // Architecture overview:
 //
@@ -47663,7 +47663,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     const uint64_t fb   = g_gds_frames_fallback.load(std::memory_order_relaxed);
     const uint64_t nofl = g_gds_members_nofile.load(std::memory_order_relaxed);
     const bool bar1_moved = (b1 > g_gds_bar1_before);
-    char b[320];
+    // 512, not 320: the degraded message with every clause and three 20-digit
+    // counts needs 340 bytes, and 320 cut it off before its second line.  The
+    // release build's gcc 9 flagged it (-Wformat-truncation).
+    char b[512];
     if (fb || nofl || !bar1_moved) {
       // Build the optional clauses separately: the single-snprintf version
       // printed "bounced through host memory0 members cuFile would not take"
